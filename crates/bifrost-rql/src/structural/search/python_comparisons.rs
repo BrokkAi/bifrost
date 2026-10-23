@@ -1625,6 +1625,7 @@ fn push_incomplete_diagnostic(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code,
         impact: CodeQueryDiagnosticImpact::Incomplete,

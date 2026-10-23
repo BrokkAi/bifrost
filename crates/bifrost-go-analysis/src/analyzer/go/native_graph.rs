@@ -100,37 +100,19 @@ impl NativeWorkspaceGraphProvider for GoNativeWorkspaceGraphProvider {
                 files: request_files,
             });
         }
-        let Some(snapshot) = go.inner.selected_workspace_snapshots().get("go").cloned() else {
+        let Some(_snapshot) = go.inner.selected_workspace_snapshots().get("go").cloned() else {
             return Some(LanguageEdgeFailure {
                 reason: "selected Go source publication is unavailable",
                 files: request_files.to_vec(),
             });
         };
-        let Some(profile) = go.native_context_profile() else {
-            return Some(LanguageEdgeFailure {
-                reason: "selected Go package/import profile is unavailable",
-                files: request_files.to_vec(),
-            });
-        };
-        match go
-            .inner
-            .analyzer_store()
-            .selected_go_context(&snapshot, &profile)
-        {
-            Ok(Some(_)) => None,
-            Ok(None) => Some(LanguageEdgeFailure {
-                reason: "selected Go package/import publication is unavailable",
-                files: request_files.to_vec(),
-            }),
-            Err(error) => {
-                go.inner.record_store_error(error.context(
-                    "checking selected Go package/import publication before native graph projection",
-                ));
-                Some(LanguageEdgeFailure {
-                    reason: "selected Go package/import publication could not be checked",
-                    files: Vec::new(),
-                })
-            }
+        if go.native_context_base_profile().is_none() {
+            Some(LanguageEdgeFailure {
+                reason: "selected Go package/import base profile is unavailable",
+                files: request_files,
+            })
+        } else {
+            None
         }
     }
 }
@@ -148,23 +130,14 @@ pub fn build_go_native_workspace_graph_for_files(
     }
     let generation = go.inner.project().analysis_generation();
     let snapshots = go.inner.selected_workspace_snapshots();
-    let Some(snapshot) = snapshots.get("go") else {
+    let Some(_snapshot) = snapshots.get("go") else {
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
             "selected Go workspace snapshot is unavailable".into(),
         ));
     };
-    let Some(profile) = go.native_context_profile() else {
+    let Some(base_profile) = go.native_context_base_profile() else {
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
-            "selected Go package/import profile is unavailable".into(),
-        ));
-    };
-    let Some(context) = go
-        .inner
-        .analyzer_store()
-        .selected_go_context(snapshot, &profile)?
-    else {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
-            "selected Go package/import publication is unavailable".into(),
+            "selected Go package/import base profile is unavailable".into(),
         ));
     };
     let (masks, content_mounts) = match go
@@ -254,6 +227,7 @@ pub fn build_go_native_workspace_graph_for_files(
     let mut rows = Vec::new();
     let mut unresolved_names = BTreeSet::new();
     let mut unresolved_names_complete = true;
+    let mut withheld_references = Vec::new();
     let mut reasons = Vec::new();
     let mut reference_count = 0_usize;
     let mut batch_count = 0_usize;
@@ -261,7 +235,7 @@ pub fn build_go_native_workspace_graph_for_files(
 
     let staged = operation.stage_go_graph_reference_edge_batches_in_files(
         go,
-        context.context_id,
+        base_profile,
         &admitted_callers,
         brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH,
         cancellation,
@@ -280,6 +254,7 @@ pub fn build_go_native_workspace_graph_for_files(
                     }
                 }
             }
+            withheld_references.extend_from_slice(edge_batch.withheld_references());
             match edge_batch.unresolved_names() {
                 Some(names) => unresolved_names.extend(names.iter().cloned()),
                 None => unresolved_names_complete = false,
@@ -399,6 +374,9 @@ pub fn build_go_native_workspace_graph_for_files(
     if !accumulator.stage(&rows, cancellation) {
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
     }
+    if !accumulator.note_withheld_references(&withheld_references, cancellation) {
+        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+    }
     if !accumulator.note_unresolved_names(
         unresolved_names_complete.then_some(&unresolved_names),
         cancellation,
@@ -406,11 +384,32 @@ pub fn build_go_native_workspace_graph_for_files(
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
     }
     let projection = accumulator.finish(&completeness, &summary, rows.len(), cancellation);
+    let mut domain_failures = BTreeSet::new();
+    for publication in operation.bound_go_context_publications() {
+        if let Some(failure) = operation.go_domain_discovery_failure(publication.context_id)? {
+            domain_failures.insert(failure);
+        }
+    }
+    let projection = if !domain_failures.is_empty() {
+        match projection {
+            SelectedWorkspaceUsageGraphProjectionOutcome::Complete(mut graph)
+            | SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(mut graph) => {
+                graph.domain_discovery_failures = domain_failures.into_iter().collect();
+                graph.unresolved_names = None;
+                SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph)
+            }
+            other => other,
+        }
+    } else {
+        projection
+    };
     let projection = if let Some(discovery_error) = go.build_selection_error() {
         match projection {
             SelectedWorkspaceUsageGraphProjectionOutcome::Complete(mut graph)
             | SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(mut graph) => {
-                graph.build_selection_unavailable = Some(brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphBuildSelectionUnavailable { discovery_error });
+                if graph.domain_discovery_failures.is_empty() {
+                    graph.build_selection_unavailable = Some(brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphBuildSelectionUnavailable { discovery_error });
+                }
                 // Unknown directive selection cannot certify absent inbound references.
                 graph.unresolved_names = None;
                 SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph)
@@ -426,21 +425,18 @@ pub fn build_go_native_workspace_graph_for_files(
     if go.inner.project().analysis_generation() != generation {
         return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale);
     }
-    Ok(match projection {
-        SelectedWorkspaceUsageGraphProjectionOutcome::Complete(graph) => {
-            SelectedWorkspaceUsageGraphProjectionOutcome::Complete(graph)
-        }
-        SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph) => {
-            SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph)
-        }
-        SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled => {
-            SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled
-        }
-        SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(reason) => {
-            SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(reason)
-        }
-        SelectedWorkspaceUsageGraphProjectionOutcome::Stale => {
-            unreachable!("a reducer has no source authority to mark stale")
-        }
-    })
+    Ok(
+        match operation.finish_native(projection, &completion, cancellation)? {
+            SelectedResolutionOperationOutcome::Native(projection) => projection,
+            SelectedResolutionOperationOutcome::Cancelled(_) => {
+                SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled
+            }
+            SelectedResolutionOperationOutcome::Stale(reason) => {
+                SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(format!("{reason:?}"))
+            }
+            SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(format!("{reason:?}"))
+            }
+        },
+    )
 }

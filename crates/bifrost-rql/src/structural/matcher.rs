@@ -488,6 +488,11 @@ fn eval_pattern_inner_with_name(
     {
         return false;
     }
+    if let Some(expected) = pattern.unsafe_context
+        && fact.unsafe_context != Some(expected)
+    {
+        return false;
+    }
     if let Some(expected) = pattern.is_async
         && fact.is_async != Some(expected)
     {
@@ -967,6 +972,7 @@ fn eval_span_only(
         || pattern.body_state.is_some()
         || pattern.body_owner.is_some()
         || pattern.is_async.is_some()
+        || pattern.unsafe_context.is_some()
         || pattern.parenthesized.is_some()
         || pattern.integer_value.is_some()
         || pattern.duplicate_key.is_some()

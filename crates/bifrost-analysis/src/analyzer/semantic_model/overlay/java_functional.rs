@@ -218,10 +218,11 @@ impl SemanticModelOverlay {
         Some(JavaCallableInventory { types, ancestry })
     }
 
+    #[doc(hidden)]
     /// Return an unambiguous public instance declaration only when its entire
     /// inherited name family has one member. Overloaded and overridden families
     /// require applicability/override proof and stay unknown at this boundary.
-    pub(crate) fn java_single_instance_method<'a>(
+    pub fn java_single_instance_method<'a>(
         &'a self,
         owner: &'a SemanticModelSymbol,
         name: &str,

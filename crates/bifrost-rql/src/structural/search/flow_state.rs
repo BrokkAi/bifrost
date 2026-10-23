@@ -333,21 +333,54 @@ impl FlowStateTraversalCache {
     /// whose hole the event rows already declare covered in their own
     /// `completeness` field. Reporting it made every relational policy over
     /// state events inconclusive on every language with calls (#2443).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn report_completeness(
         &mut self,
         subject: &str,
+        procedure: Option<&super::semantic::SemanticProcedureValue>,
         language: Language,
         completeness: &FlowStateCompleteness,
         axes: &[FlowStateAxis],
         generation: u64,
         diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) {
+        let report_subject = procedure
+            .map(|procedure| procedure.wire_id())
+            .unwrap_or_else(|| subject.to_owned());
         for reason in completeness.reasons() {
             if !axes.iter().any(|axis| reason.blocks(*axis)) {
                 continue;
             }
             let (code, detail) = classify_reason(reason);
-            if !self.reported.insert((subject.to_string(), detail)) {
+            let source = procedure.and_then(|procedure| procedure.diagnostic_source());
+            let related = procedure
+                .map(|procedure| {
+                    procedure.related_flow_reasons(
+                        &completeness
+                            .reasons()
+                            .iter()
+                            .filter(|other| {
+                                axes.iter().any(|axis| other.blocks(*axis))
+                                    && classify_reason(other).1 == detail
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap_or_default();
+            if !self.reported.insert((report_subject.clone(), detail)) {
+                if let Some(existing) = diagnostics.iter_mut().find(|diagnostic| {
+                    diagnostic.code == code
+                        && diagnostic.source == source
+                        && diagnostic.message.contains(detail)
+                }) {
+                    let mut seen = existing.related.iter().cloned().collect::<HashSet<_>>();
+                    existing.related.extend(
+                        related
+                            .into_iter()
+                            .filter(|related| seen.insert(related.clone())),
+                    );
+                }
                 continue;
             }
             let uncovered = FLOW_STATE_AXES
@@ -356,7 +389,8 @@ impl FlowStateTraversalCache {
                 .map(|axis| axis.label())
                 .collect::<Vec<_>>();
             diagnostics.push(CodeQueryDiagnostic {
-                source: None,
+                related,
+                source,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
@@ -493,6 +527,7 @@ pub(super) struct StateEventValue {
     /// Exact request-retained semantic procedure used to relate the event's
     /// establishment value to call results in its initializer.
     pub(super) procedure: ProcedureHandle,
+    pub(super) diagnostic_procedure: super::semantic::SemanticProcedureValue,
     /// A scoped relation endpoint still belongs to the original aggregate
     /// derivation. Its origin tells a subsequent aggregate expansion to emit
     /// that scope's coverage before filtering.
@@ -544,6 +579,7 @@ pub(super) struct FlowRelationValue {
     pub(super) file: ProjectFile,
     pub(super) procedure_id: Arc<str>,
     pub(super) procedure: ProcedureHandle,
+    pub(super) diagnostic_procedure: super::semantic::SemanticProcedureValue,
     pub(super) selected_property: Option<Arc<SelectedPropertyRelations>>,
 }
 
@@ -613,6 +649,7 @@ impl FlowRelationValue {
             file: self.file.clone(),
             procedure_id: Arc::clone(&self.procedure_id),
             procedure: self.procedure.clone(),
+            diagnostic_procedure: self.diagnostic_procedure.clone(),
             selected_property_origin: self.selected_property.as_ref().map(|proof| proof.point),
         }
     }
@@ -816,6 +853,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         cache.report_completeness(
             "src/main.js",
+            None,
             Language::JavaScript,
             &completeness,
             FLOW_STATE_AXES,
@@ -826,6 +864,7 @@ mod tests {
         // The second call adds nothing: one reason is reported once per subject.
         cache.report_completeness(
             "src/main.js",
+            None,
             Language::JavaScript,
             &completeness,
             FLOW_STATE_AXES,
@@ -847,6 +886,7 @@ mod tests {
         let mut cache = FlowStateTraversalCache::default();
         let completeness = FlowStateCompleteness::Incomplete {
             reasons: vec![FlowStateIncompleteReason::LoweringGap {
+                gaps: Vec::new(),
                 capability: SemanticCapability::Calls,
                 kind: SemanticGapKind::Unsupported,
                 detail: "the adapter does not model this call".to_string(),
@@ -855,6 +895,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         cache.report_completeness(
             "src/main.js",
+            None,
             Language::JavaScript,
             &completeness,
             STATE_EVENT_AXES,
@@ -866,6 +907,7 @@ mod tests {
 
         cache.report_completeness(
             "src/main.js",
+            None,
             Language::JavaScript,
             &completeness,
             FLOW_RELATION_AXES,

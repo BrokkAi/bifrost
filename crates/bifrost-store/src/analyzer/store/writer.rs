@@ -1,0 +1,1000 @@
+use std::any::Any;
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TryRecvError, sync_channel};
+use std::sync::{Arc, LazyLock, LockResult, Mutex, MutexGuard, Weak};
+use std::thread::JoinHandle;
+
+use rusqlite::Connection;
+
+use super::{
+    GenerationId, PersistBatchTargets, PreparedParsedBlob, PreparedPersistenceWriter,
+    PreparedWriteCounters, StoreError, reader_source_path,
+};
+
+const WRITER_QUEUE_CAPACITY: usize = 64;
+
+/// How the writer actor thread spends its life.
+///
+/// One actor owns the write connection for a cache path, so a saturated writer
+/// and an under-fed writer look identical from the caller's side: both show up
+/// as a slow `execute`. These separate the two, which is the difference between
+/// "tune SQLite" and "the writer is waiting for the parse pool".
+///
+/// Process-global, and deliberately so: a caller wants "what did the writer do
+/// while my phase ran", which it gets from the difference of two [`snapshot`]s.
+/// Two consequences follow. Concurrent phases against one cache share these
+/// counters, so their differences overlap rather than partition. And only
+/// [`StoreWriter::Persistent`] has an actor at all, so an ephemeral store
+/// reports zero busy time -- absence of a writer, not an idle one.
+#[doc(hidden)]
+pub mod attribution {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static BUSY_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static IDLE_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static JOBS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_idle(elapsed: std::time::Duration) {
+        record_elapsed(&IDLE_NANOS, elapsed);
+    }
+
+    pub(crate) fn record_job(elapsed: std::time::Duration) {
+        record_elapsed(&BUSY_NANOS, elapsed);
+        JOBS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_elapsed(counter: &AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    #[derive(Clone, Copy)]
+    #[doc(hidden)]
+    pub struct WriterAttribution {
+        #[doc(hidden)]
+        pub busy_nanos: u64,
+        #[doc(hidden)]
+        pub idle_nanos: u64,
+        #[doc(hidden)]
+        pub jobs: u64,
+    }
+
+    #[doc(hidden)]
+    pub fn snapshot() -> WriterAttribution {
+        WriterAttribution {
+            busy_nanos: BUSY_NANOS.load(Ordering::Relaxed),
+            idle_nanos: IDLE_NANOS.load(Ordering::Relaxed),
+            jobs: JOBS.load(Ordering::Relaxed),
+        }
+    }
+
+    impl WriterAttribution {
+        #[doc(hidden)]
+        pub fn since(self, earlier: Self) -> Self {
+            Self {
+                busy_nanos: self.busy_nanos.saturating_sub(earlier.busy_nanos),
+                idle_nanos: self.idle_nanos.saturating_sub(earlier.idle_nanos),
+                jobs: self.jobs.saturating_sub(earlier.jobs),
+            }
+        }
+    }
+}
+
+type WriterJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+type WriterSlot = Arc<Mutex<Weak<PersistentWriter>>>;
+
+enum WriterMessage {
+    Execute(WriterJob),
+    Repair(Box<RepairRequest>),
+}
+
+struct RepairRequest {
+    prepared: PreparedParsedBlob,
+    counters: PreparedWriteCounters,
+    reply: SyncSender<Result<(), StoreError>>,
+}
+
+struct RepairGroup {
+    prepared: PreparedParsedBlob,
+    replies: Vec<SyncSender<Result<(), StoreError>>>,
+    conflict: Option<StoreError>,
+}
+
+static PERSISTENT_WRITERS: LazyLock<Mutex<HashMap<PathBuf, WriterSlot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(any(test, feature = "test-support"))]
+static NEXT_WRITER_ID: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    static ON_ANALYZER_WRITER_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    static RETAINED_EXCLUSIVE_READERS: std::cell::RefCell<HashMap<usize, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// The current thread must not enter the same store writer while its file
+/// operation owns an exclusive reader, which holds that writer mutex.
+/// Pooled and shared readers do not register this exclusion.
+#[doc(hidden)]
+pub struct RetainedExclusiveReader {
+    writer: usize,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for RetainedExclusiveReader {
+    fn drop(&mut self) {
+        RETAINED_EXCLUSIVE_READERS.with(|readers| {
+            let mut readers = readers.borrow_mut();
+            let count = readers
+                .get_mut(&self.writer)
+                .expect("retained reader registered");
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(&self.writer);
+            }
+        });
+    }
+}
+
+/// The writable side of one analyzer store.
+///
+/// Persistent stores share a process-local actor for their canonical cache
+/// path. Ephemeral stores retain a local mutex because their backing database
+/// is unique, and because the in-memory fallback must route reads through the
+/// same connection.
+#[doc(hidden)]
+pub enum StoreWriter {
+    Local(Mutex<Connection>),
+    Persistent(Arc<PersistentWriter>),
+}
+
+impl StoreWriter {
+    fn reader_exclusion_identity(&self) -> usize {
+        match self {
+            Self::Local(conn) => conn as *const Mutex<Connection> as usize,
+            Self::Persistent(writer) => Arc::as_ptr(writer) as usize,
+        }
+    }
+
+    fn assert_no_retained_exclusive_reader(&self) {
+        debug_assert!(
+            RETAINED_EXCLUSIVE_READERS.with(|readers| {
+                !readers
+                    .borrow()
+                    .contains_key(&self.reader_exclusion_identity())
+            }),
+            "store writer acquired while this thread retains an exclusive reader"
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn retain_exclusive_reader(&self) -> RetainedExclusiveReader {
+        let writer = self.reader_exclusion_identity();
+        RETAINED_EXCLUSIVE_READERS.with(|readers| {
+            *readers.borrow_mut().entry(writer).or_default() += 1;
+        });
+        RetainedExclusiveReader {
+            writer,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) fn local(conn: Connection) -> Self {
+        Self::Local(Mutex::new(conn))
+    }
+
+    pub(super) fn persistent(db_path: &Path) -> Result<(Self, PathBuf), StoreError> {
+        let registry_key = writer_registry_key(db_path)?;
+        let slot = {
+            let mut writers = PERSISTENT_WRITERS
+                .lock()
+                .expect("persistent analyzer writer registry poisoned");
+            Arc::clone(
+                writers
+                    .entry(registry_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(Weak::new()))),
+            )
+        };
+
+        // Opening and migrating SQLite belongs under the per-path slot. The
+        // global registry lock is already released, so unrelated repositories
+        // can initialize their writers concurrently.
+        let mut registered = slot
+            .lock()
+            .expect("persistent analyzer writer slot poisoned");
+        if let Some(writer) = registered.upgrade() {
+            let reader_source = writer.reader_source.clone();
+            return Ok((Self::Persistent(writer), reader_source));
+        }
+
+        let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
+        {
+            let _scope = crate::profiling::scope("cache_db.repair_planner_statistics");
+            repair_planner_statistics_on_open(&conn);
+        }
+        let reader_source = reader_source_path(&conn).unwrap_or_else(|| registry_key.clone());
+        let writer = Arc::new(PersistentWriter::spawn(
+            registry_key,
+            reader_source.clone(),
+            conn,
+        )?);
+        *registered = Arc::downgrade(&writer);
+        Ok((Self::Persistent(writer), reader_source))
+    }
+
+    #[doc(hidden)]
+    pub fn execute<T, F>(&self, job: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> T + Send + 'static,
+    {
+        self.assert_no_retained_exclusive_reader();
+        match self {
+            Self::Local(conn) => {
+                let mut conn = conn.lock().expect("analyzer store mutex poisoned");
+                job(&mut conn)
+            }
+            Self::Persistent(writer) => writer.execute(job),
+        }
+    }
+
+    pub(super) fn repair_prepared_blob(
+        &self,
+        prepared: PreparedParsedBlob,
+        counters: PreparedWriteCounters,
+    ) -> Result<(), StoreError> {
+        self.assert_no_retained_exclusive_reader();
+        match self {
+            Self::Local(conn) => {
+                let mut conn = conn.lock().expect("analyzer store mutex poisoned");
+                persist_one_repair(&mut conn, prepared, counters)
+            }
+            Self::Persistent(writer) => writer.repair_prepared_blob(prepared, counters),
+        }
+    }
+
+    /// Local-connection access for the in-memory reader fallback and existing
+    /// ephemeral-store SQL tests. Persistent callers must use `execute`.
+    #[doc(hidden)]
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, Connection>> {
+        self.assert_no_retained_exclusive_reader();
+        match self {
+            Self::Local(conn) => conn.lock(),
+            Self::Persistent(_) => {
+                panic!("persistent analyzer connections are owned by the writer actor")
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn identity(&self) -> usize {
+        match self {
+            Self::Local(conn) => conn as *const Mutex<Connection> as usize,
+            Self::Persistent(writer) => writer.test_id,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn repair_submissions(&self) -> usize {
+        match self {
+            Self::Local(_) => 0,
+            Self::Persistent(writer) => writer.repair_submissions.load(Ordering::SeqCst),
+        }
+    }
+
+    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn execute_submissions(&self) -> usize {
+        match self {
+            Self::Local(_) => 0,
+            Self::Persistent(writer) => writer.execute_submissions.load(Ordering::SeqCst),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn repair_transactions(&self) -> usize {
+        match self {
+            Self::Local(_) => 0,
+            Self::Persistent(writer) => writer.repair_transactions.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Repair the planner statistics of a persistent store as it is opened, and
+/// log what that did (issue #3031).
+///
+/// This is the one place in the store that runs exactly once per process per
+/// cache path: `StoreWriter::persistent` opens the writable connection under
+/// the per-path registry slot, so every later `AnalyzerStore::open_persistent`
+/// for the same path reuses this writer and repairs nothing. The two nearby
+/// alternatives are both the wrong granularity.
+/// `cache_db::configure_connection_after_busy_timeout` runs for every writable
+/// connection, including the one each collection opens, and
+/// `open_readonly_temp_connection` runs for every pooled reader -- which is
+/// read-only and could not run `ANALYZE` at all.
+///
+/// A failed repair leaves the store exactly as it was, which is a store that
+/// serves queries with default-guess plans, so the open continues: refusing to
+/// open a repository because an optional maintenance refresh lost a race for
+/// the write lock would be worse than the cliff it was trying to fix. The
+/// evidence goes through the same profiling channel as the build and
+/// collection hooks (`BIFROST_TIMING=1`), success and failure alike.
+fn repair_planner_statistics_on_open(conn: &Connection) {
+    match brokk_bifrost_core::cache_gc::repair_planner_statistics_on_open(conn) {
+        Ok(None) => {}
+        Ok(Some(evidence)) => crate::profiling::note_with(|| {
+            format!(
+                "store.planner_statistics repaired on open: {:.1} ms, {} sqlite_stat1 rows, tables {:?}",
+                evidence.elapsed.as_secs_f64() * 1000.0,
+                evidence.stat1_rows,
+                evidence.analyzed_tables
+            )
+        }),
+        Err(error) => crate::profiling::note_with(|| {
+            format!("store.planner_statistics repair on open failed: {error}")
+        }),
+    }
+}
+
+#[doc(hidden)]
+pub struct PersistentWriter {
+    registry_key: PathBuf,
+    reader_source: PathBuf,
+    sender: Mutex<Option<SyncSender<WriterMessage>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    execute_submissions: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    repair_submissions: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    repair_transactions: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_id: usize,
+}
+
+impl PersistentWriter {
+    fn spawn(
+        registry_key: PathBuf,
+        reader_source: PathBuf,
+        mut conn: Connection,
+    ) -> Result<Self, StoreError> {
+        let (sender, receiver) = sync_channel::<WriterMessage>(WRITER_QUEUE_CAPACITY);
+        let thread_path = registry_key.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let repair_transactions = Arc::new(AtomicUsize::new(0));
+        #[cfg(any(test, feature = "test-support"))]
+        let thread_repair_transactions = Arc::clone(&repair_transactions);
+        let thread = std::thread::Builder::new()
+            .name("bifrost-analyzer-writer".to_string())
+            .spawn(move || {
+                ON_ANALYZER_WRITER_THREAD.with(|active| active.set(true));
+                let mut pending = VecDeque::new();
+                loop {
+                    let message = match pending.pop_front() {
+                        Some(message) => message,
+                        None => {
+                            let idle = std::time::Instant::now();
+                            let received = receiver.recv();
+                            attribution::record_idle(idle.elapsed());
+                            match received {
+                                Ok(message) => message,
+                                Err(_) => break,
+                            }
+                        }
+                    };
+                    let busy = std::time::Instant::now();
+                    match message {
+                        WriterMessage::Execute(job) => job(&mut conn),
+                        WriterMessage::Repair(first) => {
+                            let mut batch = RepairBatch::new(first);
+                            loop {
+                                match receiver.try_recv() {
+                                    Ok(WriterMessage::Repair(request)) => {
+                                        if let Err(request) = batch.try_push(request) {
+                                            pending.push_back(WriterMessage::Repair(request));
+                                            break;
+                                        }
+                                    }
+                                    Ok(message @ WriterMessage::Execute(_)) => {
+                                        pending.push_back(message);
+                                        break;
+                                    }
+                                    Err(TryRecvError::Empty) => break,
+                                    Err(TryRecvError::Disconnected) => break,
+                                }
+                            }
+                            let transactions = batch.persist(&mut conn);
+                            #[cfg(any(test, feature = "test-support"))]
+                            thread_repair_transactions.fetch_add(transactions, Ordering::SeqCst);
+                            #[cfg(not(any(test, feature = "test-support")))]
+                            let _ = transactions;
+                        }
+                    }
+                    attribution::record_job(busy.elapsed());
+                }
+                match brokk_bifrost_core::cache_db::checkpoint_wal_for_close(&conn) {
+                    // A reader that still holds a snapshot defers truncation;
+                    // the next checkpoint truncates the WAL. That is a normal
+                    // outcome, not a diagnostic, so it must not reach stderr,
+                    // which CLI hosts reserve for their own failure line.
+                    Ok(
+                        brokk_bifrost_core::cache_db::CloseCheckpoint::Complete
+                        | brokk_bifrost_core::cache_db::CloseCheckpoint::Deferred { .. },
+                    ) => {}
+                    Err(error) => {
+                        panic!("persistent analyzer writer close checkpoint failed: {error}");
+                    }
+                }
+                ON_ANALYZER_WRITER_THREAD.with(|active| active.set(false));
+            })
+            .map_err(|error| {
+                StoreError::new(format!(
+                    "starting analyzer writer for {}: {error}",
+                    thread_path.display()
+                ))
+            })?;
+        Ok(Self {
+            registry_key,
+            reader_source,
+            sender: Mutex::new(Some(sender)),
+            thread: Mutex::new(Some(thread)),
+            #[cfg(any(test, feature = "test-support"))]
+            execute_submissions: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            repair_submissions: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            repair_transactions,
+            #[cfg(any(test, feature = "test-support"))]
+            test_id: NEXT_WRITER_ID.fetch_add(1, Ordering::SeqCst),
+        })
+    }
+
+    fn execute<T, F>(&self, job: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> T + Send + 'static,
+    {
+        ON_ANALYZER_WRITER_THREAD.with(|active| {
+            assert!(
+                !active.get(),
+                "analyzer writer jobs must not synchronously submit another writer job"
+            );
+        });
+        let (reply_tx, reply_rx) = sync_channel::<Result<T, Box<dyn Any + Send>>>(1);
+        let envelope: WriterJob = Box::new(move |conn| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(conn)));
+            if reply_tx.send(outcome).is_err() {
+                eprintln!("persistent analyzer writer execute caller dropped its reply channel");
+            }
+        });
+        let sender = self
+            .sender
+            .lock()
+            .expect("persistent analyzer writer sender poisoned")
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "persistent analyzer writer is closed for {}",
+                    self.registry_key.display()
+                )
+            });
+        #[cfg(any(test, feature = "test-support"))]
+        self.execute_submissions.fetch_add(1, Ordering::SeqCst);
+        sender
+            .send(WriterMessage::Execute(envelope))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "persistent analyzer writer disconnected for {}",
+                    self.registry_key.display()
+                )
+            });
+        match reply_rx.recv() {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(_) => panic!(
+                "persistent analyzer writer dropped a reply for {}",
+                self.registry_key.display()
+            ),
+        }
+    }
+
+    fn repair_prepared_blob(
+        &self,
+        prepared: PreparedParsedBlob,
+        counters: PreparedWriteCounters,
+    ) -> Result<(), StoreError> {
+        let (reply, result) = sync_channel(1);
+        let sender = self
+            .sender
+            .lock()
+            .expect("persistent analyzer writer sender poisoned")
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "persistent analyzer writer is closed for {}",
+                    self.registry_key.display()
+                )
+            });
+        sender
+            .send(WriterMessage::Repair(Box::new(RepairRequest {
+                prepared,
+                counters,
+                reply,
+            })))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "persistent analyzer writer disconnected for {}",
+                    self.registry_key.display()
+                )
+            });
+        #[cfg(any(test, feature = "test-support"))]
+        self.repair_submissions.fetch_add(1, Ordering::SeqCst);
+        result.recv().unwrap_or_else(|_| {
+            panic!(
+                "persistent analyzer writer dropped a repair reply for {}",
+                self.registry_key.display()
+            )
+        })
+    }
+}
+
+struct RepairBatch {
+    groups: Vec<RepairGroup>,
+    by_key: HashMap<(git2::Oid, String, GenerationId), usize>,
+    generations_by_blob: HashMap<(git2::Oid, String), GenerationId>,
+    accepted_requests: usize,
+    fragments: usize,
+    rows: usize,
+    bytes: usize,
+    counters: PreparedWriteCounters,
+}
+
+impl RepairBatch {
+    fn new(first: Box<RepairRequest>) -> Self {
+        let first = *first;
+        let fragments = first.prepared.fragment_count();
+        let rows = first.prepared.mutation_logical_rows();
+        let bytes = first.prepared.mutation_payload_bytes();
+        let key = repair_key(&first.prepared);
+        let blob_key = (key.0, key.1.clone());
+        let mut by_key = HashMap::new();
+        by_key.insert(key.clone(), 0);
+        let mut generations_by_blob = HashMap::new();
+        let mut fragment_generations = Vec::with_capacity(first.prepared.fragment_count());
+        first
+            .prepared
+            .append_fragment_generations(&mut fragment_generations);
+        for (oid, storage_language, generation) in fragment_generations {
+            let previous = generations_by_blob.insert((oid, storage_language), generation);
+            assert!(
+                previous.is_none_or(|previous| previous == generation),
+                "one prepared envelope must use one generation per physical blob key"
+            );
+        }
+        debug_assert_eq!(generations_by_blob.get(&blob_key), Some(&key.2));
+        Self {
+            groups: vec![RepairGroup {
+                prepared: first.prepared,
+                replies: vec![first.reply],
+                conflict: None,
+            }],
+            by_key,
+            generations_by_blob,
+            accepted_requests: 1,
+            fragments,
+            rows,
+            bytes,
+            counters: first.counters,
+        }
+    }
+
+    fn try_push(&mut self, request: Box<RepairRequest>) -> Result<(), Box<RepairRequest>> {
+        let limits = PersistBatchTargets::PRODUCTION;
+        if self.accepted_requests >= limits.max_blobs {
+            return Err(request);
+        }
+        let key = repair_key(&request.prepared);
+        let mut fragment_generations = Vec::with_capacity(request.prepared.fragment_count());
+        request
+            .prepared
+            .append_fragment_generations(&mut fragment_generations);
+        for (oid, storage_language, generation) in &fragment_generations {
+            if self
+                .generations_by_blob
+                .get(&(*oid, storage_language.clone()))
+                .is_some_and(|current| current != generation)
+            {
+                return Err(request);
+            }
+        }
+        if let Some(&group) = self.by_key.get(&key) {
+            let group = &mut self.groups[group];
+            if group.conflict.is_some() {
+                group.replies.push(request.reply);
+                self.accepted_requests = self.accepted_requests.saturating_add(1);
+                return Ok(());
+            }
+            let Some((added_fragments, added_rows, added_bytes)) = group
+                .prepared
+                .compatible_persistence_envelope_addition_cost(&request.prepared)
+            else {
+                group.conflict = Some(StoreError::new(format!(
+                    "conflicting prepared repair envelopes for {}/{}",
+                    key.0, key.1
+                )));
+                group.replies.push(request.reply);
+                self.accepted_requests = self.accepted_requests.saturating_add(1);
+                return Ok(());
+            };
+            if added_fragments > 0
+                && (self.fragments.saturating_add(added_fragments) > limits.max_blobs
+                    || self.rows.saturating_add(added_rows) > limits.max_rows
+                    || self.bytes.saturating_add(added_bytes) > limits.max_payload_bytes)
+            {
+                return Err(request);
+            }
+            let RepairRequest {
+                prepared,
+                counters: _,
+                reply,
+            } = *request;
+            let merged = group
+                .prepared
+                .merge_compatible_persistence_envelope(prepared);
+            debug_assert_eq!(merged, (added_fragments, added_rows, added_bytes));
+            self.fragments = self.fragments.saturating_add(added_fragments);
+            self.rows = self.rows.saturating_add(added_rows);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+            for (oid, storage_language, generation) in fragment_generations {
+                self.generations_by_blob
+                    .entry((oid, storage_language))
+                    .or_insert(generation);
+            }
+            group.replies.push(reply);
+            self.accepted_requests = self.accepted_requests.saturating_add(1);
+            return Ok(());
+        }
+
+        let fragments = request.prepared.fragment_count();
+        let rows = request.prepared.mutation_logical_rows();
+        let bytes = request.prepared.mutation_payload_bytes();
+        if self.fragments.saturating_add(fragments) > limits.max_blobs
+            || self.rows.saturating_add(rows) > limits.max_rows
+            || self.bytes.saturating_add(bytes) > limits.max_payload_bytes
+        {
+            return Err(request);
+        }
+
+        let group = self.groups.len();
+        self.by_key.insert(key.clone(), group);
+        for (oid, storage_language, generation) in fragment_generations {
+            self.generations_by_blob
+                .insert((oid, storage_language), generation);
+        }
+        self.groups.push(RepairGroup {
+            prepared: request.prepared,
+            replies: vec![request.reply],
+            conflict: None,
+        });
+        self.fragments = self.fragments.saturating_add(fragments);
+        self.accepted_requests = self.accepted_requests.saturating_add(1);
+        self.rows = self.rows.saturating_add(rows);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn persist(self, conn: &mut Connection) -> usize {
+        let mut prepared = Vec::with_capacity(self.groups.len());
+        let mut grouped_replies = Vec::with_capacity(self.groups.len());
+        for group in self.groups {
+            if let Some(error) = group.conflict {
+                for reply in group.replies {
+                    send_repair_reply(reply, Err(error.clone()));
+                }
+            } else {
+                prepared.push(group.prepared);
+                grouped_replies.push(group.replies);
+            }
+        }
+        if prepared.is_empty() {
+            return 0;
+        }
+        let (outcomes, stats) = PreparedPersistenceWriter::new(
+            conn,
+            self.counters,
+            crate::CancellationToken::default(),
+        )
+        .persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+        assert_eq!(
+            outcomes.len(),
+            grouped_replies.len(),
+            "each repair representative must retain its reply group"
+        );
+        for (outcome, replies) in outcomes.into_iter().zip(grouped_replies) {
+            let result = outcome.error.map_or(Ok(()), Err);
+            for reply in replies {
+                send_repair_reply(reply, result.clone());
+            }
+        }
+        stats.transactions
+    }
+}
+
+fn send_repair_reply(reply: SyncSender<Result<(), StoreError>>, result: Result<(), StoreError>) {
+    if let Err(error) = reply.send(result) {
+        eprintln!(
+            "persistent analyzer writer repair caller dropped its reply channel: {:?}",
+            error.0
+        );
+    }
+}
+
+fn persist_one_repair(
+    conn: &mut Connection,
+    prepared: PreparedParsedBlob,
+    counters: PreparedWriteCounters,
+) -> Result<(), StoreError> {
+    let (mut outcomes, _) =
+        PreparedPersistenceWriter::new(conn, counters, crate::CancellationToken::default())
+            .persist_prepared_blobs(vec![prepared], PersistBatchTargets::PRODUCTION);
+    outcomes
+        .pop()
+        .expect("one prepared repair has one outcome")
+        .error
+        .map_or(Ok(()), Err)
+}
+
+fn repair_key(prepared: &PreparedParsedBlob) -> (git2::Oid, String, GenerationId) {
+    (
+        prepared.oid(),
+        prepared.lang().to_string(),
+        prepared.generation,
+    )
+}
+
+impl Drop for PersistentWriter {
+    fn drop(&mut self) {
+        self.sender
+            .get_mut()
+            .expect("persistent analyzer writer sender poisoned")
+            .take();
+        if let Some(thread) = self
+            .thread
+            .get_mut()
+            .expect("persistent analyzer writer thread lock poisoned")
+            .take()
+        {
+            thread.join().unwrap_or_else(|payload| {
+                std::panic::resume_unwind(payload);
+            });
+        }
+    }
+}
+
+fn writer_registry_key(db_path: &Path) -> Result<PathBuf, StoreError> {
+    let absolute = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| StoreError::new(format!("reading current directory: {error}")))?
+            .join(db_path)
+    };
+    let Some(file_name) = absolute.file_name() else {
+        return Err(StoreError::new(format!(
+            "analyzer cache path has no file name: {}",
+            absolute.display()
+        )));
+    };
+    Ok(absolute
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .map(|parent| parent.join(file_name))
+        .unwrap_or(absolute))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{TryRecvError, sync_channel};
+
+    use super::StoreWriter;
+
+    #[cfg(test)]
+    #[test]
+    fn persistent_stores_for_one_path_share_one_actor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let (first, _) = StoreWriter::persistent(&db).unwrap();
+        let (second, _) = StoreWriter::persistent(&db).unwrap();
+        assert_eq!(first.identity(), second.identity());
+
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let blocker = std::thread::spawn(move || {
+            first.execute(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+
+        let (completed_tx, completed_rx) = sync_channel(1);
+        let follower = std::thread::spawn(move || {
+            second.execute(move |_| completed_tx.send(()).unwrap());
+        });
+        assert_eq!(completed_rx.try_recv(), Err(TryRecvError::Empty));
+        release_tx.send(()).unwrap();
+        completed_rx.recv().unwrap();
+        blocker.join().unwrap();
+        follower.join().unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn different_cache_paths_have_independent_actors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (first, _) = StoreWriter::persistent(&temp.path().join("a.db")).unwrap();
+        let (second, _) = StoreWriter::persistent(&temp.path().join("b.db")).unwrap();
+        assert_ne!(first.identity(), second.identity());
+
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let blocker = std::thread::spawn(move || {
+            first.execute(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+
+        let (completed_tx, completed_rx) = sync_channel(1);
+        second.execute(move |_| completed_tx.send(()).unwrap());
+        completed_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn panicking_caller_does_not_kill_shared_actor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let (writer, _) = StoreWriter::persistent(&db).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.execute::<(), _>(|_| panic!("injected writer job panic"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(writer.execute(|_| 42), 42);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn dropping_the_last_handle_stops_the_actor_before_reopen() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let first_id = {
+            let (writer, _) = StoreWriter::persistent(&db).unwrap();
+            writer.execute(|conn| {
+                conn.execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation)
+                     VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)",
+                    [],
+                )
+                .unwrap();
+            });
+            writer.identity()
+        };
+        let wal_len = match std::fs::metadata(brokk_bifrost_core::cache_db::store_file_with_suffix(
+            &db, "-wal",
+        )) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read checkpointed WAL metadata: {error}"),
+        };
+        assert_eq!(wal_len, 0);
+
+        let (reopened, _) = StoreWriter::persistent(&db).unwrap();
+        assert_ne!(first_id, reopened.identity());
+        assert_eq!(reopened.execute(|_| 42), 42);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn active_reader_survives_writer_close_and_later_close_truncates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("busy-close.db");
+        let (writer, _) = StoreWriter::persistent(&db).unwrap();
+        writer.execute(|conn| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)",
+                [],
+            )
+            .unwrap();
+            brokk_bifrost_core::cache_db::checkpoint_wal_for_close(conn).unwrap();
+        });
+        let reader = brokk_bifrost_core::cache_db::open_readonly_connection(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        writer.execute(|conn| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'rust', 0)",
+                [],
+            )
+            .unwrap();
+        });
+
+        drop(writer);
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the external reader keeps its snapshot across writer shutdown"
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+        let (reopened, _) = StoreWriter::persistent(&db).unwrap();
+        assert_eq!(
+            reopened.execute(|conn| conn
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap()),
+            2,
+            "both committed writes survive the deferred checkpoint"
+        );
+        reopened.execute(|conn| {
+            assert_eq!(
+                brokk_bifrost_core::cache_db::checkpoint_wal_for_close(conn).unwrap(),
+                brokk_bifrost_core::cache_db::CloseCheckpoint::Complete
+            );
+        });
+        assert_eq!(
+            std::fs::metadata(brokk_bifrost_core::cache_db::store_file_with_suffix(
+                &db, "-wal"
+            ))
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn persistent_store_open_repairs_missing_planner_statistics() {
+        let _guard = brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("statistics.db");
+        {
+            let conn = crate::cache_db::open_unified_connection(&db).unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation)
+                 VALUES('3333333333333333333333333333333333333333', 'rust', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1;")
+                .unwrap();
+        }
+
+        let (writer, _) = StoreWriter::persistent(&db).unwrap();
+        assert!(writer.execute(|conn| {
+            brokk_bifrost_core::cache_gc::planner_statistics_row_count(conn).unwrap() > 0
+        }));
+    }
+}

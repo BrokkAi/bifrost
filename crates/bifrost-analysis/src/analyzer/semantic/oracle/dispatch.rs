@@ -111,7 +111,8 @@ pub struct DispatchBoundary {
 }
 
 impl DispatchBoundary {
-    pub(crate) fn target_locator(&self) -> Option<&SemanticLocator> {
+    #[doc(hidden)]
+    pub fn target_locator(&self) -> Option<&SemanticLocator> {
         self.kind.target_locator()
     }
 

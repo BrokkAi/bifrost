@@ -23,29 +23,6 @@ use tree_sitter::Tree;
 pub struct PhpAdapter;
 
 impl LanguageAdapter for PhpAdapter {
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::php::source_publication::SOURCE_STORAGE)
-    }
-
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        true
-    }
-
-    fn produces_canonical_source_facts(&self) -> bool {
-        true
-    }
-
-    fn php_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::php_facts::PHP_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::Php
-    }
-
     /// Relative to `brokk-bifrost-php`'s crate root: the `.scm` assets moved with
     /// the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
@@ -81,5 +58,26 @@ impl LanguageAdapter for PhpAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&PHP_COGNITIVE_CONFIG)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PhpAdapter {
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::php::source_publication::SOURCE_STORAGE)
+    }
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+    fn php_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::php_facts::PHP_SOURCE_FACTS_VERSION)
+    }
+    fn language(&self) -> Language {
+        Language::Php
     }
 }

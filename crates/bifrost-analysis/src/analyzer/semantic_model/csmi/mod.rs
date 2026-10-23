@@ -379,6 +379,9 @@ pub(crate) mod tests {
             underlying_type: None,
             value_semantics: None,
             jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
             runtime_bases: None,
             ambient_use: None,
             embedded_types: Vec::new(),
@@ -411,6 +414,8 @@ pub(crate) mod tests {
             is_static: kind == MemberKind::Function,
             is_abstract: false,
             is_virtual: false,
+            implemented_trait: None,
+            self_form: None,
             non_overridable: None,
             implicit_operation: None,
             explicit_operation: None,
@@ -1867,6 +1872,9 @@ pub(crate) mod tests {
         relations.clear();
         types.push(TypeFact {
             jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
             runtime_bases: None,
             ambient_use: None,
             id: "type.java.lang.string".to_owned(),
@@ -2005,6 +2013,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let activation = |sha256: String| SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
                 language: "java".to_owned(),
@@ -4646,6 +4655,7 @@ pub(crate) mod tests {
             ),
         ] {
             let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence,
                 controls: Vec::new(),
@@ -4765,6 +4775,7 @@ pub(crate) mod tests {
             ),
         ] {
             let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence,
                 controls: Vec::new(),

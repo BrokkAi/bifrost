@@ -116,7 +116,8 @@ pub(crate) struct GoResolutionBuilder<'source, 'tree> {
     type_contexts: Vec<TypeContext>,
     source_type_parameter_counts: HashMap<String, usize>,
     callable_contexts: Vec<CallableContext>,
-    declaration_owners: Vec<ResolutionSiteId>,
+    declaration_owners: Vec<Option<ResolutionSiteId>>,
+    parser_interface_method: Option<usize>,
     function_literal_contexts: Vec<FunctionLiteralContext>,
     body_scopes: HashMap<usize, ResolutionScopeId>,
     type_syntax_by_node: HashMap<usize, LoweredTypeSyntax>,
@@ -159,6 +160,7 @@ enum ExitAction {
 
 #[derive(Debug, Clone, Copy)]
 struct TypeContext {
+    anonymous_interface: bool,
     declaration: ResolutionSiteId,
     generic_scope: Option<ResolutionScopeId>,
 }
@@ -390,6 +392,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             source_type_parameter_counts,
             callable_contexts: Vec::new(),
             declaration_owners: Vec::new(),
+            parser_interface_method: None,
             function_literal_contexts: Vec::new(),
             body_scopes: HashMap::default(),
             type_syntax_by_node: HashMap::default(),
@@ -407,6 +410,13 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
 
     pub(crate) fn source_collector_mut(&mut self) -> &mut PrimarySourceFactCollector<'source> {
         &mut self.source_collector
+    }
+
+    // Parser registration precedes native entry for this same node. Retain
+    // existing graph declarations for anonymous interfaces stored in fields.
+    pub(crate) fn register_parser_interface_method(&mut self, node: Node<'_>) {
+        assert_eq!(node.kind(), "method_elem");
+        self.parser_interface_method = Some(node.id());
     }
 
     pub(crate) fn capture_source_node(&mut self, node: Node<'_>) {
@@ -885,10 +895,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         );
         self.scope_stack.push(scope);
         self.type_contexts.push(TypeContext {
+            anonymous_interface: true,
             declaration,
             generic_scope: None,
         });
-        self.declaration_owners.push(declaration);
+        // Keep semantic interface ownership in type_contexts and lexical scopes.
+        // References use the enclosing named declaration, as function literals do.
+        let reference_owner = self.declaration_owners.last().copied().flatten();
+        self.declaration_owners.push(reference_owner);
         self.exit_actions.push(ExitAction::AnonymousTypeBody);
         TreeWalkAction::DescendWithExit
     }
@@ -924,6 +938,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             );
             assert!(self.body_scopes.insert(fields.id(), body_scope).is_none());
             self.type_contexts.push(TypeContext {
+                anonymous_interface: false,
                 declaration,
                 generic_scope: None,
             });
@@ -935,7 +950,8 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 .declaration_owners
                 .last()
                 .copied()
-                .unwrap_or(declaration);
+                .flatten()
+                .or(Some(declaration));
             self.declaration_owners.push(reference_owner);
             self.exit_actions.push(ExitAction::TypeContext);
             TreeWalkAction::DescendWithExit
@@ -1428,7 +1444,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 .reference_owners
                 .push(ResolutionReferenceOwnerFact {
                     reference: site,
-                    owner: self.declaration_owners.last().copied(),
+                    owner: self.declaration_owners.last().copied().flatten(),
                 });
         }
         true
@@ -1728,9 +1744,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             self.add_gap(declaration, ResolutionGapKind::MalformedSyntax);
             return Some(TypeAliasContext { generic_scope });
         };
-        self.declaration_owners.push(declaration);
+        self.declaration_owners.push(Some(declaration));
         let syntax = self.lower_type(target);
-        assert_eq!(self.declaration_owners.pop(), Some(declaration));
+        assert_eq!(self.declaration_owners.pop(), Some(Some(declaration)));
         self.publish_function_type_signature(declaration, syntax.input);
         self.add_transfer(
             syntax.input,
@@ -1902,12 +1918,13 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             None,
         )?;
         self.add_type_binder(declaration, name);
-        self.declaration_owners.push(declaration);
+        self.declaration_owners.push(Some(declaration));
         let generic_scope = self.enter_owned_type_parameter_scope(node, declaration);
 
         let Some(type_node) = node.child_by_field_name("type") else {
             self.add_gap(declaration, ResolutionGapKind::MalformedSyntax);
             return Some(TypeContext {
+                anonymous_interface: false,
                 declaration,
                 generic_scope,
             });
@@ -1989,6 +2006,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             _ => self.add_gap(declaration, ResolutionGapKind::UnsupportedTypeSyntax),
         }
         Some(TypeContext {
+            anonymous_interface: false,
             declaration,
             generic_scope,
         })
@@ -2099,7 +2117,18 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             ResolutionNamespace::Callable,
             None,
         )?;
-        self.declaration_owners.push(declaration);
+        let reference_owner = if node.kind() == "method_elem"
+            && self.parser_interface_method != Some(node.id())
+            && self
+                .type_contexts
+                .last()
+                .is_some_and(|context| context.anonymous_interface)
+        {
+            self.declaration_owners.last().copied().flatten()
+        } else {
+            Some(declaration)
+        };
+        self.declaration_owners.push(reference_owner);
         let signature_index = self.facts.callable_signatures.len();
         self.facts
             .callable_signatures
@@ -4611,32 +4640,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         match node.kind() {
             "identifier"
-                if is_spelled_identifier(node) && {
-                    // Parentheses and stars preserve the selector's type-or-value
-                    // ambiguity until binding identifies the operand category.
-                    let mut current = node;
-                    loop {
-                        let Some(parent) = current.parent() else {
-                            break false;
-                        };
-                        match parent.kind() {
-                            "parenthesized_expression" => current = parent,
-                            "unary_expression"
-                                if parent
-                                    .child_by_field_name("operator")
-                                    .is_some_and(|operator| operator.kind() == "*") =>
-                            {
-                                current = parent
-                            }
-                            "selector_expression" => {
-                                break parent
-                                    .child_by_field_name("operand")
-                                    .is_some_and(|operand| operand.id() == current.id());
-                            }
-                            _ => break false,
-                        }
-                    }
-                } =>
+                if is_spelled_identifier(node) && self.is_ambiguous_callee_operand(node) =>
             {
                 self.lower_qualifier_reference(node)
             }
@@ -5035,7 +5039,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         }
         let reference = self.add_site(field, ResolutionSiteKind::MemberReference);
         let receiver = self.add_slot(reference, ResolutionTypeSlotRole::Receiver);
-        let type_or_value = self.is_method_expression_type_operand(node);
+        let type_or_value = self.is_ambiguous_callee_operand(node);
         self.add_transfer(
             self.expression_slot(operand),
             receiver,
@@ -5073,11 +5077,10 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         self.expression_slots_by_node.insert(node.id(), output);
     }
 
-    /// A selector used as the operand of a call's selector callee is
-    /// structurally ambiguous between a package value and a type qualifier.
-    /// Keep both possibilities in facts so selected package/type resolution
-    /// can choose the right one; don't infer from the selector's spelling.
-    fn is_method_expression_type_operand(&self, node: Node<'tree>) -> bool {
+    /// Parentheses and stars preserve type-or-value ambiguity in a callee
+    /// and in the operand of a method-expression selector. Binding, rather
+    /// than the spelling, determines which category these expressions carry.
+    fn is_ambiguous_callee_operand(&self, node: Node<'tree>) -> bool {
         let mut current = node;
         loop {
             let Some(parent) = current.parent() else {
@@ -5097,12 +5100,20 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                         .child_by_field_name("operand")
                         .is_some_and(|operand| operand.id() == current.id()) =>
                 {
-                    return parent.parent().is_some_and(|call| {
-                        call.kind() == "call_expression"
-                            && call
-                                .child_by_field_name("function")
-                                .is_some_and(|function| function.id() == parent.id())
-                    });
+                    // A selector's root identifier may name an imported package
+                    // even when the selector is a value rather than a callee.
+                    return node.kind() == "identifier"
+                        || parent.parent().is_some_and(|call| {
+                            call.kind() == "call_expression"
+                                && call
+                                    .child_by_field_name("function")
+                                    .is_some_and(|function| function.id() == parent.id())
+                        });
+                }
+                "call_expression" => {
+                    return parent
+                        .child_by_field_name("function")
+                        .is_some_and(|function| function.id() == current.id());
                 }
                 _ => return false,
             }
@@ -5226,7 +5237,44 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 self.lower_type(*argument);
             }
         }
+        let mut conversion_input = None;
         let (callee, receiver) = match function {
+            Some(function) if function.kind() == "parenthesized_expression" => {
+                let mut base = function;
+                loop {
+                    match base.kind() {
+                        "parenthesized_expression" => {
+                            let Some(inner) = first_named_child(base) else {
+                                self.finish_unsupported_call(node, call);
+                                return;
+                            };
+                            base = inner;
+                        }
+                        "unary_expression"
+                            if base
+                                .child_by_field_name("operator")
+                                .is_some_and(|operator| operator.kind() == "*") =>
+                        {
+                            let Some(inner) = base.child_by_field_name("operand") else {
+                                self.finish_unsupported_call(node, call);
+                                return;
+                            };
+                            base = inner;
+                        }
+                        _ => break,
+                    }
+                }
+                if !matches!(base.kind(), "identifier" | "selector_expression") {
+                    self.finish_unsupported_call(node, call);
+                    return;
+                }
+                conversion_input = Some(self.expression_slot(function));
+                let callee = self.slot(self.expression_slot(base)).site;
+                // Expression lowering has already preserved the terminal name's
+                // type-or-value category. It now serves as the invocation endpoint.
+                self.facts.sites[callee.index()].kind = ResolutionSiteKind::CallableReference;
+                (callee, None)
+            }
             Some(function) if is_spelled_identifier(function) => {
                 let Some(callee) = self.add_go_call_or_conversion_reference(
                     function,
@@ -5426,10 +5474,41 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             output: result,
             kind: BindingProjectionKind::TargetCallableResultType,
         });
+        let expression_result = if let Some(input) = conversion_input {
+            let merged_result = self.add_slot(call, ResolutionTypeSlotRole::ExpressionValue);
+            self.add_transfer(
+                result,
+                merged_result,
+                ResolutionTypeTransferKind::ExpressionResult,
+                0,
+                ResolutionTypeTransferValueTransform::Preserve,
+            );
+            // Callable results and conversions are disjoint: a type has no
+            // callable signature, while a runtime function is not a type object.
+            // Keep the stars' type-category pointer deltas for the conversion.
+            let type_object = self.add_slot(call, ResolutionTypeSlotRole::ExpressionValue);
+            self.add_transfer(
+                input,
+                type_object,
+                ResolutionTypeTransferKind::Construction,
+                0,
+                ResolutionTypeTransferValueTransform::TypeObjectOnly,
+            );
+            self.add_transfer(
+                type_object,
+                merged_result,
+                ResolutionTypeTransferKind::ExpressionResult,
+                0,
+                ResolutionTypeTransferValueTransform::ToRuntime { addressable: false },
+            );
+            merged_result
+        } else {
+            result
+        };
         if let Some(arguments) = explicit_type_arguments {
             self.attach_call_type_arguments(call, arguments);
         }
-        self.finish_call_arguments(node, call, result);
+        self.finish_call_arguments(node, call, expression_result);
     }
 
     /// The Go grammar represents both generic instantiation and ordinary

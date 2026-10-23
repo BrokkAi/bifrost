@@ -171,6 +171,7 @@ mod python_mutable_default;
 mod python_rule_facts;
 mod python_url_construction;
 mod python_variables;
+mod rust_marker_impls;
 mod rust_pointer_safety;
 mod statement_reachability;
 use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
@@ -235,6 +236,7 @@ use pending_cleanup_flow::PendingCleanupFlowValue;
 use python_class_hierarchy::PythonHierarchyFactValue;
 use python_rule_facts::PythonRuleFactValue;
 use rewrite_paths::{RewritePathKey, RewritePathTraversalCache, RewritePathValue};
+use rust_marker_impls::RustMarkerImplValue;
 use rust_pointer_safety::RustPointerFindingValue;
 use statement_reachability::StatementReachabilityValue;
 use topology_rows::{
@@ -282,6 +284,7 @@ fn incomplete_diagnostic(
     exhausted_roots: Vec<CodeQueryExhaustedRoot>,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -671,7 +674,6 @@ pub use results::CodeQuerySemanticRowLimits;
 pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySignatureParameter;
 pub use results::CodeQuerySourceSite;
-pub use results::CodeQuerySourceSpan;
 pub use results::CodeQueryStableOwnerCandidate;
 pub use results::CodeQueryStableOwnerDerivation;
 pub use results::CodeQueryStatementReachability;
@@ -714,7 +716,9 @@ pub use results::code_query_completion;
 pub use results::code_query_result_fixtures_json;
 pub use results::code_query_result_json_schema;
 pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEventRef};
+pub use results::{CodeQueryRelatedSource, CodeQuerySourceSpan};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
+pub use results::{CodeQueryRustMarkerImpl, CodeQueryRustMarkerUse};
 pub use results::{MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, render_exhausted_roots};
 
 /// Longest match/capture snippet reported inline; full content is always
@@ -1439,6 +1443,7 @@ enum SemanticPipelineValue {
     FlowWitness(SemanticFlowWitnessValue),
     AbsentMemberWitness(AbsentMemberWitnessValue),
     TaintFinding(Box<SemanticTaintFindingValue>),
+    RustMarkerImpl(Box<RustMarkerImplValue>),
     RustPointerFinding(Box<RustPointerFindingValue>),
 }
 
@@ -1546,6 +1551,7 @@ enum SemanticPipelineKey {
     FlowWitness(String),
     AbsentMemberWitness(String),
     TaintFinding(String),
+    RustMarkerImpl(String),
     RustPointerFinding(String),
 }
 
@@ -1754,6 +1760,9 @@ impl SemanticPipelineValue {
             Self::TaintFinding(finding) => {
                 SemanticPipelineKey::TaintFinding(finding.key().to_string())
             }
+            Self::RustMarkerImpl(finding) => {
+                SemanticPipelineKey::RustMarkerImpl(finding.row.id.clone())
+            }
             Self::RustPointerFinding(finding) => {
                 SemanticPipelineKey::RustPointerFinding(finding.row.id.clone())
             }
@@ -1775,6 +1784,7 @@ impl SemanticPipelineValue {
             Self::FlowWitness(value) => value.file(),
             Self::AbsentMemberWitness(value) => value.file(),
             Self::TaintFinding(value) => value.file(),
+            Self::RustMarkerImpl(value) => &value.file,
             Self::RustPointerFinding(value) => &value.file,
         }
     }
@@ -1820,6 +1830,9 @@ impl SemanticPipelineValue {
             Self::TaintFinding(value) => CodeQueryResultValue::TaintFinding {
                 value: Box::new(value.public),
             },
+            Self::RustMarkerImpl(value) => CodeQueryResultValue::RustMarkerImpl {
+                value: Box::new(value.row.clone()),
+            },
             Self::RustPointerFinding(value) => CodeQueryResultValue::RustPointerFinding {
                 value: Box::new(value.row.clone()),
             },
@@ -1855,6 +1868,12 @@ impl SemanticPipelineValue {
             Self::FlowWitness(value) => value.public_ref(),
             Self::AbsentMemberWitness(value) => value.public_ref(),
             Self::TaintFinding(value) => value.public_ref(),
+            Self::RustMarkerImpl(value) => CodeQueryResultRef::RustMarkerImpl {
+                id: value.row.id.clone(),
+                path: value.row.path.clone(),
+                range: value.row.range,
+                relation: value.row.trait_kind,
+            },
             Self::RustPointerFinding(value) => CodeQueryResultRef::RustPointerFinding {
                 id: value.row.id.clone(),
                 path: value.row.path.clone(),
@@ -2028,6 +2047,17 @@ impl SemanticPipelineValue {
                 display_range: value.public.range,
                 language: value.public.language,
                 stable_id: value.public.id.clone(),
+            },
+            Self::RustMarkerImpl(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::RustMarkerImpl,
+                key: DetailedCodeQueryKey::RustMarkerImpl {
+                    id: value.row.id.clone(),
+                },
+                file: &value.file,
+                byte_span: value.byte_span.clone(),
+                display_range: value.row.range,
+                language: value.row.language,
+                stable_id: value.row.id.clone(),
             },
             Self::RustPointerFinding(value) => DetailedSemanticProjection {
                 domain: DetailedCodeQueryDomain::RustPointerFinding,
@@ -2961,6 +2991,9 @@ struct QueryExecutionState<'a> {
     /// Which files the seed scanners enumerate. Narrowed only by a unit
     /// execution; every derived-value expansion still sees the workspace.
     scope: CodeQueryExecutionScope<'a>,
+    /// Languages in this run's seed-file inventory, independent of provider
+    /// registration and of any branch's language or path filters.
+    scanned_languages: HashSet<Language>,
     /// Physical node at which an opt-in expansion execution retains its exact
     /// source rows. `None` preserves all existing execution behavior.
     source_row_boundary: Option<PhysicalQueryNodeId>,
@@ -2994,6 +3027,7 @@ struct QueryExecutionState<'a> {
         ProjectFile,
         Arc<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>>,
     >,
+    rust_marker_impls_cache: rust_marker_impls::RustMarkerImplsCache,
     /// Query-local callable metrics expansion results; never retained by the workspace.
     callable_metrics_cache: HashMap<
         ProjectFile,
@@ -4656,6 +4690,12 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         workspace,
         cancellation,
         scope: scope.clone(),
+        scanned_languages: scope
+            .seed_files()
+            .unwrap_or(&preflight_files)
+            .iter()
+            .map(crate::analyzer::common::language_for_file)
+            .collect(),
         source_row_boundary,
         step_outputs: vec![0; physical_plan.node_count()],
         receiver_budget_override,
@@ -4675,6 +4715,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         cpp_expression_cache: HashMap::default(),
         cpp_class_fact_cache: HashMap::default(),
         cpp_class_declaration_cache: HashMap::default(),
+        rust_marker_impls_cache: rust_marker_impls::RustMarkerImplsCache::default(),
         callable_metrics_cache: HashMap::default(),
         failure_handler_state_cache: FailureHandlerStateCache::default(),
         topology_cache: TopologyTraversalCache::default(),
@@ -4789,6 +4830,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             .access_failure
             .get_or_insert_with(|| "workspace content changed before result rendering".to_string());
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -4902,6 +4944,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 && diagnostic.message.contains("structural posting")
         }) {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -6945,6 +6988,7 @@ fn retain_held_source_snapshot(
     }
     if !conflict_before {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,

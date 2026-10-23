@@ -68,13 +68,15 @@ pub struct CallSiteSyntax {
 /// declaration; retaining that shape keeps exact dispatch from degrading them
 /// to an `InvalidLocation` parse failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactCallReference {
+#[doc(hidden)]
+pub enum ExactCallReference {
     Resolvable(Range),
     Unsupported(ExactCallReferenceGap),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactCallReferenceGap {
+#[doc(hidden)]
+pub enum ExactCallReferenceGap {
     /// `proc.(value)` invokes the value held by the receiver. Resolving its
     /// target requires value/heap information rather than a method-name lookup.
     RubyCallableObject,
@@ -114,7 +116,8 @@ pub fn call_reference_range_for_call(
     }
 }
 
-pub(crate) fn exact_call_reference_for_call(
+#[doc(hidden)]
+pub fn exact_call_reference_for_call(
     tree: &Tree,
     language: Language,
     call_span: &Range,
@@ -363,8 +366,11 @@ fn call_signature_context_for_node(
     byte_offset: usize,
 ) -> Option<CallSignatureContext> {
     if language == Language::Scala
-        && let Some(context) = crate::analyzer::languages::language_support(language)
-            .and_then(|support| support.definition_call_signature_context(node, byte_offset))
+        && let Some(context) = crate::analyzer::languages::language_support_for_hook(
+            language,
+            "definition_call_signature_context",
+        )
+        .and_then(|support| support.definition_call_signature_context(node, byte_offset))
     {
         return Some(context);
     }
@@ -455,8 +461,11 @@ pub fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Opt
                 .or_else(|| first_named_child_not_arguments(node, language)),
             _ => None,
         },
-        Language::Scala => crate::analyzer::languages::language_support(Language::Scala)?
-            .definition_call_callee(node),
+        Language::Scala => crate::analyzer::languages::language_support_for_hook(
+            Language::Scala,
+            "call_argument_nodes",
+        )?
+        .definition_call_callee(node),
         Language::Kotlin => {
             crate::analyzer::languages::language_knowledge(language)?.call_callee_node(node)
         }
@@ -514,7 +523,8 @@ fn first_named_child_not_arguments(node: Node<'_>, language: Language) -> Option
         .find(|child| Some(*child) != arguments)
 }
 
-pub(crate) fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+#[doc(hidden)]
+pub fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     let arguments = node.child_by_field_name("arguments");
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {
@@ -522,13 +532,17 @@ pub(crate) fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-pub(crate) fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
+#[doc(hidden)]
+pub fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         node = match node.kind() {
             "identifier" | "operator_identifier" | "type_identifier" => return Some(node),
             "call_expression" | "infix_expression" | "postfix_expression" => {
-                crate::analyzer::languages::language_support(Language::Scala)?
-                    .definition_call_callee(node)?
+                crate::analyzer::languages::language_support_for_hook(
+                    Language::Scala,
+                    "definition_call_callee",
+                )?
+                .definition_call_callee(node)?
             }
             "instance_expression" => scala_constructor_type_node(node)?,
             "generic_function" | "generic_type" => node
@@ -702,7 +716,7 @@ fn is_nested_callable_node(node: Node<'_>, language: Language, search_range: &Ra
     if node.start_byte() <= search_range.start_byte || node.end_byte() >= search_range.end_byte {
         return false;
     }
-    if crate::analyzer::languages::language_support(language)
+    if crate::analyzer::languages::language_support_for_hook(language, "definition_nested_callable")
         .is_some_and(|support| support.definition_nested_callable(node))
     {
         return true;
@@ -763,12 +777,15 @@ fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
     if !is_reference_candidate_kind(node.kind()) && !php_relative_constructor_scope {
         return false;
     }
-    match language {
-        // #4452: Kotlin stays on its held definition route.
-        Language::Kotlin => super::kotlin::kotlin_call_reference_candidate(node),
-        _ => crate::analyzer::languages::language_support(language)
-            .is_some_and(|support| support.definition_call_reference_candidate(node)),
-    }
+    crate::analyzer::languages::language_support_for_hook(
+        language,
+        "definition_call_reference_candidate",
+    )
+    .is_some_and(|support| {
+        support
+            .call_reference_candidate_override(node)
+            .unwrap_or_else(|| support.definition_call_reference_candidate(node))
+    })
 }
 
 fn is_reference_candidate_kind(kind: &str) -> bool {
@@ -829,7 +846,8 @@ fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-pub(crate) fn enclosing_call_reference_candidate<'tree>(
+#[doc(hidden)]
+pub fn enclosing_call_reference_candidate<'tree>(
     node: Node<'tree>,
     is_call_target: impl Fn(Node<'tree>, Node<'tree>) -> bool,
     is_transparent_wrapper: impl Fn(Node<'tree>) -> bool,
@@ -868,33 +886,25 @@ fn ruby_exact_bare_call_identifier(node: Node<'_>) -> bool {
     node.kind() == "identifier" && !ruby_is_call_method_identifier(node)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::test_support::*;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod registry_fixture_support {
 
-    use crate::analyzer::usages::get_definition::call_sites::cpp_test_support::*;
-
-    use super::ExactCallReference;
-    use super::ExactCallReferenceGap;
     use super::call_reference_range_for_call;
-    use super::call_reference_ranges_in_tree;
+
     use super::call_signature_context;
-    use super::call_site_syntax_for_reference;
-    use super::exact_call_reference_for_call;
 
+    use super::test_support::*;
     use crate::analyzer::Language;
-
-    use crate::analyzer::structural::extract::extract_file_facts;
 
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
 
-    use brokk_bifrost_ruby::structural::RUBY_STRUCTURAL_SPEC;
-
-    fn offset_after(source: &str, needle: &str) -> usize {
+    #[doc(hidden)]
+    pub fn offset_after(source: &str, needle: &str) -> usize {
         source.find(needle).expect("needle exists") + needle.len()
     }
-
-    fn assert_signature_context(
+    #[doc(hidden)]
+    pub fn assert_signature_context(
         path: &str,
         source: &str,
         cursor_after: &str,
@@ -910,8 +920,8 @@ mod tests {
         );
         assert_eq!(context.active_parameter, active_parameter);
     }
-
-    fn assert_nested_call_reference_names(path: &str, language: Language, source: &str) {
+    #[doc(hidden)]
+    pub fn assert_nested_call_reference_names(path: &str, language: Language, source: &str) {
         let file = file(path);
         let tree = parse_tree_for_language(&file, language, source).expect("syntax tree");
         for (call, expected) in [("outer(inner())", "outer"), ("inner()", "inner")] {
@@ -921,17 +931,34 @@ mod tests {
             assert_eq!(&source[reference.start_byte..reference.end_byte], expected);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registry_fixture_support::*;
+    use super::test_support::*;
+
+    use crate::analyzer::usages::get_definition::call_sites::cpp_test_support::*;
+
+    use super::ExactCallReference;
+    use super::ExactCallReferenceGap;
+    use super::call_reference_range_for_call;
+    use super::call_signature_context;
+    use super::call_site_syntax_for_reference;
+    use super::exact_call_reference_for_call;
+
+    use crate::analyzer::Language;
+
+    use crate::analyzer::structural::extract::extract_file_facts;
+
+    use crate::analyzer::usages::get_definition::parse_tree_for_language;
+
+    use brokk_bifrost_ruby::structural::RUBY_STRUCTURAL_SPEC;
 
     #[test]
     fn exact_call_span_distinguishes_outer_and_inner_callees() {
         let source = "function outer(value: number) { return value; }\nfunction inner() { return 1; }\nouter(inner());\n";
         assert_nested_call_reference_names("nested.ts", Language::TypeScript, source);
-    }
-
-    #[test]
-    fn exact_java_call_span_uses_the_named_method_field() {
-        let source = "class Nested { static int outer(int value) { return value; } static int inner() { return 1; } int call() { return outer(inner()); } }";
-        assert_nested_call_reference_names("Nested.java", Language::Java, source);
     }
 
     #[test]
@@ -979,93 +1006,6 @@ mod tests {
                 "wrong exact C++ callee for `{call}`"
             );
         }
-    }
-
-    #[test]
-    fn exact_scala_call_spans_use_the_terminal_direct_callee() {
-        let source = r#"
-object Calls {
-  class Box[A](value: Int)
-  class Curried(value: Int)(label: String)
-  class Service {
-    def curried[A](value: Int)(label: String): Int = value
-    def combine(other: Service): Service = this
-    def ping: Int = 1
-  }
-  def ordinary(value: Int): Int = value
-  def caller(service: Service, other: Service, head: Int, tail: List[Int]): Unit = {
-    ordinary(1)
-    ordinary[Int](1)
-    service.curried[Int](1)("label")
-    new Box[Int](1)
-    new Curried(1)("label")
-    service combine other
-    service ping
-    head :: tail
-  }
-}
-"#;
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
-
-        for (call, callee) in [
-            ("ordinary(1)", "ordinary"),
-            ("ordinary[Int](1)", "ordinary"),
-            ("service.curried[Int](1)(\"label\")", "curried"),
-            ("new Box[Int](1)", "Box"),
-            ("new Curried(1)(\"label\")", "Curried"),
-            ("service combine other", "combine"),
-            ("service ping", "ping"),
-            ("head :: tail", "::"),
-        ] {
-            let reference =
-                call_reference_range_for_call(&tree, Language::Scala, &byte_range(source, call))
-                    .unwrap_or_else(|| panic!("missing exact Scala call reference for `{call}`"));
-            assert_eq!(
-                &source[reference.start_byte..reference.end_byte],
-                callee,
-                "wrong exact Scala callee for `{call}`"
-            );
-        }
-    }
-
-    #[test]
-    fn scala_parameterless_selection_is_not_an_immediate_call_candidate() {
-        let source = "object Calls { def caller(service: Service) = service.value }";
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
-        let selection = byte_range(source, "service.value");
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &selection, 20);
-
-        assert!(references.is_empty(), "{references:#?}");
-    }
-
-    #[test]
-    fn scala_call_candidates_prune_partial_functions_and_givens_but_not_match_cases() {
-        let outer = r#"def outer(value: Int): Int = {
-    val partial: PartialFunction[Int, Int] = { case _ => nestedCall() }
-    given generated: Int = nestedCall()
-    val matched = value match { case _ => matchCall() }
-    directCall()
-  }"#;
-        let source = format!(
-            "object Calls {{ def nestedCall(): Int = 1; def matchCall(): Int = 2; def directCall(): Int = 3; {outer} }}"
-        );
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, &source).expect("Scala syntax tree");
-        let search_range = byte_range(&source, outer);
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &search_range, 20);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["matchCall", "directCall"]);
     }
 
     #[test]
@@ -1162,24 +1102,6 @@ end
     }
 
     #[test]
-    fn signature_context_handles_scala_brace_argument_block() {
-        let source =
-            "object App {\n  def target(value: Int): Int = value\n  val result = target { 1 }\n}\n";
-        let context = call_signature_context(
-            &file("App.scala"),
-            source,
-            offset_after(source, "target { "),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "target"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
     fn signature_context_handles_ruby_command_call_with_block() {
         let source = "target 1, 2 do |item|\n  item\nend\n";
         let context = call_signature_context(
@@ -1203,37 +1125,6 @@ end
     }
 
     #[test]
-    fn signature_context_handles_scala_infix_call() {
-        let source = "object App {\n  class Box { def combine(value: Int): Int = value }\n  val box = new Box\n  val result = box combine 1\n}\n";
-        let context = call_signature_context(
-            &file("App.scala"),
-            source,
-            offset_after(source, "box combine "),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "combine"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
-    fn signature_context_handles_scala_postfix_operator_call() {
-        let source = "object App {\n  class Box { def ! : Boolean = true }\n  val box = new Box\n  val result = box !\n}\n";
-        let context =
-            call_signature_context(&file("App.scala"), source, offset_after(source, "box !"))
-                .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "!"
-        );
-        assert_eq!(context.active_parameter, 0);
-    }
-
-    #[test]
     fn signature_context_rejects_higher_order_call_callee() {
         let source = "function factory() { return (value: number) => value; }\nconst result = factory()(1);\n";
         let context = call_signature_context(
@@ -1243,40 +1134,6 @@ end
         );
 
         assert_eq!(context, None);
-    }
-
-    #[test]
-    fn scala_call_candidates_exclude_receivers_arguments_and_type_arguments() {
-        let source = "object Calls { def caller(service: Service, value: Int, label: String) = service.curried[String](value)(label) }";
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
-        let call = byte_range(source, "service.curried[String](value)(label)");
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["curried"]);
-    }
-
-    #[test]
-    fn scala_constructor_candidates_exclude_qualifiers_arguments_and_type_arguments() {
-        let source = "object Calls { def caller(value: Int) = new pkg.Box[String](value) }";
-        let file = file("Calls.scala");
-        let tree =
-            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
-        let call = byte_range(source, "new pkg.Box[String](value)");
-
-        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
-        let names = references
-            .iter()
-            .map(|range| &source[range.start_byte..range.end_byte])
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["Box"]);
     }
 
     #[test]
@@ -1313,13 +1170,6 @@ end
             &source[site.range.start_byte..site.range.end_byte],
             "target"
         );
-    }
-
-    #[test]
-    fn signature_context_counts_active_parameter_after_comma() {
-        let source =
-            "class A { int target(int left, int right) { return 0; } void f() { target(1, 2); } }";
-        assert_signature_context("A.java", source, "1, ", "target", 1);
     }
 
     #[test]
@@ -1377,23 +1227,6 @@ end
             "target"
         );
         assert_eq!(context.active_parameter, 1);
-    }
-
-    #[test]
-    fn signature_context_handles_scala_postfix_call() {
-        let source = "object App {\n  class Box { def ready: Boolean = true }\n  val box = new Box\n  val result = box ready\n}\n";
-        let context = call_signature_context(
-            &file("App.scala"),
-            source,
-            offset_after(source, "box ready"),
-        )
-        .expect("signature context");
-
-        assert_eq!(
-            &source[context.callee_range.start_byte..context.callee_range.end_byte],
-            "ready"
-        );
-        assert_eq!(context.active_parameter, 0);
     }
 }
 

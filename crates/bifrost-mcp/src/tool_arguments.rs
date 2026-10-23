@@ -55,6 +55,7 @@ fn tool_path_arguments(tool_name: &str) -> &'static [ToolPathArgument] {
         "get_file_contents" => GET_FILE_CONTENTS,
         "query_code" => QUERY_CODE,
         "search_file_contents" => SEARCH_FILE_CONTENTS,
+        "list_function_sources" => SCAN_USAGES_BY_REFERENCE,
         "compute_cyclomatic_complexity"
         | "compute_cognitive_complexity"
         | "report_comment_density_for_files"

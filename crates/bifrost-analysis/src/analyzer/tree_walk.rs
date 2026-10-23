@@ -85,9 +85,9 @@ where
 #[cfg(test)]
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    child_by_field_or_named_child_of_kinds, children_iter, first_named_child_of_kind,
-    named_children, named_children_iter, node_for_exact_range, push_children_reversed,
-    push_named_children_reversed, single_named_child_matching, subtree_contains,
+    child_by_field_or_named_child_of_kinds, children_iter, named_children, named_children_iter,
+    node_for_exact_range, push_children_reversed, push_named_children_reversed,
+    single_named_child_matching,
 };
 
 #[doc(hidden)]

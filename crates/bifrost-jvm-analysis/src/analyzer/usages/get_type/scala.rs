@@ -1,0 +1,365 @@
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::candidates_outcome_with_target_kind;
+
+use brokk_bifrost_analysis::analyzer::usages::get_type::no_type;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+use crate::analyzer::usages::get_definition::scala::ScalaDefinitionProvider;
+
+use crate::analyzer::usages::get_definition::scala::ScalaTypeLookupResolution;
+
+use crate::analyzer::usages::get_definition::scala::scala_type_lookup_resolution_in_session;
+
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+
+use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+
+use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+use crate::analyzer::JavaAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use crate::analyzer::ScalaAnalyzer;
+
+use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::cancellation::CancellationToken;
+use tree_sitter::Tree;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_scala_type_bounded(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    ResolutionSession::run_bounded(budget, cancellation, |session| {
+        let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
+            return no_type(
+                "scala_analyzer_unavailable",
+                "Scala analyzer is unavailable",
+            );
+        };
+        let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
+        let support = ScalaDefinitionProvider::new(scala, java, session);
+        let Some(tree) = tree else {
+            return no_type("scala_parse_failed", "Scala source could not be parsed");
+        };
+        let resolution = scala_type_lookup_resolution_in_session(
+            analyzer,
+            token,
+            &support,
+            file,
+            source,
+            tree.root_node(),
+            site,
+            session,
+        );
+        scala_type_resolution_outcome(&support, site, resolution)
+    })
+}
+
+fn scala_type_resolution_outcome(
+    support: &dyn BoundedDefinitionLookup,
+    site: &ResolvedReferenceSite,
+    resolution: Option<ScalaTypeLookupResolution>,
+) -> TypeLookupOutcome {
+    let Some(resolution) = resolution else {
+        return no_type(
+            "no_explicit_type",
+            format!(
+                "`{}` does not have a supported explicit Scala type",
+                site.text
+            ),
+        );
+    };
+    match resolution {
+        ScalaTypeLookupResolution::Type { fqn, target_kind } => {
+            let mut candidates = support.fqn(&fqn);
+            // The provider's lookup also answers relaxed spellings, which for a
+            // singleton fq name (`app.Settings$`) includes the class it is the
+            // companion of. The resolver named this exact fq name, so when the
+            // index holds it exactly, the relaxed spellings are not
+            // alternatives.
+            let exact: Vec<_> = candidates
+                .iter()
+                .filter(|unit| unit.fq_name() == fqn)
+                .cloned()
+                .collect();
+            if !exact.is_empty() {
+                candidates = exact;
+            }
+            if candidates.is_empty() {
+                return no_type(
+                    "no_indexed_type_definition",
+                    format!("`{fqn}` resolved as a Scala type but has no indexed definition"),
+                );
+            }
+            candidates_outcome_with_target_kind(fqn, candidates, target_kind)
+        }
+        ScalaTypeLookupResolution::InappropriateSymbolContext => no_type(
+            "inappropriate_symbol_context",
+            format!(
+                "`{}` is a callable declaration name, not a type-bearing expression",
+                site.text
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::analyzer::usages::get_type::scala::*;
+
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
+
+    use brokk_bifrost_analysis::analyzer::usages::test_support::assert_scope_budget_exceeded;
+
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+
+    use brokk_bifrost_core::analyzer::model::Language;
+
+    use brokk_bifrost_core::analyzer::model::Range;
+
+    use brokk_bifrost_core::path_utils::rel_path_string;
+
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+
+    fn expression_site(
+        file: &ProjectFile,
+        source: &str,
+        expression: &str,
+    ) -> ResolvedReferenceSite {
+        let start_byte = source
+            .find(expression)
+            .unwrap_or_else(|| panic!("missing expression {expression:?}"));
+        let end_byte = start_byte + expression.len();
+        let line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        brokk_bifrost_analysis::test_support::resolved_reference_site(
+            rel_path_string(file),
+            expression.to_string(),
+            Range {
+                start_byte,
+                end_byte,
+                start_line: line,
+                end_line: line,
+            },
+        )
+    }
+
+    fn last_expression_site(
+        file: &ProjectFile,
+        source: &str,
+        expression: &str,
+    ) -> ResolvedReferenceSite {
+        let start_byte = source
+            .rfind(expression)
+            .unwrap_or_else(|| panic!("missing expression {expression:?}"));
+        let end_byte = start_byte + expression.len();
+        let line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        brokk_bifrost_analysis::test_support::resolved_reference_site(
+            rel_path_string(file),
+            expression.to_string(),
+            Range {
+                start_byte,
+                end_byte,
+                start_line: line,
+                end_line: line,
+            },
+        )
+    }
+
+    fn factory_fixture() -> (AnalyzerFixture, ProjectFile, &'static str, Tree) {
+        const SOURCE: &str = r#"
+class Service
+object Factory {
+  def makeService(): Service = new Service()
+}
+object Caller {
+  val service = Factory.makeService()
+}
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Scala, &[("Receiver.scala", SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, SOURCE).expect("Scala syntax tree");
+        (fixture, file, SOURCE, tree)
+    }
+
+    fn deep_wide_factory_source(width: usize, depth: usize) -> String {
+        let mut source = String::from(
+            r#"
+class Service
+object Factory {
+  def makeService(): Service = new Service()
+}
+object Caller {
+  def use(): Unit = {
+"#,
+        );
+        for index in 0..width {
+            source.push_str(&format!("    val sibling{index} = {index}\n"));
+        }
+        for _ in 0..depth {
+            source.push_str("    {\n");
+        }
+        source.push_str("      Factory.makeService()\n");
+        for _ in 0..depth {
+            source.push_str("    }\n");
+        }
+        source.push_str(
+            r#"  }
+}
+"#,
+        );
+        source
+    }
+
+    #[test]
+    fn bounded_scala_factory_lookup_reports_scope_budget_without_partial_result() {
+        let (fixture, file, source, tree) = factory_fixture();
+        let budget = ReceiverAnalysisBudget::tiny();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let outcome = resolve_scala_type_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &file,
+            source,
+            Some(&tree),
+            &expression_site(&file, source, "Factory.makeService()"),
+            budget,
+            None,
+        );
+
+        assert_scope_budget_exceeded(&outcome, budget);
+    }
+
+    #[test]
+    fn bounded_scala_deep_wide_lookup_stops_at_exact_small_scope_budget() {
+        let source = deep_wide_factory_source(128, 128);
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Scala, &[("Receiver.scala", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
+        let tree = parse_tree_for_language(&file, Language::Scala, &source)
+            .expect("deep and wide Scala syntax tree");
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 48,
+            ..ReceiverAnalysisBudget::default()
+        };
+
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let outcome = resolve_scala_type_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &file,
+            &source,
+            Some(&tree),
+            &expression_site(&file, &source, "Factory.makeService()"),
+            budget,
+            None,
+        );
+
+        assert_scope_budget_exceeded(&outcome, budget);
+    }
+
+    #[test]
+    fn bounded_scala_deep_alias_chain_is_iterative() {
+        const ALIASES: usize = 2_048;
+        let mut source = String::from(
+            r#"
+class Service
+object Caller {
+  def use(): Unit = {
+    val service0: Service = new Service()
+"#,
+        );
+        for index in 1..ALIASES {
+            source.push_str(&format!("    val service{index} = service{}\n", index - 1));
+        }
+        source.push_str(&format!("    service{}\n  }}\n}}\n", ALIASES - 1));
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Scala, &[("Receiver.scala", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "Receiver.scala");
+        let tree = parse_tree_for_language(&file, Language::Scala, &source)
+            .expect("deep Scala alias-chain syntax tree");
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 200_000,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let target = format!("service{}", ALIASES - 1);
+
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let outcome = resolve_scala_type_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &file,
+            &source,
+            Some(&tree),
+            &last_expression_site(&file, &source, &target),
+            budget,
+            None,
+        );
+
+        let BoundedResolution::Complete { value, work } = outcome else {
+            panic!("iterative Scala alias lookup must complete: {outcome:#?}");
+        };
+        assert!(work.scope_nodes < budget.max_scope_nodes, "{work:#?}");
+        assert_eq!(
+            value.status,
+            brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved,
+            "{value:#?}"
+        );
+        assert!(
+            matches!(value.types.as_slice(), [ty] if ty.fqn == "Service"),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_scala_factory_lookup_reports_cancellation_without_partial_result() {
+        let (fixture, file, source, tree) = factory_fixture();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let outcome = resolve_scala_type_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &file,
+            source,
+            Some(&tree),
+            &expression_site(&file, source, "Factory.makeService()"),
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+
+        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
+}

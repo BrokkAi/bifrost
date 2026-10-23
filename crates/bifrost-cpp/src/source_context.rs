@@ -138,7 +138,7 @@ fn macro_displaced_return_type(declaration: Node<'_>, source: &str) -> bool {
         return false;
     };
     let name = crate::declarations::node_text(ty, source).trim();
-    !name.is_empty()
+    if !name.is_empty()
         && name
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
@@ -147,6 +147,23 @@ fn macro_displaced_return_type(declaration: Node<'_>, source: &str) -> bool {
                 .named_child(index)
                 .is_some_and(|child| child.kind() == "ERROR")
         })
+    {
+        return true;
+    }
+    // The macro-declaration grammar keeps the same macro as a
+    // `macro_modifier` sibling of the real type rather than a bogus type with
+    // an `ERROR`; both are admitted only where the declaration would
+    // otherwise not parse.
+    let mut cursor = declaration.walk();
+    declaration.named_children(&mut cursor).any(|child| {
+        crate::declarations::macro_modifier_identifier(child).is_some_and(|identifier| {
+            let name = crate::declarations::node_text(identifier, source).trim();
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        })
+    })
 }
 
 fn namespace_closing_brace(node: Node<'_>) -> Option<Node<'_>> {

@@ -244,24 +244,31 @@ fn code_unit_declaration_name_range_scoped<'tree>(
 ) -> Option<Range> {
     let identifier = declaration_source_identifier(code_unit);
     let support = crate::analyzer::languages::language_knowledge(language_for_target(code_unit));
-    let name_node = node_for_exact_range(scope, &declaration_range)
-        .or_else(|| node_for_smallest_containing_range(scope, &declaration_range))
-        .and_then(|declaration_node| {
+    let name_node = match node_for_exact_range(scope, &declaration_range) {
+        Some(declaration_node) => {
             declaration_name_node(declaration_node, identifier, content, support)
-        })
-        .or_else(|| {
-            // Persisted ranges can have byte offsets from a different line
-            // ending representation than the current source. Line spans are
-            // stable across LF and CRLF, so use the current AST to recover the
-            // declaration name when byte containment cannot do so.
-            declaration_name_node_for_line_range(
-                root,
-                &declaration_range,
-                identifier,
-                content,
-                support,
-            )
-        })?;
+        }
+        // A declaration a region reparse recovered has no node of its own in
+        // this tree, and the node containing it can spell the same name
+        // outside it: a C++ class-scope macro invocation that swallowed the
+        // constructor after it spells the class name as its argument first
+        // (#3298). A declaration's name lies inside its own range.
+        None => node_for_smallest_containing_range(scope, &declaration_range)
+            .and_then(|declaration_node| {
+                declaration_name_node(declaration_node, identifier, content, support)
+            })
+            .filter(|name_node| {
+                name_node.start_byte() >= declaration_range.start_byte
+                    && name_node.end_byte() <= declaration_range.end_byte
+            }),
+    }
+    .or_else(|| {
+        // Persisted ranges can have byte offsets from a different line
+        // ending representation than the current source. Line spans are
+        // stable across LF and CRLF, so use the current AST to recover the
+        // declaration name when byte containment cannot do so.
+        declaration_name_node_for_line_range(root, &declaration_range, identifier, content, support)
+    })?;
     Some(support.map_or_else(
         || node_byte_range(name_node),
         |support| support.declaration_name_range(name_node, content),

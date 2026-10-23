@@ -20,7 +20,7 @@ use brokk_bifrost_analysis::analyzer::declaration_range::DeclarationNameRangeCon
 
 use brokk_bifrost_analysis::analyzer::declaration_range::code_unit_declaration_name_range;
 
-use brokk_bifrost_analysis::analyzer::languages::language_support;
+use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalDefinition;
 
@@ -348,6 +348,8 @@ pub use crate::searchtools::scan_usages::UsageGraphFileNote;
 
 pub use crate::searchtools::scan_usages::UsageGraphIncompleteReason;
 
+pub use crate::searchtools::scan_usages::UsageGraphImplicitCallers;
+
 pub use crate::searchtools::scan_usages::UsageGraphNode;
 
 pub use crate::searchtools::scan_usages::UsageGraphParams;
@@ -355,6 +357,8 @@ pub use crate::searchtools::scan_usages::UsageGraphParams;
 pub use crate::searchtools::scan_usages::UsageGraphResult;
 
 pub use crate::searchtools::scan_usages::UsageGraphTruncatedSymbol;
+
+pub use crate::searchtools::scan_usages::{UsageGraphWithheldCallee, UsageGraphWithheldReference};
 
 pub use crate::searchtools::scan_usages::UsageLocation;
 
@@ -779,7 +783,11 @@ fn declaration_navigation_occurrences(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Option<Vec<brokk_bifrost_analysis::analyzer::languages::DeclarationNavigationOccurrence>> {
-    language_support(language_for_target(unit))?.declaration_navigation_occurrences(analyzer, unit)
+    language_support_for_hook(
+        language_for_target(unit),
+        "declaration_navigation_occurrences",
+    )?
+    .declaration_navigation_occurrences(analyzer, unit)
 }
 
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {

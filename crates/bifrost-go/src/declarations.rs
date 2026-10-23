@@ -2057,6 +2057,7 @@ where
                 );
             }
             let declaration = self.source_declaration(node, Some(name_node), code_unit.clone());
+            self.native.register_parser_interface_method(node);
             if let Some(previous) = declaration_id {
                 assert_eq!(previous, declaration);
             } else {

@@ -36,6 +36,7 @@ pub(super) fn initializer_relation_expansions(
     let candidates = cpp_initializer_candidates(workspace, &procedure.handle, cancellation);
     if !candidates.complete {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -149,6 +150,7 @@ fn exact_row(
     digest.push(&(candidate.access_range.start_byte as u64).to_le_bytes());
     digest.push(&(candidate.access_range.end_byte as u64).to_le_bytes());
     let mut value = AssignmentRelationValue {
+        related: Vec::new(),
         file: procedure.file().clone(),
         range: candidate.declaration_range,
         ast_id: read
@@ -232,6 +234,7 @@ fn relation_row(
     digest.push(verdict.as_bytes());
     pipeline_expansion(PipelineValue::AssignmentRelation(Box::new(
         AssignmentRelationValue {
+            related: Vec::new(),
             file: procedure.file().clone(),
             range: candidate.declaration_range,
             ast_id: None,

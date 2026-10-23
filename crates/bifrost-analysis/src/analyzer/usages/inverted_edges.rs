@@ -29,7 +29,7 @@
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedUsageEdges, NodeKey,
-    PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, first_precise,
+    PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts,
 };
 
 use crate::analyzer::common::declaration_language_for_file;
@@ -47,14 +47,16 @@ use std::sync::Arc;
 
 /// [`ClassRangeIndex`] over a persisted file state, for scans that already
 /// hydrated one and would otherwise pay the declaration/range queries twice.
-pub(crate) fn class_range_index_from_state(state: &FileState) -> ClassRangeIndex {
+#[doc(hidden)]
+pub fn class_range_index_from_state(state: &FileState) -> ClassRangeIndex {
     class_range_index_from_declaration_ranges(&state.declarations, &state.ranges)
 }
 
 /// [`class_range_index_from_state`] over the two maps it actually reads, for a
 /// scan whose per-file record is a language crate's decode of the state rather
 /// than the state itself.
-pub(crate) fn class_range_index_from_declaration_ranges(
+#[doc(hidden)]
+pub fn class_range_index_from_declaration_ranges(
     declarations: &HashSet<CodeUnit>,
     ranges: &HashMap<CodeUnit, Vec<Range>>,
 ) -> ClassRangeIndex {
@@ -216,7 +218,8 @@ pub fn weight_usage_edge_contents(key_bytes: usize, edges: &UsageEdges) -> u32 {
 /// every selected input was processed. A best-effort graph from an omitted
 /// input remains available to the current report, but is never published into
 /// the generation-local cache.
-pub(crate) fn cached_dead_code_usage_edges(
+#[doc(hidden)]
+pub fn cached_dead_code_usage_edges(
     analyzer: &dyn IAnalyzer,
     cache: &UsageEdgesCache,
     targets: &HashSet<String>,
@@ -324,7 +327,8 @@ pub fn build_file_declarations<K: NodeKey>(
     build_file_declarations_with_file_scope(analyzer, file, false)
 }
 
-pub(crate) fn build_file_declarations_with_file_scope<K: NodeKey>(
+#[doc(hidden)]
+pub fn build_file_declarations_with_file_scope<K: NodeKey>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     include_file_scope: bool,
@@ -372,13 +376,13 @@ fn append_file_declaration_ranges<K: NodeKey>(
     }
 }
 
-pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
-    state: &FileState,
-) -> FileDeclarations<K> {
+#[doc(hidden)]
+pub fn build_file_declarations_from_state<K: NodeKey>(state: &FileState) -> FileDeclarations<K> {
     build_file_declarations_from_state_with_file_scope(state, false)
 }
 
-pub(crate) fn build_file_declarations_from_state_with_file_scope<K: NodeKey>(
+#[doc(hidden)]
+pub fn build_file_declarations_from_state_with_file_scope<K: NodeKey>(
     state: &FileState,
     include_file_scope: bool,
 ) -> FileDeclarations<K> {
@@ -391,7 +395,8 @@ pub(crate) fn build_file_declarations_from_state_with_file_scope<K: NodeKey>(
 
 /// [`build_file_declarations_from_state`] over the two maps it actually reads,
 /// with a declaration filter; see [`class_range_index_from_declaration_ranges`].
-pub(crate) fn build_file_declarations_from_declaration_ranges_filtered<K: NodeKey>(
+#[doc(hidden)]
+pub fn build_file_declarations_from_declaration_ranges_filtered<K: NodeKey>(
     declarations: &HashSet<CodeUnit>,
     ranges: &HashMap<CodeUnit, Vec<Range>>,
     include: impl Fn(&CodeUnit) -> bool,
@@ -681,7 +686,8 @@ where
     ))
 }
 
-pub(crate) fn parse_and_collect_with_declarations_and_domain<S>(
+#[doc(hidden)]
+pub fn parse_and_collect_with_declarations_and_domain<S>(
     file: &ProjectFile,
     domain: EdgeNodeDomain<'_>,
     spec: ParseSpec<'_>,
@@ -785,7 +791,8 @@ impl<K: NodeKey> EdgeSitesPartial<K> {
     }
 }
 
-pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> UsageEdges<K> {
+#[doc(hidden)]
+pub fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> UsageEdges<K> {
     let mut partial = EdgeSitesPartial::default();
     for file in per_file {
         partial.absorb(file);

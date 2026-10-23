@@ -2,8 +2,8 @@
 
 use crate::declarations::{
     cpp_callable_identity_suffix, cpp_callable_is_structural_constructor,
-    cpp_comparable_parameter_shapes, cpp_declarator_adds_indirection, extract_function_declarator,
-    node_text,
+    cpp_comparable_parameter_shapes, cpp_declarator_adds_indirection,
+    cpp_macro_swallowed_access_label, extract_function_declarator, node_text,
 };
 use crate::graph::resolver::{
     cpp_declared_field_type_fact, cpp_type_name_components, declarator_name_node,
@@ -1142,7 +1142,7 @@ fn capture_member_fact(
     } else {
         CppSpecialMemberState::Declared
     };
-    let access = member_access_specifier(node, ancestry);
+    let access = member_access_specifier(node, source, ancestry);
     let assignment_return = if role == CppMemberRole::AssignmentOperator {
         assignment_return_shape(node, source, owner_name)
     } else {
@@ -1439,7 +1439,11 @@ fn append_owner_components(owner: &mut Vec<String>, written: &[String]) {
     owner.extend(written[overlap..].iter().cloned());
 }
 
-fn member_access_specifier(node: Node<'_>, ancestry: &ParentIndex<'_>) -> CppAccessSpecifier {
+fn member_access_specifier(
+    node: Node<'_>,
+    source: &str,
+    ancestry: &ParentIndex<'_>,
+) -> CppAccessSpecifier {
     let mut current = ancestry.parent(node);
     while let Some(parent) = current {
         if matches!(
@@ -1466,6 +1470,12 @@ fn member_access_specifier(node: Node<'_>, ancestry: &ParentIndex<'_>) -> CppAcc
                         Some("protected") => CppAccessSpecifier::Protected,
                         Some("private") => CppAccessSpecifier::Private,
                         _ => CppAccessSpecifier::Unknown,
+                    };
+                } else if let Some(label) = cpp_macro_swallowed_access_label(child, source) {
+                    access = match label.access {
+                        "public" => CppAccessSpecifier::Public,
+                        "protected" => CppAccessSpecifier::Protected,
+                        _ => CppAccessSpecifier::Private,
                     };
                 }
             }

@@ -260,6 +260,41 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         let duplicate_key = (normalized_kind == NormalizedKind::ObjectProperty)
             .then(|| self.spec.duplicate_dictionary_key(node, self.source))
             .flatten();
+        let (call_site, unsafe_context) = if normalized_kind.satisfies(NormalizedKind::Call) {
+            let mut work = 0usize;
+            // Keep the reserved node admission available after the syntax walk.
+            let remaining = self
+                .max_work_items
+                .saturating_sub(self.nodes.len() + self.role_count + 1);
+            let cancellation = self.cancellation;
+            let mut charge = |amount| {
+                if crate::cancellation::optional_is_cancelled(cancellation) {
+                    return Err(StructuralFactCollectorStop::Cancelled);
+                }
+                work = work.saturating_add(amount);
+                if work > remaining {
+                    return Err(StructuralFactCollectorStop::Exceeded);
+                }
+                Ok(())
+            };
+            let provenance = self
+                .spec
+                .callee_provenance(node, self.source, &mut charge)?;
+            let unsafe_context = self.spec.unsafe_context_value(node, &mut charge)?;
+            self.max_work_items -= work;
+            let site = self.spec.call_site_facts(node, self.source, self.context);
+            let call_site = match provenance {
+                Some(provenance) => {
+                    let mut site = site.unwrap_or_else(super::callable::CallSiteFacts::unrefined);
+                    site.callee_provenance = Some(provenance);
+                    Some(site)
+                }
+                None => site,
+            };
+            (call_site, unsafe_context)
+        } else {
+            (None, None)
+        };
         self.nodes.push(NormalizedNode {
             kind: normalized_kind,
             occurrence,
@@ -269,6 +304,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             integer_literal_value,
             duplicate_key,
             is_async,
+            unsafe_context,
             string_value,
             construct: self
                 .spec
@@ -277,10 +313,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             parent: enclosing_normalized_id,
             name: None,
             subtree_end: fact_id + 1,
-            call_site: normalized_kind
-                .satisfies(NormalizedKind::Call)
-                .then(|| self.spec.call_site_facts(node, self.source, self.context))
-                .flatten(),
+            call_site,
         });
         self.pending_roles.push(Vec::new());
         assert!(
@@ -337,6 +370,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                 integer_literal_value: None,
                 duplicate_key: None,
                 is_async: None,
+                unsafe_context: None,
                 string_value: None,
                 construct: embedded.construct.clone(),
                 parent: Some(

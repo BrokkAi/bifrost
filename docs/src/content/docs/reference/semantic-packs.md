@@ -20,9 +20,16 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `16`, inclusive. It writes version `16`. Version `1` and
+through `18`, inclusive. Its newest version is `18`. Version `1` and
 any other value fail with `schema.unsupported_version`. The field is
 required; there is no default.
+
+`bifrost-semantic-pack generate` writes each pack produced from a pinned
+artifact at the lowest version its content needs: the highest version gate in
+the table below that the content meets, and never below `8`. A pack that uses
+no field newer than version 8 is written as version 8, so a reader that predates
+later fields still accepts it. A pack loaded from an `authored_semantic_model`
+spec keeps the version its author declared.
 
 A field is accepted only in a pack whose `schema_version` is at least the
 version that introduced it. A pack that declares an earlier version and uses
@@ -45,22 +52,24 @@ of an older version parse every pack that it accepts by number.
 | 14 | Directional variadic kinds on structured procedure formals. | `summary.formals_schema_version`, `summary.variadic_formals_schema_version` |
 | 15 | Typed module values (`value_type`, `proxied_type`) and callable parameter roles. | `declaration.module_value_type_schema_version`, `parameter.role_schema_version` |
 | 16 | Non-empty `exact_return_classes` on members. | `declaration.exact_return_classes_schema_version` |
+| 17 | Ordered, exhaustive `runtime_bases` on Python class facts. | `declaration.runtime_bases_schema_version` |
+| 18 | Rust generic defaults, implemented-trait facts and associated bindings, generic forwarding impls, self forms, and associated-type projections. | `declaration.rust_contract_schema_version` |
 
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v10.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v10.schema.json).
+[`schemas/semantic-model-pack-v18.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v18.schema.json).
 `cargo run --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `11`. It requires `compatibility.bifrost` for versions `2` through
+`2` through `18`. It requires `compatibility.bifrost` for versions `2` through
 `7` and forbids it for versions `8` and newer. It does not express the other
 per-field version gates in the table above; the validator enforces them.
 
-The version-two through version-eight schema files remain checked in. The v8
-file accepts versions `2` through `8`, requires `compatibility.bifrost` through
-version `7`, and forbids it for version `8`.
+The schema files for earlier versions remain checked in; there is no v7 file.
+The v8 file accepts versions `2` through `8`, requires `compatibility.bifrost`
+through version `7`, and forbids it for version `8`.
 
 ## Pack envelope
 
@@ -69,7 +78,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 11 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 18 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -172,6 +181,9 @@ otherwise it is a language selector. See
 | `callable_surface_complete` | boolean | `false` | 6 | Every directly declared, externally visible callable and every direct hierarchy edge of this type is in the pack. It does not cover inherited members, fields, effects, or overload applicability. `false` means not reviewed. |
 | `has_explicit_type_terms` | boolean | `false` | 2 | The type is a Go interface that lists explicit type terms (a type-set constraint). |
 | `type_parameters` | list of names | `[]` | 2 | Generic parameter names, in order. Names must be unique. |
+| `type_parameter_defaults` | list of optional defaults | `[]` | 18 | Rust defaults parallel to `type_parameters`, excluding lifetimes. A default is `{kind: type, type: TypeRef}` or `{kind: const, value: text}`; null means no default, and an empty list means unreviewed. |
+| `implemented_traits` | list of implemented-trait facts | `[]` | 18 | Rust trait identities and structured associated-type bindings, retained even when no method is overridden. Negative impls contribute nothing. |
+| `generic_trait_impls` | list of generic impl facts | `[]` | 18 | Rust forwarding rules owned by the implemented trait: `type_parameters`, structured `self_pattern`, `bounds`, and `implementation`. |
 | `type_parameter_constraints` | list of [`TypeParameterConstraint`](#small-declaration-types) | `[]` | 2 | Constraints on the type parameters. One per parameter at most. |
 | `underlying_type` | [`StructuredTypeExpression`](#small-declaration-types) | absent | 2 | The underlying type of a defined type, such as a Go named type. |
 | `value_semantics` | [`TypeValueSemantics`](#value-semantics) | absent | 2 | Reviewed copy and move behavior. Absence means not reviewed, not "no operations". |
@@ -181,6 +193,14 @@ otherwise it is a language selector. See
 | `aliases` | list of names | `[]` | 2 | Other names for the same type. |
 | `extension_surfaces` | list of names | `[]` | 2 | Names of declarations that add extension members to this type. |
 | `guard` | [`DeclarationGuard`](#declarationguard) | absent | 2 | The toolchain and target condition under which the type exists. |
+
+An implemented-trait fact has `trait_type: TypeRef` and `associated_types`, a list of
+`{name, type: TypeRef}` bindings. A generic impl bound has `subject: TypeRef`,
+`bound` (an implemented-trait fact), and `maybe` (for `?Sized`). Subjects may be
+associated projections such as `P::Target`. A self pattern is a `parameter`
+with `name`, a `reference` with `mutable` and `inner`, or a `constructor` with
+`owner: TypeRef` and nested `arguments`. These facts retain declarations; they
+do not assert that a bound has been solved for an arbitrary receiver.
 
 ### MemberFact
 
@@ -195,6 +215,8 @@ otherwise it is a language selector. See
 | `is_static` | boolean | `false` | 2 | The member is static. |
 | `is_abstract` | boolean | `false` | 2 | The member is abstract. |
 | `is_virtual` | boolean | `false` | 2 | The member is virtual. `false` is not evidence that the member cannot be overridden. |
+| `implemented_trait` | `TypeRef` | absent | 18 | The Rust trait implemented by this impl member. |
+| `self_form` | tagged object | absent | 18 | Rust receiver form: `value`, `shared`, `mutable`, or `other` with a structured `pattern`. |
 | `non_overridable` | `java_final_method` | absent | 2 | Evidence that the member cannot be overridden. A producer sets it only after it reads an exact Java `final` method. |
 | `implicit_operation` | [`ImplicitOperation`](#value-semantics) | absent | 2 | The member's role in an implicit value operation. |
 | `explicit_operation` | [`ExplicitValueOperation`](#value-semantics) | absent | 2 | The member's role in a value operation that the call site writes out. |
@@ -255,6 +277,7 @@ A `TypeRef` is tagged by `kind`. Type nesting is limited to depth 64.
 | `unknown` | none | The type is not known. This preserves a present parameter or result port without asserting a concrete type or that every type is allowed. Added in schema version 9. |
 | `named` | `name`, `arguments` (default `[]`), `nullable` (default `false`) | A type named by its qualified spelling. |
 | `declared` | `id`, `arguments` (default `[]`), `nullable` (default `false`) | A type declared in this pack, by stable ID. |
+| `projection` | `owner`, optional `trait_type`, `name`, `arguments` (default `[]`) | A Rust associated type such as `<I as Iterator>::Item`. Schema 18 retains its structure while leaving the projected result unresolved. |
 | `type_parameter` | `name` | A generic parameter in scope. Unknown names fail with `type.unknown_parameter`. |
 | `array` | `element` | An array of `element`. |
 | `by_ref` | `element`, `reference_kind` (`lvalue` or `rvalue`, default `lvalue`) | A by-reference type. |
@@ -264,7 +287,7 @@ A `TypeRef` is tagged by `kind`. Type nesting is limited to depth 64.
 | `map` | `key`, `value` | A map type. |
 | `channel` | `element`, `direction` (`bidirectional`, `receive`, or `send`) | A Go channel. |
 | `wildcard` | `variance` (`any`, `extends`, or `super`), `bound` | A wildcard. `extends` and `super` require `bound`; `any` forbids it. |
-| `tuple` | `elements` (at least one) | A tuple type. |
+| `tuple` | `elements` | A tuple type. Empty elements represent Rust unit `()` at schema 18; other languages require at least one element. |
 | `function` | `parameters` (list of `Parameter`), `result` (optional `TypeRef`) | A function type. |
 
 ### Locator
@@ -1130,9 +1153,9 @@ None of these resolvers downloads anything.
 1. Discovery narrows candidates by language, ecosystem, and the populated
    package, module, toolchain, or artifact index, without reading payloads.
 2. Each candidate must be compatible. For a version 2 to 7 pack,
-   `compatibility.bifrost` must match the engine version. A version 8 or 9 pack
-   has no engine range; this build accepts them because it reads those
-   versions. Each populated selector field must match one evidence row.
+   `compatibility.bifrost` must match the engine version. A version 8 or later
+   pack has no engine range; this build accepts it when it reads that
+   version. Each populated selector field must match one evidence row.
 3. Controls apply. A workspace control outranks a user control. Within a scope,
    a control that names `manifest_digest` outranks one that names `version`,
    which outranks one that names only `pack_id`. Equally ranked controls with
@@ -1306,7 +1329,7 @@ pins for authored semantic models.
 | `pack_id`, `pack_version`, `ecosystem` | The pack identity. |
 | `kind` | The producer family, tagged by `artifact_kind` (table below). |
 | `artifact` | `{file_name, sha256, url?, container?}`. `container` is `{file_name, sha256, url, artifact_path}` when the artifact is inside another archive. |
-| `compatibility` | As in the pack envelope. Generated packs use schema version 14, so every spec except `authored_semantic_model` must omit `bifrost`. `generate` rejects a generated spec that sets it. |
+| `compatibility` | As in the pack envelope. Generated packs are written at schema version 8 or later, so every spec except `authored_semantic_model` must omit `bifrost`. `generate` rejects a generated spec that sets it. |
 | `activation` | Required, bounded activation selectors. Generated shards use these selectors. Authored shards without per-shard pins must repeat this selector vector exactly. When pins are present, they state the authored shards' exact selectors. |
 | `provenance`, `license`, `safety` | As in the pack envelope. |
 | `notices` | Notice files to include. |
@@ -1369,11 +1392,14 @@ provenance; it does not claim that those files are available for navigation.
 
 A release bundle has `index.json` (bundle index schema version `3`),
 `rejects.json`, `measurements.json`, `SHA256SUMS`, and the pack assets.
-`verify`, `install`, and `bifrost install-semantic-packs` reject a bundle
-whose index names a different generator than the running build
-(`brokk-bifrost-semantic-packs` at the same version). Installation does not
-install a generated production whose cache version is not current for this
-build.
+`verify` and `merge` reject a bundle whose index names a different generator
+than the running build (`brokk-bifrost-semantic-packs` at the same version),
+because publishing a bundle must not mix generators. `install` and
+`bifrost install-semantic-packs` accept a bundle from any generator: each
+curated pack installs when this build reads its schema version. Installation
+skips, without reporting it, a generated production whose schema or cache
+version is not current for this build; the engine builds that production on
+demand instead.
 
 ## bifrost pack commands
 
@@ -1394,8 +1420,8 @@ this build supports. A host passes it to pack selection tools.
 | `schemas.policy_document` | Supported policy document versions. |
 | `schemas.rql` | Supported RQL schema versions. |
 | `schemas.builtin_catalog` | Supported built-in policy catalog versions. |
-| `schemas.semantic_model_read` | `[2, 3, 4, 5, 6, 7, 8, 9]`. |
-| `schemas.semantic_model_write` | `[9]`. |
+| `schemas.semantic_model_read` | `[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]`. |
+| `schemas.semantic_model_write` | `[17]`, the newest version. Generated packs may declare a lower one. |
 | `schemas.release_index` | `[3]`, the release bundle index version. |
 | `schemas.policy_bundle`, `schemas.semantic_spec`, `schemas.runtime` | Empty lists. |
 | `capabilities` | Always an empty list. This build advertises no pack capability requirements. |

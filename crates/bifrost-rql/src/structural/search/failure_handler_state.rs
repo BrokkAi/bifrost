@@ -159,6 +159,7 @@ fn expansion_at(
         && cache.reported.insert((value.row.id.clone(), reason))
     {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::FailureHandlerDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,

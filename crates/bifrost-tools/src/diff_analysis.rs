@@ -1321,6 +1321,7 @@ fn analyze_prepared_diff_from_images(
             usage_graph_with_cancellation(
                 base_analyzer.analyzer(),
                 UsageGraphParams {
+                    include_same_owner: false,
                     include_tests,
                     paths: Some(changed_paths.clone()),
                     depth: 1,
@@ -1340,6 +1341,7 @@ fn analyze_prepared_diff_from_images(
             usage_graph_with_cancellation(
                 target_analyzer.analyzer(),
                 UsageGraphParams {
+                    include_same_owner: false,
                     include_tests,
                     paths: Some(changed_paths.clone()),
                     depth: 1,
@@ -4832,6 +4834,7 @@ fn rename_edges<'e>(
         edges
             .iter()
             .map(|edge| UsageGraphEdge {
+                proven: edge.proven,
                 // Diffing still keys moved symbols by their before/after names.
                 // Preserve the snapshot-local exact identities while rewriting
                 // only the display names used by that comparison.

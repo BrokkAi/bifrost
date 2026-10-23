@@ -1,0 +1,6850 @@
+//! Scala lowering into the language-neutral executable-semantics IR.
+
+use brokk_bifrost_core::analyzer::tree_walk::children_by_field_name;
+
+use brokk_bifrost_semantic::analyzer::semantic::inventory::*;
+use brokk_bifrost_semantic::analyzer::semantic::lowering::ConditionTargets;
+use brokk_bifrost_semantic::analyzer::semantic::lowering::*;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::ProcedureWork;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::ProcedureWorkHandler;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::ShortCircuitKind;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::dispatch_procedure_work;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::schedule_sequential_work;
+
+use brokk_bifrost_core::analyzer::model::{
+    StructuredTypeIdentity, StructuredTypeIdentityBuilder, StructuredTypeName,
+};
+use brokk_bifrost_core::analyzer::tree_walk::root_node as compilation_unit_root;
+use brokk_bifrost_jvm::scala::graph::syntax::{
+    is_scala_named_argument_assignment, scala_literal_type_name,
+};
+use brokk_bifrost_jvm::scala::structural::named_argument_parts;
+use brokk_bifrost_semantic::analyzer::semantic::lowering::schedule_short_circuit_condition;
+use tree_sitter::Node;
+
+use crate::analyzer::scala::case_block_is_partial_function;
+
+use crate::analyzer::scala::scalar::scala_scalar_literal_value_kind;
+
+use crate::analyzer::scala::scalar::scala_scalar_type_for_definition;
+
+use crate::analyzer::scala::scalar::scala_scalar_type_for_literal;
+
+use crate::analyzer::scala::scalar::scala_scalar_type_for_type;
+
+use brokk_bifrost_analysis::analyzer::declared_scalar::DeclaredScalarType;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::semantic::cfg::{
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
+};
+
+use brokk_bifrost_semantic::analyzer::semantic::service::ProgramSemanticsLowerer;
+
+use brokk_bifrost_semantic::analyzer::semantic::service::SemanticAdapterIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic::*;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowBoundaryRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowEntryComponent;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowShape;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowSubstitution;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputBoundaryRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputBoundaryRoot;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::CollectionFlowContract;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallApplication;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableDisposition;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableKey;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+
+use brokk_bifrost_core::analyzer::tree_walk::WalkControl;
+
+use brokk_bifrost_core::analyzer::tree_walk::try_walk_named_tree_preorder;
+
+use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind;
+
+use brokk_bifrost_core::analyzer::tree_walk::named_children;
+
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+
+use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
+
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use crate::analyzer::ScalaAnalyzer;
+
+use brokk_bifrost_core::hash::HashMap;
+use std::sync::Arc;
+
+use crate::analyzer::scala::semantic_adaptation::AdaptationFailure;
+
+use crate::analyzer::scala::semantic_adaptation::ScalaAdaptationCatalog;
+
+use crate::analyzer::scala::semantic_adaptation::ScalaConversionCallableKind;
+
+use crate::analyzer::scala::semantic_adaptation::SelectedAdaptationKind;
+
+use crate::analyzer::scala::semantic_adaptation::scala_nominal_types_match;
+
+use crate::analyzer::scala::semantic_adaptation::type_identity as scala_type_identity;
+
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v22";
+
+/// Procedure syntax roles used by source-backed assignment relations. The
+/// Scala lowering already publishes exact assignment effects; these roles
+/// let the shared candidate builder locate the one callable and skip nested
+/// execution bodies while preserving Scala's distinct callable shapes.
+pub(crate) const PROCEDURE_SYNTAX_ROLES:
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles =
+    brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles {
+        statement_kind: scala_statement_kind,
+        loop_site: scala_loop_site,
+        loop_site_with_source: None,
+        procedure_matches: scala_procedure_matches,
+        nested_procedure: is_scala_nested_execution_boundary,
+    };
+
+fn scala_statement_kind(node: Node<'_>) -> Option<&'static str> {
+    let parent = node.parent()?;
+    if is_scala_nested_execution_boundary(node) {
+        return None;
+    }
+    let in_statement_list = matches!(
+        parent.kind(),
+        "block" | "indented_block" | "template_body" | "with_template_body"
+    );
+    let in_case_body = matches!(parent.kind(), "case_clause" | "catch_clause")
+        && case_body_nodes(parent)
+            .into_iter()
+            .any(|body| body.id() == node.id());
+    if !in_statement_list && !in_case_body {
+        return None;
+    }
+    Some(match node.kind() {
+        "val_definition" | "var_definition" => "local_declaration",
+        "import_declaration" => "declaration",
+        "return_expression" => "return",
+        "throw_expression" => "throw",
+        "while_expression" => "while",
+        "do_while_expression" => "do",
+        "for_expression" => "enhanced_for",
+        "if_expression" => "if",
+        "match_expression" => "switch",
+        "try_expression" => "try",
+        "block" | "indented_block" => "block",
+        _ => "expression",
+    })
+}
+
+fn scala_loop_site(
+    node: Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax<'_>> {
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopKind;
+
+    use brokk_bifrost_analysis::analyzer::loop_facts::LoopSyntax;
+    let kind = match node.kind() {
+        "while_expression" => LoopKind::While,
+        "do_while_expression" => LoopKind::Do,
+        _ => return None,
+    };
+    Some(LoopSyntax {
+        kind,
+        body: node.child_by_field_name("body"),
+        condition: node.child_by_field_name("condition"),
+    })
+}
+
+fn scala_procedure_matches(kind: ProcedureKind, node: Node<'_>) -> bool {
+    match kind {
+        ProcedureKind::Function
+        | ProcedureKind::Method
+        | ProcedureKind::LocalFunction
+        | ProcedureKind::Accessor
+        | ProcedureKind::Operator => {
+            matches!(node.kind(), "function_definition" | "given_definition")
+        }
+        ProcedureKind::Constructor => {
+            matches!(node.kind(), "function_definition" | "class_definition")
+        }
+        ProcedureKind::Initializer => {
+            matches!(
+                node.kind(),
+                "object_definition" | "trait_definition" | "given_definition"
+            )
+        }
+        ProcedureKind::Lambda => node.kind() == "lambda_expression",
+        ProcedureKind::Closure => {
+            node.kind() == "case_block" && case_block_is_partial_function(node)
+        }
+    }
+}
+
+/// Bound on the expression nodes examined while proving that a result
+/// expression already carries the callable's declared result type. The
+/// congruence is structurally finite, but a pathological body must not make
+/// each return proof walk an unbounded subtree.
+const SCALA_RESULT_IDENTITY_NODE_BUDGET: usize = 64;
+
+impl_program_semantics_provider!(ScalaAnalyzer, |analyzer| ScalaSemanticLowerer::new(
+    analyzer
+));
+
+struct ScalaSemanticLowerer {
+    dependencies: DependencyFingerprint,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+}
+
+impl ScalaSemanticLowerer {
+    fn new(analyzer: &ScalaAnalyzer) -> Self {
+        let snapshot = analyzer.active_semantic_model_snapshot();
+        let dependencies =
+            brokk_bifrost_analysis::analyzer::semantic::lowering::semantic_model_dependency_fingerprint(
+                snapshot.as_deref(),
+                b"scala-semantic-model-set-v1\0",
+            );
+        Self {
+            dependencies,
+            semantic_model_overlay: snapshot
+                .and_then(|snapshot| snapshot.semantic_model_overlay().cloned()),
+        }
+    }
+}
+
+impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
+    fn identity(&self) -> SemanticAdapterIdentity {
+        SemanticAdapterIdentity::for_adapter(
+            "scala",
+            ADAPTER_VERSION,
+            b"scala-intrafile-execution-defaults-v1",
+            self.dependencies,
+        )
+    }
+
+    fn capabilities(&self) -> SemanticCapabilities {
+        scala_capabilities()
+    }
+
+    fn lower(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        budget: &SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+        let (specs, initial_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)?.into_lowering_input()
+            {
+                ProcedureLoweringInput::Complete {
+                    value,
+                    initial_work,
+                } => (value, initial_work),
+                ProcedureLoweringInput::Stopped(outcome) => return Ok(outcome),
+            };
+
+        let semantic_model_overlay = self.semantic_model_overlay.clone();
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| (spec.callable.id(), spec.id))
+            .collect::<HashMap<_, _>>();
+        let adaptations = ScalaAdaptationCatalog::collect(
+            prepared.source(),
+            prepared.tree().root_node(),
+            &procedure_targets,
+        );
+        lower_procedure_batch(
+            &specs,
+            initial_work,
+            budget,
+            cancellation,
+            |spec, staged_budget, cancellation| {
+                lower_procedure(
+                    prepared,
+                    spec,
+                    staged_budget,
+                    cancellation,
+                    semantic_model_overlay.clone(),
+                    &adaptations,
+                )
+            },
+        )
+    }
+}
+
+fn scala_capabilities() -> SemanticCapabilities {
+    let mut builder =
+        brokk_bifrost_analysis::analyzer::semantic::capabilities::tree_sitter_adapter_capabilities(
+        );
+    // GuardFacts stays partial: constant booleans fold through any number of
+    // `!` and parenthesis wrappers, and typed scalar conditions publish guard
+    // facts. Unsupported Scala operators retain both control arms without a
+    // scalar fact (#2443).
+    for capability in [
+        SemanticCapability::StaticMemory,
+        SemanticCapability::ConcurrentSpawn,
+    ] {
+        builder = builder.partial(capability);
+    }
+    builder.build()
+}
+
+#[derive(Clone)]
+struct ProcedureSpec<'tree> {
+    id: ProcedureId,
+    body: Node<'tree>,
+    callable: Node<'tree>,
+    locator: SemanticLocator,
+    lexical_parent: Option<ProcedureId>,
+    kind: ProcedureKind,
+    properties: ProcedureProperties,
+}
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
+
+struct ProcedureEnumerationFrame<'tree> {
+    node: Node<'tree>,
+    lexical_parent: Option<ProcedureId>,
+    declaration_path: usize,
+    member_context: bool,
+    synthetic_body_scope: Option<SyntheticBodyScope>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyntheticBodyScope {
+    procedure: ProcedureId,
+    callable_path: usize,
+}
+
+fn enumerate_procedures<'tree>(
+    file: &ProjectFile,
+    prepared: &'tree PreparedSyntaxTree,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
+    let root = prepared.tree().root_node();
+    let mut inventory =
+        ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "scala-source", budget)?;
+    let mut specs = Vec::new();
+    let mut stack = vec![ProcedureEnumerationFrame {
+        node: root,
+        lexical_parent: None,
+        declaration_path: inventory.root_path(),
+        member_context: false,
+        synthetic_body_scope: None,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+
+        let mut child_path = frame.declaration_path;
+        let mut child_member_context = frame.member_context;
+        if let Some(segment_kind) = declaration_container_kind(frame.node) {
+            let name = callable_name(prepared.source(), frame.node);
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            child_path =
+                inventory.push_container(child_path, segment_kind, name.as_deref(), anchor)?;
+            child_member_context = segment_kind == DeclarationSegmentKind::Type;
+        }
+
+        let mut callable_body_scope = None;
+        let mut self_callable_scope = None;
+        if let Some((kind, segment_kind, body, properties, attach_lexical_parent)) = callable_shape(
+            prepared.source(),
+            frame.node,
+            frame.lexical_parent,
+            frame.member_context,
+        ) {
+            let name = callable_name(prepared.source(), frame.node);
+            let anchor =
+                source_anchor(frame.node, 0).map_err(SemanticProviderError::invalid_identity)?;
+            let identity = match inventory.allocate_procedure(
+                child_path,
+                segment_kind,
+                name.as_deref(),
+                anchor,
+            )? {
+                Ok(identity) => identity,
+                Err(stop) => return Ok(stop.into_outcome()),
+            };
+            specs.push(ProcedureSpec {
+                id: identity.id,
+                body,
+                callable: frame.node,
+                locator: identity.locator,
+                lexical_parent: frame.lexical_parent,
+                kind,
+                properties,
+            });
+            let callable_path = identity.declaration_path;
+            if body.id() == frame.node.id() && attach_lexical_parent {
+                self_callable_scope = Some((identity.id, callable_path));
+            } else {
+                callable_body_scope =
+                    Some((body.id(), identity.id, callable_path, attach_lexical_parent));
+            }
+        }
+
+        let children = named_children(frame.node);
+        for child in children.into_iter().rev() {
+            let (lexical_parent, declaration_path, member_context, synthetic_body_scope) =
+                if let Some((_, procedure, path, attach)) =
+                    callable_body_scope.filter(|(body_id, _, _, _)| *body_id == child.id())
+                {
+                    if attach {
+                        (Some(procedure), path, false, None)
+                    } else {
+                        (
+                            frame.lexical_parent,
+                            child_path,
+                            child_member_context,
+                            Some(SyntheticBodyScope {
+                                procedure,
+                                callable_path: path,
+                            }),
+                        )
+                    }
+                } else if let Some(synthetic) = frame.synthetic_body_scope {
+                    if is_template_member_declaration(child) {
+                        (frame.lexical_parent, frame.declaration_path, true, None)
+                    } else {
+                        (
+                            Some(synthetic.procedure),
+                            synthetic.callable_path,
+                            false,
+                            None,
+                        )
+                    }
+                } else if let Some((procedure, path)) = self_callable_scope {
+                    (Some(procedure), path, false, None)
+                } else {
+                    (frame.lexical_parent, child_path, child_member_context, None)
+                };
+            stack.push(ProcedureEnumerationFrame {
+                node: child,
+                lexical_parent,
+                declaration_path,
+                member_context,
+                synthetic_body_scope,
+            });
+        }
+    }
+
+    Ok(inventory.complete(specs))
+}
+
+fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
+    match node.kind() {
+        "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+            Some(DeclarationSegmentKind::Type)
+        }
+        "package_clause" | "package_object" => Some(DeclarationSegmentKind::Namespace),
+        _ => None,
+    }
+}
+
+fn is_template_member_declaration(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "function_declaration"
+            | "type_definition"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "enum_case_definitions"
+            | "full_enum_case"
+            | "simple_enum_case"
+            | "given_definition"
+            | "extension_definition"
+            | "import_declaration"
+            | "export_declaration"
+            | "package_clause"
+            | "package_object"
+    )
+}
+
+fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|name| node_text(source, name))
+        .filter(|name| !name.is_empty());
+    if name == Some("this") {
+        let mut parent = node.parent();
+        while let Some(candidate) = parent {
+            if matches!(
+                candidate.kind(),
+                "class_definition" | "object_definition" | "trait_definition"
+            ) {
+                return candidate
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(source, name))
+                    .map(Box::<str>::from);
+            }
+            parent = candidate.parent();
+        }
+    }
+    name.map(Box::<str>::from)
+}
+
+fn callable_shape<'tree>(
+    source: &str,
+    node: Node<'tree>,
+    lexical_parent: Option<ProcedureId>,
+    member_context: bool,
+) -> Option<(
+    ProcedureKind,
+    DeclarationSegmentKind,
+    Node<'tree>,
+    ProcedureProperties,
+    bool,
+)> {
+    let (kind, segment_kind, body, invocation, synthetic, attach_lexical_parent) = match node.kind()
+    {
+        "function_definition" => {
+            let body = node.child_by_field_name("body")?;
+            let is_secondary_constructor = node
+                .child_by_field_name("name")
+                .and_then(|name| node_text(source, name))
+                == Some("this");
+            let (kind, segment_kind) = if is_secondary_constructor {
+                (
+                    ProcedureKind::Constructor,
+                    DeclarationSegmentKind::Constructor,
+                )
+            } else if member_context {
+                (ProcedureKind::Method, DeclarationSegmentKind::Method)
+            } else if lexical_parent.is_some() {
+                (
+                    ProcedureKind::LocalFunction,
+                    DeclarationSegmentKind::LocalFunction,
+                )
+            } else {
+                (ProcedureKind::Function, DeclarationSegmentKind::Function)
+            };
+            (
+                kind,
+                segment_kind,
+                body,
+                ProcedureInvocationKind::Immediate,
+                false,
+                true,
+            )
+        }
+        "lambda_expression" => (
+            ProcedureKind::Lambda,
+            DeclarationSegmentKind::Lambda,
+            lambda_body(node)?,
+            ProcedureInvocationKind::Immediate,
+            false,
+            true,
+        ),
+        "case_block" if case_block_is_partial_function(node) => (
+            ProcedureKind::Closure,
+            DeclarationSegmentKind::Closure,
+            node,
+            ProcedureInvocationKind::Immediate,
+            false,
+            true,
+        ),
+        "class_definition" => (
+            ProcedureKind::Constructor,
+            DeclarationSegmentKind::Constructor,
+            node.child_by_field_name("body").unwrap_or(node),
+            ProcedureInvocationKind::Immediate,
+            true,
+            false,
+        ),
+        "object_definition" | "trait_definition" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node.child_by_field_name("body").unwrap_or(node),
+            ProcedureInvocationKind::Deferred,
+            true,
+            false,
+        ),
+        "given_definition" => {
+            let body = node.child_by_field_name("body")?;
+            let parameterized = !children_by_field_name(node, "parameters").is_empty();
+            (
+                if parameterized {
+                    ProcedureKind::Function
+                } else {
+                    ProcedureKind::Initializer
+                },
+                if parameterized {
+                    DeclarationSegmentKind::Function
+                } else {
+                    DeclarationSegmentKind::Initializer
+                },
+                body,
+                if parameterized {
+                    ProcedureInvocationKind::Immediate
+                } else {
+                    ProcedureInvocationKind::Deferred
+                },
+                false,
+                true,
+            )
+        }
+        _ => return None,
+    };
+    let enclosing_template = enclosing_template_kind(node);
+    let object_member = enclosing_template == Some("object_definition");
+    let is_static = matches!(
+        kind,
+        ProcedureKind::Function
+            | ProcedureKind::LocalFunction
+            | ProcedureKind::Lambda
+            | ProcedureKind::Closure
+    ) || object_member;
+    let dispatch_extensibility = if matches!(
+        kind,
+        ProcedureKind::Constructor
+            | ProcedureKind::Function
+            | ProcedureKind::LocalFunction
+            | ProcedureKind::Lambda
+            | ProcedureKind::Closure
+    ) || object_member
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    };
+    Some((
+        kind,
+        segment_kind,
+        body,
+        ProcedureProperties {
+            is_async: false,
+            is_generator: false,
+            is_static,
+            is_synthetic: synthetic,
+            invocation,
+            dispatch_extensibility,
+            call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
+            construction_return: Default::default(),
+        },
+        attach_lexical_parent,
+    ))
+}
+
+fn enclosing_template_kind(mut node: Node<'_>) -> Option<&'static str> {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "class_definition" => return Some("class_definition"),
+            "object_definition" => return Some("object_definition"),
+            "trait_definition" => return Some("trait_definition"),
+            "enum_definition" => return Some("enum_definition"),
+            "function_definition" | "lambda_expression" | "case_block" => return None,
+            _ => node = parent,
+        }
+    }
+    None
+}
+
+fn lambda_body(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("body")
+        .or_else(|| named_children(node).into_iter().next_back())
+}
+
+type ScalaLoweringError = ProcedureLoweringError;
+
+type EdgeTarget = ControlTarget;
+
+type Work<'tree> = ProcedureWork<'tree>;
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupRegion<'tree> {
+    id: CleanupRegionId,
+    body: Node<'tree>,
+    outer_scope: ScopeFrameId,
+}
+
+struct LoweringContext<'tree, 'targets, 'catalog> {
+    prepared: &'tree PreparedSyntaxTree,
+    session: ProcedureLoweringSession<'targets>,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    adaptations: &'catalog ScalaAdaptationCatalog<'tree>,
+    callable: Node<'tree>,
+    procedure_kind: ProcedureKind,
+    procedure_body_node_id: usize,
+    expression_values: HashMap<usize, ValueId>,
+    scalar_types: HashMap<ValueId, DeclaredScalarType>,
+    parameters: HashMap<Box<str>, ValueId>,
+    parameter_types: HashMap<Box<str>, ScalaTypeIdentityId>,
+    parameter_structured_types: HashMap<Box<str>, StructuredTypeIdentity>,
+    type_identities: Vec<Arc<[String]>>,
+    type_identity_ids: HashMap<Arc<[String]>, ScalaTypeIdentityId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    receiver: Option<ValueId>,
+    cleanups: Vec<CleanupRegion<'tree>>,
+    /// One value per distinct constant index spelling, so a store through
+    /// `x(0)` and a load from `x(0)` name the same index operand. Java's
+    /// `index_value` keeps the same interning for `a[0]`.
+    constant_index_values: HashMap<Box<str>, ValueId>,
+    /// The exception binder each catch dispatcher binds the thrown value to,
+    /// for the precise single-catch shape only. Java keeps the same map.
+    catch_binders: HashMap<ProgramPointId, ValueId>,
+}
+
+impl<'tree, 'targets, 'catalog> ProcedureWorkHandler<'tree>
+    for LoweringContext<'tree, 'targets, 'catalog>
+{
+    fn cancellation_token(&self) -> &CancellationToken {
+        self.session.cancellation()
+    }
+
+    fn lower_statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session.record_statement_entry(builder, node, entry)?;
+        self.statement(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: ControlTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        self.expression(builder, node, entry, next, scope, stack)
+    }
+
+    fn lower_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        targets: ConditionTargets,
+        scope: ScopeFrameId,
+        stack: &mut Vec<ProcedureWork<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        self.condition(
+            builder,
+            node,
+            entry,
+            targets.when_true,
+            targets.when_false,
+            scope,
+            stack,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScalaTypeIdentityId(usize);
+
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
+    type_identity: Option<ScalaTypeIdentityId>,
+    structured_type_identity: Option<StructuredTypeIdentity>,
+    component_index: Option<usize>,
+    /// For a binding whose type is `Array[T]`, the identity of `T`. Scala's
+    /// arrays are invariant and their element type is exactly the written
+    /// type argument, so a selection on `values(i)` resolves against it.
+    element_identity: Option<ScalaTypeIdentityId>,
+}
+
+fn lower_procedure<'tree>(
+    prepared: &'tree PreparedSyntaxTree,
+    spec: &ProcedureSpec<'tree>,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    adaptations: &ScalaAdaptationCatalog<'tree>,
+) -> Result<(ProcedureSemanticsParts, SemanticWork), ScalaLoweringError> {
+    let mut parts = ProcedureSemanticsParts::new(
+        spec.id,
+        spec.locator.clone(),
+        spec.kind,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
+    );
+    parts.lexical_parent = spec.lexical_parent;
+    parts.properties = spec.properties;
+    let ProcedureLoweringStart {
+        mut builder,
+        session,
+        entry,
+        normal_exit,
+        exceptional_exit,
+        function_scope,
+    } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    let mut context = LoweringContext {
+        prepared,
+        session,
+        semantic_model_overlay,
+        adaptations,
+        callable: spec.callable,
+        procedure_kind: spec.kind,
+        procedure_body_node_id: spec.body.id(),
+        expression_values: HashMap::default(),
+        scalar_types: HashMap::default(),
+        parameters: HashMap::default(),
+        parameter_types: HashMap::default(),
+        parameter_structured_types: HashMap::default(),
+        type_identities: Vec::new(),
+        type_identity_ids: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
+        cleanups: Vec::new(),
+        constant_index_values: HashMap::default(),
+        catch_binders: HashMap::default(),
+    };
+    context.emit_procedure_inputs(&mut builder, entry, spec.callable, spec.kind)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
+    context.emit_nested_rebind_gaps(&mut builder, entry, spec.body)?;
+
+    if callable_has_by_name_parameter(spec.callable) {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::DeferredExecution,
+            SemanticGapKind::Unsupported,
+            "by-name parameter evaluation and repeated invocation are not lowered",
+        )?;
+    }
+    if spec.properties.invocation == ProcedureInvocationKind::Deferred {
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::DeferredExecution,
+            SemanticGapKind::Unsupported,
+            "Scala object, trait, or unconditional-given initialization is demand scheduled",
+        )?;
+    }
+    let extends_clause = if spec.properties.is_synthetic {
+        spec.callable.child_by_field_name("extend")
+    } else {
+        None
+    };
+    let parent_arguments = extends_clause
+        .map(parent_argument_expressions)
+        .unwrap_or_default();
+    if spec.properties.is_synthetic
+        && (spec.kind == ProcedureKind::Constructor || extends_clause.is_some())
+    {
+        // An unemitted implicit parent-constructor call is the same omission
+        // whether or not the template spells its parents: the call site is
+        // missing, which `Calls`/`Point` already states, and nothing about
+        // the caller-side evaluation of a *represented* call is incomplete.
+        // Java's twin (`java/semantic/control.rs`, the
+        // `explicit_constructor_invocation` branch) publishes exactly this
+        // pair with the default impacts; the extra `CALL_EVALUATION` profile
+        // this branch used to attach made every template with an extends
+        // clause value-flow-open with no fact behind it (#2664).
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            "implicit superclass and mixin initialization calls are not emitted as call sites",
+        )?;
+        // The honest content is "this lowering does not emit the implicit
+        // initialization call, so its abort edge is missing", not "an unknown
+        // fact makes the represented route uncertain". `Unsupported` is what
+        // makes it dischargeable when no abort path in the constructor runs
+        // user code, exactly as Java states the same omission.
+        context.session.record_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            "the unemitted implicit constructor and template initialization calls can complete exceptionally",
+        )?;
+    }
+
+    let body_entry = context
+        .session
+        .add_node_point(&mut builder, spec.body, Vec::new())?;
+    let mut pending = Vec::new();
+    let body_next = if matches!(
+        spec.kind,
+        ProcedureKind::Constructor | ProcedureKind::Initializer
+    ) {
+        EdgeTarget::normal(normal_exit)
+    } else {
+        let implicit_return =
+            context
+                .session
+                .add_node_point(&mut builder, spec.body, Vec::new())?;
+        let result_node = implicit_result_node(spec.body);
+        let result = result_node
+            .map(|node| context.expression_value(&mut builder, node, expression_value_kind(node)))
+            .transpose()?;
+        let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        let identity =
+            result_node.is_some_and(|node| context.callable_result_has_identity_conversion(node));
+        let mut adapted_return = false;
+        if !identity
+            && let (Some(result), Some(result_node)) = (result, result_node)
+            && !callable_declares_unit_result(spec.callable, context.prepared.source())
+        {
+            if let Some((adapted, continuation)) = context.try_adapt(
+                &mut builder,
+                implicit_return,
+                function_scope,
+                &mut pending,
+                result,
+                result_node,
+                declared_result_type_identity(spec.callable, context.prepared.source()).as_deref(),
+            )? {
+                let return_point = continuation.unwrap_or(implicit_return);
+                context.append_effect(
+                    &mut builder,
+                    return_point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: adapted,
+                        target: value,
+                    },
+                )?;
+                context.append_effect(
+                    &mut builder,
+                    return_point,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                context.session.add_target_edge(
+                    &mut builder,
+                    return_point,
+                    EdgeTarget::normal(normal_exit),
+                )?;
+                adapted_return = true;
+            } else {
+                context.session.add_gap_with_impacts(
+                    &mut builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                    SemanticGapKind::Unknown,
+                    "Scala result adaptation may apply an implicit conversion before the method returns",
+                )?;
+            }
+        }
+        if !adapted_return {
+            if identity && let Some(result) = result {
+                context.append_effect(
+                    &mut builder,
+                    implicit_return,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: result,
+                        target: value,
+                    },
+                )?;
+            }
+            context.append_effect(
+                &mut builder,
+                implicit_return,
+                SemanticEffect::ProcedureReturn { value: Some(value) },
+            )?;
+            context.session.add_target_edge(
+                &mut builder,
+                implicit_return,
+                EdgeTarget::normal(normal_exit),
+            )?;
+        }
+        EdgeTarget::normal(implicit_return)
+    };
+    // `callable_shape` retains a bodyless template's declaration as its source
+    // anchor. Its structured parent-constructor arguments still execute before
+    // the template body, while the declaration itself is not an expression.
+    let bodyless_template = spec.properties.is_synthetic && spec.body.id() == spec.callable.id();
+    if bodyless_template {
+        context
+            .session
+            .add_target_edge(&mut builder, body_entry, body_next)?;
+    } else {
+        pending.push(Work::Expression {
+            node: spec.body,
+            entry: body_entry,
+            next: body_next,
+            scope: function_scope,
+        });
+    };
+    context.schedule_expressions(
+        &mut builder,
+        entry,
+        &parent_arguments,
+        EdgeTarget::normal(body_entry),
+        function_scope,
+        &mut pending,
+    )?;
+    drive_and_finish_procedure(
+        builder,
+        pending.drain(..).rev(),
+        entry,
+        normal_exit,
+        exceptional_exit,
+        cancellation,
+        |builder, work, stack| dispatch_procedure_work(&mut context, builder, work, stack),
+    )
+}
+
+impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        callable: Node<'tree>,
+        procedure_kind: ProcedureKind,
+    ) -> Result<(), ScalaLoweringError> {
+        let layout =
+            formal_parameter_slots_for_owner(Language::Scala, callable, self.prepared.source())
+                .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(ScalaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let node = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let metadata = self.session.add_value_mapping(builder, node)?;
+            let parameter_name = slot.unique_name().map(Box::<str>::from);
+            let passing_mode = slot.passing_mode;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver { dispatch: false },
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                        name: parameter_name,
+                        passing_mode,
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    ScalaLoweringError::Invalid("too many formal parameters".into())
+                })?;
+                value
+            };
+            let type_identity = (!slot.receiver)
+                .then(|| node.child_by_field_name("type"))
+                .flatten()
+                .and_then(|type_node| self.intern_type_identity(type_node));
+            let structured_type_identity = (!slot.receiver)
+                .then(|| node.child_by_field_name("type"))
+                .flatten()
+                .and_then(|type_node| self.structured_type_identity(type_node));
+            if let Some(type_node) = (!slot.receiver)
+                .then(|| node.child_by_field_name("type"))
+                .flatten()
+                && let Some(scalar_type) =
+                    scala_scalar_type_for_type(self.prepared.source(), type_node)
+            {
+                self.scalar_types.insert(value, scalar_type);
+            }
+            for name in slot.names {
+                if let Some(type_identity) = type_identity {
+                    self.parameter_types
+                        .insert(name.clone().into_boxed_str(), type_identity);
+                }
+                if let Some(identity) = structured_type_identity.as_ref() {
+                    self.parameter_structured_types
+                        .insert(name.clone().into_boxed_str(), identity.clone());
+                }
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+            if contains_token(node, "using") || contains_token(node, "implicit") {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unsupported,
+                    "Scala contextual parameter binding requires implicit or given resolution",
+                )?;
+            }
+        }
+
+        if self.receiver.is_none()
+            && matches!(
+                procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Initializer
+            )
+        {
+            let metadata = self.session.add_value_mapping(builder, callable)?;
+            self.receiver = Some(self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver { dispatch: true },
+            )?);
+        }
+        if let Some(receiver) = self.receiver {
+            self.parameters.insert("this".into(), receiver);
+            self.parameters.insert("super".into(), receiver);
+        }
+
+        if enclosing_extension_definition(callable).is_some() {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::ParameterFlow,
+                SemanticGapKind::Unsupported,
+                "Scala extension receiver and contextual argument binding require extension resolution",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), ScalaLoweringError> {
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(ScalaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if node.id() != body.id() && is_scala_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if matches!(node.kind(), "val_definition" | "var_definition")
+                && let Some(pattern) = node.child_by_field_name("pattern")
+                && pattern.kind() == "identifier"
+                && let Some(name) = node_text(self.prepared.source(), pattern)
+                && let Some((scope_start, scope_end)) = scala_local_scope(node, body)
+            {
+                let metadata = self.session.add_value_mapping(builder, pattern)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                if let Some(scalar_type) =
+                    scala_scalar_type_for_definition(self.prepared.source(), node)
+                {
+                    self.scalar_types.insert(value, scalar_type);
+                }
+                // An unannotated binding takes the type its initializer
+                // determines, so a later reassignment or operator application
+                // can be proven against it. The preorder walk has already
+                // registered every binding an initializer can name.
+                let declared = node.child_by_field_name("type");
+                let initializer = node.child_by_field_name("value");
+                let inferred =
+                    initializer.and_then(|initializer| self.expression_type_identity(initializer));
+                let type_identity = declared
+                    .and_then(|type_node| self.intern_type_identity(type_node))
+                    .or_else(|| inferred.map(|identity| self.intern_type_segments(identity)));
+                let structured_type_identity = declared
+                    .and_then(|type_node| self.structured_type_identity(type_node))
+                    .or_else(|| {
+                        initializer.and_then(|node| self.expression_structured_type_identity(node))
+                    });
+                let declared_element = declared.and_then(|type_node| {
+                    scala_array_element_type_node(type_node, self.prepared.source())
+                });
+                let element_identity = declared_element
+                    .and_then(|element| self.intern_type_identity(element))
+                    .or_else(|| {
+                        initializer
+                            .and_then(|initializer| self.array_element_identity(initializer))
+                            .map(|identity| self.intern_type_segments(identity))
+                    });
+                self.locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: pattern.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                        type_identity,
+                        structured_type_identity,
+                        element_identity,
+                        component_index: None,
+                    });
+            }
+            if node.kind() == "enumerator"
+                && let Some(pattern) = enumerator_pattern(node)
+                && pattern.kind() == "tuple_pattern"
+                && let Some((scope_start, scope_end)) = scala_local_scope(node, body)
+            {
+                let visible_from = enumerator_rhs(node)
+                    .map_or_else(|| node.end_byte(), |source| source.end_byte());
+                for (component_index, binder) in
+                    tuple_pattern_bindings(pattern).into_iter().enumerate()
+                {
+                    let Some(name) =
+                        node_text(self.prepared.source(), binder).filter(|name| *name != "_")
+                    else {
+                        continue;
+                    };
+                    let metadata = self.session.add_value_mapping(builder, binder)?;
+                    let value = self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::Local,
+                    )?;
+                    self.locals
+                        .entry(name.into())
+                        .or_default()
+                        .push(LocalBinding {
+                            declaration_start: binder.start_byte(),
+                            visible_from,
+                            scope_start,
+                            scope_end,
+                            value,
+                            type_identity: None,
+                            structured_type_identity: None,
+                            element_identity: None,
+                            component_index: Some(component_index),
+                        });
+                }
+            }
+            // A `case caught: T =>` arm binds the thrown or matched value to
+            // `caught` with a written type. Registering it as a local is what
+            // lets a selection on the binder resolve its member, and what
+            // gives the catch binder a value for the throw to flow into.
+            if node.kind() == "case_clause"
+                && let Some(pattern) = node.child_by_field_name("pattern")
+                && let Some((binder, declared)) = typed_pattern_binding(pattern)
+                && let Some(name) = node_text(self.prepared.source(), binder)
+                && let Some((scope_start, scope_end)) = scala_local_scope(binder, body)
+            {
+                let metadata = self.session.add_value_mapping(builder, binder)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                let type_identity = self.intern_type_identity(declared);
+                let declared_element =
+                    scala_array_element_type_node(declared, self.prepared.source());
+                let element_identity =
+                    declared_element.and_then(|element| self.intern_type_identity(element));
+                let structured_type_identity = self.structured_type_identity(declared);
+                self.locals
+                    .entry(name.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: binder.start_byte(),
+                        visible_from: binder.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                        type_identity,
+                        structured_type_identity,
+                        element_identity,
+                        component_index: None,
+                    });
+            }
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    /// Publish a binding-scoped capture gap for every outer local or parameter
+    /// that a nested callable assigns. The nested procedure is lowered
+    /// independently, so its write is not a capture edge in this procedure;
+    /// the scalar solver releases the binding when a call or suspension can
+    /// run the callable.
+    fn emit_nested_rebind_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        body: Node<'tree>,
+    ) -> Result<(), ScalaLoweringError> {
+        let mut bindings = self
+            .locals
+            .iter()
+            .flat_map(|(name, locals)| locals.iter().map(|local| (name.clone(), local.value)))
+            .chain(
+                self.parameters
+                    .iter()
+                    .map(|(name, value)| (name.clone(), *value)),
+            )
+            .collect::<Vec<_>>();
+        bindings.sort_unstable_by_key(|(_, value)| *value);
+        bindings.dedup_by_key(|(_, value)| *value);
+        let source = self.prepared.source();
+        for (name, value) in bindings {
+            if !scala_nested_rebinds_name(body, name.as_ref(), source) {
+                continue;
+            }
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                entry,
+                SemanticGapSubject::Value(value),
+                SemanticCapability::Captures,
+                SemanticGapImpacts::NONE,
+                SemanticGapKind::Unsupported,
+                SemanticGapDischarge::RebindAtCallOrSuspension,
+                "a nested Scala callable rebinds this binding when it runs",
+            )?;
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(value),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "a nested Scala callable may change this scalar binding before a later guard",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_binding_at(name, byte)
+            .map(|binding| binding.value)
+    }
+
+    fn binding_type_id_at(&self, name: &str, byte: usize) -> Option<ScalaTypeIdentityId> {
+        if let Some(binding) = self.local_binding_at(name, byte) {
+            return binding.type_identity;
+        }
+        self.parameter_types.get(name).copied()
+    }
+
+    fn intern_type_identity(&mut self, node: Node<'tree>) -> Option<ScalaTypeIdentityId> {
+        let identity = scala_type_identity(node, self.prepared.source())?;
+        Some(self.intern_type_segments(identity))
+    }
+
+    /// Retain the parser's generic type shape for modeled collection receivers.
+    /// The legacy `ScalaTypeIdentityId` intentionally stores only nominal
+    /// segments for array/member compatibility; collection contracts need the
+    /// generic arguments to distinguish `Map[K, V]` from a raw or unrelated
+    /// receiver. Unsupported type syntax stays unresolved.
+    fn structured_type_identity(&self, node: Node<'tree>) -> Option<StructuredTypeIdentity> {
+        scala_structured_type_identity(node, self.prepared.source(), self.callable)
+    }
+
+    fn expression_structured_type_identity(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<StructuredTypeIdentity> {
+        let mut current = node;
+        for _ in 0..SCALA_RESULT_IDENTITY_NODE_BUDGET {
+            match current.kind() {
+                "parenthesized_expression" => {
+                    current = first_runtime_named_child(current)?;
+                }
+                "generic_function" => {
+                    return self.structured_type_identity(current);
+                }
+                "identifier" => {
+                    let name = node_text(self.prepared.source(), current)?;
+                    return self
+                        .local_binding_at(name, current.start_byte())
+                        .and_then(|binding| binding.structured_type_identity.clone())
+                        .or_else(|| self.parameter_structured_types.get(name).cloned());
+                }
+                "call_expression" => {
+                    let (function, _) = flattened_call_parts(current).ok()?;
+                    if function.kind() == "generic_function" {
+                        return self.structured_type_identity(function);
+                    }
+                    let callable = normalized_callable_expression(function).ok()?;
+                    if callable.kind() == "identifier" {
+                        return self
+                            .local_binding_at(
+                                node_text(self.prepared.source(), callable)?,
+                                callable.start_byte(),
+                            )
+                            .and_then(|binding| binding.structured_type_identity.clone())
+                            .or_else(|| {
+                                self.parameter_structured_types
+                                    .get(node_text(self.prepared.source(), callable)?)
+                                    .cloned()
+                            });
+                    }
+                    return None;
+                }
+                _ => return self.structured_type_identity(current),
+            }
+        }
+        None
+    }
+
+    fn intern_type_segments(&mut self, identity: Arc<[String]>) -> ScalaTypeIdentityId {
+        if let Some(id) = self.type_identity_ids.get(&identity) {
+            return *id;
+        }
+        let id = ScalaTypeIdentityId(self.type_identities.len());
+        self.type_identities.push(Arc::clone(&identity));
+        self.type_identity_ids.insert(identity, id);
+        id
+    }
+
+    fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
+        brokk_bifrost_analysis::analyzer::common::visible_local_binding(
+            self.locals.get(name)?,
+            byte,
+            |binding| (binding.visible_from, binding.scope_start, binding.scope_end),
+            |_, (_, scope_start, scope_end)| scope_end - scope_start,
+        )
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        brokk_bifrost_analysis::analyzer::common::local_value_for_declaration(
+            self.locals
+                .get(name)?
+                .iter()
+                .map(|binding| (binding.declaration_start, binding.value)),
+            declaration_start,
+        )
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ScalaLoweringError> {
+        let kind = scala_scalar_literal_value_kind(self.prepared.source(), node).unwrap_or(kind);
+        self.session.cached_node_value(
+            builder,
+            &mut self.expression_values,
+            node,
+            kind,
+            |session, builder, node| session.add_value_mapping(builder, node),
+        )
+    }
+    fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ScalaLoweringError> {
+        self.session.add_node_value(builder, node, kind)
+    }
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), ScalaLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let (source, kind) =
+            if matches!(node.kind(), "this" | "super") || matches!(name, "this" | "super") {
+                (self.receiver, ValueFlowKind::Receiver)
+            } else if node.kind() == "identifier" {
+                if let Some(local) = self.local_at(name, node.start_byte()) {
+                    (Some(local), ValueFlowKind::Local)
+                } else {
+                    (self.parameters.get(name).copied(), ValueFlowKind::Parameter)
+                }
+            } else {
+                (None, ValueFlowKind::Local)
+            };
+        if let Some(source) = source {
+            self.session
+                .append_value_flow_if_distinct(builder, point, kind, source, target)?;
+        }
+        Ok(())
+    }
+
+    fn leaf_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), ScalaLoweringError> {
+        let value = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.emit_lexical_input_flow(builder, node, entry, value)?;
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn identifier_is_lexical(&self, node: Node<'tree>) -> bool {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return false;
+        };
+        self.local_at(name, node.start_byte()).is_some() || self.parameters.contains_key(name)
+    }
+
+    fn scalar_binding_type(&self, mut node: Node<'tree>) -> Option<(ValueId, DeclaredScalarType)> {
+        while node.kind() == "parenthesized_expression" {
+            node = first_runtime_named_child(node)?;
+        }
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), node)?;
+        let value = self
+            .local_at(name, node.start_byte())
+            .or_else(|| self.parameters.get(name).copied())?;
+        self.scalar_types
+            .get(&value)
+            .copied()
+            .map(|scalar_type| (value, scalar_type))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        // A folded literal keeps exactly one arm, so an `if (false)` body is
+        // never reachable and the shared kill on the join is the honest
+        // answer. Recording the guard is the other half of the fold: after it,
+        // nothing else in the artifact says the branch was constant (#2443).
+        //
+        // Java folds the `true`/`false` node kinds directly
+        // (`java/semantic/control.rs`); Scala's grammar spells the literal the
+        // way Kotlin's does -- one `boolean_literal` node whose value is bare
+        // leaf text -- so the value is read the way
+        // `kotlin/semantic/control.rs` reads it, and the `!` and parenthesis
+        // wrappers are peeled the way its `normalize_condition` peels them.
+        if let Some(value) = constant_boolean_condition(self.prepared.source(), node) {
+            let anchor = scala_condition_anchor(node);
+            let decision = self.condition_entry_for_node(builder, entry, anchor)?;
+            let taken = if value { when_true } else { when_false };
+            self.session.add_target_edge(builder, decision, taken)?;
+            return self.record_constant_guard(builder, decision, value, taken);
+        }
+        match (node.kind(), infix_operator(self.prepared.source(), node)) {
+            ("infix_expression", Some(operator @ ("&&" | "||")))
+                if self.builtin_boolean_condition(node) =>
+            {
+                let left = required_field(node, "left")?;
+                let right = required_runtime_field(node, "right")?;
+                let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                let kind = match operator {
+                    "&&" => ShortCircuitKind::And,
+                    "||" => ShortCircuitKind::Or,
+                    _ => unreachable!("the match arm selects Scala boolean operators"),
+                };
+                schedule_short_circuit_condition(
+                    stack,
+                    kind,
+                    (left, entry),
+                    (right, right_entry),
+                    when_true,
+                    when_false,
+                    scope,
+                    |node, entry, when_true, when_false, scope| Work::Condition {
+                        node,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
+                    },
+                );
+                Ok(())
+            }
+            ("parenthesized_expression", _) => {
+                let value = first_runtime_named_child(node)
+                    .ok_or_else(|| missing_field(node, "expression"))?;
+                stack.push(Work::Condition {
+                    node: value,
+                    entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                Ok(())
+            }
+            ("prefix_expression", _)
+                if has_direct_token(node, "!")
+                    && first_runtime_named_child(node)
+                        .and_then(|operand| self.scalar_binding_type(operand))
+                        .is_some_and(|(_, scalar_type)| {
+                            matches!(scalar_type, DeclaredScalarType::Boolean)
+                        }) =>
+            {
+                let operand = first_runtime_named_child(node)
+                    .ok_or_else(|| missing_field(node, "prefix operand"))?;
+                let anchor = scala_condition_anchor(operand);
+                let operand_entry = self.condition_entry_for_node(builder, entry, anchor)?;
+                stack.push(Work::Condition {
+                    node: operand,
+                    entry: operand_entry,
+                    when_true: when_false,
+                    when_false: when_true,
+                    scope,
+                });
+                Ok(())
+            }
+            _ => {
+                // Keep the existing leaf topology: a lexical identifier is
+                // already the condition point, so adding an evaluation point
+                // here would insert a value-flow edge before the two arms.
+                // A typed Boolean leaf can still publish its guard fact at
+                // an exact condition point. Unsupported leaves keep the
+                // existing topology and remain open to the consumer.
+                if is_runtime_leaf(node.kind()) {
+                    if let Some((value, DeclaredScalarType::Boolean)) =
+                        self.scalar_binding_type(node)
+                    {
+                        let decision = self.condition_entry_for_node(builder, entry, node)?;
+                        self.session.add_target_edge(builder, decision, when_true)?;
+                        self.session
+                            .add_target_edge(builder, decision, when_false)?;
+                        self.record_guard(
+                            builder,
+                            decision,
+                            GuardPredicate::Truthy { value },
+                            Some(value),
+                            Some(when_true),
+                            Some(when_false),
+                        )?;
+                    } else {
+                        self.session.add_target_edge(builder, entry, when_true)?;
+                        self.session.add_target_edge(builder, entry, when_false)?;
+                    }
+                    return Ok(());
+                }
+                let decision = self.session.add_node_point(builder, node, Vec::new())?;
+                self.session.add_target_edge(builder, decision, when_true)?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+                if let Some((predicate, subject)) = self.normalize_condition(builder, node)? {
+                    self.record_guard(
+                        builder,
+                        decision,
+                        predicate,
+                        Some(subject),
+                        Some(when_true),
+                        Some(when_false),
+                    )?;
+                }
+                stack.push(Work::Expression {
+                    node,
+                    entry,
+                    next: EdgeTarget::normal(decision),
+                    scope,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn condition_entry_for_node(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        node: Node<'tree>,
+    ) -> Result<ProgramPointId, ScalaLoweringError> {
+        let metadata = self.session.metadata(entry)?;
+        let mapping = builder.source_mapping(metadata.source);
+        let span = mapping.locator.anchor().span();
+        if mapping.kind == SourceMappingKind::Exact
+            && span.start_byte() as usize == node.start_byte()
+            && span.end_byte() as usize == node.end_byte()
+        {
+            return Ok(entry);
+        }
+        let decision = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(decision))?;
+        Ok(decision)
+    }
+
+    /// Normalize Scala guards only when both the lexical binding and literal
+    /// operand have one of Scala's exact scalar primitive types. Operators on
+    /// every other receiver remain opaque because Scala resolves them as
+    /// methods and may apply an alias, conversion, or extension method.
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, ValueId)>, ScalaLoweringError> {
+        let source = self.prepared.source();
+        if let Some((_, DeclaredScalarType::Boolean)) = self.scalar_binding_type(node) {
+            let value = self.expression_value(builder, node, expression_value_kind(node))?;
+            return Ok(Some((GuardPredicate::Truthy { value }, value)));
+        }
+        if node.kind() != "infix_expression" {
+            return Ok(None);
+        }
+        let (Some(left), Some(right), Some(operator)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+            node.child_by_field_name("operator"),
+        ) else {
+            return Ok(None);
+        };
+        let Some(operator) = node_text(source, operator) else {
+            return Ok(None);
+        };
+        let left_binding = self.scalar_binding_type(left);
+        let right_binding = self.scalar_binding_type(right);
+        let left_literal = scala_scalar_type_for_literal(source, left);
+        let right_literal = scala_scalar_type_for_literal(source, right);
+        let (subject, subject_type, constant, reversed) =
+            match (left_binding, right_binding, left_literal, right_literal) {
+                (Some((_, scalar_type)), None, _, Some(_)) => (left, scalar_type, right, false),
+                (None, Some((_, scalar_type)), Some(_), _) => (right, scalar_type, left, true),
+                _ => return Ok(None),
+            };
+        let constant_type = scala_scalar_type_for_literal(source, constant)
+            .expect("the selected Scala guard operand is a literal");
+        let numeric = |scalar_type| matches!(scalar_type, DeclaredScalarType::Signed(_));
+        let compatible = match (subject_type, constant_type) {
+            (DeclaredScalarType::Boolean, DeclaredScalarType::Boolean) => true,
+            (subject_type, constant_type) => numeric(subject_type) && numeric(constant_type),
+        };
+        if !compatible {
+            return Ok(None);
+        }
+        let constant = self.expression_value(builder, constant, expression_value_kind(constant))?;
+        let subject = self.expression_value(builder, subject, expression_value_kind(subject))?;
+        let relation = match operator {
+            "<" => Some(IntegerComparison::LessThan),
+            "<=" => Some(IntegerComparison::LessThanOrEqual),
+            ">" => Some(IntegerComparison::GreaterThan),
+            ">=" => Some(IntegerComparison::GreaterThanOrEqual),
+            _ => None,
+        };
+        if let Some(relation) = relation {
+            if !numeric(subject_type) || !numeric(constant_type) {
+                return Ok(None);
+            }
+            return Ok(Some((
+                GuardPredicate::OrderedIntegerComparison {
+                    relation: if reversed {
+                        relation.reverse()
+                    } else {
+                        relation
+                    },
+                    constant,
+                },
+                subject,
+            )));
+        }
+        let negated = match operator {
+            "==" => false,
+            "!=" => true,
+            _ => return Ok(None),
+        };
+        Ok(Some((
+            GuardPredicate::ConstantEquality { negated, constant },
+            subject,
+        )))
+    }
+
+    fn builtin_boolean_condition(&self, node: Node<'tree>) -> bool {
+        let source = self.prepared.source();
+        let mut pending = vec![node];
+        while let Some(mut node) = pending.pop() {
+            while node.kind() == "parenthesized_expression" {
+                let Some(inner) = first_runtime_named_child(node) else {
+                    return false;
+                };
+                node = inner;
+            }
+            if self
+                .scalar_binding_type(node)
+                .is_some_and(|(_, scalar_type)| matches!(scalar_type, DeclaredScalarType::Boolean))
+                || scala_scalar_type_for_literal(source, node)
+                    .is_some_and(|scalar_type| matches!(scalar_type, DeclaredScalarType::Boolean))
+            {
+                continue;
+            }
+            if node.kind() == "prefix_expression" && has_direct_token(node, "!") {
+                let Some(operand) = first_runtime_named_child(node) else {
+                    return false;
+                };
+                pending.push(operand);
+                continue;
+            }
+            if node.kind() != "infix_expression" {
+                return false;
+            }
+            let Some(operator) = infix_operator(source, node) else {
+                return false;
+            };
+            let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) else {
+                return false;
+            };
+            if matches!(operator, "&&" | "||") {
+                pending.push(left);
+                pending.push(right);
+                continue;
+            }
+            if !matches!(operator, "<" | "<=" | ">" | ">=" | "==" | "!=") {
+                return false;
+            }
+            let left_binding = self.scalar_binding_type(left);
+            let right_binding = self.scalar_binding_type(right);
+            let left_literal = scala_scalar_type_for_literal(source, left);
+            let right_literal = scala_scalar_type_for_literal(source, right);
+            let (binding_type, literal_type) =
+                match (left_binding, right_binding, left_literal, right_literal) {
+                    (Some((_, binding_type)), None, _, Some(literal_type))
+                    | (None, Some((_, binding_type)), Some(literal_type), _) => {
+                        (binding_type, literal_type)
+                    }
+                    _ => return false,
+                };
+            if !matches!(
+                (binding_type, literal_type),
+                (DeclaredScalarType::Boolean, DeclaredScalarType::Boolean)
+                    | (DeclaredScalarType::Signed(_), DeclaredScalarType::Signed(_))
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Publish the guard fact for a condition fold. Only the folded arm exists
+    /// as an edge, so only that arm is declared; the predicate needs no
+    /// subject because a constant tests nothing. Other conditions use
+    /// `record_guard` after scalar normalization; unsupported operators keep
+    /// the existing open control topology without a scalar fact.
+    fn record_constant_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        value: bool,
+        taken: EdgeTarget,
+    ) -> Result<(), ScalaLoweringError> {
+        let arm = GuardArm {
+            target_point: taken.point,
+            kind: taken.kind,
+        };
+        let (true_arm, false_arm) = if value {
+            (Some(arm), None)
+        } else {
+            (None, Some(arm))
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            GuardPredicate::ConstantBoolean { value },
+            None,
+            true_arm,
+            false_arm,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session
+            .add_guard_for_targets(builder, point, predicate, subject, when_true, when_false)
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn statement(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        match node.kind() {
+            "block" | "indented_block" | "template_body" | "with_template_body" => {
+                let children = runtime_statement_children(node);
+                self.schedule_statements(builder, entry, &children, next, scope, stack)
+            }
+            "function_definition" | "lambda_expression" => {
+                self.callable_value(builder, entry, next)
+            }
+            "given_definition" => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapKind::Unsupported,
+                    "given initialization or factory execution occurs at use, not declaration",
+                )?;
+                self.callable_value(builder, entry, next)
+            }
+            "val_definition" | "var_definition" => {
+                self.definition(builder, node, entry, next, scope, stack)
+            }
+            "function_declaration"
+            | "type_definition"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "import_declaration"
+            | "export_declaration" => self.session.add_target_edge(builder, entry, next),
+            _ => self.expression(builder, node, entry, next, scope, stack),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        match node.kind() {
+            "block" | "indented_block" | "template_body" | "with_template_body" => {
+                let children = runtime_statement_children(node);
+                self.schedule_statements(builder, entry, &children, next, scope, stack)
+            }
+            "if_expression" => self.if_expression(builder, node, entry, next, scope, stack),
+            "while_expression" => self.while_expression(builder, node, entry, next, scope, stack),
+            "do_while_expression" => {
+                self.do_while_expression(builder, node, entry, next, scope, stack)
+            }
+            "match_expression" => self.match_expression(builder, node, entry, next, scope, stack),
+            "try_expression" => self.try_expression(builder, node, entry, next, scope, stack),
+            "for_expression" => self.for_expression(builder, node, entry, next, scope, stack),
+            "case_block"
+                if case_block_is_partial_function(node)
+                    && !(self.procedure_kind == ProcedureKind::Closure
+                        && node.id() == self.procedure_body_node_id) =>
+            {
+                self.callable_value(builder, entry, next)
+            }
+            "case_block" | "indented_cases" => {
+                let arms = case_arms(node);
+                self.case_dispatch(
+                    builder,
+                    node,
+                    &arms,
+                    entry,
+                    next,
+                    scope,
+                    "an unmatched partial-function case raises MatchError",
+                    stack,
+                )
+            }
+            "case_clause" | "catch_clause" => {
+                let body = case_body_nodes(node);
+                self.schedule_statements(builder, entry, &body, next, scope, stack)
+            }
+            "return_expression" => self.return_expression(builder, node, entry, scope, stack),
+            "throw_expression" => self.throw_expression(builder, node, entry, scope, stack),
+            "call_expression" => self.call_expression(builder, node, entry, next, scope, stack),
+            "instance_expression" => {
+                self.instance_expression(builder, node, entry, next, scope, stack)
+            }
+            "generic_function" => {
+                // A type application yields exactly the value its function
+                // expression yields, so it relays that identity rather than
+                // leaving the applied node's own value undefined.
+                let function = required_field(node, "function")?;
+                self.transparent_expression(builder, node, function, entry, next, scope, stack)
+            }
+            "postfix_expression" => {
+                self.postfix_expression(builder, node, entry, next, scope, stack)
+            }
+            "prefix_expression" => self.prefix_expression(builder, node, entry, next, scope, stack),
+            "function_definition" | "lambda_expression" => {
+                self.callable_value(builder, entry, next)
+            }
+            "parenthesized_expression" => {
+                if let Some(value) = first_runtime_named_child(node) {
+                    self.transparent_expression(builder, node, value, entry, next, scope, stack)
+                } else {
+                    self.session.add_target_edge(builder, entry, next)
+                }
+            }
+            "typed_expression" | "ascription_expression" => {
+                let value =
+                    first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+                let target = self.expression_value(builder, node, expression_value_kind(node))?;
+                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                let ascribed = node
+                    .child_by_field_name("type")
+                    .or_else(|| {
+                        named_children(node)
+                            .into_iter()
+                            .find(|child| !is_runtime_node(child.kind()))
+                    })
+                    .and_then(|declared| {
+                        let segments =
+                            brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(
+                                declared,
+                                self.prepared.source(),
+                            );
+                        (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
+                    });
+                let identity = ascribed.as_deref().is_some_and(|ascribed| {
+                    self.expression_type_identity(value)
+                        .is_some_and(|identity| scala_nominal_types_match(&identity, ascribed))
+                });
+                if identity {
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        },
+                    )?;
+                    self.session.add_target_edge(builder, terminal, next)?;
+                } else if let Some((adapted, continuation)) = self.try_adapt(
+                    builder,
+                    terminal,
+                    scope,
+                    stack,
+                    source,
+                    value,
+                    ascribed.as_deref(),
+                )? {
+                    let store_point = continuation.unwrap_or(terminal);
+                    self.append_effect(
+                        builder,
+                        store_point,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: adapted,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        store_point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: adapted,
+                            target,
+                        },
+                    )?;
+                    if store_point == terminal {
+                        self.session.add_target_edge(builder, terminal, next)?;
+                    } else {
+                        self.session.add_target_edge(builder, store_point, next)?;
+                    }
+                } else {
+                    self.session.record_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "Scala type ascription may require value adaptation or an implicit conversion",
+                    )?;
+                    self.session.add_target_edge(builder, terminal, next)?;
+                }
+                stack.push(Work::Expression {
+                    node: value,
+                    entry,
+                    next: EdgeTarget::normal(terminal),
+                    scope,
+                });
+                Ok(())
+            }
+            "assignment_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "field_expression" => self.field_expression(builder, node, entry, next, scope, stack),
+            "tuple_expression" | "arguments" | "colon_argument" => {
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "interpolated_string_expression" => {
+                for (capability, detail) in [
+                    (
+                        SemanticCapability::Calls,
+                        "string interpolation invokes an interpolator and may invoke formatting or conversion protocols",
+                    ),
+                    (
+                        SemanticCapability::ExceptionalControlFlow,
+                        "interpolator resolution, formatting, or implicit conversion may complete exceptionally",
+                    ),
+                    (
+                        SemanticCapability::Values,
+                        "interpolator selection and formatted result values are not represented",
+                    ),
+                ] {
+                    self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        capability,
+                        SemanticGapKind::Unknown,
+                        detail,
+                    )?;
+                }
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "infix_expression" => {
+                if matches!(
+                    infix_operator(self.prepared.source(), node),
+                    Some("&&" | "||")
+                ) {
+                    let right = required_runtime_field(node, "right")?;
+                    let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
+                    stack.push(Work::Expression {
+                        node: right,
+                        entry: right_entry,
+                        next,
+                        scope,
+                    });
+                    let (when_true, when_false) =
+                        if infix_operator(self.prepared.source(), node) == Some("&&") {
+                            (
+                                EdgeTarget {
+                                    point: right_entry,
+                                    kind: ControlEdgeKind::ConditionalTrue,
+                                },
+                                EdgeTarget {
+                                    point: next.point,
+                                    kind: ControlEdgeKind::ConditionalFalse,
+                                },
+                            )
+                        } else {
+                            (
+                                EdgeTarget {
+                                    point: next.point,
+                                    kind: ControlEdgeKind::ConditionalTrue,
+                                },
+                                EdgeTarget {
+                                    point: right_entry,
+                                    kind: ControlEdgeKind::ConditionalFalse,
+                                },
+                            )
+                        };
+                    stack.push(Work::Condition {
+                        node: required_field(node, "left")?,
+                        entry,
+                        when_true,
+                        when_false,
+                        scope,
+                    });
+                    Ok(())
+                } else {
+                    self.infix_expression(builder, node, entry, next, scope, stack)
+                }
+            }
+            "identifier"
+                if identifier_has_auto_application_ambiguity(node)
+                    && !self.identifier_is_lexical(node) =>
+            {
+                for (capability, kind, detail) in [
+                    (
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unknown,
+                        "unqualified identifier may auto-apply a parameterless method",
+                    ),
+                    (
+                        // Whether the identifier applies anything is the
+                        // unknown above. What this gap states is narrower and
+                        // certain: no call site is emitted for a possible
+                        // auto-application, so its abort edge is missing --
+                        // the same omission the implicit constructor call
+                        // publishes, and dischargeable on the same terms.
+                        SemanticCapability::ExceptionalControlFlow,
+                        SemanticGapKind::Unsupported,
+                        "no call site is emitted for a possible auto-application or implicit conversion, so its abort edge is not lowered",
+                    ),
+                    (
+                        SemanticCapability::CallableReferences,
+                        SemanticGapKind::Unknown,
+                        "unqualified identifier may denote a value, method application, or eta-expanded callable",
+                    ),
+                ] {
+                    self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        capability,
+                        kind,
+                        detail,
+                    )?;
+                }
+                self.leaf_expression(builder, node, entry, next)
+            }
+            "operator_identifier" if node_text(self.prepared.source(), node) == Some("???") => {
+                self.unimplemented_call(builder, node, entry, scope, stack)
+            }
+            kind if is_runtime_leaf(kind) => self.leaf_expression(builder, node, entry, next),
+            _ => self.unsupported_expression(
+                builder,
+                node,
+                entry,
+                next,
+                "Scala executable syntax is retained at a typed semantic boundary",
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn if_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let condition = required_runtime_field(node, "condition")?;
+        let consequence = required_field(node, "consequence")?;
+        let alternative = node.child_by_field_name("alternative");
+        let consequence_entry = self
+            .session
+            .add_node_point(builder, consequence, Vec::new())?;
+        // A two-armed Scala `if` is an expression: the chosen arm's value is
+        // the conditional's value. Each arm therefore leaves through its own
+        // merge point, which carries that one flow ordered after the arm's
+        // own effects. A one-armed `if` yields `Unit` and joins nothing.
+        let when_false = if let Some(alternative) = alternative {
+            let alternative_entry =
+                self.session
+                    .add_node_point(builder, alternative, Vec::new())?;
+            let consequence_merge =
+                self.session
+                    .add_node_point(builder, consequence, Vec::new())?;
+            let alternative_merge =
+                self.session
+                    .add_node_point(builder, alternative, Vec::new())?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            for (merge, arm) in [
+                (consequence_merge, consequence),
+                (alternative_merge, alternative),
+            ] {
+                // A braced arm yields its own trailing expression, which is
+                // the value the arm's lowering actually populates.
+                let arm_result = implicit_result_node(arm).unwrap_or(arm);
+                let source =
+                    self.expression_value(builder, arm_result, expression_value_kind(arm_result))?;
+                self.append_effect(
+                    builder,
+                    merge,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target: result,
+                    },
+                )?;
+                self.session.add_target_edge(builder, merge, next)?;
+            }
+            stack.push(Work::Expression {
+                node: consequence,
+                entry: consequence_entry,
+                next: EdgeTarget::normal(consequence_merge),
+                scope,
+            });
+            stack.push(Work::Expression {
+                node: alternative,
+                entry: alternative_entry,
+                next: EdgeTarget::normal(alternative_merge),
+                scope,
+            });
+            EdgeTarget {
+                point: alternative_entry,
+                kind: ControlEdgeKind::ConditionalFalse,
+            }
+        } else {
+            stack.push(Work::Expression {
+                node: consequence,
+                entry: consequence_entry,
+                next,
+                scope,
+            });
+            EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            }
+        };
+        stack.push(Work::Condition {
+            node: condition,
+            entry,
+            when_true: EdgeTarget {
+                point: consequence_entry,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            when_false,
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn while_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let condition = required_runtime_field(node, "condition")?;
+        let body = required_field(node, "body")?;
+        let condition_anchor = scala_condition_anchor(condition);
+        let condition_entry = self
+            .session
+            .add_node_point(builder, condition_anchor, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
+        // First-iteration peel: when the guard is provably true on entry, the
+        // zero-trip path does not exist and must not be lowered as if it did.
+        // Entry then reaches the body directly; the header stays reachable
+        // through the body's own loop-back edge, so every later iteration is
+        // still decided by the guard. This is the while-header analogue of
+        // Java's `for_condition_starts_true`.
+        let entry_target = if while_guard_is_true_on_entry(self.prepared.source(), node, condition)
+        {
+            body_entry
+        } else {
+            condition_entry
+        };
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entry_target))?;
+        stack.push(Work::Expression {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: condition_entry,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            scope,
+        });
+        stack.push(Work::Condition {
+            node: condition,
+            entry: condition_entry,
+            when_true: EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+            when_false: EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn do_while_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let body = required_field(node, "body")?;
+        let condition = required_field(node, "condition")?;
+        let condition_anchor = scala_condition_anchor(condition);
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        let condition_entry = self
+            .session
+            .add_node_point(builder, condition_anchor, Vec::new())?;
+        self.session
+            .record_loop_site(builder, node, condition_entry, body_entry)?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(body_entry))?;
+        stack.push(Work::Condition {
+            node: condition,
+            entry: condition_entry,
+            when_true: EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            when_false: EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+            scope,
+        });
+        stack.push(Work::Expression {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget::normal(condition_entry),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn match_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let subject = required_field(node, "value")?;
+        let body = required_field(node, "body")?;
+        let arms = case_arms(body);
+        let dispatch = self.session.add_node_point(builder, node, Vec::new())?;
+        self.case_dispatch(
+            builder,
+            node,
+            &arms,
+            dispatch,
+            next,
+            scope,
+            "an unmatched Scala match raises MatchError unless refinement proves an irrefutable arm",
+            stack,
+        )?;
+        stack.push(Work::Expression {
+            node: subject,
+            entry,
+            next: EdgeTarget::normal(dispatch),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn case_dispatch(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        container: Node<'tree>,
+        arms: &[Node<'tree>],
+        dispatch: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        unmatched_detail: &str,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let unmatched = self
+            .session
+            .add_node_point(builder, container, Vec::new())?;
+        let exception = self.value(builder, unmatched, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            unmatched,
+            SemanticEffect::Throw {
+                value: Some(exception),
+            },
+        )?;
+        self.session.record_gap(
+            builder,
+            unmatched,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+            unmatched_detail,
+        )?;
+        self.abrupt(builder, unmatched, scope, CompletionKind::Throw, stack)?;
+
+        if arms.is_empty() {
+            return self.session.add_target_edge(
+                builder,
+                dispatch,
+                EdgeTarget {
+                    point: unmatched,
+                    kind: ControlEdgeKind::Exceptional,
+                },
+            );
+        }
+
+        let decisions = arms
+            .iter()
+            .map(|arm| {
+                let pattern = case_pattern(*arm).unwrap_or(*arm);
+                self.session.add_node_point(builder, pattern, Vec::new())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let body_entries = arms
+            .iter()
+            .map(|arm| self.session.add_node_point(builder, *arm, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .add_target_edge(builder, dispatch, EdgeTarget::normal(decisions[0]))?;
+
+        for index in (0..arms.len()).rev() {
+            let arm = arms[index];
+            let no_match = decisions
+                .get(index + 1)
+                .copied()
+                .map(|point| EdgeTarget {
+                    point,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                })
+                .unwrap_or(EdgeTarget {
+                    point: unmatched,
+                    kind: ControlEdgeKind::ConditionalFalse,
+                });
+            self.session.record_gap(
+                builder,
+                decisions[index],
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "pattern matching may invoke extractor, equality, or type-test protocols",
+            )?;
+            self.session.record_gap(
+                builder,
+                decisions[index],
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "pattern bindings and type refinement are not represented in control topology",
+            )?;
+            self.session.record_gap(
+                builder,
+                decisions[index],
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "extractor, equality, or type-test protocols may complete exceptionally",
+            )?;
+            if let Some(guard) = case_guard(arm) {
+                let guard_value = first_runtime_named_child(guard).unwrap_or(guard);
+                let guard_entry = self
+                    .session
+                    .add_node_point(builder, guard_value, Vec::new())?;
+                self.session.add_target_edge(
+                    builder,
+                    decisions[index],
+                    EdgeTarget {
+                        point: guard_entry,
+                        kind: ControlEdgeKind::SwitchCase,
+                    },
+                )?;
+                self.session
+                    .add_target_edge(builder, decisions[index], no_match)?;
+                stack.push(Work::Condition {
+                    node: guard_value,
+                    entry: guard_entry,
+                    when_true: EdgeTarget {
+                        point: body_entries[index],
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                    when_false: no_match,
+                    scope,
+                });
+            } else {
+                self.session.add_target_edge(
+                    builder,
+                    decisions[index],
+                    EdgeTarget {
+                        point: body_entries[index],
+                        kind: ControlEdgeKind::SwitchCase,
+                    },
+                )?;
+                self.session
+                    .add_target_edge(builder, decisions[index], no_match)?;
+            }
+            stack.push(Work::Expression {
+                node: arm,
+                entry: body_entries[index],
+                next,
+                scope,
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let body = required_field(node, "body")?;
+        let children = named_children(node);
+        let catch_clause = children
+            .iter()
+            .copied()
+            .find(|child| child.kind() == "catch_clause");
+        let finalizer = children
+            .iter()
+            .copied()
+            .find(|child| child.kind() == "finally_clause")
+            .and_then(first_runtime_named_child);
+
+        let (cleanup_scope, cleanup_region) = if let Some(finalizer) = finalizer {
+            let region = CleanupRegionId::new(
+                u32::try_from(self.cleanups.len())
+                    .map_err(|_| ScalaLoweringError::Invalid("too many cleanup regions".into()))?,
+            );
+            self.cleanups.push(CleanupRegion {
+                id: region,
+                body: finalizer,
+                outer_scope: scope,
+            });
+            (
+                builder.push_scope(Some(scope), ScopeBinding::Cleanup { region }),
+                Some(region),
+            )
+        } else {
+            (scope, None)
+        };
+
+        let normal_destination = if cleanup_region.is_some() && next.kind != ControlEdgeKind::Normal
+        {
+            let relay = self.session.add_node_point(builder, node, Vec::new())?;
+            self.session.add_target_edge(builder, relay, next)?;
+            relay
+        } else {
+            next.point
+        };
+        let normal_route = cleanup_region
+            .map(|region| builder.normal_cleanup_completion(region, normal_destination));
+
+        let try_scope = if let Some(catch_clause) = catch_clause {
+            let dispatcher = self
+                .session
+                .add_node_point(builder, catch_clause, Vec::new())?;
+            let arms = catch_arms(catch_clause);
+            let catch_exit = self
+                .session
+                .add_node_point(builder, catch_clause, Vec::new())?;
+            if let Some(route) = &normal_route {
+                self.route(builder, catch_exit, route, stack)?;
+            } else {
+                self.session.add_target_edge(builder, catch_exit, next)?;
+            }
+            // A single unguarded `case name: T =>` arm is Java's
+            // `precise_single_catch`: the handler's selection is one written
+            // type test, and the binder is a registered local. Nothing about
+            // the dispatch is unrepresented, so the arm is wired directly and
+            // the thrown value binds to the parameter, exactly as Java's
+            // `catch_binders` and `abrupt_throw` do. Any other catch shape
+            // keeps the pattern-dispatch lowering and its gaps.
+            let precise_binder = match arms.as_slice() {
+                [arm] => case_guard(*arm)
+                    .is_none()
+                    .then(|| case_pattern(*arm))
+                    .flatten()
+                    .and_then(typed_pattern_binding)
+                    .and_then(|(binder, _)| {
+                        node_text(self.prepared.source(), binder).and_then(|name| {
+                            self.local_declaration_value(name, binder.start_byte())
+                        })
+                    }),
+                _ => None,
+            };
+            if let (Some(binder), [arm]) = (precise_binder, arms.as_slice()) {
+                self.catch_binders.insert(dispatcher, binder);
+                let arm_entry = self.session.add_node_point(builder, *arm, Vec::new())?;
+                self.session.add_target_edge(
+                    builder,
+                    dispatcher,
+                    EdgeTarget {
+                        point: arm_entry,
+                        kind: ControlEdgeKind::SwitchCase,
+                    },
+                )?;
+                let unmatched = self
+                    .session
+                    .add_node_point(builder, catch_clause, Vec::new())?;
+                self.session.add_target_edge(
+                    builder,
+                    dispatcher,
+                    EdgeTarget {
+                        point: unmatched,
+                        kind: ControlEdgeKind::Exceptional,
+                    },
+                )?;
+                self.abrupt(
+                    builder,
+                    unmatched,
+                    cleanup_scope,
+                    CompletionKind::Throw,
+                    stack,
+                )?;
+                stack.push(Work::Expression {
+                    node: *arm,
+                    entry: arm_entry,
+                    next: EdgeTarget::normal(catch_exit),
+                    scope: cleanup_scope,
+                });
+            } else {
+                self.session.record_gap(
+                    builder,
+                    dispatcher,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unknown,
+                    "catch pattern compatibility and exception binding require type refinement",
+                )?;
+                self.case_dispatch(
+                    builder,
+                    catch_clause,
+                    &arms,
+                    dispatcher,
+                    EdgeTarget::normal(catch_exit),
+                    cleanup_scope,
+                    "an unmatched catch pattern rethrows the original exception",
+                    stack,
+                )?;
+            }
+            builder.push_scope(
+                Some(cleanup_scope),
+                ScopeBinding::Handler { entry: dispatcher },
+            )
+        } else {
+            cleanup_scope
+        };
+
+        let body_exit = self.session.add_node_point(builder, body, Vec::new())?;
+        if let Some(route) = &normal_route {
+            self.route(builder, body_exit, route, stack)?;
+        } else {
+            self.session.add_target_edge(builder, body_exit, next)?;
+        }
+        stack.push(Work::Expression {
+            node: body,
+            entry,
+            next: EdgeTarget::normal(body_exit),
+            scope: try_scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let body = required_field(node, "body")?;
+        let enumerators = required_runtime_field(node, "enumerators")?;
+        let enumerator_nodes = named_children(enumerators)
+            .into_iter()
+            .filter(|child| child.kind() == "enumerator")
+            .collect::<Vec<_>>();
+        let first_source = enumerator_nodes
+            .first()
+            .and_then(|item| enumerator_rhs(*item));
+        let decision = self
+            .session
+            .add_node_point(builder, enumerators, Vec::new())?;
+        let body_entry = self.session.add_node_point(builder, body, Vec::new())?;
+        if let Some(first_source) = first_source
+            && let Some((_, value_parameter)) = self.modeled_map_iteration_flow(first_source)
+            && let Some(enumerator) = enumerator_nodes.first()
+            && let Some(pattern) = enumerator_pattern(*enumerator)
+            && pattern.kind() == "tuple_pattern"
+        {
+            let iterable =
+                self.expression_value(builder, first_source, expression_value_kind(first_source))?;
+            let location = self.session.add_memory_location(
+                builder,
+                decision,
+                MemoryLocationKind::Index {
+                    base: iterable,
+                    index: None,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Aggregate,
+                },
+            )?;
+            let entry = self.source_value(builder, node, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                decision,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result: entry,
+                },
+            )?;
+            // The CSMI invocation proves the callback's ordered entry
+            // component layout. The neutral IR has no product-component
+            // value kind, so retain the proven value component as a local
+            // flow from the aggregate entry; do not copy the entry into the
+            // key binder, which would falsely taint keys from value writes.
+            if let Ok(value_component) = usize::try_from(value_parameter)
+                && let Some(value_binder) = tuple_pattern_bindings(pattern)
+                    .get(value_component)
+                    .and_then(|binder| node_text(self.prepared.source(), *binder))
+                    .and_then(|name| self.local_binding_at(name, body.start_byte()))
+                    .filter(|binding| binding.component_index == Some(value_component))
+            {
+                self.append_effect(
+                    builder,
+                    decision,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: entry,
+                        target: value_binder.value,
+                    },
+                )?;
+            }
+        }
+        for (capability, kind, detail) in [
+            (
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "for-comprehension map, flatMap, withFilter, and foreach protocol calls are not emitted as synthetic call sites",
+            ),
+            (
+                SemanticCapability::DeferredExecution,
+                SemanticGapKind::Unsupported,
+                "later enumerators, guards, and the body execute inside desugared closures",
+            ),
+            (
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unsupported,
+                "collection protocol iteration count and filtering require dispatch and value refinement",
+            ),
+            (
+                // The protocol calls and the pattern filtering this gap names
+                // are exactly the ones the two gaps above state are not
+                // emitted, so what is missing is their abort edges.
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "no call sites are emitted for the for-comprehension protocol calls or pattern filtering, so their abort edges are not lowered",
+            ),
+        ] {
+            self.session.record_gap(
+                builder,
+                decision,
+                SemanticGapSubject::Point,
+                capability,
+                kind,
+                detail,
+            )?;
+        }
+        if has_direct_token(node, "yield") {
+            self.session.record_gap(
+                builder,
+                decision,
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "yielded collection construction and element value flow are not lowered",
+            )?;
+        }
+        self.session.add_target_edge(
+            builder,
+            decision,
+            EdgeTarget {
+                point: body_entry,
+                kind: ControlEdgeKind::ConditionalTrue,
+            },
+        )?;
+        self.session.add_target_edge(
+            builder,
+            decision,
+            EdgeTarget {
+                point: next.point,
+                kind: ControlEdgeKind::ConditionalFalse,
+            },
+        )?;
+        stack.push(Work::Expression {
+            node: body,
+            entry: body_entry,
+            next: EdgeTarget {
+                point: decision,
+                kind: ControlEdgeKind::LoopBack,
+            },
+            scope,
+        });
+        if let Some(first_source) = first_source {
+            stack.push(Work::Expression {
+                node: first_source,
+                entry,
+                next: EdgeTarget::normal(decision),
+                scope,
+            });
+            Ok(())
+        } else {
+            self.session
+                .add_target_edge(builder, entry, EdgeTarget::normal(decision))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn definition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let value = required_field(node, "value")?;
+        if contains_token(node, "lazy") {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::DeferredExecution,
+                SemanticGapKind::Unsupported,
+                "lazy value initialization, synchronization, retry, and memoization are not lowered eagerly",
+            )?;
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "the deferred lazy initializer may contain calls",
+            )?;
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "lazy initialization may throw and be retried",
+            )?;
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let pattern = node.child_by_field_name("pattern");
+        if pattern.is_some_and(|pattern| pattern.kind() != "identifier") {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "destructuring definition bindings are not represented in value flow",
+            )?;
+        }
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let mut continue_from_terminal = true;
+        if let Some(pattern) = pattern.filter(|pattern| pattern.kind() == "identifier")
+            && let Some(name) = node_text(self.prepared.source(), pattern)
+            && let Some(target) = self.local_declaration_value(name, pattern.start_byte())
+        {
+            let source = self.expression_value(builder, value, expression_value_kind(value))?;
+            let stored = if self.definition_has_identity_initializer(node, value) {
+                Some((source, terminal))
+            } else {
+                self.try_adapt(
+                    builder,
+                    terminal,
+                    scope,
+                    stack,
+                    source,
+                    value,
+                    node.child_by_field_name("type")
+                        .and_then(|declared| {
+                            let segments =
+                                brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(
+                                    declared,
+                                    self.prepared.source(),
+                                );
+                            (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
+                        })
+                        .as_deref(),
+                )?
+                .map(|(adapted, continuation)| (adapted, continuation.unwrap_or(terminal)))
+            };
+            if let Some((stored, store_point)) = stored {
+                self.append_effect(
+                    builder,
+                    store_point,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: stored,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    store_point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: stored,
+                        target,
+                    },
+                )?;
+                if store_point != terminal {
+                    self.session.add_target_edge(builder, store_point, next)?;
+                    continue_from_terminal = false;
+                }
+                // A `val`/`var` written directly in a template body is that
+                // template's member, and the primary constructor is where its
+                // initializer runs. Without this store a later
+                // `outer.middle.inner` load has no defining write anywhere,
+                // which is what kept every access path through a
+                // constructor-initialized member open (#2664). Java reaches
+                // the same place through its per-field `Initializer`
+                // procedures.
+                if let Some(base) = self.receiver
+                    && matches!(
+                        self.procedure_kind,
+                        ProcedureKind::Constructor | ProcedureKind::Initializer
+                    )
+                    && is_scala_template_member(node)
+                {
+                    let member = self.declared_member_locator(pattern)?;
+                    let location = self.session.add_memory_location(
+                        builder,
+                        store_point,
+                        MemoryLocationKind::Field { base, member },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        store_point,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Field,
+                            location,
+                            value: stored,
+                        },
+                    )?;
+                }
+            } else {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "Scala typed value initialization may apply an implicit conversion",
+                )?;
+            }
+        }
+        if contains_token(node, "implicit") || contains_token(node, "given") {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "implicit or given value selection requires contextual resolution",
+            )?;
+        }
+        if continue_from_terminal {
+            self.session.add_target_edge(builder, terminal, next)?;
+        }
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let left = required_field(node, "left").or_else(|_| required_field(node, "target"))?;
+        let right = required_field(node, "right").or_else(|_| required_field(node, "value"))?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let mut continue_from_terminal = true;
+        let mut evaluations = vec![left, right];
+        let lexical_target = self.lexical_assignment_target(left);
+        if let Some((target, kind)) = lexical_target {
+            // A Scala assignment evaluates to `Unit`, so its own result needs
+            // no identity gap. What can still adapt is the stored value, and
+            // only when the target's type differs from the assigned type.
+            let source = self.expression_value(builder, right, expression_value_kind(right))?;
+            let stored = if self.assigned_value_has_target_identity(left, right) {
+                Some((source, terminal))
+            } else {
+                let target_type = node_text(self.prepared.source(), left).and_then(|name| {
+                    self.binding_type_id_at(name, left.start_byte())
+                        .and_then(|id| self.type_identities.get(id.0).cloned())
+                });
+                self.try_adapt(
+                    builder,
+                    terminal,
+                    scope,
+                    stack,
+                    source,
+                    right,
+                    target_type.as_deref(),
+                )?
+                .map(|(adapted, continuation)| (adapted, continuation.unwrap_or(terminal)))
+            };
+            if let Some((stored, store_point)) = stored {
+                self.append_effect(
+                    builder,
+                    store_point,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: stored,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    store_point,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: stored,
+                        target,
+                    },
+                )?;
+                if store_point != terminal {
+                    self.session.add_target_edge(builder, store_point, next)?;
+                    continue_from_terminal = false;
+                }
+            } else {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unknown,
+                    "Scala variable reassignment is retained without assuming identity-preserving adaptation",
+                )?;
+            }
+            if scala_assignment_has_plain_operator(node) {
+                // A simple local assignment evaluates the right-hand side and
+                // stores it in the target. Evaluating the left identifier as
+                // an ordinary expression would publish a spurious binding
+                // read, which makes overwrite proofs treat `x = value` as a
+                // use of the old value. Compound assignments still evaluate
+                // the left side below because their operator reads it.
+                evaluations = vec![right];
+            }
+        } else if left.kind() == "field_expression" && self.selection_base_is_value(left) {
+            // A member store, lowered exactly as Java lowers `field_access`
+            // on the left of an assignment: the base is an operand, the
+            // member is a located field, and the store is a heap effect.
+            let object = required_field(left, "value")?;
+            let field = required_field(left, "field")?;
+            let source = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let (member, resolved) = self.memory_member_locator(field, object)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field { base, member },
+            )?;
+            if !resolved {
+                self.add_field_identity_gap(builder, terminal, location)?;
+            }
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value: source,
+                },
+            )?;
+            evaluations = vec![object, right];
+        } else if let Some((base_node, index_node)) = self.array_index_access(left) {
+            // `values(i) = v` is Scala's update sugar. On an `Array` receiver
+            // that is the language's own element store, so it lowers as index
+            // memory, matching Java's `array_access` assignment target.
+            let source = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base =
+                self.expression_value(builder, base_node, expression_value_kind(base_node))?;
+            let index = self.index_value(builder, index_node)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index),
+                    constant_index: None,
+                    identity: brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value: source,
+                },
+            )?;
+            evaluations = vec![base_node, index_node, right];
+        } else if let Some((base_node, index_node)) = self.map_update_access(left)
+            && self.modeled_map_update_flow(base_node).is_some()
+        {
+            // A mutable.Map update is compiler-generated `update(key, value)`
+            // syntax. It is a map backing-store write only after the exact
+            // active model proves the standard-library callable and its
+            // parameter-1 -> receiver.entry-value transfer.
+            let source = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base =
+                self.expression_value(builder, base_node, expression_value_kind(base_node))?;
+            let index = self.index_value(builder, index_node)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index),
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Aggregate,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value: source,
+                },
+            )?;
+            evaluations = vec![base_node, index_node, right];
+        } else {
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "Scala assignment identity requires the declared target type and implicit conversion resolution",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "Scala destructuring or user-defined update assignment is not lowered into memory flow",
+            )?;
+        }
+        if continue_from_terminal {
+            self.session.add_target_edge(builder, terminal, next)?;
+        }
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    /// Lower a selection.
+    ///
+    /// A selection whose base is a package or type qualifier denotes no
+    /// runtime value at all, so it mints neither a memory location nor an
+    /// undischargeable `FieldMemory` gap -- the #2363 rule Java applies to
+    /// `field_access` type qualifiers. `asInstanceOf` and `isInstanceOf` are
+    /// the language's own type operations rather than members. Everything
+    /// else is a member read: a located field load, with the identity gap and
+    /// the parameterless-method gaps raised only when this compilation unit
+    /// does not settle which declaration the member names. A member that does
+    /// resolve to a `val` or `var` declaration is a stored field, and Scala's
+    /// uniform access does not make reading one a call.
+    #[allow(clippy::too_many_arguments)]
+    fn field_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let object = required_field(node, "value")?;
+        let field = required_field(node, "field")?;
+        if !self.selection_base_is_value(object) {
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let member_name = node_text(self.prepared.source(), field);
+        if matches!(member_name, Some("asInstanceOf" | "isInstanceOf")) {
+            let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+            if member_name == Some("asInstanceOf") {
+                // A checked cast yields the operand itself; only its runtime
+                // check can fail, and that abort edge is not lowered.
+                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let source =
+                    self.expression_value(builder, object, expression_value_kind(object))?;
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    terminal,
+                    vec![source],
+                    result,
+                )?;
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
+                    "the checked-cast abort edge of a type ascription is not lowered",
+                )?;
+            }
+            self.session.add_target_edge(builder, terminal, next)?;
+            stack.push(Work::Expression {
+                node: object,
+                entry,
+                next: EdgeTarget::normal(terminal),
+                scope,
+            });
+            return Ok(());
+        }
+        let access = self.session.add_node_point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let base = self.expression_value(builder, object, expression_value_kind(object))?;
+        if let Some(field_name) = member_name
+            && let Some(wrapper_type) = self.expression_type_identity(object)
+            && self
+                .adaptations
+                .value_class_unwrap(self.prepared.source(), &wrapper_type, field_name, object)
+                .is_some()
+        {
+            self.emit_value_class_unwrap(builder, access, base, result)?;
+            self.session.add_target_edge(builder, access, next)?;
+            stack.push(Work::Expression {
+                node: object,
+                entry,
+                next: EdgeTarget::normal(access),
+                scope,
+            });
+            return Ok(());
+        }
+        let (member, resolved) = self.memory_member_locator(field, object)?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        if !resolved {
+            self.add_field_identity_gap(builder, access, location)?;
+            self.session.record_gap(
+                builder,
+                access,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "selection may denote a parameterless method or require an implicit conversion",
+            )?;
+            self.session.record_gap(
+                builder,
+                access,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "parameterless method selection or an implicit conversion may complete exceptionally",
+            )?;
+        }
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location,
+                result,
+            },
+        )?;
+        self.session.add_target_edge(builder, access, next)?;
+        stack.push(Work::Expression {
+            node: object,
+            entry,
+            next: EdgeTarget::normal(access),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn lexical_assignment_target(&self, left: Node<'tree>) -> Option<(ValueId, ValueFlowKind)> {
+        let name = (left.kind() == "identifier")
+            .then(|| node_text(self.prepared.source(), left))
+            .flatten()?;
+        self.local_at(name, left.start_byte())
+            .map(|target| (target, ValueFlowKind::Local))
+            .or_else(|| {
+                self.parameters
+                    .get(name)
+                    .copied()
+                    .map(|target| (target, ValueFlowKind::Parameter))
+            })
+    }
+
+    /// Whether `new T(...)` allocates one of Scala's own arrays.
+    fn constructs_language_defined_array(&self, function: Node<'tree>) -> bool {
+        let source = self.prepared.source();
+        let Some(constructed) = scala_constructed_type_node(function) else {
+            return false;
+        };
+        if brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(constructed, source)
+            .last()
+            .map(String::as_str)
+            != Some("Array")
+        {
+            return false;
+        }
+        scala_type_definitions_named(compilation_unit_root(self.callable), "Array", source)
+            .is_empty()
+    }
+
+    /// Lower `new Array[T](n)` as the array allocation it is.
+    ///
+    /// Scala's array creation is the JVM's own `newarray`, not a method
+    /// application: there is no callee body anywhere for a whole-program
+    /// resolver to bind, so minting a call site here would publish a boundary
+    /// that can never close. Java lowers `array_creation_expression` the same
+    /// way, as an allocation with no call.
+    #[allow(clippy::too_many_arguments)]
+    fn array_allocation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        lengths: &[Node<'tree>],
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.session
+            .add_allocation(builder, terminal, result, AllocationKind::Array)?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            lengths,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    /// Lower `values(i)` on an `Array` receiver as an element read.
+    #[allow(clippy::too_many_arguments)]
+    fn array_element_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        base_node: Node<'tree>,
+        index_node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let access = self.session.add_node_point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let base = self.expression_value(builder, base_node, expression_value_kind(base_node))?;
+        let index = self.index_value(builder, index_node)?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Index {
+                base,
+                index: Some(index),
+                constant_index: None,
+                identity:
+                    brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Index,
+                location,
+                result,
+            },
+        )?;
+        self.session.record_gap(
+            builder,
+            access,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            "the bounds-check abort edge of an array element access is not lowered",
+        )?;
+        self.session.add_target_edge(builder, access, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[base_node, index_node],
+            EdgeTarget::normal(access),
+            scope,
+            stack,
+        )
+    }
+
+    /// Apply a uniquely selected adaptation or report that none is modeled.
+    ///
+    /// `None` is typed incompleteness: competing implicits, a missing body, or
+    /// an unresolved pair. It is never an identity claim.
+    #[allow(clippy::too_many_arguments)]
+    fn try_adapt(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        source: ValueId,
+        source_node: Node<'tree>,
+        target_type: Option<&[String]>,
+    ) -> Result<Option<(ValueId, Option<ProgramPointId>)>, ScalaLoweringError> {
+        let Some(target_type) = target_type else {
+            return Ok(None);
+        };
+        let Some(source_type) = self.expression_type_identity(source_node) else {
+            return Ok(None);
+        };
+        match self.adaptations.select(
+            self.prepared.source(),
+            source_node,
+            &source_type,
+            target_type,
+        ) {
+            Ok(selected) => self.emit_selected_adaptation(
+                builder,
+                invoke,
+                scope,
+                stack,
+                source,
+                source_node,
+                &selected.kind,
+            ),
+            Err(AdaptationFailure::Unresolved | AdaptationFailure::Ambiguous) => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_selected_adaptation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        source: ValueId,
+        source_node: Node<'tree>,
+        kind: &SelectedAdaptationKind,
+    ) -> Result<Option<(ValueId, Option<ProgramPointId>)>, ScalaLoweringError> {
+        match *kind {
+            SelectedAdaptationKind::OpaqueWrap | SelectedAdaptationKind::OpaqueUnwrap => {
+                let target =
+                    self.source_value(builder, source_node, SemanticValueKind::Temporary)?;
+                self.append_effect(
+                    builder,
+                    invoke,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    invoke,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(ValueTransfer {
+                            kind: TransferKind::Conversion {
+                                preservation: ValuePreservation::Preserving,
+                            },
+                            operation: TransferOperation::None,
+                        }),
+                        source,
+                        target,
+                    },
+                )?;
+                Ok(Some((target, None)))
+            }
+            SelectedAdaptationKind::ImplicitCall {
+                procedure: None, ..
+            } => Ok(None),
+            SelectedAdaptationKind::ImplicitCall {
+                procedure: Some(procedure),
+                callable,
+            } => self.emit_conversion_call(
+                builder,
+                invoke,
+                scope,
+                stack,
+                source,
+                source_node,
+                procedure,
+                callable,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_conversion_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        source: ValueId,
+        source_node: Node<'tree>,
+        procedure: ProcedureId,
+        callable: ScalaConversionCallableKind,
+    ) -> Result<Option<(ValueId, Option<ProgramPointId>)>, ScalaLoweringError> {
+        let normal = self
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let exceptional = self
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let callee = self.source_value(builder, source_node, SemanticValueKind::Callable)?;
+        let result = self.source_value(builder, source_node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, source_node, SemanticValueKind::Exception)?;
+        let resolution = CallableTargetResolution::Proven(CallableTarget::Local(procedure));
+        let metadata = self.metadata(invoke)?;
+        let callable_kind = match callable {
+            ScalaConversionCallableKind::Function => CallableReferenceKind::Function,
+            ScalaConversionCallableKind::Constructor { .. } => CallableReferenceKind::Constructor,
+        };
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: None,
+                arguments: vec![SemanticCallArgument::direct(
+                    source,
+                    ArgumentDomain::Positional,
+                )]
+                .into(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution,
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        if let ScalaConversionCallableKind::Constructor { value_class } = callable {
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::Assignment {
+                    target: result,
+                    value: source,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(ValueTransfer {
+                        kind: TransferKind::Boxing,
+                        operation: TransferOperation::CallSite(call_site),
+                    }),
+                    source,
+                    target: result,
+                },
+            )?;
+            if !value_class {
+                self.session
+                    .add_allocation(builder, normal, result, AllocationKind::Object)?;
+            }
+        }
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
+        Ok(Some((result, Some(normal))))
+    }
+
+    fn value_class_construction(
+        &self,
+        function: Node<'tree>,
+        callable: Node<'tree>,
+        arguments: &[Node<'tree>],
+    ) -> Option<(ProcedureId, Node<'tree>)> {
+        let [payload] = arguments else {
+            return None;
+        };
+        let source = self.prepared.source();
+        let (type_path, use_site) = if function.kind() == "instance_expression" {
+            let constructed = scala_constructed_type_node(function)?;
+            (
+                brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(
+                    constructed,
+                    source,
+                ),
+                function,
+            )
+        } else if callable.kind() == "identifier" {
+            let name = node_text(source, callable)?;
+            if self.term_is_bound(name, callable.start_byte()) {
+                return None;
+            }
+            (vec![name.to_owned()], callable)
+        } else {
+            return None;
+        };
+        if type_path.is_empty() {
+            return None;
+        }
+        let class = self
+            .adaptations
+            .value_class_for_type(source, use_site, &type_path)?;
+        Some((class.constructor?, *payload))
+    }
+
+    fn term_is_bound(&self, name: &str, byte: usize) -> bool {
+        self.local_binding_at(name, byte).is_some() || self.parameters.contains_key(name)
+    }
+
+    fn emit_value_class_unwrap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        wrapper: ValueId,
+        result: ValueId,
+    ) -> Result<(), ScalaLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target: result,
+                value: wrapper,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Unboxing,
+                    operation: TransferOperation::None,
+                }),
+                source: wrapper,
+                target: result,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_value_class_wrap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        payload: ValueId,
+        result: ValueId,
+        source_node: Node<'tree>,
+        procedure: ProcedureId,
+    ) -> Result<(), ScalaLoweringError> {
+        let exceptional = self
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let callee = self.source_value(builder, source_node, SemanticValueKind::Callable)?;
+        let thrown = self.source_value(builder, source_node, SemanticValueKind::Exception)?;
+        let resolution = CallableTargetResolution::Proven(CallableTarget::Local(procedure));
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Constructor,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: None,
+                arguments: vec![SemanticCallArgument::direct(
+                    payload,
+                    ArgumentDomain::Positional,
+                )]
+                .into(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution,
+                normal_continuation: next.point,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::Assignment {
+                target: result,
+                value: payload,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Boxing,
+                    operation: TransferOperation::CallSite(call_site),
+                }),
+                source: payload,
+                target: result,
+            },
+        )?;
+        self.session.add_target_edge(builder, invoke, next)?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
+        Ok(())
+    }
+
+    /// Whether an annotated `val`/`var` initializer provably already has the
+    /// declared type, so the binding applies no implicit conversion.
+    ///
+    /// The three arms are the same identity discipline the return proof uses:
+    /// an unannotated binding takes whatever the initializer yields, a `new
+    /// T(...)` initializer names its own type, a literal names the type its
+    /// spelling fixes, and anything else must have a structurally determined
+    /// identity equal to the declared one. Everything else keeps its gap.
+    fn definition_has_identity_initializer(
+        &self,
+        definition: Node<'tree>,
+        initializer: Node<'tree>,
+    ) -> bool {
+        let Some(declared) = definition.child_by_field_name("type") else {
+            return true;
+        };
+        let source = self.prepared.source();
+        if scala_constructed_type_node(initializer).is_some_and(|constructed| {
+            scala_type_nodes_have_same_identity(declared, constructed, source)
+        }) || scala_literal_has_declared_identity_type(declared, initializer, source)
+        {
+            return true;
+        }
+        let Some(declared_identity) = scala_type_identity(declared, source) else {
+            return false;
+        };
+        self.expression_type_identity(initializer)
+            .is_some_and(|identity| identity == declared_identity)
+    }
+
+    /// Whether the value stored by `left = right` provably already has the
+    /// target's type, so the store applies no implicit conversion.
+    fn assigned_value_has_target_identity(&self, left: Node<'tree>, right: Node<'tree>) -> bool {
+        let Some(name) = node_text(self.prepared.source(), left) else {
+            return false;
+        };
+        let Some(target) = self
+            .binding_type_id_at(name, left.start_byte())
+            .and_then(|id| self.type_identities.get(id.0))
+        else {
+            return false;
+        };
+        self.expression_type_identity(right)
+            .is_some_and(|identity| identity == *target)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transparent_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        value: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let source = self.expression_value(builder, value, expression_value_kind(value))?;
+        let target = self.expression_value(builder, node, expression_value_kind(node))?;
+        let terminal = self
+            .session
+            .add_transparent_assignment(builder, node, source, target, next)?;
+        stack.push(Work::Expression {
+            node: value,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn return_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let argument = first_runtime_named_child(node);
+        let terminal = if argument.is_some() {
+            self.session.add_node_point(builder, node, Vec::new())?
+        } else {
+            entry
+        };
+        if matches!(
+            self.procedure_kind,
+            ProcedureKind::Lambda | ProcedureKind::Closure
+        ) {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unsupported,
+                "return inside a Scala anonymous function is non-local control and is not a return from that anonymous procedure",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "non-local return boundary propagation is not lowered",
+            )?;
+        } else if let Some(argument) = argument {
+            let source =
+                self.expression_value(builder, argument, expression_value_kind(argument))?;
+            let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+            if self.callable_result_has_identity_conversion(argument) {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        target: value,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
+            } else if let Some((adapted, continuation)) = self.try_adapt(
+                builder,
+                terminal,
+                scope,
+                stack,
+                source,
+                argument,
+                declared_result_type_identity(self.callable, self.prepared.source()).as_deref(),
+            )? {
+                let return_point = continuation.unwrap_or(terminal);
+                self.append_effect(
+                    builder,
+                    return_point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: adapted,
+                        target: value,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    return_point,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                self.abrupt(builder, return_point, scope, CompletionKind::Return, stack)?;
+            } else {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                    SemanticGapKind::Unknown,
+                    "Scala explicit return may apply an implicit conversion to the declared result type",
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
+            }
+        } else {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ProcedureReturn { value: None },
+            )?;
+            self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
+        }
+        if let Some(argument) = argument {
+            stack.push(Work::Expression {
+                node: argument,
+                entry,
+                next: EdgeTarget::normal(terminal),
+                scope,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `result` provably already has the callable's declared result
+    /// type, so returning it applies no implicit conversion.
+    ///
+    /// The proof is structural and congruent: a conditional, block, or match
+    /// carries its declared identity when every value it can yield does, and
+    /// a call to a definition in this compilation unit carries it when that
+    /// definition declares the same result type. Type identity remains the
+    /// discipline -- a widened or shadowed result still fails here and keeps
+    /// its `ReturnTransfer` gap.
+    fn callable_result_has_identity_conversion(&self, result: Node<'tree>) -> bool {
+        let Some(declared) = self.callable.child_by_field_name("return_type") else {
+            return true;
+        };
+        let source = self.prepared.source();
+        let declared_identity =
+            brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(declared, source);
+        if declared_identity.is_empty() {
+            return false;
+        }
+        let mut pending = vec![result];
+        let mut examined = 0_usize;
+        while let Some(node) = pending.pop() {
+            examined += 1;
+            if examined > SCALA_RESULT_IDENTITY_NODE_BUDGET {
+                return false;
+            }
+            if self.result_node_has_declared_identity(declared, &declared_identity, node) {
+                continue;
+            }
+            match node.kind() {
+                "parenthesized_expression" => match first_runtime_named_child(node) {
+                    Some(inner) => pending.push(inner),
+                    None => return false,
+                },
+                "block" | "indented_block" => match implicit_result_node(node) {
+                    Some(inner) if inner.id() != node.id() => pending.push(inner),
+                    _ => return false,
+                },
+                "if_expression" => {
+                    // A one-armed `if` yields `Unit` on the missing arm, so
+                    // only a complete conditional can carry a declared type.
+                    let (Some(consequence), Some(alternative)) = (
+                        node.child_by_field_name("consequence"),
+                        node.child_by_field_name("alternative"),
+                    ) else {
+                        return false;
+                    };
+                    pending.push(consequence);
+                    pending.push(alternative);
+                }
+                "match_expression" => {
+                    let arms = case_arms(node);
+                    if arms.is_empty() {
+                        return false;
+                    }
+                    for arm in arms {
+                        match case_body_nodes(arm).last() {
+                            Some(body) => pending.push(*body),
+                            None => return false,
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn result_node_has_declared_identity(
+        &self,
+        declared: Node<'tree>,
+        declared_identity: &[String],
+        node: Node<'tree>,
+    ) -> bool {
+        let source = self.prepared.source();
+        scala_constructed_type_node(node).is_some_and(|constructed| {
+            scala_type_nodes_have_same_identity(declared, constructed, source)
+        }) || scala_literal_has_declared_identity_type(declared, node, source)
+            // A type parameter or a second parameter list can make the
+            // declared result type depend on the application, which this
+            // file-local inference does not model.
+            || (callable_has_simple_parameter_shape(self.callable)
+                && self
+                    .expression_type_identity(node)
+                    .is_some_and(|identity| identity.as_ref() == declared_identity))
+    }
+
+    /// The structurally determined type identity of an expression, or `None`
+    /// when this compilation unit's structure does not determine it.
+    ///
+    /// This is deliberately narrow: it reads literals, lexical binding types,
+    /// same-file callable result declarations, and the operand types of
+    /// operators built from Scala's operator characters. It never guesses. A
+    /// `None` answer keeps every caller on its conservative path.
+    fn expression_type_identity(&self, node: Node<'tree>) -> Option<Arc<[String]>> {
+        let source = self.prepared.source();
+        // A selection chain is walked down to its base and then applied back
+        // outwards through the declared member types, so `outer.middle.inner`
+        // answers without recursing once per access-path segment.
+        let mut members: Vec<&str> = Vec::new();
+        let mut current = node;
+        let mut examined = 0_usize;
+        let base = loop {
+            examined += 1;
+            if examined > SCALA_RESULT_IDENTITY_NODE_BUDGET {
+                return None;
+            }
+            // `new T(...)` names its own type, whatever else the expression
+            // shape is; nothing about the application can change it.
+            if let Some(constructed) = scala_constructed_type_node(current) {
+                break scala_type_identity(constructed, source)?;
+            }
+            match current.kind() {
+                "parenthesized_expression" => current = first_runtime_named_child(current)?,
+                "generic_function" => current = current.child_by_field_name("function")?,
+                "field_expression" => {
+                    members.push(node_text(source, current.child_by_field_name("field")?)?);
+                    current = current.child_by_field_name("value")?;
+                }
+                "identifier" => {
+                    let name = node_text(source, current)?;
+                    let identity = self.binding_type_id_at(name, current.start_byte())?;
+                    break self.type_identities.get(identity.0).cloned()?;
+                }
+                "call_expression" => {
+                    break self
+                        .array_element_type_identity(current)
+                        .or_else(|| self.call_result_type_identity(current))?;
+                }
+                "infix_expression" => break self.infix_result_type_identity(current)?,
+                _ => {
+                    break scala_literal_type_name(source, current)
+                        .map(|name| Arc::from(vec![name.to_string()].into_boxed_slice()))?;
+                }
+            }
+        };
+        let mut identity = base;
+        while let Some(member) = members.pop() {
+            identity = self.member_declared_type_identity(&identity, member)?;
+        }
+        Some(identity)
+    }
+
+    /// The unique `val` or `var` member declaration this compilation unit
+    /// shows for `member` on `owner`.
+    ///
+    /// Deliberately narrow, and `None` whenever the file does not settle the
+    /// answer: no such template, several same-named templates, a template
+    /// that declares parents whose members this file never shows, or no such
+    /// member. Java's `memory_member_locator` resolves against the same
+    /// same-file evidence.
+    fn template_value_member(&self, owner: &[String], member: &str) -> Option<Node<'tree>> {
+        let source = self.prepared.source();
+        let name = owner.last()?;
+        let template = unique_node(scala_type_definitions_named(
+            compilation_unit_root(self.callable),
+            name,
+            source,
+        ))?;
+        // A member the template declares for itself is the one a selection
+        // names, whether or not the template also declares parents: Scala
+        // requires `override` for an inherited redeclaration, so a local
+        // declaration is never a silently shadowed inherited member.
+        scala_template_value_member(template, member, source)
+    }
+
+    /// The written type of a resolved member declaration.
+    fn member_declared_type_identity(
+        &self,
+        owner: &[String],
+        member: &str,
+    ) -> Option<Arc<[String]>> {
+        let definition = self.template_value_member(owner, member)?;
+        scala_type_identity(
+            definition.child_by_field_name("type")?,
+            self.prepared.source(),
+        )
+    }
+
+    /// The base and index of an application that Scala's `apply`/`update`
+    /// sugar makes an element access on an `Array`.
+    ///
+    /// Only an `Array`-typed lexical base qualifies. `Array` is the language's
+    /// own array type, so `values(i)` and `values(i) = v` are its element read
+    /// and write exactly as `a[i]` is in Java; any other receiver's `apply` is
+    /// an ordinary member and stays a call site.
+    fn array_index_access(&self, node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+        let (function, argument_lists) = flattened_call_parts(node).ok()?;
+        let [arguments] = argument_lists.as_slice() else {
+            return None;
+        };
+        let indices = semantic_argument_nodes(*arguments);
+        let [index] = indices.as_slice() else {
+            return None;
+        };
+        let base = normalized_callable_expression(function).ok()?;
+        if base.kind() != "identifier" {
+            return None;
+        }
+        let identity = self.expression_type_identity(base)?;
+        (identity.last().map(String::as_str) == Some("Array")).then_some((base, *index))
+    }
+
+    /// The receiver and key of a Scala assignment target that desugars to
+    /// `update`. The assigned value is the assignment's right-hand side. This
+    /// is only a candidate shape; the active semantic-model resolver must
+    /// still prove that the receiver's standard-library declaration owns
+    /// `update`.
+    fn map_update_access(&self, node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+        let (function, argument_lists) = flattened_call_parts(node).ok()?;
+        let [arguments] = argument_lists.as_slice() else {
+            return None;
+        };
+        let actuals = semantic_argument_nodes(*arguments);
+        let [key] = actuals.as_slice() else {
+            return None;
+        };
+        let base = normalized_callable_expression(function).ok()?;
+        if base.kind() != "identifier" {
+            return None;
+        }
+        self.is_parameterized_map(base).then_some((base, *key))
+    }
+
+    fn is_parameterized_map(&self, receiver: Node<'tree>) -> bool {
+        let Some(identity) = self.expression_structured_type_identity(receiver) else {
+            return false;
+        };
+        identity.generic_argument_count() == Some(2)
+            && identity
+                .nominal_name()
+                .is_some_and(|name| name.path().last().map(String::as_str) == Some("Map"))
+    }
+
+    fn modeled_collection_flow(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+        parameter_count: usize,
+    ) -> Option<&CollectionFlowContract> {
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        let identity = self.expression_structured_type_identity(receiver)?;
+        let owner_name = identity.nominal_name()?;
+        // A terminal-only type name can be shadowed by an import or local
+        // declaration. Requiring the explicit qualified path keeps this query
+        // resolver-proven instead of turning a nominal name into identity.
+        if owner_name.path().len() < 2 {
+            return None;
+        }
+        let owner = owner_name.path().join(".");
+        let parameter_count = u32::try_from(parameter_count).ok()?;
+        let matched = overlay.callable_for_application(
+            SemanticModelCallableKey::new(
+                Language::Scala.config_label(),
+                &owner,
+                member,
+                true,
+                parameter_count,
+            ),
+            &SemanticModelCallApplication::positional(parameter_count),
+        );
+        if matched.disposition != SemanticModelCallableDisposition::Unique {
+            return None;
+        }
+        let callable = matched.unique()?;
+        overlay.unique_complete_collection_flow(&callable.id)
+    }
+
+    fn modeled_map_update_flow(&self, receiver: Node<'tree>) -> Option<&CollectionFlowContract> {
+        let flow = self.modeled_collection_flow(receiver, "update", 2)?;
+        if matches!(
+            flow.payload.receiver_substitution,
+            Some(
+                CsmiCollectionFlowSubstitution::Unknown { .. }
+                    | CsmiCollectionFlowSubstitution::Unsupported { .. }
+            )
+        ) {
+            return None;
+        }
+        let receiver_is_keyed = flow.payload.roots.iter().any(|root| {
+            matches!(
+                &root.root,
+                CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Receiver(_))
+            ) && matches!(root.shape, CsmiCollectionFlowShape::Keyed { .. })
+        });
+        if !receiver_is_keyed {
+            return None;
+        }
+        flow.payload
+            .transfers
+            .iter()
+            .any(|transfer| {
+                matches!(
+                    &transfer.source.root,
+                    CsmiInputBoundaryRoot::Parameter(parameter) if parameter.position == 1
+                ) && transfer.source.projection.is_none()
+                    && matches!(
+                        transfer.destination.root,
+                        CsmiOutputBoundaryRoot::Receiver(_)
+                    )
+                    && projection_is_entry_component(
+                        transfer.destination.projection.as_ref(),
+                        "parameter",
+                        0,
+                        "entry-value",
+                    )
+            })
+            .then_some(flow)
+    }
+
+    fn modeled_map_iteration_flow(&self, receiver: Node<'tree>) -> Option<(u32, u32)> {
+        let flow = self.modeled_collection_flow(receiver, "foreach", 1)?;
+        if matches!(
+            flow.payload.receiver_substitution,
+            Some(
+                CsmiCollectionFlowSubstitution::Unknown { .. }
+                    | CsmiCollectionFlowSubstitution::Unsupported { .. }
+            )
+        ) {
+            return None;
+        }
+        let receiver_entry_components = flow
+            .payload
+            .roots
+            .iter()
+            .filter_map(|root| {
+                if !matches!(
+                    &root.root,
+                    CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Receiver(_))
+                ) {
+                    return None;
+                }
+                match &root.shape {
+                    CsmiCollectionFlowShape::Keyed {
+                        entry_components: Some(components),
+                        ..
+                    } => Some(components),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let [receiver_entry_components] = receiver_entry_components.as_slice() else {
+            return None;
+        };
+        if receiver_entry_components.as_slice()
+            != [
+                CsmiCollectionFlowEntryComponent::Key,
+                CsmiCollectionFlowEntryComponent::Value,
+            ]
+        {
+            return None;
+        }
+        flow.payload.invocations.iter().find_map(|invocation| {
+            let [parameter] = invocation.parameters.as_slice() else {
+                return None;
+            };
+            let CsmiCollectionFlowShape::Product { components } = parameter else {
+                return None;
+            };
+            if components.len() != 2
+                || !components
+                    .iter()
+                    .all(|component| matches!(component, CsmiCollectionFlowShape::Value { .. }))
+            {
+                return None;
+            }
+            if !matches!(
+                &invocation.callback.root,
+                CsmiInputBoundaryRoot::Parameter(parameter) if parameter.position == 0
+            ) || invocation.callback.projection.is_some()
+            {
+                return None;
+            }
+            let [argument] = invocation.arguments.as_slice() else {
+                return None;
+            };
+            if argument.parameter != 0
+                || !matches!(argument.source.root, CsmiInputBoundaryRoot::Receiver(_))
+                || !projection_is_entry_all(argument.source.projection.as_ref())
+            {
+                return None;
+            }
+            // The keyed shape's ordered entryComponents and the callback's
+            // Product components jointly prove tuple (key, value) layout.
+            Some((0, 1))
+        })
+    }
+
+    /// The element type of an `Array` element read.
+    fn array_element_type_identity(&self, node: Node<'tree>) -> Option<Arc<[String]>> {
+        let (base, _) = self.array_index_access(node)?;
+        let name = node_text(self.prepared.source(), base)?;
+        let binding = self.local_binding_at(name, base.start_byte())?;
+        self.type_identities
+            .get(binding.element_identity?.0)
+            .cloned()
+    }
+
+    /// The element identity an `Array` initializer determines: the written
+    /// type argument of `new Array[T](n)`, or the single identity every
+    /// element of an `Array(...)` factory application carries.
+    fn array_element_identity(&self, initializer: Node<'tree>) -> Option<Arc<[String]>> {
+        let source = self.prepared.source();
+        if let Some(constructed) = scala_constructed_type_node(initializer) {
+            return scala_array_element_type_node(constructed, source)
+                .and_then(|element| scala_type_identity(element, source));
+        }
+        let (function, argument_lists) = flattened_call_parts(initializer).ok()?;
+        if !self.names_language_defined_array(function) {
+            return None;
+        }
+        let [arguments] = argument_lists.as_slice() else {
+            return None;
+        };
+        let mut identity: Option<Arc<[String]>> = None;
+        for element in runtime_expression_children(*arguments) {
+            let element_identity = self.expression_type_identity(element)?;
+            match &identity {
+                Some(previous) if *previous != element_identity => return None,
+                Some(_) => {}
+                None => identity = Some(element_identity),
+            }
+        }
+        identity
+    }
+
+    /// Whether an application's callee is Scala's own `Array` companion: an
+    /// unqualified `Array` that is neither a lexical binding here nor a
+    /// function or type this compilation unit declares for itself.
+    fn names_language_defined_array(&self, function: Node<'tree>) -> bool {
+        let source = self.prepared.source();
+        let Ok(callable) = normalized_callable_expression(function) else {
+            return false;
+        };
+        if callable.kind() != "identifier"
+            || node_text(source, callable) != Some("Array")
+            || self.identifier_is_lexical(callable)
+        {
+            return false;
+        }
+        let root = compilation_unit_root(self.callable);
+        scala_function_definitions_named(root, "Array", source).is_empty()
+            && scala_type_definitions_named(root, "Array", source).is_empty()
+    }
+
+    /// The locator naming the member a selection reads or writes, and whether
+    /// its declaration resolved.
+    ///
+    /// Mirrors Java's `memory_member_locator`: the base's structurally known
+    /// type identity selects the declaring template in this compilation unit,
+    /// and the member's own declaration anchors the location. An unresolved
+    /// member keeps the occurrence anchor and its caller publishes the
+    /// identity gap.
+    fn memory_member_locator(
+        &self,
+        member: Node<'tree>,
+        base: Node<'tree>,
+    ) -> Result<(SemanticLocator, bool), ScalaLoweringError> {
+        let procedure = self.session.locator();
+        let occurrence = source_anchor(member, 0).map_err(ScalaLoweringError::Invalid)?;
+        let declaration = node_text(self.prepared.source(), member)
+            .zip(self.expression_type_identity(base))
+            .and_then(|(name, owner)| self.template_value_member(&owner, name))
+            .and_then(|definition| definition.child_by_field_name("pattern"))
+            .map(|pattern| source_anchor(pattern, 0))
+            .transpose()
+            .map_err(ScalaLoweringError::Invalid)?;
+        let resolved = declaration.is_some();
+        Ok((
+            procedure.memory_location_at(declaration.unwrap_or(occurrence)),
+            resolved,
+        ))
+    }
+
+    /// The locator for a member declared here, anchored exactly where
+    /// [`Self::memory_member_locator`] anchors a resolved selection of it.
+    fn declared_member_locator(
+        &self,
+        declaration: Node<'tree>,
+    ) -> Result<SemanticLocator, ScalaLoweringError> {
+        let procedure = self.session.locator();
+        let anchor = source_anchor(declaration, 0).map_err(ScalaLoweringError::Invalid)?;
+        Ok(procedure.memory_location_at(anchor))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session.add_unknown_field_identity_gap(
+            builder,
+            point,
+            location,
+            "field occurrence is structured, but its declaration identity is not yet resolved",
+        )
+    }
+
+    /// Whether a selection's base denotes a runtime value rather than the
+    /// package or type prefix of a qualified name (#2363). A qualifier
+    /// denotes no value, so it must not mint a memory location or an
+    /// undischargeable `FieldMemory` gap.
+    fn selection_base_is_value(&self, base: Node<'tree>) -> bool {
+        let mut current = base;
+        loop {
+            match current.kind() {
+                "field_expression" => match current.child_by_field_name("value") {
+                    Some(inner) => current = inner,
+                    None => return false,
+                },
+                "identifier" => return self.identifier_is_lexical(current),
+                "this" | "super" => return true,
+                kind => return is_runtime_node(kind),
+            }
+        }
+    }
+
+    /// One value per distinct constant index spelling, so a store through
+    /// `x(0)` and a load from `x(0)` name the same index operand.
+    fn index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<ValueId, ScalaLoweringError> {
+        let kind = expression_value_kind(node);
+        if kind != SemanticValueKind::Constant {
+            return self.expression_value(builder, node, kind);
+        }
+        let Some(text) = node_text(self.prepared.source(), node) else {
+            return self.expression_value(builder, node, kind);
+        };
+        if let Some(value) = self.constant_index_values.get(text) {
+            self.expression_values.insert(node.id(), *value);
+            return Ok(*value);
+        }
+        let value = self.expression_value(builder, node, kind)?;
+        self.constant_index_values.insert(text.into(), value);
+        Ok(value)
+    }
+
+    /// The declared result type of an unqualified application in this
+    /// compilation unit.
+    ///
+    /// The applied name must resolve to `function_definition`s that all
+    /// declare the same explicit result type. Requiring every same-named
+    /// definition in the file to agree covers overloads and lexical shadowing
+    /// without modelling Scala's selection rules. An enclosing template that
+    /// declares parents can inherit a same-named overload this file never
+    /// shows, so no answer is offered there.
+    fn call_result_type_identity(&self, node: Node<'tree>) -> Option<Arc<[String]>> {
+        let source = self.prepared.source();
+        let (function, _) = flattened_call_parts(node).ok()?;
+        if self.names_language_defined_array(function) {
+            return Some(Arc::from(vec!["Array".to_string()].into_boxed_slice()));
+        }
+        let callable = normalized_callable_expression(function).ok()?;
+        if callable.kind() != "identifier" || enclosing_template_declares_parents(self.callable) {
+            return None;
+        }
+        let name = node_text(source, callable)?;
+        let mut declared: Option<Arc<[String]>> = None;
+        for definition in
+            scala_function_definitions_named(compilation_unit_root(self.callable), name, source)
+        {
+            let identity =
+                scala_type_identity(definition.child_by_field_name("return_type")?, source)?;
+            match &declared {
+                Some(previous) if *previous != identity => return None,
+                Some(_) => {}
+                None => declared = Some(identity),
+            }
+        }
+        declared
+    }
+
+    /// The result type of an operator application that Scala's own value
+    /// classes define. Only an operator spelled entirely from Scala's
+    /// operator characters over a receiver whose type is a primitive or
+    /// `String` selects a language-defined member, so anything else is left
+    /// undetermined.
+    fn infix_result_type_identity(&self, node: Node<'tree>) -> Option<Arc<[String]>> {
+        let source = self.prepared.source();
+        let operator = node_text(source, node.child_by_field_name("operator")?)?;
+        if !scala_operator_is_language_defined(operator) {
+            return None;
+        }
+        let left = self.expression_type_identity(node.child_by_field_name("left")?)?;
+        let [receiver] = left.as_ref() else {
+            return None;
+        };
+        if !scala_type_name_is_language_defined(receiver) {
+            return None;
+        }
+        if scala_operator_yields_boolean(operator) {
+            return Some(Arc::from(vec!["Boolean".to_string()].into_boxed_slice()));
+        }
+        // Widening (`Int + Double`) and `String + Any` both change the
+        // result type, so only an operation over one type answers.
+        let right = self.expression_type_identity(required_runtime_field(node, "right").ok()?)?;
+        (right == left).then_some(left)
+    }
+
+    fn throw_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let argument = first_runtime_named_child(node)
+            .ok_or_else(|| missing_field(node, "exception expression"))?;
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let source = self.expression_value(builder, argument, expression_value_kind(argument))?;
+        let value = self.value(builder, terminal, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: value,
+                value: source,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Throw { value: Some(value) },
+        )?;
+        self.abrupt_throw(builder, terminal, scope, value, stack)?;
+        stack.push(Work::Expression {
+            node: argument,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
+    }
+
+    fn unimplemented_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(terminal))?;
+        let value = self.source_value(builder, node, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Throw { value: Some(value) },
+        )?;
+        self.abrupt_throw(builder, terminal, scope, value, stack)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        if let Some((base_node, index_node)) = self.array_index_access(node) {
+            return self.array_element_load(
+                builder, node, base_node, index_node, entry, next, scope, stack,
+            );
+        }
+        let (function, mut argument_lists) = flattened_call_parts(node)?;
+        let constructor_application = function.kind() == "instance_expression";
+        if constructor_application && self.constructs_language_defined_array(function) {
+            let mut lengths = function
+                .child_by_field_name("arguments")
+                .map(runtime_expression_children)
+                .unwrap_or_default();
+            for arguments in &argument_lists {
+                lengths.extend(runtime_expression_children(*arguments));
+            }
+            return self.array_allocation(builder, node, &lengths, entry, next, scope, stack);
+        }
+        if constructor_application
+            && let Some(arguments) = function.child_by_field_name("arguments")
+        {
+            argument_lists.insert(0, arguments);
+        }
+        let callable = normalized_callable_expression(function)?;
+        let argument_nodes = argument_lists
+            .iter()
+            .flat_map(|arguments| semantic_argument_nodes(*arguments))
+            .collect::<Vec<_>>();
+        if callable.kind() == "identifier"
+            && node_text(self.prepared.source(), callable) == Some("???")
+        {
+            return self.unimplemented_call(builder, node, entry, scope, stack);
+        }
+        if let Some((constructor, payload_node)) =
+            self.value_class_construction(function, callable, &argument_nodes)
+        {
+            let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+            let payload =
+                self.expression_value(builder, payload_node, expression_value_kind(payload_node))?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.emit_value_class_wrap(
+                builder,
+                invoke,
+                next,
+                scope,
+                stack,
+                payload,
+                result,
+                node,
+                constructor,
+            )?;
+            let mut evaluations = vec![payload_node];
+            if let Some(receiver) = scala_bound_receiver(callable) {
+                evaluations.insert(0, receiver);
+            }
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &evaluations,
+                EdgeTarget::normal(invoke),
+                scope,
+                stack,
+            );
+        }
+        let has_structured_argument = argument_lists
+            .iter()
+            .any(|arguments| has_structured_by_name_argument(*arguments));
+        let curried = argument_lists.len() > 1;
+        let has_implicit_arguments = argument_lists
+            .iter()
+            .any(|arguments| contains_token(*arguments, "using"));
+        let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+        let normal = self.session.add_node_point(builder, node, Vec::new())?;
+        let exceptional = self.session.add_node_point(builder, node, Vec::new())?;
+        let callee = self.source_value(builder, callable, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, callable, SemanticValueKind::Exception)?;
+        let receiver_node = (!constructor_application)
+            .then(|| scala_bound_receiver(callable))
+            .flatten();
+        let receiver = receiver_node
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
+            .transpose()?;
+        let callable_kind = if constructor_application {
+            CallableReferenceKind::Constructor
+        } else if receiver.is_some() {
+            CallableReferenceKind::BoundMethod
+        } else {
+            CallableReferenceKind::Function
+        };
+        let resolution = CallableTargetResolution::Unknown;
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: receiver,
+                    environment: None,
+                },
+            },
+        )?;
+        let arguments = argument_nodes
+            .iter()
+            .map(
+                |argument| -> Result<SemanticCallArgument, ScalaLoweringError> {
+                    let written = self.call_argument(builder, *argument)?;
+                    // A contextual (`using`) list inserts arguments this syntax
+                    // never wrote, so the written rows carry no proven domain.
+                    Ok(if has_implicit_arguments {
+                        SemanticCallArgument::unclassified(written.value)
+                    } else {
+                        written
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: arguments.into(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        if constructor_application {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
+        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        if !constructor_application {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "application may dispatch through a virtual member or callable value; static/final dispatch and complete override coverage require type refinement",
+            )?;
+        }
+
+        if curried || has_implicit_arguments {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Point,
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "actual-to-formal binding across curried or contextual parameter lists is not represented",
+            )?;
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "curried application and contextual argument insertion require dispatch refinement",
+            )?;
+        }
+
+        if !argument_nodes.is_empty() {
+            if has_structured_argument {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::CALL_EVALUATION,
+                    SemanticGapKind::Unknown,
+                    "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved",
+                )?;
+            } else {
+                // Ordinary arguments are lowered strictly: every expression
+                // is scheduled before the invoke. The resolved signature
+                // answers whether that is right, so the gap declares a
+                // call-resolution discharge; a callee that defers evaluation
+                // (a by-name parameter) carries its own procedure-level gap,
+                // which keeps every binding to it open and the discharge
+                // unearned.
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::NONE,
+                    SemanticGapKind::Unknown,
+                    SemanticGapDischarge::CallResolution,
+                    "argument evaluation strictness depends on the resolved Scala parameter signature",
+                )?;
+            }
+        }
+        if is_future_like_call(self.prepared.source(), callable) {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::ConcurrentSpawn,
+                SemanticGapKind::Unknown,
+                "Future-style execution-context scheduling is not lowered",
+            )?;
+            if argument_nodes.is_empty() {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    invoke,
+                    SemanticGapSubject::CallSite(call_site),
+                    SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::CALL_EVALUATION,
+                    SemanticGapKind::Unknown,
+                    "Future body execution timing is not lowered",
+                )?;
+            }
+        }
+
+        let mut evaluations = Vec::with_capacity(argument_nodes.len() + 1);
+        if !constructor_application {
+            // A selection in callee position is the call's own member
+            // selection, which the call site already represents; only its
+            // receiver is a separate operand to evaluate. Lowering it as a
+            // member read instead would mint a second, unresolvable field
+            // location for the method the call already names -- Java's
+            // `method_invocation` schedules the `object`, never a synthetic
+            // field access.
+            evaluations.push(receiver_node.unwrap_or(function));
+        }
+        for arguments in &argument_lists {
+            if !has_structured_by_name_argument(*arguments) {
+                // A named argument evaluates its right-hand side. Scheduling
+                // the `assignment_expression` itself lowered the label as a
+                // store to a same-named binding in the caller's scope.
+                evaluations.extend(
+                    runtime_expression_children(*arguments)
+                        .into_iter()
+                        .map(call_argument_value_node),
+                );
+            }
+        }
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(invoke),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn instance_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let arguments = node
+            .child_by_field_name("arguments")
+            .map(runtime_expression_children)
+            .unwrap_or_default();
+        if self.constructs_language_defined_array(node) {
+            return self.array_allocation(builder, node, &arguments, entry, next, scope, stack);
+        }
+        if let Some((constructor, payload_node)) =
+            self.value_class_construction(node, node, &arguments)
+        {
+            let invoke = self.session.add_node_point(builder, node, Vec::new())?;
+            let payload =
+                self.expression_value(builder, payload_node, expression_value_kind(payload_node))?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.emit_value_class_wrap(
+                builder,
+                invoke,
+                next,
+                scope,
+                stack,
+                payload,
+                result,
+                node,
+                constructor,
+            )?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &[payload_node],
+                EdgeTarget::normal(invoke),
+                scope,
+                stack,
+            );
+        }
+        self.call_like_expression(
+            builder,
+            node,
+            entry,
+            next,
+            scope,
+            node,
+            CallableReferenceKind::Constructor,
+            &arguments,
+            &arguments,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infix_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_runtime_field(node, "right")?;
+        let operator = required_field(node, "operator")?;
+        let operator_name = node_text(self.prepared.source(), operator);
+        if operator_name.is_some_and(scala_compound_assignment_operator)
+            && let Some((target, kind)) = self.lexical_assignment_target(left)
+            && self.infix_result_type_identity(node).is_some()
+        {
+            return self.compound_assignment_operation(
+                builder, node, entry, next, scope, left, right, target, kind, stack,
+            );
+        }
+        // An operator that Scala itself defines on a value-class receiver
+        // dispatches nowhere: its result is a language-defined function of its
+        // operands, exactly as Java lowers `binary_expression`. Minting a call
+        // site for it would publish a callee that no whole-program refinement
+        // can ever resolve, which keeps every enclosing procedure open.
+        if self.infix_result_type_identity(node).is_some() {
+            return self.language_defined_operation(
+                builder,
+                node,
+                entry,
+                next,
+                scope,
+                &[left, right],
+                stack,
+            );
+        }
+        if left.kind() == "infix_expression" || right.kind() == "infix_expression" {
+            let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unknown,
+                "compound infix result identity requires precedence and dispatch refinement",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "compound infix method dispatch is not emitted from an unrefined parse grouping",
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "exceptions from compound infix dispatch require precedence and target refinement",
+            )?;
+            // The grouping's dispatch stays unproven, but its operands do
+            // execute and the group does complete normally. Withholding the
+            // edge instead severed the procedure's control flow below this
+            // point, which is a strictly worse claim than an open result.
+            self.session.add_target_edge(builder, terminal, next)?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &[left, right],
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            );
+        }
+        let right_associative = operator_name.is_some_and(|name| name.ends_with(':'));
+        let arguments = if right_associative {
+            vec![left]
+        } else {
+            vec![right]
+        };
+        let evaluations = vec![left, right];
+        self.call_like_expression(
+            builder,
+            node,
+            entry,
+            next,
+            scope,
+            operator,
+            CallableReferenceKind::BoundMethod,
+            &arguments,
+            &evaluations,
+            stack,
+        )
+    }
+
+    /// Lower an operator whose meaning the language fixes: each operand flows
+    /// into the result at one terminal point, no call site is minted, and no
+    /// callable-reference gap is opened.
+    #[allow(clippy::too_many_arguments)]
+    fn language_defined_operation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        operands: &[Node<'tree>],
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let sources = operands
+            .iter()
+            .map(|operand| {
+                self.expression_value(builder, *operand, expression_value_kind(*operand))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .append_language_defined_value_flows(builder, terminal, sources, result)?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            operands,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compound_assignment_operation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        left: Node<'tree>,
+        right: Node<'tree>,
+        target: ValueId,
+        kind: ValueFlowKind,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let source = self.expression_value(builder, right, expression_value_kind(right))?;
+        self.session.append_language_defined_value_flows(
+            builder,
+            terminal,
+            [target, source],
+            result,
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target,
+                value: result,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind,
+                source: result,
+                target,
+            },
+        )?;
+        self.session.record_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Value(target),
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "Scala compound assignment may wrap or select an overloaded update",
+        )?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[left, right],
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn postfix_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let children = runtime_expression_children(node);
+        let operator = children
+            .last()
+            .copied()
+            .ok_or_else(|| missing_field(node, "postfix operator"))?;
+        let evaluations = children[..children.len().saturating_sub(1)].to_vec();
+        self.call_like_expression(
+            builder,
+            node,
+            entry,
+            next,
+            scope,
+            operator,
+            CallableReferenceKind::BoundMethod,
+            &[],
+            &evaluations,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefix_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let operand =
+            first_runtime_named_child(node).ok_or_else(|| missing_field(node, "prefix operand"))?;
+        self.call_like_expression(
+            builder,
+            node,
+            entry,
+            next,
+            scope,
+            node,
+            CallableReferenceKind::BoundMethod,
+            &[],
+            &[operand],
+            stack,
+        )
+    }
+
+    /// Lower one written call argument into its call-site row.
+    ///
+    /// Scala spells a named argument as an `assignment_expression` inside the
+    /// invocation's argument list. The label names a formal at the callee and
+    /// the passed value is the right-hand side, so the row binds that value
+    /// and carries the label; binding the assignment node instead published a
+    /// value identity no formal ever receives (#2959). Every other argument,
+    /// including an assignment whose left side is not a plain name and is
+    /// therefore a unit-typed assignment expression, stays positional and
+    /// binds the argument node itself.
+    fn call_argument(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        argument: Node<'tree>,
+    ) -> Result<SemanticCallArgument, ScalaLoweringError> {
+        let Some((keyword, passed)) = named_call_argument_parts(argument) else {
+            let value =
+                self.expression_value(builder, argument, expression_value_kind(argument))?;
+            return Ok(SemanticCallArgument::direct(
+                value,
+                ArgumentDomain::Positional,
+            ));
+        };
+        let value = self.expression_value(builder, passed, expression_value_kind(passed))?;
+        let name = node_text(self.prepared.source(), keyword).ok_or_else(|| {
+            ScalaLoweringError::Invalid(
+                "Scala named argument label does not lie on a source boundary".into(),
+            )
+        })?;
+        Ok(SemanticCallArgument::keyword(value, name))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_like_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        source_node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        function: Node<'tree>,
+        callable_kind: CallableReferenceKind,
+        argument_nodes: &[Node<'tree>],
+        evaluations: &[Node<'tree>],
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let invoke = self
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let normal = self
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let exceptional = self
+            .session
+            .add_node_point(builder, source_node, Vec::new())?;
+        let callee = self.source_value(builder, function, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, source_node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, function, SemanticValueKind::Exception)?;
+        let receiver_node = (callable_kind == CallableReferenceKind::BoundMethod)
+            .then(|| scala_call_like_receiver(source_node, function, self.prepared.source()))
+            .flatten();
+        let receiver = receiver_node
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
+            .transpose()?;
+        let resolution = CallableTargetResolution::Unknown;
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: receiver,
+                    environment: None,
+                },
+            },
+        )?;
+        let arguments = argument_nodes
+            .iter()
+            .map(|argument| self.call_argument(builder, *argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: arguments.into(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        if callable_kind == CallableReferenceKind::Constructor {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
+        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        if receiver.is_some() {
+            self.session.record_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "operator or postfix dispatch may select an override; receiver type and complete target coverage require type refinement",
+            )?;
+        }
+        if !argument_nodes.is_empty() {
+            // Strict operator/postfix argument evaluation with the same
+            // call-resolution discharge as in `call_expression`.
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DeferredExecution,
+                SemanticGapImpacts::NONE,
+                SemanticGapKind::Unknown,
+                SemanticGapDischarge::CallResolution,
+                "argument evaluation strictness depends on the resolved Scala parameter signature",
+            )?;
+        }
+        let evaluations = evaluations
+            .iter()
+            .copied()
+            .map(call_argument_value_node)
+            .collect::<Vec<_>>();
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(invoke),
+            scope,
+            stack,
+        )
+    }
+
+    fn callable_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session.record_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::CallableReferences,
+            SemanticGapKind::Unknown,
+            "nested callable target and captured environment mapping require dispatch refinement",
+        )?;
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn unsupported_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        detail: &str,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session.record_gap(
+            builder,
+            entry,
+            SemanticGapSubject::Point,
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unsupported,
+            detail,
+        )?;
+        if node.named_child_count() > 0 {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "unlowered structured children may contain implicit or explicit calls",
+            )?;
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "exceptions from unlowered structured children require refinement",
+            )?;
+        }
+        self.session.add_target_edge(builder, entry, next)
+    }
+
+    fn schedule_statements(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        if children.is_empty() {
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let entries = children
+            .iter()
+            .map(|child| self.session.add_node_point(builder, *child, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
+    }
+
+    fn schedule_expressions(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        children: &[Node<'tree>],
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        if children.is_empty() {
+            return self.session.add_target_edge(builder, entry, next);
+        }
+        let entries = children
+            .iter()
+            .map(|child| self.session.add_node_point(builder, *child, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .add_target_edge(builder, entry, EdgeTarget::normal(entries[0]))?;
+        schedule_sequential_work(
+            stack,
+            children,
+            &entries,
+            next,
+            scope,
+            |_, node, entry, next, scope| Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            },
+        );
+        Ok(())
+    }
+
+    fn abrupt(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        scope: ScopeFrameId,
+        kind: CompletionKind,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let route = builder
+            .resolve_completion(scope, &CompletionRequest::new(kind, None))
+            .ok_or_else(|| {
+                ScalaLoweringError::Invalid(format!(
+                    "{kind:?} completion has no structured continuation"
+                ))
+            })?;
+        self.route(builder, from, &route, stack)
+    }
+
+    /// Route a `throw` to its structured continuation, binding the thrown
+    /// value to the destination handler's catch parameter when that handler
+    /// registered one. Java's `abrupt_throw` performs the same binding.
+    fn abrupt_throw(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        scope: ScopeFrameId,
+        value: ValueId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let Some((route, effect)) =
+            brokk_bifrost_analysis::analyzer::semantic::cfg::resolve_abrupt_throw(
+                builder,
+                scope,
+                value,
+                &self.catch_binders,
+            )
+        else {
+            return Err(ScalaLoweringError::Invalid(
+                "throw completion has no structured continuation".to_string(),
+            ));
+        };
+        if let Some(effect) = effect {
+            self.append_effect(builder, from, effect)?;
+        }
+        self.route(builder, from, &route, stack)
+    }
+
+    fn route(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        route: &CompletionRoute,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), ScalaLoweringError> {
+        let mut plan = CleanupRoutePlanner::new(route);
+        while let Some(step) = plan.next(
+            builder,
+            &mut self.session,
+            &self.cleanups,
+            |region| region.id,
+            |region| region.body,
+        )? {
+            let cleanup_next =
+                self.session
+                    .cleanup_next_target(builder, step.region.body, step.next)?;
+            stack.push(Work::Expression {
+                node: step.region.body,
+                entry: step.entry,
+                next: cleanup_next,
+                scope: step.region.outer_scope,
+            });
+        }
+        self.session.add_target_edge(builder, from, plan.target())
+    }
+
+    fn resolution_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callee: ValueId,
+        call_site: CallSiteId,
+        resolution: &CallableTargetResolution,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session.add_callable_resolution_gaps(
+            builder,
+            point,
+            callee,
+            call_site,
+            resolution,
+            "callable target requires whole-program Scala dispatch refinement",
+            "call target requires whole-program Scala dispatch refinement",
+        )
+    }
+
+    fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, ScalaLoweringError> {
+        self.session.metadata(point)
+    }
+
+    fn value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ScalaLoweringError> {
+        self.session.add_value(builder, point, kind)
+    }
+
+    fn append_effect(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        effect: SemanticEffect,
+    ) -> Result<(), ScalaLoweringError> {
+        self.session.append_effect(builder, point, effect)
+    }
+}
+
+fn is_scala_nested_execution_boundary(node: Node<'_>) -> bool {
+    // A `match` or `catch` case block executes inline in the enclosing
+    // procedure -- `expression` lowers exactly those through `case_dispatch`
+    // rather than through `callable_value` -- so its arms' bindings belong to
+    // the enclosing procedure's binding table, not behind a boundary.
+    if node.kind() == "case_block" {
+        return case_block_is_partial_function(node);
+    }
+    matches!(
+        node.kind(),
+        "function_definition"
+            | "lambda_expression"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "given_definition"
+    )
+}
+
+fn scala_nested_rebinds_name(root: Node<'_>, name: &str, source: &str) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.id() != root.id() && is_scala_nested_execution_boundary(node) {
+            if scala_nested_boundary_rebinds_name(node, name, source) {
+                return true;
+            }
+            continue;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+fn scala_nested_boundary_rebinds_name(boundary: Node<'_>, name: &str, source: &str) -> bool {
+    let mut stack = vec![boundary];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "assignment_expression"
+            && node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("target"))
+                .is_some_and(|left| {
+                    left.kind() == "identifier"
+                        && node_text(source, left) == Some(name)
+                        && !scala_assignment_name_is_shadowed(left, boundary, name, source)
+                })
+        {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+fn scala_assignment_name_is_shadowed(
+    assignment_target: Node<'_>,
+    boundary: Node<'_>,
+    name: &str,
+    source: &str,
+) -> bool {
+    let mut current = assignment_target.parent();
+    while let Some(node) = current {
+        if node.id() == boundary.id() {
+            return false;
+        }
+        if is_scala_nested_execution_boundary(node)
+            && scala_callable_has_parameter_named(node, name, source)
+        {
+            return true;
+        }
+        if matches!(node.kind(), "block" | "indented_block")
+            && named_children(node).into_iter().any(|child| {
+                child.start_byte() < assignment_target.start_byte()
+                    && matches!(child.kind(), "val_definition" | "var_definition")
+                    && child
+                        .child_by_field_name("pattern")
+                        .and_then(|pattern| node_text(source, pattern))
+                        == Some(name)
+            })
+        {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn scala_callable_has_parameter_named(callable: Node<'_>, name: &str, source: &str) -> bool {
+    callable
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| {
+            subtree_contains(parameters, |node| {
+                node.kind() == "parameter"
+                    && node
+                        .child_by_field_name("name")
+                        .or_else(|| node.child_by_field_name("pattern"))
+                        .and_then(|parameter_name| node_text(source, parameter_name))
+                        == Some(name)
+            })
+        })
+}
+
+fn scala_local_scope(node: Node<'_>, procedure_body: Node<'_>) -> Option<(usize, usize)> {
+    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |parent| {
+        matches!(
+            parent.kind(),
+            "block"
+                | "indented_block"
+                | "case_clause"
+                | "catch_clause"
+                | "for_expression"
+                | "while_expression"
+                | "do_while_expression"
+        ) || parent.id() == procedure_body.id()
+            || is_scala_nested_execution_boundary(parent)
+    })
+    .map(|scope| (scope.start_byte(), scope.end_byte()))
+}
+
+fn enclosing_extension_definition(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "extension_definition" => return Some(parent),
+            "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "function_definition"
+            | "lambda_expression" => return None,
+            _ => node = parent,
+        }
+    }
+    None
+}
+
+fn implicit_result_node(mut body: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if !matches!(
+            body.kind(),
+            "block" | "indented_block" | "template_body" | "with_template_body"
+        ) {
+            return Some(body);
+        }
+        body = runtime_statement_children(body).into_iter().next_back()?;
+    }
+}
+
+fn scala_constructed_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let instance = match node.kind() {
+        "instance_expression" => node,
+        "call_expression" => node
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "instance_expression")?,
+        _ => return None,
+    };
+    instance.child_by_field_name("type").or_else(|| {
+        named_children(instance).into_iter().find(|child| {
+            !matches!(
+                child.kind(),
+                "arguments" | "template_body" | "block" | "indented_block"
+            )
+        })
+    })
+}
+
+fn scala_type_nodes_have_same_identity(left: Node<'_>, right: Node<'_>, source: &str) -> bool {
+    let left = brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(left, source);
+    !left.is_empty()
+        && left == brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(right, source)
+}
+
+enum ScalaStructuredTypeFrame<'tree> {
+    Visit(Node<'tree>),
+    Generic { argument_count: usize },
+}
+
+/// Preserve Scala's nominal generic type shape using only parser fields. This
+/// accepts the JVM declaration producer's unambiguous type-position subset
+/// plus expression-position equivalents (`identifier`, `field_expression`, and
+/// `generic_function`), such as `new a.B` and `f[T]`, that map to the same
+/// nominal identities. It returns no identity for aliases, refinements,
+/// wildcards, or value-dependent types.
+fn scala_structured_type_identity(
+    node: Node<'_>,
+    source: &str,
+    callable: Node<'_>,
+) -> Option<StructuredTypeIdentity> {
+    let lexical_scope =
+        brokk_bifrost_jvm::scala::declarations::scala_callable_lexical_scope(callable, source)?;
+    let mut frames = vec![ScalaStructuredTypeFrame::Visit(node)];
+    let mut values = Vec::new();
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ScalaStructuredTypeFrame::Visit(current) => match current.kind() {
+                "identifier"
+                | "type_identifier"
+                | "stable_type_identifier"
+                | "field_expression" => {
+                    values.push(builder.named(scala_structured_named_type(
+                        current,
+                        source,
+                        &lexical_scope,
+                    )?)?);
+                }
+                "generic_type" | "generic_function" => {
+                    let base = current
+                        .child_by_field_name("type")
+                        .or_else(|| current.child_by_field_name("function"))?;
+                    let arguments = current.child_by_field_name("type_arguments")?;
+                    let argument_nodes = named_children(arguments);
+                    if argument_nodes.is_empty() {
+                        return None;
+                    }
+                    frames.push(ScalaStructuredTypeFrame::Generic {
+                        argument_count: argument_nodes.len(),
+                    });
+                    frames.extend(
+                        argument_nodes
+                            .into_iter()
+                            .rev()
+                            .map(ScalaStructuredTypeFrame::Visit),
+                    );
+                    frames.push(ScalaStructuredTypeFrame::Visit(base));
+                }
+                "annotated_type" => {
+                    let types = named_children(current)
+                        .into_iter()
+                        .filter(|child| child.kind() != "annotation")
+                        .collect::<Vec<_>>();
+                    let [base] = types.as_slice() else {
+                        return None;
+                    };
+                    frames.push(ScalaStructuredTypeFrame::Visit(*base));
+                }
+                _ => return None,
+            },
+            ScalaStructuredTypeFrame::Generic { argument_count } => {
+                let value_count = argument_count.checked_add(1)?;
+                let start = values.len().checked_sub(value_count)?;
+                let mut built = values.split_off(start);
+                let base = built.remove(0);
+                values.push(builder.generic(base, built)?);
+            }
+        }
+    }
+    (values.len() == 1)
+        .then(|| values.pop())
+        .flatten()
+        .and_then(|root| builder.finish(root))
+}
+
+fn scala_structured_named_type(
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeName> {
+    let mut path = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                let segment = node_text(source, current)?.trim();
+                if segment.is_empty() {
+                    return None;
+                }
+                path.push(segment.to_owned());
+            }
+            "stable_identifier" | "stable_type_identifier" | "field_expression" => {
+                let mut children = named_children(current);
+                children.reverse();
+                stack.extend(children);
+            }
+            _ => return None,
+        }
+    }
+    let absolute = path.first().is_some_and(|segment| segment == "_root_");
+    if absolute {
+        path.remove(0);
+    }
+    StructuredTypeName::new(path, lexical_scope.to_vec(), absolute)
+}
+
+fn callable_has_simple_parameter_shape(callable: Node<'_>) -> bool {
+    let mut parameter_lists = 0;
+    for child in named_children(callable) {
+        match child.kind() {
+            "type_parameters" => return false,
+            "parameters" => {
+                parameter_lists += 1;
+                if parameter_lists > 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn scala_literal_has_declared_identity_type(
+    declared: Node<'_>,
+    expression: Node<'_>,
+    source: &str,
+) -> bool {
+    let declared_segments =
+        brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(declared, source);
+    let Some(expected) = scala_literal_type_name(source, expression) else {
+        return false;
+    };
+    if declared_segments
+        .last()
+        .is_some_and(|segment| segment == expected)
+    {
+        return true;
+    }
+    let Some(declared_scalar) = scala_scalar_type_for_type(source, declared) else {
+        return false;
+    };
+    let Some(literal_scalar) = scala_scalar_type_for_literal(source, expression) else {
+        return false;
+    };
+    let Some(literal_kind) = scala_scalar_literal_value_kind(source, expression) else {
+        return false;
+    };
+    match declared_scalar {
+        DeclaredScalarType::Boolean => matches!(literal_kind, SemanticValueKind::Boolean(_)),
+        DeclaredScalarType::Signed(bits) => {
+            let literal_bits = match literal_scalar {
+                DeclaredScalarType::Signed(bits) => bits,
+                DeclaredScalarType::Boolean | DeclaredScalarType::Unsigned(_) => return false,
+            };
+            if !matches!((bits, literal_bits), (64, 32 | 64) | (8 | 16 | 32, 32)) {
+                return false;
+            }
+            let value = match literal_kind {
+                SemanticValueKind::SignedInteger(value) => value,
+                SemanticValueKind::UnsignedInteger(value) => match i128::try_from(value) {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                },
+                _ => return false,
+            };
+            let (minimum, maximum) = match bits {
+                8 => (i8::MIN as i128, i8::MAX as i128),
+                16 => (i16::MIN as i128, i16::MAX as i128),
+                32 => (i32::MIN as i128, i32::MAX as i128),
+                64 => (i64::MIN as i128, i64::MAX as i128),
+                _ => return false,
+            };
+            (minimum..=maximum).contains(&value)
+        }
+        DeclaredScalarType::Unsigned(_) => false,
+    }
+}
+
+/// Whether a type names one of the Scala value classes (or `String`) whose
+/// operator members the language defines, rather than a user type that can
+/// give an operator its own meaning.
+fn scala_type_name_is_language_defined(name: &str) -> bool {
+    matches!(
+        name,
+        "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Char" | "Boolean" | "String"
+    )
+}
+
+/// Whether an operator is spelled entirely from Scala's operator characters,
+/// so that on a value-class receiver it names a language-defined member.
+///
+/// `/` and `%` are excluded: integral division aborts on a zero divisor, and
+/// that abort edge is only lowered on the dispatched-call path.
+fn scala_operator_is_language_defined(operator: &str) -> bool {
+    !operator.is_empty()
+        && !matches!(operator, "/" | "%")
+        && operator
+            .chars()
+            .all(|character| "+-*/%<>=!&|^~".contains(character))
+}
+
+fn scala_compound_assignment_operator(operator: &str) -> bool {
+    matches!(
+        operator,
+        "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | ">>>=" | "&=" | "|=" | "^="
+    )
+}
+
+fn scala_operator_yields_boolean(operator: &str) -> bool {
+    matches!(
+        operator,
+        "<" | ">" | "<=" | ">=" | "==" | "!=" | "&&" | "||"
+    )
+}
+
+/// Whether the nearest template enclosing `callable` declares parents, whose
+/// members this compilation unit does not show.
+fn enclosing_template_declares_parents(callable: Node<'_>) -> bool {
+    let mut current = callable;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) {
+            return parent.child_by_field_name("extend").is_some();
+        }
+        current = parent;
+    }
+    false
+}
+
+fn scala_function_definitions_named<'tree>(
+    root: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Vec<Node<'tree>> {
+    scala_definitions_named(root, name, source, &["function_definition"])
+}
+
+fn scala_definitions_named<'tree>(
+    root: Node<'tree>,
+    name: &str,
+    source: &str,
+    kinds: &[&str],
+) -> Vec<Node<'tree>> {
+    let mut found = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if kinds.contains(&node.kind())
+            && node
+                .child_by_field_name("name")
+                .and_then(|declared| node_text(source, declared))
+                == Some(name)
+        {
+            found.push(node);
+        }
+        stack.extend(named_children(node));
+    }
+    found
+}
+
+/// Whether a definition is written directly in a template body, which makes
+/// it that template's member rather than a block-local binding.
+fn is_scala_template_member(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| matches!(parent.kind(), "template_body" | "with_template_body"))
+}
+
+/// The class-like definitions this compilation unit declares under `name`.
+fn scala_type_definitions_named<'tree>(
+    root: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Vec<Node<'tree>> {
+    scala_definitions_named(
+        root,
+        name,
+        source,
+        &[
+            "class_definition",
+            "object_definition",
+            "trait_definition",
+            "enum_definition",
+        ],
+    )
+}
+
+fn unique_node<'tree>(mut nodes: Vec<Node<'tree>>) -> Option<Node<'tree>> {
+    let node = nodes.pop()?;
+    nodes.is_empty().then_some(node)
+}
+
+/// The `val` or `var` definition a template declares directly for `member`.
+fn scala_template_value_member<'tree>(
+    template: Node<'tree>,
+    member: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let body = template.child_by_field_name("body")?;
+    let declarations = named_children(body)
+        .into_iter()
+        .filter(|child| {
+            matches!(child.kind(), "val_definition" | "var_definition")
+                && child
+                    .child_by_field_name("pattern")
+                    .and_then(|pattern| node_text(source, pattern))
+                    == Some(member)
+        })
+        .collect::<Vec<_>>();
+    unique_node(declarations)
+}
+
+/// The element type argument of a written `Array[T]` type node.
+fn scala_array_element_type_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if node.kind() != "generic_type" {
+        return None;
+    }
+    let base = node.child_by_field_name("type")?;
+    if brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(base, source)
+        .last()
+        .map(String::as_str)
+        != Some("Array")
+    {
+        return None;
+    }
+    let arguments = node.child_by_field_name("type_arguments")?;
+    named_children(arguments).into_iter().next()
+}
+
+/// The binder and its written type in a `case name: T =>` pattern.
+fn typed_pattern_binding(pattern: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    if pattern.kind() != "typed_pattern" {
+        return None;
+    }
+    let binder = pattern.child_by_field_name("pattern")?;
+    if binder.kind() != "identifier" {
+        return None;
+    }
+    Some((binder, pattern.child_by_field_name("type")?))
+}
+
+fn scala_bound_receiver(callable: Node<'_>) -> Option<Node<'_>> {
+    (callable.kind() == "field_expression")
+        .then(|| callable.child_by_field_name("value"))
+        .flatten()
+}
+
+fn scala_call_like_receiver<'tree>(
+    source_node: Node<'tree>,
+    function: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if let Some(receiver) = scala_bound_receiver(function) {
+        return Some(receiver);
+    }
+    match source_node.kind() {
+        "infix_expression" => {
+            let field =
+                if infix_operator(source, source_node).is_some_and(|name| name.ends_with(':')) {
+                    "right"
+                } else {
+                    "left"
+                };
+            source_node.child_by_field_name(field)
+        }
+        "postfix_expression" => {
+            let mut cursor = source_node.walk();
+            source_node
+                .named_children(&mut cursor)
+                .find(|child| child.end_byte() <= function.start_byte())
+        }
+        "prefix_expression" => first_runtime_named_child(source_node),
+        _ => None,
+    }
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "function_definition" | "lambda_expression" | "case_block" => SemanticValueKind::Callable,
+        "integer_literal"
+        | "floating_point_literal"
+        | "boolean_literal"
+        | "character_literal"
+        | "string"
+        | "symbol_literal"
+        | "null_literal"
+        | "unit" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        is_runtime_node(child.kind())
+    })
+}
+
+fn required_field<'tree>(
+    node: Node<'tree>,
+    field: &str,
+) -> Result<Node<'tree>, ScalaLoweringError> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::required_field_or_else(
+        node,
+        field,
+        missing_field,
+    )
+}
+
+fn required_runtime_field<'tree>(
+    node: Node<'tree>,
+    field: &str,
+) -> Result<Node<'tree>, ScalaLoweringError> {
+    children_by_field_name(node, field)
+        .into_iter()
+        .find(|child| child.is_named() && is_runtime_node(child.kind()))
+        .ok_or_else(|| missing_field(node, field))
+}
+
+fn infix_operator<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
+    node.child_by_field_name("operator")
+        .and_then(|operator| node_text(source, operator))
+}
+
+fn scala_condition_anchor<'tree>(mut node: Node<'tree>) -> Node<'tree> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(inner) = first_runtime_named_child(node) else {
+            break;
+        };
+        node = inner;
+    }
+    node
+}
+
+fn flattened_call_parts<'tree>(
+    node: Node<'tree>,
+) -> Result<(Node<'tree>, Vec<Node<'tree>>), ScalaLoweringError> {
+    let mut current = node;
+    let mut argument_lists = Vec::new();
+    loop {
+        argument_lists.push(required_field(current, "arguments")?);
+        let function = required_field(current, "function")?;
+        if function.kind() == "call_expression" {
+            current = function;
+        } else {
+            argument_lists.reverse();
+            return Ok((function, argument_lists));
+        }
+    }
+}
+
+fn normalized_callable_expression(mut node: Node<'_>) -> Result<Node<'_>, ScalaLoweringError> {
+    while node.kind() == "generic_function" {
+        node = required_field(node, "function")?;
+    }
+    Ok(node)
+}
+
+/// The label and passed value of a Scala named call argument.
+///
+/// The shape test is structural and belongs to the shared Scala layer: the
+/// assignment must sit directly in an invocation's argument list
+/// (`is_scala_named_argument_assignment`) and its left side must be a plain
+/// name (`named_argument_parts`). `x.y = 1` written as an argument satisfies
+/// neither and stays the unit-typed assignment expression it is.
+fn named_call_argument_parts<'tree>(argument: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    is_scala_named_argument_assignment(argument)
+        .then(|| named_argument_parts(argument))
+        .flatten()
+}
+
+/// The expression a written call argument evaluates.
+fn call_argument_value_node(argument: Node<'_>) -> Node<'_> {
+    named_call_argument_parts(argument).map_or(argument, |(_, passed)| passed)
+}
+
+fn semantic_argument_nodes(arguments: Node<'_>) -> Vec<Node<'_>> {
+    if has_structured_by_name_argument(arguments) {
+        vec![arguments]
+    } else {
+        runtime_expression_children(arguments)
+    }
+}
+
+fn runtime_statement_children(node: Node<'_>) -> Vec<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| {
+            !matches!(
+                child.kind(),
+                "comment" | "line_comment" | "block_comment" | "self_type"
+            )
+        })
+        .collect()
+}
+
+fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| is_runtime_node(child.kind()))
+        .collect()
+}
+
+/// Return executable expressions from structured parent-constructor argument
+/// lists. Curried trailing lists are unfielded children of `extends_clause`,
+/// so collect every direct `arguments` child in source order.
+fn parent_argument_expressions(extends_clause: Node<'_>) -> Vec<Node<'_>> {
+    named_children(extends_clause)
+        .into_iter()
+        .filter(|child| child.kind() == "arguments")
+        .flat_map(runtime_expression_children)
+        .collect()
+}
+
+fn case_arms(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut arms = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "case_clause" {
+            arms.push(current);
+            continue;
+        }
+        let children = named_children(current);
+        for child in children.into_iter().rev() {
+            if matches!(
+                child.kind(),
+                "case_block" | "indented_cases" | "case_clause"
+            ) {
+                stack.push(child);
+            }
+        }
+    }
+    arms.sort_by_key(Node::start_byte);
+    arms
+}
+
+fn catch_arms(catch_clause: Node<'_>) -> Vec<Node<'_>> {
+    let nested = case_arms(catch_clause);
+    if nested.is_empty()
+        && (catch_clause.child_by_field_name("body").is_some()
+            || catch_clause.child_by_field_name("pattern").is_some())
+    {
+        vec![catch_clause]
+    } else {
+        nested
+    }
+}
+
+fn case_pattern(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("pattern")
+}
+
+fn case_guard(node: Node<'_>) -> Option<Node<'_>> {
+    first_named_child_of_kind(node, "guard")
+}
+
+fn case_body_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let bodies = children_by_field_name(node, "body")
+        .into_iter()
+        .filter(|child| child.is_named() && is_runtime_node(child.kind()))
+        .collect::<Vec<_>>();
+    if !bodies.is_empty() {
+        return bodies;
+    }
+    named_children(node)
+        .into_iter()
+        .filter(|child| {
+            child.kind() != "guard"
+                && case_pattern(node).is_none_or(|pattern| child.id() != pattern.id())
+                && is_runtime_node(child.kind())
+        })
+        .collect()
+}
+
+fn enumerator_pattern(enumerator: Node<'_>) -> Option<Node<'_>> {
+    named_children(enumerator).into_iter().find(|child| {
+        matches!(
+            child.kind(),
+            "tuple_pattern" | "identifier" | "typed_pattern"
+        )
+    })
+}
+
+fn tuple_pattern_bindings(pattern: Node<'_>) -> Vec<Node<'_>> {
+    let mut bindings = Vec::new();
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            bindings.push(node);
+            continue;
+        }
+        let mut children = named_children(node);
+        children.reverse();
+        stack.extend(children);
+    }
+    bindings
+}
+
+fn projection_is_entry_all(
+    projection: Option<&brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiProjection>,
+) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    let [entry] = projection.steps.as_slice() else {
+        return false;
+    };
+    entry.kind == "entry"
+        && entry
+            .key_selector()
+            .and_then(|key| key.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("all")
+}
+
+fn projection_is_entry_component(
+    projection: Option<&brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiProjection>,
+    selector_kind: &str,
+    selector_position: u32,
+    component: &str,
+) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    let [entry, selected_component] = projection.steps.as_slice() else {
+        return false;
+    };
+    entry.kind == "entry"
+        && entry
+            .key_selector()
+            .and_then(|key| key.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some(selector_kind)
+        && entry
+            .key_selector()
+            .and_then(|key| key.get("position"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(selector_position))
+        && selected_component.kind == component
+}
+
+fn enumerator_rhs(enumerator: Node<'_>) -> Option<Node<'_>> {
+    let children = named_children(enumerator);
+    children
+        .into_iter()
+        .rev()
+        .find(|child| child.kind() != "guard" && is_runtime_node(child.kind()))
+}
+
+use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
+
+fn contains_token(node: Node<'_>, kind: &str) -> bool {
+    subtree_contains(node, |current| has_direct_token(current, kind))
+}
+
+fn is_runtime_node(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "type_identifier"
+            | "type_arguments"
+            | "type_parameters"
+            | "parameters"
+            | "parameter"
+            | "annotation"
+            | "modifiers"
+            | "access_modifier"
+            | "variance_parameter"
+            | "function_type"
+            | "generic_type"
+            | "infix_type"
+            | "annotated_type"
+            | "applied_constructor_type"
+    )
+}
+
+/// The value of a `boolean_literal`, which the grammar spells as bare text
+/// rather than as two node kinds -- the same shape Kotlin's adapter reads.
+fn boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
+    if node.kind() != "boolean_literal" {
+        return None;
+    }
+    brokk_bifrost_core::analyzer::structural::adapter_helpers::boolean_literal_value(node_text(
+        source, node,
+    )?)
+}
+
+#[doc = " The value of an `integer_literal`, or `None` when it is not a plain decimal"]
+#[doc = " the adapter can read exactly. A suffixed, underscored, or radix-prefixed"]
+#[doc = " literal answers `None` rather than a guessed number."]
+use brokk_bifrost_analysis::analyzer::common::integer_literal_value;
+
+/// The constant value of a condition, once parentheses and `!` are peeled.
+///
+/// `!` inverts the outcome rather than deciding one of its own, so peeling it
+/// is a rewrite, not a lost evaluation: `Boolean.unary_!` is language-defined
+/// and cannot be overridden for a literal. Anything else answers `None` and
+/// keeps the ordinary two-armed lowering.
+fn constant_boolean_condition(source: &str, node: Node<'_>) -> Option<bool> {
+    let mut cursor = node;
+    let mut negated = false;
+    loop {
+        match cursor.kind() {
+            "parenthesized_expression" => cursor = first_runtime_named_child(cursor)?,
+            "prefix_expression" if has_direct_token(cursor, "!") => {
+                negated = !negated;
+                cursor = first_runtime_named_child(cursor)?;
+            }
+            _ => break,
+        }
+    }
+    Some(boolean_literal_value(source, cursor)? != negated)
+}
+
+/// Whether a `while` guard is provably true the first time it is tested, so
+/// the loop body runs before the exit test is ever taken.
+///
+/// This is the while-header analogue of Java's `for_condition_starts_true`
+/// (`java/semantic/control.rs`) and of `kotlin_range_has_first_iteration`.
+/// Java gets the proof cheaply because a counted `for` initializes its counter
+/// inside the header; Scala's counter is a sibling statement, so the binding
+/// has to be found in the enclosing block. The proof is deliberately narrow
+/// and purely structural:
+///
+/// * the loop is a direct runtime statement of a block;
+/// * the guard compares an identifier with an integer literal through one of
+///   `<`, `<=`, `>`, `>=`;
+/// * exactly one preceding statement of that block binds the identifier, as a
+///   `val`/`var` definition whose value is an integer literal, and no other
+///   preceding statement mentions the identifier at all -- any intervening
+///   write, call that could observe or rebind it, or nested shadowing
+///   disqualifies the proof;
+/// * the comparison over the two literals decides true.
+///
+/// Anything unproven answers `false`, which keeps the ordinary zero-trip
+/// shape. That shape is an over-approximation, never a wrong answer.
+fn while_guard_is_true_on_entry(source: &str, loop_node: Node<'_>, condition: Node<'_>) -> bool {
+    let mut guard = condition;
+    while guard.kind() == "parenthesized_expression" {
+        let Some(inner) = first_runtime_named_child(guard) else {
+            return false;
+        };
+        guard = inner;
+    }
+    if guard.kind() != "infix_expression" {
+        return false;
+    }
+    let (Some(left), Some(right), Some(operator)) = (
+        guard.child_by_field_name("left"),
+        guard.child_by_field_name("right"),
+        infix_operator(source, guard),
+    ) else {
+        return false;
+    };
+    if !matches!(operator, "<" | "<=" | ">" | ">=") {
+        return false;
+    }
+    // One side names the counter, the other bounds it. Both sides literal is
+    // not this shape, and neither is both sides identifier.
+    let (counter, bound, counter_on_left) = match (
+        left.kind(),
+        integer_literal_value(source, right),
+        integer_literal_value(source, left),
+        right.kind(),
+    ) {
+        ("identifier", Some(bound), _, _) => (left, bound, true),
+        (_, _, Some(bound), "identifier") => (right, bound, false),
+        _ => return false,
+    };
+    let Some(name) = node_text(source, counter) else {
+        return false;
+    };
+    let Some(block) = loop_node.parent() else {
+        return false;
+    };
+    if !matches!(block.kind(), "block" | "indented_block") {
+        return false;
+    }
+    let preceding = runtime_statement_children(block)
+        .into_iter()
+        .take_while(|statement| statement.start_byte() < loop_node.start_byte())
+        .collect::<Vec<_>>();
+    let mut initial = None;
+    for statement in preceding {
+        if let Some((bound_name, bound_value)) = literal_integer_binding(source, statement)
+            && bound_name == name
+        {
+            if initial.replace(bound_value).is_some() {
+                return false;
+            }
+            continue;
+        }
+        // Any other mention of the counter before the loop -- a write, a call
+        // that could observe it, a nested rebinding -- ends the proof.
+        if mentions_identifier(source, statement, name) {
+            return false;
+        }
+    }
+    let Some(initial) = initial else {
+        return false;
+    };
+    let (left_value, right_value) = if counter_on_left {
+        (initial, bound)
+    } else {
+        (bound, initial)
+    };
+    match operator {
+        "<" => left_value < right_value,
+        "<=" => left_value <= right_value,
+        ">" => left_value > right_value,
+        ">=" => left_value >= right_value,
+        _ => false,
+    }
+}
+
+/// The name and value a statement binds, when it is a `val`/`var` definition
+/// of one plain identifier to an integer literal.
+fn literal_integer_binding<'source>(
+    source: &'source str,
+    statement: Node<'_>,
+) -> Option<(&'source str, i64)> {
+    if !matches!(statement.kind(), "val_definition" | "var_definition") {
+        return None;
+    }
+    let pattern = statement.child_by_field_name("pattern")?;
+    if pattern.kind() != "identifier" {
+        return None;
+    }
+    let value = statement.child_by_field_name("value")?;
+    Some((
+        node_text(source, pattern)?,
+        integer_literal_value(source, value)?,
+    ))
+}
+
+/// Whether an identifier of this name occurs anywhere in the statement.
+fn mentions_identifier(source: &str, statement: Node<'_>, name: &str) -> bool {
+    let mut stack = vec![statement];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node_text(source, node) == Some(name) {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+fn is_runtime_leaf(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "operator_identifier"
+            | "integer_literal"
+            | "floating_point_literal"
+            | "boolean_literal"
+            | "character_literal"
+            | "string"
+            | "symbol_literal"
+            | "null_literal"
+            | "unit"
+            | "this"
+            | "super"
+            | "wildcard"
+    )
+}
+
+fn scala_assignment_has_plain_operator(node: Node<'_>) -> bool {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .any(|child| child.kind() == "=")
+}
+
+fn identifier_has_auto_application_ambiguity(node: Node<'_>) -> bool {
+    !node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "call_expression"
+                | "arguments"
+                | "field_expression"
+                | "infix_expression"
+                | "postfix_expression"
+                | "prefix_expression"
+                | "case_clause"
+                | "guard"
+                | "parameters"
+                | "parameter"
+                | "type_parameters"
+                | "type_arguments"
+        )
+    })
+}
+
+fn declared_result_type_identity(callable: Node<'_>, source: &str) -> Option<Arc<[String]>> {
+    let declared = callable.child_by_field_name("return_type")?;
+    scala_type_identity(declared, source)
+}
+
+/// Whether the callable declares a `Unit` (or `scala.Unit`) result type.
+/// Adaptation to `Unit` is a value discard, never an implicit conversion.
+fn callable_declares_unit_result(callable: Node<'_>, source: &str) -> bool {
+    callable
+        .child_by_field_name("return_type")
+        .is_some_and(|declared| {
+            let segments =
+                brokk_bifrost_jvm::scala::supertypes::scala_type_lookup_segments(declared, source);
+            matches!(
+                segments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["Unit"] | ["scala", "Unit"]
+            )
+        })
+}
+
+fn callable_has_by_name_parameter(callable: Node<'_>) -> bool {
+    let mut stack = children_by_field_name(callable, "parameters");
+    while let Some(node) = stack.pop() {
+        if node.kind() == "lazy_parameter_type" {
+            return true;
+        }
+        stack.extend(named_children(node));
+    }
+    false
+}
+
+fn has_structured_by_name_argument(arguments: Node<'_>) -> bool {
+    matches!(arguments.kind(), "block" | "case_block" | "colon_argument")
+}
+
+fn is_future_like_call(source: &str, function: Node<'_>) -> bool {
+    matches!(function.kind(), "identifier" | "field_expression")
+        && node_text(source, function)
+            .is_some_and(|text| text == "Future" || text.ends_with(".Future"))
+}

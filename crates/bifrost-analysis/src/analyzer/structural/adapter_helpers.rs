@@ -9,9 +9,6 @@
 //! The two remaining helpers stay because [`occurrence_roles_of`] extracts
 //! facts through [`super::extract`], which is the engine this crate owns.
 
-#[cfg(test)]
-pub(crate) use brokk_bifrost_core::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar;
-
 #[cfg(any(test, feature = "test-support"))]
 use super::kinds::NormalizedKind;
 

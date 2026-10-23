@@ -46,6 +46,54 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6524: argument typing cycle blocked an argument-independent interface method binding"
+    )]
+    fn native_go_graph_keeps_interface_method_edge_with_cyclic_argument_types() {
+        let source = r#"package diag
+import "net/http"
+import "context"
+type J interface { Do(req *http.Request) (*http.Response, error) }
+func newRequest(ctx context.Context) (*http.Request, error) { return nil, nil }
+func caller(client J, ctx context.Context) {
+    req, err := newRequest(ctx)
+    req = req.WithContext(ctx)
+    resp, err := client.Do(req)
+    _, _ = resp, err
+}
+"#;
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/diag\n\ngo 1.22\n")
+            .file("main.go", source)
+            .build();
+        let go = GoAnalyzer::new(fixture.project_dyn());
+        brokk_bifrost_go_analysis::analyzer::go::persist_live_go_sources_for_test(&go);
+        let projected = GoNativeWorkspaceGraphProvider
+            .project(&go, &[fixture.file("main.go")], &CancellationToken::new())
+            .unwrap();
+        let graph = match projected {
+            SelectedWorkspaceUsageGraphProjectionOutcome::Complete(graph)
+            | SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph) => graph,
+            SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled => {
+                panic!("Go graph projection was cancelled")
+            }
+            SelectedWorkspaceUsageGraphProjectionOutcome::Stale => {
+                panic!("Go graph projection became stale")
+            }
+            SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(reason) => {
+                panic!("Go graph projection unavailable: {reason}")
+            }
+        };
+        let edges = native_edge_names(&graph);
+        assert!(
+            edges
+                .iter()
+                .any(|(from, to)| from.ends_with("caller") && to.ends_with("J.Do")),
+            "argument cycle must not discard the interface method edge: {edges:?}"
+        );
+    }
+
+    #[test]
     fn native_go_graph_projects_whole_and_rooted_references() {
         let fixture = InlineTestProject::with_language(Language::Go)
             .file("go.mod", "module example.test/graph\n\ngo 1.22\n")
@@ -85,6 +133,7 @@ mod tests {
         let incumbent_whole = usage_graph(
             &go,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -142,6 +191,7 @@ mod tests {
         let incumbent_rooted = usage_graph(
             &go,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: Some(vec!["pkg/caller.go".to_owned()]),
                 depth: 1,
@@ -597,6 +647,7 @@ func Build() Stack[int] { return Stack[int]{} }
         let incumbent = usage_graph(
             &go,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,

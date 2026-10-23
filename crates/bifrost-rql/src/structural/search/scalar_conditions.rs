@@ -19,16 +19,42 @@ use crate::analyzer::declared_scalar::{
     csharp_declared_scalar_types, go_declared_scalar_types, rust_declared_scalar_types,
 };
 use crate::analyzer::resolve_analyzer;
+use crate::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmRequest, Dominators, dominators,
+};
 use crate::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
 use crate::analyzer::semantic::{
     ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, EvidenceId, GuardFact, GuardPredicate,
     MemoryLocationKind, ProcedureHandle, ProcedureSemantics, ProgramPointId, ProofStatus,
-    SemanticCapability, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
-    SemanticValueKind, SourceMappingKind,
+    SemanticCapability, SemanticEffect, SemanticGap, SemanticGapDischarge, SemanticGapImpact,
+    SemanticGapSubject, SemanticValueKind, SourceMappingKind, ValueId,
 };
-use crate::analyzer::{Language, LanguageDialect, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
 use crate::analyzer::{kotlin_declared_scalar_types, scala_declared_scalar_types};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_flow::flow_state::{
+    cleanup_has_retained_destination, destructor_style_cleanup, gap_has_exit_only_control,
+    points_before_exit_only_exceptions,
+};
+
+// Language facts augment the predicate/typing table below. A new true entry
+// requires checking the producer, including every by-reference argument form.
+struct ScalarLanguageFacts {
+    field_access_runs_no_user_code: bool,
+    strict_call_operands_and_address_arguments: bool,
+    destructor_style_cleanup: bool,
+}
+
+fn scalar_language_facts(language: Language) -> ScalarLanguageFacts {
+    ScalarLanguageFacts {
+        field_access_runs_no_user_code: matches!(language, Language::Java | Language::Rust),
+        // Rust schedules operands exactly once and writes back explicit &mut
+        // arguments; the scalar solver releases autoref receivers (#6409). C# ref/out
+        // has not been checked; Scala admits by-name arguments.
+        strict_call_operands_and_address_arguments: language == Language::Rust,
+        destructor_style_cleanup: destructor_style_cleanup(language),
+    }
+}
 
 // The scalar solver retains one value vector per reachable program point and
 // revisits joins to a finite widening limit. Bound its matrix before entering
@@ -91,6 +117,15 @@ pub(super) struct ScalarConditionOutcome {
     pub(super) condition_start_byte: usize,
     pub(super) condition_end_byte: usize,
     pub(super) verdict: ScalarConditionVerdict,
+}
+
+/// Keep procedure attribution once per derivation, rather than cloning it for
+/// every guard that the same preflight left open.
+#[derive(Debug, Clone)]
+pub(super) struct ScalarConditionDerivation {
+    pub(super) outcomes: Vec<ScalarConditionOutcome>,
+    pub(super) procedure_gaps: Vec<super::CodeQueryRelatedSource>,
+    pub(super) producer_gaps: Vec<super::CodeQueryRelatedSource>,
 }
 
 fn complete_evidence(semantics: &ProcedureSemantics, id: EvidenceId) -> bool {
@@ -298,6 +333,381 @@ fn guard_is_decided(
         .is_some_and(|fact| guard_decides(procedure.semantics(), guard.predicate, fact))
 }
 
+/// #6409: can this gap change a guard beyond scalar_state::transfer_point?
+fn gap_is_relevant_to_scalar_guards(
+    semantics: &ProcedureSemantics,
+    gap: &SemanticGap,
+    facts: &ScalarLanguageFacts,
+    dominance: Option<&Dominators<ProgramPointId>>,
+    before_exceptions: &HashSet<ProgramPointId>,
+) -> bool {
+    // Missing paths, predicates and unrepresented writes are never repaired by
+    // value havoc. Partial evidence is independently checked by the caller.
+    if matches!(
+        gap.capability,
+        SemanticCapability::NormalControlFlow
+            | SemanticCapability::NonLocalControl
+            | SemanticCapability::GuardFacts
+    ) {
+        return true;
+    }
+    // E1: fact_of maps unestablished values to Unknown; Gap(ValueFlow)
+    // writes Unknown in event order. Check both dominance and the last write,
+    // including reads before the gap within the same point.
+    if let SemanticGapSubject::Value(value) = gap.subject {
+        let unused_temporary = semantics.value(value).is_some_and(|row| {
+            matches!(row.kind, SemanticValueKind::Return | SemanticValueKind::Temporary)
+        }) && !semantics.guard_facts().iter().any(|guard| guard.subject == Some(value)
+            || matches!(guard.predicate, GuardPredicate::Truthy { value: operand } if operand == value));
+        if unused_temporary || value_gap_is_modeled(semantics, gap, value, dominance) {
+            return false;
+        }
+    }
+    // Call operand evaluation is retained, and Invoke receiver/address havoc
+    // plus explicit argument write-backs cover these mutations. CallEvaluation stays meaningful
+    // to ordering consumers even though it cannot change these guard facts.
+    if facts.strict_call_operands_and_address_arguments
+        && gap.capability == SemanticCapability::Calls
+        && matches!(gap.subject, SemanticGapSubject::CallSite(_))
+        && gap.discharge == SemanticGapDischarge::CallResolution
+    {
+        return false;
+    }
+    // A Point Calls event releases shared and escaped-address writers exactly
+    // as Invoke does. The address-taking premise is documented at that solver
+    // arm; macro NormalControlFlow/NonLocalControl companions still veto.
+    let release_only = gap.impacts.iter().all(|impact| {
+        matches!(
+            impact,
+            SemanticGapImpact::DispatchCoverage
+                | SemanticGapImpact::HeapRead
+                | SemanticGapImpact::HeapWrite
+                | SemanticGapImpact::Aliasing
+        )
+    });
+    if gap.subject == SemanticGapSubject::Point && gap.capability == SemanticCapability::Calls {
+        return !release_only;
+    }
+    // R-cleanup: emit_cleanup_completion_route (semantic/lowering.rs) emits
+    // lifecycle facts at the completion point, then add_target_edge preserves
+    // route.destination(). Destructor-style cleanup adds no normal successor;
+    // exceptional exits have their own gap. transfer_point releases effects
+    // through the companion Calls event. Finally/recover languages cannot use
+    // this rule, because their cleanup can replace normal control (#6409).
+    // Safe-Rust borrow discipline: a destructor reaches a closed scalar only
+    // through the dropped value: stored &mut, derived raw pointer, or a
+    // by-reference closure capture. Address values flowing into aggregates,
+    // stores and call arguments escape via address_escape_points and are
+    // released at Invoke and Point Calls gaps; shared_capture_bindings covers
+    // by-reference captures. Autoref-returned guards cannot coexist with a
+    // safe access to the borrowed receiver, made Unknown by Invoke receiver havoc.
+    // Unsafe raw-pointer writes after reassignment retain the same limitation
+    // as ordinary calls. Every lowered &mut/raw-pointer creation is Address;
+    // the #6409 pattern rule marks ref mut scrutinee roots as escaped.
+    // Unlowered cleanup routing includes moved-out drop flags, temporary
+    // timing and coroutine-frame drops: these select which destructors run,
+    // not new destinations. Destructor panics have their separate exceptional
+    // row, so this exemption never discharges their effects or control.
+    // Point gaps never write a scalar value: transfer_point's Gap(ValueFlow)
+    // branch acts only on Value subjects. ReturnTransfer concerns the return
+    // value/edge, which no body guard reads. Destructor value/heap/alias effects
+    // reach a binding only through an escape or shared capture, covered by the
+    // same-point release under safe-Rust borrow discipline. Producer impacts
+    // remain facts for every consumer; relevance is decided here (#6409).
+    let cleanup_effects = gap.impacts.iter().all(|impact| {
+        matches!(
+            impact,
+            SemanticGapImpact::ValueFlow
+                | SemanticGapImpact::Aliasing
+                | SemanticGapImpact::HeapRead
+                | SemanticGapImpact::HeapWrite
+                | SemanticGapImpact::ReturnTransfer
+                | SemanticGapImpact::DispatchCoverage
+        )
+    });
+    // R-resource: CallEvaluation here means evaluating the destructor call;
+    // the Invoke-equivalent release models that evaluation for scalar guards.
+    // The retained destination is a property of the point for BOTH row kinds.
+    if facts.destructor_style_cleanup
+        && gap.subject == SemanticGapSubject::Point
+        && ((gap.capability == SemanticCapability::CleanupControlFlow && cleanup_effects)
+            || gap.capability == SemanticCapability::ResourceManagement)
+        && semantics.gaps().iter().any(|other| {
+            other.point == gap.point
+                && other.subject == SemanticGapSubject::Point
+                && other.capability == SemanticCapability::Calls
+        })
+        && cleanup_has_retained_destination(semantics, gap.point)
+    {
+        debug_assert!(semantics.point(gap.point).expect("validated gap point").events.iter().any(|event| {
+            matches!(event.effect, SemanticEffect::Gap { gap: id } if semantics.gap(id).is_some_and(|row|
+                row.capability == SemanticCapability::Calls && row.subject == SemanticGapSubject::Point))
+        }), "the companion Calls gap must execute its scalar release");
+        return false;
+    }
+    // Completion-only cleanup cannot add a path into ordinary-body guards.
+    if matches!(
+        gap.capability,
+        SemanticCapability::CleanupControlFlow | SemanticCapability::ResourceManagement
+    ) && !before_exceptions.contains(&gap.point)
+    {
+        return false;
+    }
+    // A procedure-level suspension gap describes how callers construct
+    // and schedule a generator or coroutine activation. Inside the body,
+    // each suspension is lowered as a scaffold or as its own point gap.
+    if matches!(
+        gap.capability,
+        SemanticCapability::GeneratorSuspension | SemanticCapability::AsyncSuspendResume
+    ) && gap.subject == SemanticGapSubject::Procedure
+    {
+        return false;
+    }
+    // E2: scalar_state::transfer_point makes field/index/static loads
+    // Unknown; stores cannot write a closed binding. Rust Deref/Index user
+    // code has separate Point Calls gaps. In JavaScript and Python,
+    // accessors or descriptors may execute code, so retain their memory
+    // gaps until those effects are modeled at the access point.
+    if facts.field_access_runs_no_user_code
+        && let SemanticGapSubject::MemoryLocation(location) = gap.subject
+        && gap.impacts.iter().all(|impact| {
+            matches!(
+                impact,
+                SemanticGapImpact::ValueFlow
+                    | SemanticGapImpact::HeapRead
+                    | SemanticGapImpact::HeapWrite
+                    | SemanticGapImpact::Aliasing
+            )
+        })
+        && semantics.memory_location(location).is_some_and(|location| {
+            matches!(
+                location.kind,
+                MemoryLocationKind::Field { .. }
+                    | MemoryLocationKind::Property { .. }
+                    | MemoryLocationKind::Index { .. }
+                    | MemoryLocationKind::Static { .. }
+            )
+        })
+    {
+        return false;
+    }
+    // A yield's normal resumption edge is retained, the solver releases
+    // shared bindings there, and its abrupt resumption is a separate
+    // exceptional gap at the same point, judged by the rule below.
+    if gap.capability == SemanticCapability::GeneratorSuspension
+        && gap.subject == SemanticGapSubject::Point
+    {
+        return false;
+    }
+    // An exceptional gap whose omitted paths leave the procedure without
+    // running more of its code reaches no guard.
+    if gap_has_exit_only_control(gap) {
+        return false;
+    }
+    // An exception dispatch that retains every handler and the
+    // unmatched propagation as successors only leaves the selection
+    // among them unrefined, which over-approximates the paths.
+    if gap.capability == SemanticCapability::ExceptionalControlFlow
+        && gap.subject == SemanticGapSubject::Point
+        && gap.discharge == SemanticGapDischarge::RetainedControlTopology
+    {
+        return false;
+    }
+    // A binding a nested callable rebinds is released by the solver at
+    // every call and suspension, where that callable could run. Scala's
+    // closure target and captured environment are still unresolved, so
+    // retain that lane's gap as open evidence instead of treating the
+    // full declared scalar domain as a proved result.
+    // Unmodeled captured inputs are read through capture locations, which
+    // the solver never treats as closed cells, so such a gap cannot
+    // change a local this procedure establishes.
+    if gap.capability == SemanticCapability::Captures
+        && matches!(
+            gap.subject,
+            SemanticGapSubject::Procedure
+                | SemanticGapSubject::MemoryLocation(_)
+                | SemanticGapSubject::Capture(_)
+        )
+    {
+        return false;
+    }
+    if gap.capability == SemanticCapability::Captures
+        && gap.discharge == SemanticGapDischarge::RebindAtCallOrSuspension
+        && let SemanticGapSubject::Value(value) = gap.subject
+        && semantics.value(value).is_some_and(|value| {
+            matches!(
+                value.kind,
+                SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
+            )
+        })
+    {
+        return false;
+    }
+
+    // Preserve the previous scoped call/callable exemptions: their results
+    // are Unknown and transfer_point releases caller-external writers.
+    if matches!(
+        gap.capability,
+        SemanticCapability::Calls
+            | SemanticCapability::CallableReferences
+            | SemanticCapability::DynamicDispatch
+    ) && gap.impacts.iter().all(|impact| {
+        matches!(
+            impact,
+            SemanticGapImpact::ValueFlow
+                | SemanticGapImpact::Aliasing
+                | SemanticGapImpact::DispatchCoverage
+        )
+    }) && match gap.subject {
+        SemanticGapSubject::CallSite(_) => true,
+        SemanticGapSubject::Value(value) => !matches!(
+            semantics.value(value).map(|value| &value.kind),
+            Some(
+                SemanticValueKind::Local
+                    | SemanticValueKind::Parameter { .. }
+                    | SemanticValueKind::Receiver { .. }
+            )
+        ),
+        _ => false,
+    } {
+        return false;
+    }
+    matches!(
+        gap.capability,
+        SemanticCapability::ExceptionalControlFlow
+            | SemanticCapability::CleanupControlFlow
+            | SemanticCapability::Assignments
+            | SemanticCapability::Values
+            | SemanticCapability::LocalFlow
+            | SemanticCapability::ParameterFlow
+    ) || gap.impacts.contains(SemanticGapImpact::ValueFlow)
+        || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+}
+
+// Reads include transfers, call operands, memory identities and guard operands.
+// Counting all structural references is deliberately conservative: a declaration
+// or an alias use can only retain a veto, never invent a dominance exemption.
+fn point_reads_value(
+    semantics: &ProcedureSemantics,
+    effect: &SemanticEffect,
+    value: ValueId,
+) -> bool {
+    match effect {
+        SemanticEffect::Assignment { value: source, .. }
+        | SemanticEffect::ValueFlow { source, .. }
+        | SemanticEffect::ValueUse { value: source, .. } => *source == value,
+        SemanticEffect::MemoryLoad { location, .. } => semantics
+            .memory_location(*location)
+            .is_some_and(|l| l.kind.uses_value(value)),
+        SemanticEffect::MemoryStore {
+            location,
+            value: source,
+            ..
+        } => {
+            *source == value
+                || semantics
+                    .memory_location(*location)
+                    .is_some_and(|l| l.kind.uses_value(value))
+        }
+        SemanticEffect::AggregateInitializer {
+            aggregate,
+            value: source,
+            ..
+        } => *aggregate == value || *source == value,
+        SemanticEffect::Invoke { call_site } => {
+            semantics.call_site(*call_site).is_some_and(|call| {
+                call.callee == value
+                    || call.receiver == Some(value)
+                    || call.arguments.iter().any(|a| a.value == value)
+            })
+        }
+        SemanticEffect::ProcedureReturn { value: source }
+        | SemanticEffect::Throw { value: source } => *source == Some(value),
+        SemanticEffect::AsyncSuspend { awaited, .. } => *awaited == Some(value),
+        // No E1 exemption when a complex operation might consume this value.
+        SemanticEffect::Synchronization { .. }
+        | SemanticEffect::CaptureBind { .. }
+        | SemanticEffect::CallableCreation { .. }
+        | SemanticEffect::CallableReference { .. } => true,
+        _ => false,
+    }
+}
+
+fn effect_writes_value(
+    semantics: &ProcedureSemantics,
+    effect: &SemanticEffect,
+    value: ValueId,
+) -> bool {
+    match effect {
+        SemanticEffect::Assignment { target, .. }
+        | SemanticEffect::ValueFlow { target, .. }
+        | SemanticEffect::MemoryLoad { result: target, .. }
+        | SemanticEffect::AsyncResume {
+            result: Some(target),
+            ..
+        } => *target == value,
+        SemanticEffect::Gap { gap } => semantics.gap(*gap).is_some_and(|g| {
+            g.subject == SemanticGapSubject::Value(value)
+                && g.impacts.contains(SemanticGapImpact::ValueFlow)
+        }),
+        _ => false,
+    }
+}
+
+fn value_gap_is_modeled(
+    semantics: &ProcedureSemantics,
+    gap: &SemanticGap,
+    value: ValueId,
+    dominance: Option<&Dominators<ProgramPointId>>,
+) -> bool {
+    if !gap.impacts.contains(SemanticGapImpact::ValueFlow) {
+        return false;
+    }
+    if semantics
+        .value(value)
+        .is_some_and(|row| row.kind == SemanticValueKind::Local)
+        && !semantics
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .any(|event| {
+                !matches!(event.effect, SemanticEffect::Gap { .. })
+                    && effect_writes_value(semantics, &event.effect, value)
+            })
+    {
+        // Unsupported-pattern binding with no establishing write: fact_of
+        // returns Unknown even before this bookkeeping gap (#6409).
+        return true;
+    }
+    let Some(point) = semantics.point(gap.point) else {
+        return false;
+    };
+    let Some(event_index) = point
+        .events
+        .iter()
+        .position(|e| matches!(e.effect, SemanticEffect::Gap { gap: id } if id == gap.id))
+    else {
+        return false;
+    };
+    if point.events[event_index + 1..]
+        .iter()
+        .any(|e| effect_writes_value(semantics, &e.effect, value))
+        || point.events[..event_index]
+            .iter()
+            .any(|e| point_reads_value(semantics, &e.effect, value))
+    {
+        return false;
+    }
+    let Some(dominance) = dominance else {
+        return false;
+    };
+    semantics.points().iter().all(|point| {
+        let reads = point.events.iter().any(|e| point_reads_value(semantics, &e.effect, value))
+            || semantics.guard_facts().iter().any(|g| g.point == point.id && (g.subject == Some(value) || matches!(g.predicate, GuardPredicate::Truthy { value: operand } if operand == value)));
+        !reads || dominance.dominates(semantics, gap.point, point.id)
+    })
+}
+
 /// Derive outcomes for every guard in one procedure: null identity, constant
 /// conditions, and numeric order, equality, NaN and truth tests, each
 /// qualified by the language's supported predicates. Short-circuit
@@ -309,7 +719,7 @@ pub(super) fn scalar_condition_outcomes(
     procedure: &ProcedureHandle,
     prepared: Arc<PreparedSyntaxTree>,
     cancellation: &CancellationToken,
-) -> Result<Vec<ScalarConditionOutcome>, ScalarConditionGap> {
+) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
     if cancellation.is_cancelled() {
         return Err(ScalarConditionGap::Cancelled);
     }
@@ -327,170 +737,72 @@ pub(super) fn scalar_condition_outcomes(
     {
         return Err(ScalarConditionGap::WorkLimit);
     }
-    // The language capability table is intentionally partial even for simple
-    // methods. Producer-authored gaps, rather than that global table, record
-    // the missing procedure-local control and value effects relevant to a
-    // negative reachability proof.
-    // An unresolved call or callable reference leaves its own result and
-    // dispatch open, but in Java, JavaScript/TypeScript and Python it cannot
-    // rebind a caller local: none has by-reference arguments, and captured
-    // or escaped locals are already outside the solver's closed cells. A Go
-    // local whose address reaches a call is likewise outside them. Such a
-    // gap therefore does not open every guard in the procedure. A value gap on
-    // a binding itself still does, because the solver would otherwise refine
-    // that binding as if its value were known.
-    let scoped_call_gap = |gap: &crate::analyzer::semantic::SemanticGap| {
-        // A procedure-level suspension gap describes how callers construct
-        // and schedule a generator or coroutine activation. Inside the body,
-        // each suspension is lowered as a scaffold or as its own point gap.
-        if matches!(
-            gap.capability,
-            SemanticCapability::GeneratorSuspension | SemanticCapability::AsyncSuspendResume
-        ) && gap.subject == SemanticGapSubject::Procedure
-        {
-            return true;
-        }
-        // Java field access cannot rebind a method local, and the solver
-        // treats every heap-loaded value as unknown. In JavaScript and Python,
-        // accessors or descriptors may execute code, so retain their memory
-        // gaps until those effects are modeled at the access point.
-        if semantics.locator().language() == LanguageDialect::Standard(Language::Java)
-            && let SemanticGapSubject::MemoryLocation(location) = gap.subject
-            && gap.impacts.iter().all(|impact| {
-                matches!(
-                    impact,
-                    SemanticGapImpact::ValueFlow
-                        | SemanticGapImpact::HeapRead
-                        | SemanticGapImpact::HeapWrite
-                        | SemanticGapImpact::Aliasing
-                )
-            })
-            && semantics.memory_location(location).is_some_and(|location| {
-                !matches!(
-                    location.kind,
-                    MemoryLocationKind::LexicalCell { .. } | MemoryLocationKind::Capture { .. }
-                )
-            })
-        {
-            return true;
-        }
-        // A yield's normal resumption edge is retained, the solver releases
-        // shared bindings there, and its abrupt resumption is a separate
-        // exceptional gap at the same point, judged by the rule below.
-        if gap.capability == SemanticCapability::GeneratorSuspension
-            && gap.subject == SemanticGapSubject::Point
-        {
-            return true;
-        }
-        // An exceptional gap whose omitted paths leave the procedure without
-        // running more of its code reaches no guard.
-        if gap.capability == SemanticCapability::ExceptionalControlFlow
-            && gap.subject == SemanticGapSubject::Point
-            && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
-        {
-            return true;
-        }
-        // An exception dispatch that retains every handler and the
-        // unmatched propagation as successors only leaves the selection
-        // among them unrefined, which over-approximates the paths.
-        if gap.capability == SemanticCapability::ExceptionalControlFlow
-            && gap.subject == SemanticGapSubject::Point
-            && gap.discharge == SemanticGapDischarge::RetainedControlTopology
-        {
-            return true;
-        }
-        // A binding a nested callable rebinds is released by the solver at
-        // every call and suspension, where that callable could run. Scala's
-        // closure target and captured environment are still unresolved, so
-        // retain that lane's gap as open evidence instead of treating the
-        // full declared scalar domain as a proved result.
-        // Unmodeled captured inputs are read through capture locations, which
-        // the solver never treats as closed cells, so such a gap cannot
-        // change a local this procedure establishes.
-        if gap.capability == SemanticCapability::Captures
-            && matches!(
-                gap.subject,
-                SemanticGapSubject::Procedure
-                    | SemanticGapSubject::MemoryLocation(_)
-                    | SemanticGapSubject::Capture(_)
-            )
-        {
-            return true;
-        }
-        if gap.capability == SemanticCapability::Captures
-            && gap.discharge == SemanticGapDischarge::RebindAtCallOrSuspension
-            && let SemanticGapSubject::Value(value) = gap.subject
-            && semantics.value(value).is_some_and(|value| {
-                matches!(
-                    value.kind,
-                    SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
-                )
-            })
-        {
-            return true;
-        }
-        matches!(
-            gap.capability,
-            SemanticCapability::Calls
-                | SemanticCapability::CallableReferences
-                | SemanticCapability::DynamicDispatch
-        ) && gap.impacts.iter().all(|impact| {
-            matches!(
-                impact,
-                SemanticGapImpact::ValueFlow
-                    | SemanticGapImpact::Aliasing
-                    | SemanticGapImpact::DispatchCoverage
-            )
-        }) && match gap.subject {
-            SemanticGapSubject::CallSite(_) => true,
-            SemanticGapSubject::Value(value) => !matches!(
-                semantics.value(value).map(|value| &value.kind),
-                Some(
-                    SemanticValueKind::Local
-                        | SemanticValueKind::Parameter { .. }
-                        | SemanticValueKind::Receiver { .. }
-                )
-            ),
-            _ => false,
-        }
-    };
-    let partial_procedure = semantics
+    let facts = scalar_language_facts(language);
+    let mut cfg_budget = CfgAlgorithmBudget::default();
+    let dominance = dominators(
+        semantics,
+        semantics.entry_point(),
+        &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
+    )
+    .ok();
+    let before_exceptions = points_before_exit_only_exceptions(semantics);
+    let vetoing_gaps = semantics
         .gaps()
         .iter()
-        .filter(|gap| !scoped_call_gap(gap))
-        .any(|gap| {
-            matches!(
-                gap.capability,
-                SemanticCapability::NormalControlFlow
-                    | SemanticCapability::ExceptionalControlFlow
-                    | SemanticCapability::CleanupControlFlow
-                    | SemanticCapability::NonLocalControl
-                    | SemanticCapability::Assignments
-                    | SemanticCapability::Values
-                    | SemanticCapability::LocalFlow
-                    | SemanticCapability::ParameterFlow
-                    | SemanticCapability::GuardFacts
-            ) || gap.impacts.contains(SemanticGapImpact::ValueFlow)
-                || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-        });
-    let partial_producer = semantics.points().iter().any(|point| {
-        !complete_evidence(semantics, point.evidence)
-            || point
+        .filter(|gap| {
+            gap_is_relevant_to_scalar_guards(
+                semantics,
+                gap,
+                &facts,
+                dominance.as_ref(),
+                &before_exceptions,
+            )
+        })
+        .collect::<Vec<_>>();
+    let partial_procedure = !vetoing_gaps.is_empty();
+    let partial_rows = semantics
+        .points()
+        .iter()
+        .map(|point| (point.source, point.evidence))
+        .chain(semantics.points().iter().flat_map(|point| {
+            point
                 .events
                 .iter()
-                .any(|event| !complete_evidence(semantics, event.evidence))
-    }) || semantics
-        .control_edges()
+                .map(|event| (event.source, event.evidence))
+        }))
+        .chain(
+            semantics
+                .control_edges()
+                .iter()
+                .map(|edge| (edge.source, edge.evidence)),
+        )
+        .chain(
+            semantics
+                .values()
+                .iter()
+                .map(|value| (value.source, value.evidence)),
+        )
+        .chain(
+            semantics
+                .guard_facts()
+                .iter()
+                .map(|guard| (guard.source, guard.evidence)),
+        )
+        .filter(|(_, evidence)| !complete_evidence(semantics, *evidence))
+        .collect::<Vec<_>>();
+    let partial_producer = !partial_rows.is_empty();
+    let partial_sources = partial_rows
         .iter()
-        .any(|edge| !complete_evidence(semantics, edge.evidence))
-        || semantics
-            .values()
-            .iter()
-            .any(|value| !complete_evidence(semantics, value.evidence))
-        || semantics
-            .guard_facts()
-            .iter()
-            .any(|guard| !complete_evidence(semantics, guard.evidence));
+        .flat_map(|(source, evidence)| {
+            semantics
+                .evidence_row(*evidence)
+                .expect("validated row owns its evidence")
+                .sources
+                .iter()
+                .copied()
+                .chain(std::iter::once(*source))
+        })
+        .collect::<HashSet<_>>();
     let scalar = (!partial_procedure && !partial_producer)
         .then(|| derive_scalar_states(workspace, file, language, procedure, &prepared));
     if cancellation.is_cancelled() {
@@ -579,7 +891,34 @@ pub(super) fn scalar_condition_outcomes(
         })?),
         _ => {}
     }
-    Ok(outcomes)
+    let diagnostic_line_starts = crate::text_utils::compute_line_starts(prepared.source());
+    let related_gaps = super::semantic::gap_related_sources(vetoing_gaps, |id| {
+        super::semantic::mapping_diagnostic_source(
+            procedure,
+            prepared.source(),
+            &diagnostic_line_starts,
+            id,
+        )
+    });
+    let mut partial_sources = partial_sources.into_iter().collect::<Vec<_>>();
+    partial_sources.sort_unstable();
+    let partial_related = partial_sources
+        .into_iter()
+        .map(|source| super::CodeQueryRelatedSource {
+            source: super::semantic::mapping_diagnostic_source(
+                procedure,
+                prepared.source(),
+                &diagnostic_line_starts,
+                source,
+            ),
+            label: "producer/partial".into(),
+        })
+        .collect::<Vec<_>>();
+    Ok(ScalarConditionDerivation {
+        outcomes,
+        procedure_gaps: related_gaps,
+        producer_gaps: partial_related,
+    })
 }
 
 fn single_guard_verdict(
@@ -1601,3 +1940,263 @@ impl ComposedConditions<'_> {
 use brokk_bifrost_ruby_analysis::ruby_declared_scalar_types;
 
 use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;
+
+#[cfg(test)]
+mod gap_relevance_tests {
+    use super::super::tests::inline_project::InlineTestProject;
+    use super::*;
+    use crate::analyzer::AnalyzerConfig;
+    use crate::analyzer::semantic::{
+        ProcedureSemanticsParts, SemanticArtifact, SemanticBudget, SemanticGapId,
+        SemanticGapImpacts, SemanticGapKind, SemanticRequest,
+    };
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6409: method autoref could write a receiver binding with no recorded write"
+    )]
+    fn method_autoref_does_not_preserve_literal_receiver_facts() {
+        for declaration in ["let mut n = 0", "let mut n: u8 = 0"] {
+            let source = format!("fn f() {{ {declaration}; n.add_assign(1); if n == 0 {{}} }}");
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("lib.rs", &source)
+                .build();
+            let file = project.file("lib.rs");
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let outcome = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("Rust semantics");
+            let artifact = outcome.available_value().expect("fixture semantics");
+            let original = artifact
+                .procedures()
+                .iter()
+                .find(|p| !p.guard_facts().is_empty())
+                .expect("guard");
+            let handle = artifact.procedure_handle(original.id()).expect("procedure");
+            let origins = crate::analyzer::semantic::BindingOriginIndex::new(&handle);
+            let receivers = original
+                .call_sites()
+                .iter()
+                .filter_map(|call| call.receiver)
+                .filter_map(|receiver| {
+                    origins
+                        .unique_binding_origin(receiver)
+                        .map(|binding| (receiver, binding))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !receivers.is_empty(),
+                "the receiver binding must be exercised"
+            );
+            // Use the real repaired producer facts: the scalar solver, not a
+            // producer write-back or a test rewrite, must invalidate n (#6409).
+            assert!(!original.points().iter().flat_map(|point| &point.events).any(|event|
+                matches!(event.effect, SemanticEffect::ValueFlow {
+                    kind: crate::analyzer::semantic::ValueFlowKind::LanguageDefined, source, target }
+                    if receivers.contains(&(source, target)))), "producer receiver write-back must stay absent");
+            let tree =
+                brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
+                    &file,
+                    Language::Rust,
+                    &source,
+                )
+                .expect("parse");
+            let prepared = Arc::new(PreparedSyntaxTree::new(
+                brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource::Exact(
+                    Arc::from(source.as_str()),
+                ),
+                tree,
+                brokk_bifrost_core::text_utils::compute_line_starts(&source),
+                crate::analyzer::LanguageDialect::Standard(Language::Rust),
+                brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin::Disk,
+                None,
+            ));
+            let derived =
+                scalar_condition_outcomes(&workspace, &file, &handle, prepared, &cancellation)
+                    .expect("scalar conditions");
+            assert_eq!(derived.outcomes.len(), 1, "{declaration}: {derived:?}");
+            assert!(
+                matches!(
+                    derived.outcomes[0].verdict,
+                    ScalarConditionVerdict::BothFeasible
+                        | ScalarConditionVerdict::Open(ScalarConditionGap::UnknownScalar)
+                ),
+                "{declaration}: {derived:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_gap_ordering_and_finally_cleanup_language_boundary() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "C.java",
+                "class C { int f() { int x = 0; try {} finally { return x; } } }",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = workspace
+            .materialize_program_semantics(
+                &project.file("C.java"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Java semantics");
+        let artifact = outcome
+            .available_value()
+            .expect("complete fixture semantics");
+        let original = artifact
+            .procedures()
+            .iter()
+            .find(|p| !p.values().is_empty())
+            .expect("method");
+        assert!(original.gaps().is_empty());
+        let (point, assignment, target) = original
+            .points()
+            .iter()
+            .find_map(|point| {
+                point.events.iter().find_map(|event| match event.effect {
+                    SemanticEffect::Assignment { target, .. }
+                        if original
+                            .value(target)
+                            .is_some_and(|v| v.kind == SemanticValueKind::Local) =>
+                    {
+                        Some((point.id, event.clone(), target))
+                    }
+                    _ => None,
+                })
+            })
+            .expect("local establishing assignment");
+        let read = original.points().iter().flat_map(|point| &point.events).find(|event| {
+            matches!(event.effect, SemanticEffect::ValueFlow { source, .. } if source == target)
+        }).expect("return read").clone();
+        let gap = SemanticGap {
+            id: SemanticGapId::new(0),
+            point,
+            subject: SemanticGapSubject::Value(target),
+            capability: SemanticCapability::Values,
+            impacts: SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                .with(SemanticGapImpact::Aliasing),
+            kind: SemanticGapKind::Unknown,
+            budget: None,
+            discharge: SemanticGapDischarge::None,
+            detail: "test-only value uncertainty".into(),
+            source: assignment.source,
+            evidence: assignment.evidence,
+        };
+        // Java fully lowers this finally { return } precisely. Add the
+        // destructor-shaped gap/event pair to pin the language boundary of
+        // R-cleanup itself: matching points and impacts cannot license Java
+        // cleanup to replace the normal completion destination.
+        let mut call_gap = gap.clone();
+        call_gap.id = SemanticGapId::new(1);
+        call_gap.subject = SemanticGapSubject::Point;
+        call_gap.capability = SemanticCapability::Calls;
+        call_gap.impacts = SemanticGapImpacts::NONE;
+        let mut cleanup_gap = call_gap.clone();
+        cleanup_gap.id = SemanticGapId::new(2);
+        cleanup_gap.capability = SemanticCapability::CleanupControlFlow;
+        cleanup_gap.impacts = SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage)
+            .with(SemanticGapImpact::HeapRead)
+            .with(SemanticGapImpact::HeapWrite)
+            .with(SemanticGapImpact::Aliasing)
+            .with(SemanticGapImpact::ValueFlow)
+            .with(SemanticGapImpact::ReturnTransfer);
+        let mut gap_event = assignment.clone();
+        gap_event.effect = SemanticEffect::Gap { gap: gap.id };
+        for (mut events, irrelevant) in [
+            (vec![gap_event.clone(), assignment.clone()], false),
+            (vec![assignment.clone(), gap_event.clone()], true),
+            (vec![assignment.clone(), read, gap_event.clone()], false),
+        ] {
+            let mut parts = ProcedureSemanticsParts::new(
+                original.id(),
+                original.locator().clone(),
+                original.kind(),
+                original.source(),
+                original.evidence(),
+            );
+            parts.properties = original.properties();
+            parts.values = original.values().to_vec();
+            parts.source_mappings = original.source_mappings().to_vec();
+            parts.evidence_rows = original.evidence_rows().to_vec();
+            parts.blocks = original.blocks().to_vec();
+            parts.points = original.points().to_vec();
+            parts.control_edges = original.control_edges().to_vec();
+            parts.gaps = vec![gap.clone(), call_gap.clone(), cleanup_gap.clone()];
+            for extra in [&call_gap, &cleanup_gap] {
+                let mut event = gap_event.clone();
+                event.effect = SemanticEffect::Gap { gap: extra.id };
+                events.push(event);
+            }
+            parts.points[point.index()].events = events.into_boxed_slice();
+            let reordered = SemanticArtifact::try_new(
+                artifact.key().clone(),
+                artifact.capabilities().clone(),
+                vec![parts],
+            )
+            .expect("ordered IR");
+            let semantics = &reordered.procedures()[0];
+            let mut cfg_budget = CfgAlgorithmBudget::default();
+            let dominance = dominators(
+                semantics,
+                semantics.entry_point(),
+                &mut CfgAlgorithmRequest::new(&mut cfg_budget, &cancellation),
+            )
+            .expect("dominance");
+            assert_eq!(
+                value_gap_is_modeled(semantics, &gap, target, Some(&dominance)),
+                irrelevant
+            );
+            let normal_points = HashSet::from([point]);
+            assert!(gap_is_relevant_to_scalar_guards(
+                semantics,
+                &cleanup_gap,
+                &scalar_language_facts(Language::Java),
+                Some(&dominance),
+                &normal_points
+            ));
+            assert!(!gap_is_relevant_to_scalar_guards(
+                semantics,
+                &cleanup_gap,
+                &scalar_language_facts(Language::Rust),
+                Some(&dominance),
+                &normal_points
+            ));
+            let mut resource_gap = cleanup_gap.clone();
+            resource_gap.capability = SemanticCapability::ResourceManagement;
+            resource_gap.impacts = SemanticGapImpacts::single(SemanticGapImpact::CallEvaluation);
+            assert!(!gap_is_relevant_to_scalar_guards(
+                semantics,
+                &resource_gap,
+                &scalar_language_facts(Language::Rust),
+                Some(&dominance),
+                &normal_points
+            ));
+            assert!(gap_is_relevant_to_scalar_guards(
+                semantics,
+                &resource_gap,
+                &scalar_language_facts(Language::Java),
+                Some(&dominance),
+                &normal_points
+            ));
+            let mut evaluation_gap = cleanup_gap.clone();
+            evaluation_gap.impacts = evaluation_gap
+                .impacts
+                .with(SemanticGapImpact::CallEvaluation);
+            assert!(gap_is_relevant_to_scalar_guards(
+                semantics,
+                &evaluation_gap,
+                &scalar_language_facts(Language::Rust),
+                Some(&dominance),
+                &normal_points
+            ));
+        }
+    }
+}

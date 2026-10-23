@@ -18,6 +18,7 @@ pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
 // Four times that maximum, rounded up to a power of two, is 1024.
 pub const DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS: usize = 1_024;
 pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
+pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS: usize = DEFAULT_RECEIVER_MAX_SCOPE_NODES;
 
 /// Budget for one interactive `get_type_by_location` request.
 ///
@@ -33,6 +34,7 @@ pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnaly
     max_summary_expansions: 256,
     max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
     max_scope_nodes: 200_000,
+    max_hierarchy_order_steps: 200_000,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -204,6 +206,8 @@ pub struct ReceiverAnalysisBudget {
     /// Typed convergence and lexical frontier iterations within one query.
     pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
+    /// Optional hierarchy discharge ordering; exhaustion never stops aggregate resolution.
+    pub max_hierarchy_order_steps: usize,
 }
 
 impl Default for ReceiverAnalysisBudget {
@@ -214,6 +218,7 @@ impl Default for ReceiverAnalysisBudget {
             max_summary_expansions: DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS,
             max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
             max_scope_nodes: DEFAULT_RECEIVER_MAX_SCOPE_NODES,
+            max_hierarchy_order_steps: DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS,
         }
     }
 }
@@ -226,6 +231,7 @@ impl ReceiverAnalysisBudget {
             max_summary_expansions: 1,
             max_resolution_rounds: 1,
             max_scope_nodes: 1,
+            max_hierarchy_order_steps: 1,
         }
     }
 }
@@ -281,6 +287,7 @@ pub struct ReceiverAnalysisCacheKey {
     pub max_summary_expansions: usize,
     pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
+    pub max_hierarchy_order_steps: usize,
 }
 
 impl ReceiverAnalysisCacheKey {
@@ -300,6 +307,7 @@ impl ReceiverAnalysisCacheKey {
             max_summary_expansions: query.budget.max_summary_expansions,
             max_resolution_rounds: query.budget.max_resolution_rounds,
             max_scope_nodes: query.budget.max_scope_nodes,
+            max_hierarchy_order_steps: query.budget.max_hierarchy_order_steps,
         }
     }
 }

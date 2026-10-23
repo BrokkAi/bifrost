@@ -14,7 +14,10 @@ pub fn open_value_type_barrier_context<'a>(
     Option<Box<dyn ValueTypeBarrierContext + 'a>>,
     crate::analyzer::semantic::SemanticProviderError,
 > {
-    let Some(support) = crate::analyzer::languages::language_support(language) else {
+    let Some(support) = crate::analyzer::languages::language_support_for_hook(
+        language,
+        "value_type_barrier_context",
+    ) else {
         return Ok(None);
     };
     support.value_type_barrier_context(analyzer, cancellation)
@@ -28,7 +31,9 @@ pub fn evaluate_value_type_barrier(
     predicate: ValueTypePredicate,
     request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
 ) -> Result<ValueTypeBarrierDecision, crate::analyzer::semantic::SemanticProviderError> {
-    let Some(support) = crate::analyzer::languages::language_support(language) else {
+    let Some(support) =
+        crate::analyzer::languages::language_support_for_hook(language, "value_type_barrier")
+    else {
         return Ok(ValueTypeBarrierDecision::Undecided(
             ValueTypeBarrierReason::UnsupportedLanguage,
         ));

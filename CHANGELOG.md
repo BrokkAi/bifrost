@@ -5,12 +5,130 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## Unreleased
+## [0.14.1] - 2026-10-23
+
+### Changed
+
+- Semantic-pack installation accepts compatible bundles made by other engine
+  versions. Generation from pinned artifacts writes the lowest schema the
+  content needs; generated runtime productions remain engine-bound (#6270).
+- Rust library users import JVM analysis from `brokk-bifrost-jvm-analysis`
+  and store and resolution APIs from `brokk-bifrost-store`. The top-level
+  `brokk-bifrost` facade retains its analyzer exports (#6253, #6282).
+- Unpinned Rust projects can use the newest installed compatible standard-library
+  pack, explicitly marked approximate with an advisory rather than exact
+  toolchain evidence. Rust pack generation preserves authored activation
+  selectors; pinned projects need regenerated packs to benefit (#6538).
+- Policy pipeline and selector row budgets scale with workspace source volume,
+  up to a fixed hard cap, and multi-language queries no longer reserve rows for
+  language arms with no applicable files (#6424, #6430).
+- The engine no longer advertises the eleven synonym policy capability names
+  it accepted for earlier open rule releases: `control-flow`,
+  `type-hierarchy`, `exception-hierarchy`, `binding-resolution`,
+  `literal-value-matching`, `expression-kind-facts`, `member-resolution`,
+  `local-value-flow`, `python-syntax-diagnostics`, `exact-value-identity` and
+  `generic-type-facts`. Open rules 0.5.1 require the canonical names instead.
+  With rules 0.5.0 or older, the 27 policies that require a synonym report
+  that they did not run and name it; the rest of the release still runs
+  (#4709).
+
+### Added
+
+- The CLI and MCP `list_function_sources` tool lists indexed functions and
+  methods with their source text, declaration ranges and Git blob identities,
+  with optional file and test filters (#6277).
+- Rust usage graphs expose proven-edge status, withheld-reference evidence and
+  implicit trait callers for test-selection consumers. Optional same-owner
+  edges preserve receiver reachability without changing default ranking
+  (#6246, #6255).
+- Rust RQL queries expose call-site callee provenance and unsafe context, plus
+  unsafe `Send`/`Sync` implementation parameters and marker bounds for policy
+  authors. These are query capabilities, not newly bundled rules
+  (#6237, #6239).
+- `bifrost pack-admission --cache-dir DIR --request-path FILE` reports whether
+  this engine admits a published release of a requested pack stream and its
+  dependencies, using the same selection as open-pack acquisition, without
+  downloading or installing anything. Release qualification now requires an
+  admitted public packs release and an admitted public rules release (#4709).
+- The engine advertises the `callable-metrics`, `literal-occurrences` and
+  `pending-cleanup-flow` policy capabilities, so the open rules 0.5.1
+  excessive-nesting, oversized-function span and complexity, repeated-literal
+  and pending-cleanup-flow policies run instead of reporting that they did
+  not. Every rules 0.5.1 policy is now admitted (#4709).
 
 ### Fixed
 
 - Kotlin structural points-to queries resolve constructor-call arguments instead
   of reporting their canonical facts as unavailable.
+- Kotlin extension-receiver lookup uses closed standard-library member
+  inventories and selected external type bindings to resolve calls that
+  previously stayed incomplete. Callable receiver properties retain precedence
+  over imported constructors, and unknown receiver hierarchies remain open
+  (#6225, #6287, #6337).
+- C# attribute and receiver lookup respects the namespace and imports at each
+  reference, so a later namespace cannot silently hide obsolete-method findings
+  (#6207).
+- C# dependency discovery reads framework targeting-pack references from .NET
+  restore output instead of treating them as an empty external surface. Missing
+  or ambiguous packs and unsupported metadata remain incomplete (#6208).
+- JavaScript and TypeScript overwritten-property rules recognize computed
+  string keys and report unknown computed keys as incomplete while retaining
+  proven findings (#6205).
+- C/C++ analysis supports macro-decorated declarations in grammar 0.24.4,
+  preserving class and constructor ownership, template parameters, access and
+  conditional-branch boundaries, scalar types and return-alias precedence
+  (#6309, #6391).
+- Rust cfg-gated imports no longer discard usable glob alternatives when the
+  named import is inactive or undecided; undecided routes retain incomplete
+  evidence (#6250).
+- Rust macro analysis handles invocations inside item attributes without
+  panicking and binds re-exported procedural macros without treating them as
+  textual `macro_rules` expansions (#6256, #6340).
+- Rust and Go usage-graph call edges use call-target completion rather than
+  unrelated type-projection gaps (#6241).
+- Native Go navigation stays available after source edits in a live MCP session
+  and covers nested modules using each file's own module context. Failed or
+  superseded discovery still reports incomplete or stale results
+  (#6519, #6536, #6550).
+- Go find-usages for a struct field includes the keys of keyed composite
+  literals such as `T{Key: v}`, generic or not, so native dead-code analysis no
+  longer reports those fields unused. A literal whose type does not resolve
+  keeps the result incomplete (#6582).
+- Go definition and type lookup handles interface-signature shadowing,
+  anonymous interface owners and parenthesized pointer conversions (#6559).
+- C# definition and usage lookup respects compilation membership, so types and
+  partial declarations in unrelated projects cannot supply invisible members
+  or change a reference's binding. Unsupported project configuration remains
+  incomplete (#6342).
+- Rust type-member enumeration includes resolved impl methods, associated
+  constants and associated types declared in other files (#6457).
+- Native dead-code analysis counts uses from constant and static initializers
+  whose callers are not graph nodes, avoiding false unused reports (#6558).
+- Rust parsing accepts turbofish type paths in casts, annotations, fields and
+  nested type arguments instead of marking valid syntax incomplete (#6406).
+- Rust scalar, initialization and assignment analysis checks whether a gap can
+  affect the particular proof instead of rejecting an entire procedure.
+  Self-assignment and swap checks use binding identities, unresolved proofs
+  retain their source diagnostics, and compound and dereference writes are
+  accounted for. Alias-ownership proofs also survive sibling items that carry
+  built-in attributes such as `#[test]` (#6409, #6423, #6431, #6483, #6533,
+  #6553, #6563).
+- Rust standard-library pack generation skips rustdoc's per-type presentation
+  copies of blanket implementations, which produced malformed rules and false
+  implementation facts, and shards the generated pack by owning crate within
+  the existing size limits (#6542).
+
+### Performance
+
+- Rust cold workspace builds reduce repeated crate-derivation work on large
+  workspaces (#6378).
+- C++ analysis reuses deterministic incomplete file reads while retaining their
+  reasons and retrying transient failures (#6380).
+- RQL intersections and differences stop early for complete-empty operands
+  without discarding incomplete diagnostics (#6363).
+- Semantic partial-flow analysis bounds frontier memory and traversal work for
+  large generated procedures while preserving explicit budget-exhaustion
+  outcomes (#6439).
 
 ## [0.14.0] - 2026-10-21
 

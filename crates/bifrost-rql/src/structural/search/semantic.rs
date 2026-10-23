@@ -35,6 +35,7 @@ use crate::analyzer::semantic::{
     SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticRole, SemanticValue,
     SemanticWork, SourceMapping, SourceMappingKind, SourceSpan, StructuralNodeIdentity,
     ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind, ValueHandle, ValueId,
+    WorkspaceMountId,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledConcurrencyEffect, CompiledSummaryInput, Completeness,
@@ -872,6 +873,13 @@ impl<'a> SemanticQueryContext<'a> {
         SemanticOutcome<crate::analyzer::semantic::workspace_oracle::SourceDispatchResult>,
         crate::analyzer::semantic::SemanticProviderError,
     > {
+        assert!(
+            self.prepared_source_dispatch
+                .iter()
+                .all(|cached| !cached.session.has_definition_operation()),
+            "release the previous file operation before resolving the next file"
+        );
+        session.enable_definition_operation_reuse();
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         let artifact_collector = self
             .artifact_window
@@ -883,8 +891,24 @@ impl<'a> SemanticQueryContext<'a> {
         }
         let outcome = session.resolve_at_source_recorded(range, &mut request);
         drop(request);
+        if outcome.is_err()
+            || cancellation.is_cancelled()
+            || matches!(
+                &outcome,
+                Ok(SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. })
+            )
+        {
+            session.release_definition_operation();
+        }
         self.try_retain_prepared_source_dispatch(file, session, expected_retained_bytes);
         outcome
+    }
+
+    /// Close reader-backed file operations before yielding to another step.
+    pub(super) fn release_definition_operations(&mut self) {
+        for cached in &mut self.prepared_source_dispatch {
+            cached.session.release_definition_operation();
+        }
     }
 
     fn prepared_dispatch_at_source(
@@ -950,6 +974,19 @@ impl<'a> SemanticQueryContext<'a> {
     ) -> super::dispatch::DispatchSiteAnswer {
         use super::dispatch::{DispatchArm, DispatchSiteAnswer};
 
+        // Release before materializing the next file: materialization may publish.
+        for cached in &mut self.prepared_source_dispatch {
+            if &cached.file != file {
+                cached.session.release_definition_operation();
+            }
+        }
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.release_definition_operations();
+            return DispatchSiteAnswer::interrupted("cancelled", None, None);
+        }
         let outcome = match self.prepared_dispatch_at_source(file, range) {
             Some(outcome) => outcome,
             None => {
@@ -1525,10 +1562,20 @@ impl<'a> SemanticQueryContext<'a> {
     /// The lookup is span-structural, never name-based: an exactly aligned
     /// declaration wins, and otherwise the smallest declaration whose own
     /// range contains the procedure's anchor span does.
+    ///
+    /// A locator outside this workspace's mount, such as the synthetic
+    /// provenance of an unmaterialized external target, names no workspace
+    /// file. Reading its path from disk would fail and report a store failure
+    /// for a file that was never part of the workspace.
     fn definition_for_locator(
         &self,
         locator: &SemanticLocator,
     ) -> Option<crate::analyzer::CodeUnit> {
+        if locator.mount()
+            != WorkspaceMountId::from_root(self.workspace.analyzer().project().root())
+        {
+            return None;
+        }
         let file = super::witness_projection::locator_file(self.workspace, locator);
         super::dispatch::declaration_at_locator(self.workspace.analyzer(), locator, &file)
     }
@@ -2206,7 +2253,7 @@ impl<'a> SemanticQueryContext<'a> {
         }
         let available = usize::MAX;
         let mut remaining = available;
-        let result = crate::analyzer::usages::get_definition::java::lambda::java_expression_lambda_result_use(
+        let result = brokk_bifrost_jvm_analysis::analyzer::usages::get_definition::java::lambda::java_expression_lambda_result_use(
             analyzer,
             self.active_semantic_model_snapshot.as_deref(),
             file,
@@ -4107,6 +4154,7 @@ impl<'a> SemanticQueryContext<'a> {
             return;
         }
         self.diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code,
             impact,
@@ -4330,6 +4378,55 @@ impl SemanticProcedureValue {
         })
     }
 
+    pub(super) fn related_gaps<'a>(
+        &self,
+        gaps: impl IntoIterator<Item = &'a crate::analyzer::semantic::SemanticGap>,
+    ) -> Vec<super::CodeQueryRelatedSource> {
+        gap_related_sources(gaps, |id| self.mapping_source(id))
+    }
+
+    pub(super) fn related_flow_reasons(
+        &self,
+        reasons: &[brokk_bifrost_flow::flow_state::FlowStateIncompleteReason],
+    ) -> Vec<super::CodeQueryRelatedSource> {
+        self.related_gaps(
+            reasons
+                .iter()
+                .flat_map(|reason| match reason {
+                    brokk_bifrost_flow::flow_state::FlowStateIncompleteReason::LoweringGap {
+                        gaps,
+                        ..
+                    } => gaps.as_slice(),
+                    _ => &[],
+                })
+                .map(|id| {
+                    self.handle
+                        .semantics()
+                        .gap(*id)
+                        .expect("reason belongs to this procedure")
+                }),
+        )
+    }
+
+    pub(super) fn mapping_source(
+        &self,
+        id: crate::analyzer::semantic::SourceMappingId,
+    ) -> super::CodeQuerySourceSpan {
+        let mapping = self
+            .handle
+            .semantics()
+            .source_mapping(id)
+            .expect("validated row owns its source mapping");
+        let location = public_semantic_location(mapping, &self.source);
+        let span = byte_span(mapping);
+        super::CodeQuerySourceSpan {
+            path: location.path,
+            range: location.range,
+            start_byte: span.start,
+            end_byte: span.end,
+        }
+    }
+
     pub(super) fn public(&self) -> CodeQueryProcedure {
         let procedure = self.handle.semantics();
         let mapping = procedure_source_mapping(&self.handle);
@@ -4401,6 +4498,15 @@ impl SemanticProcedureValue {
 }
 
 impl SemanticProgramPointValue {
+    pub(super) fn procedure_value(&self) -> SemanticProcedureValue {
+        SemanticProcedureValue {
+            handle: self.handle.procedure().clone(),
+            file: self.file.clone(),
+            source: self.source.clone(),
+            quality: self.quality.clone(),
+        }
+    }
+
     pub(super) fn reference(&self) -> SemanticProgramPointReferenceValue {
         let procedure = SemanticProcedureValue {
             handle: self.handle.procedure().clone(),
@@ -4858,6 +4964,46 @@ fn procedure_evidence(handle: &ProcedureHandle) -> &Evidence {
         .expect("validated procedure has evidence")
 }
 
+pub(super) fn mapping_diagnostic_source(
+    procedure: &ProcedureHandle,
+    source: &str,
+    line_starts: &[usize],
+    id: crate::analyzer::semantic::SourceMappingId,
+) -> super::CodeQuerySourceSpan {
+    let mapping = procedure
+        .semantics()
+        .source_mapping(id)
+        .expect("validated row owns its source mapping");
+    let span = byte_span(mapping);
+    super::CodeQuerySourceSpan {
+        path: mapping.locator.path().as_str().to_owned(),
+        range: super::render::range_for_offsets(source, line_starts, span.start, span.end),
+        start_byte: span.start,
+        end_byte: span.end,
+    }
+}
+
+pub(super) fn gap_related_sources<'a>(
+    gaps: impl IntoIterator<Item = &'a crate::analyzer::semantic::SemanticGap>,
+    mut source: impl FnMut(crate::analyzer::semantic::SourceMappingId) -> super::CodeQuerySourceSpan,
+) -> Vec<super::CodeQueryRelatedSource> {
+    let mut seen = HashSet::default();
+    gaps.into_iter()
+        .filter_map(|gap| {
+            let mut label = format!("{}/{}", gap.capability.label(), gap.kind.label());
+            if gap.discharge != crate::analyzer::semantic::SemanticGapDischarge::None {
+                use std::fmt::Write;
+                write!(label, "/{:?}", gap.discharge).expect("writing to a string succeeds");
+            }
+            let related = super::CodeQueryRelatedSource {
+                source: source(gap.source),
+                label,
+            };
+            seen.insert(related.clone()).then_some(related)
+        })
+        .collect()
+}
+
 struct PublicSemanticLocation {
     path: String,
     language: &'static str,
@@ -5052,6 +5198,86 @@ mod tests {
         WorkspaceMountId, WorkspaceRelativePath,
     };
     use brokk_bifrost_analysis::test_support::source_anchor;
+
+    #[test]
+    fn dispatch_file_operations_release_before_next_file_and_discard_stale() {
+        let source = "mod other; fn first() {} fn second() {} fn third() {} fn caller() { first(); second(); third(); }\n";
+        let other = "pub fn caller() { crate::first(); }\n";
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='dispatch_lifetime'\nversion='0.1.0'\nedition='2024'\n",
+            )
+            .file("src/lib.rs", source)
+            .file("src/other.rs", other)
+            .build();
+        let overlay = Arc::new(crate::analyzer::OverlayProject::new(project.project_dyn()));
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            overlay.clone(),
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .expect("workspace");
+        let parent = SemanticBudget::default();
+        let execution = SemanticExecutionBudget::new(1);
+        let mut context = continuation_context(
+            &workspace,
+            &parent,
+            &execution,
+            CodeQuerySemanticLimits::default(),
+        );
+        let range = |source: &str, call: &str| {
+            let start_byte = source.rfind(call).expect("fixture call");
+            crate::analyzer::Range {
+                start_byte,
+                end_byte: start_byte + call.len(),
+                start_line: 0,
+                end_line: 0,
+            }
+        };
+        let first = project.file("src/lib.rs");
+        let second = project.file("src/other.rs");
+        context.dispatch_at_source(&first, range(source, "first()"));
+        assert!(
+            context
+                .prepared_source_dispatch
+                .iter()
+                .any(|cached| cached.file == first && cached.session.has_definition_operation())
+        );
+        context.dispatch_at_source(&second, range(other, "crate::first()"));
+        assert!(
+            context
+                .prepared_source_dispatch
+                .iter()
+                .filter(|cached| cached.file != second)
+                .all(|cached| !cached.session.has_definition_operation())
+        );
+        context.dispatch_at_source(&first, range(source, "second()"));
+        assert!(
+            context
+                .prepared_source_dispatch
+                .iter()
+                .any(|cached| cached.file == first && cached.session.has_definition_operation())
+        );
+        assert!(overlay.set(second.abs_path(), format!("{other}pub fn added() {{}}\n")));
+        context.dispatch_at_source(&first, range(source, "third()"));
+        assert!(
+            context
+                .prepared_source_dispatch
+                .iter()
+                .all(|cached| !cached.session.has_definition_operation()),
+            "stale native state is discarded"
+        );
+        context.release_definition_operations();
+        assert!(
+            context
+                .prepared_source_dispatch
+                .iter()
+                .all(|cached| !cached.session.has_definition_operation())
+        );
+    }
 
     #[test]
     fn semantic_source_snapshot_retained_bytes_include_both_arc_allocations() {

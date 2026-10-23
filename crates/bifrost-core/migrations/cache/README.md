@@ -242,3 +242,13 @@ language of class-set rows from the physical dialect of their owner blob. It
 preserves parent IDs, children, generation constraints and cascades while
 binding the owner through `blobs.id`. Root-result attachment accounting retains
 the exact storage key once, without changing semantic output digests.
+
+Migration `0197-rust-expanding-attribute-contexts.sql` adds a positional JSONB
+array of start bytes to each Rust source context, recording the attributes that
+may expand to code. A NULL array belongs to a row published before this
+producer and proves nothing; the Rust source epoch republishes it. An empty
+array proves that the context has no expanding attribute.
+
+Migration `0198-jvm-package-private-visibility.sql` rewrites legacy JVM
+inventory visibility labels from `package` to the canonical
+`package_private` label.

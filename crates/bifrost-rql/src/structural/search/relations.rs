@@ -106,6 +106,7 @@ pub(super) fn call_site_expansions(
                 })
             {
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -465,6 +466,7 @@ pub(super) fn map_call_relation_diagnostic(
     );
     let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
     CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code,
         impact,
@@ -678,6 +680,7 @@ pub(super) fn outbound_reference_expansions(
         diagnostics
             .retain(|diagnostic| diagnostic.code != CodeQueryDiagnosticCode::UsesTargetsAmbiguous);
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,

@@ -1,11 +1,8 @@
 use super::*;
 
 use crate::analyzer::Language;
-
 use crate::analyzer::WorkspaceAnalyzer;
-
 use crate::analyzer::structural::test_support::workspace_fixture;
-
 use tempfile::TempDir;
 
 #[doc(hidden)]

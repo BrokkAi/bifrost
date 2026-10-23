@@ -149,6 +149,7 @@ pub(super) fn execute_dependency_evidence_seed(
         Ok(evidence) => evidence,
         Err(error) => {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -169,6 +170,7 @@ pub(super) fn execute_dependency_evidence_seed(
     let mut incomplete = !evidence.complete();
     for gap in &evidence.gaps {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -191,6 +193,7 @@ pub(super) fn execute_dependency_evidence_seed(
         Err(error) => {
             incomplete = true;
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -224,6 +227,7 @@ pub(super) fn execute_dependency_evidence_seed(
             unknown => {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -247,6 +251,7 @@ pub(super) fn execute_dependency_evidence_seed(
             missing_location_reported = true;
             truncated = true;
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                 impact: CodeQueryDiagnosticImpact::Incomplete,

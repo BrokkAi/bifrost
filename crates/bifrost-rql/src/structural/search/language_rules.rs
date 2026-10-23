@@ -52,6 +52,7 @@ impl LanguageRuleMatches {
         Self {
             ranges,
             diagnostics: vec![CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: super::results::CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
                 impact: CodeQueryDiagnosticImpact::Incomplete,

@@ -173,6 +173,8 @@ pub struct NormalizedNode {
     /// AST-backed async modifier for a callable fact. `None` means this
     /// adapter cannot answer the property for this node.
     pub is_async: Option<bool>,
+    /// Rust call-site unsafe context; absent on other kinds and languages.
+    pub unsafe_context: Option<bool>,
     /// Decoded value of a string-literal expression, when the adapter can
     /// classify its complete source spelling. `None` for other kinds or when
     /// the adapter does not support this axis.

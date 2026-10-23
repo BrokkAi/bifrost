@@ -520,6 +520,10 @@ impl CodeUnitIndex for PhpAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
+    }
+
+    delegate_inner_methods! {
         fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
@@ -1213,6 +1217,8 @@ mod dependency_packs {
         }
     }
 }
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PhpSupport {}
 
 #[cfg(test)]
 mod source_fact_tests;

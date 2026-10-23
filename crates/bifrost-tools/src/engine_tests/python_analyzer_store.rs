@@ -47,7 +47,7 @@ mod python_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context;
 
-    use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
     use brokk_bifrost_python_analysis::analyzer::python::PythonAdapter;
 

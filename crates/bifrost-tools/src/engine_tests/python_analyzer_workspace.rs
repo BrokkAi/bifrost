@@ -293,6 +293,7 @@ mod python_extraction_tests {
         let workspace = project.workspace_analyzer(config.clone());
         let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: Vec::new(),
             controls: Vec::new(),

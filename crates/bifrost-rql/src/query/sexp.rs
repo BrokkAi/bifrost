@@ -648,6 +648,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CfgEdgeSource
         | RqlForm::CfgEdgeTarget
         | RqlForm::ClassSet
+        | RqlForm::RustMarkerImplsOf
         | RqlForm::RustPointerFindings
         | RqlForm::FileOf
         | RqlForm::ImportsOf
@@ -2031,6 +2032,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::AssignmentUnstarredCountMismatch
         | RqlForm::Index
         | RqlForm::Async
+        | RqlForm::UnsafeContext
         | RqlForm::Modifier
         | RqlForm::StringValueRegex
         | RqlForm::Not
@@ -2753,6 +2755,16 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             )
             .at(expr)?;
         }
+        RqlForm::UnsafeContext => {
+            expect_len(expr, items, 2, "unsafe-context")?;
+            insert_unique(&mut object, "kind", json!("call")).at(expr)?;
+            insert_unique(
+                &mut object,
+                "unsafe_context",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
         RqlForm::Async => {
             expect_len(expr, items, 2, "async")?;
             insert_unique(&mut object, "async", Value::Bool(boolean_arg(&items[1])?)).at(expr)?;
@@ -3187,7 +3199,10 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::StatementReachability
         | RqlForm::BranchRelations
         | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
-        RqlForm::ClassSet | RqlForm::AbsentMember | RqlForm::RustPointerFindings => {
+        RqlForm::ClassSet
+        | RqlForm::AbsentMember
+        | RqlForm::RustMarkerImplsOf
+        | RqlForm::RustPointerFindings => {
             unreachable!("wrapper filtered above")
         }
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
@@ -3268,6 +3283,10 @@ fn insert_keyword(
             }
             RqlProperty::DuplicateKey => {
                 insert_unique(object, "duplicate_key", Value::Bool(boolean_arg(value)?))
+                    .at(key_expr)
+            }
+            RqlProperty::UnsafeContext => {
+                insert_unique(object, "unsafe_context", Value::Bool(boolean_arg(value)?))
                     .at(key_expr)
             }
             RqlProperty::Async => {

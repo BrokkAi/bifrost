@@ -106,3 +106,14 @@ pub fn first_named_node_matching_reverse_preorder<'tree>(
     }
     None
 }
+
+#[doc(hidden)]
+pub fn first_named_kind<'tree>(
+    root: tree_sitter::Node<'tree>,
+    kind: &str,
+) -> tree_sitter::Node<'tree> {
+    crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
+        node.kind() == kind
+    })
+    .unwrap_or_else(|| panic!("missing `{kind}` node"))
+}

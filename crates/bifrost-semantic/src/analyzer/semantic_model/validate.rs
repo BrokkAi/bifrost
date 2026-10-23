@@ -79,7 +79,7 @@ pub(crate) fn validate_pack(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
 ) -> Vec<Diagnostic> {
-    validate_pack_internal(pack, limits, true)
+    validate_pack_internal(pack, limits, true).0
 }
 
 #[doc(hidden)]
@@ -87,7 +87,7 @@ pub fn validate_pack_locally(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
 ) -> Vec<Diagnostic> {
-    validate_pack_internal(pack, limits, false)
+    validate_pack_internal(pack, limits, false).0
 }
 
 #[doc(hidden)]
@@ -99,11 +99,13 @@ pub fn validate_csmi_profile_evidence(pack: &AuthoredSemanticModelPack) -> Vec<D
     diagnostics
 }
 
-fn validate_pack_internal(
+/// Validates `pack` at its declared schema version and also returns the
+/// lowest version whose gates admit every field the pack uses.
+pub(crate) fn validate_pack_internal(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
     validate_references: bool,
-) -> Vec<Diagnostic> {
+) -> (Vec<Diagnostic>, u32) {
     let mut validator = Validator {
         language: pack.language.clone(),
         diagnostics: Vec::new(),
@@ -124,6 +126,7 @@ fn validate_pack_internal(
         pack_completeness: pack.completeness,
         pack_id_bytes: pack.pack_id.len(),
         schema_version: pack.schema_version,
+        required_schema_version: VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION,
         validate_references,
     };
     validator.validate(pack);
@@ -138,7 +141,7 @@ fn validate_pack_internal(
     validator
         .diagnostics
         .sort_by(|left, right| (&left.path, &left.code).cmp(&(&right.path, &right.code)));
-    validator.diagnostics
+    (validator.diagnostics, validator.required_schema_version)
 }
 
 struct Validator {
@@ -161,6 +164,9 @@ struct Validator {
     pack_completeness: Completeness,
     pack_id_bytes: usize,
     schema_version: u32,
+    /// The highest schema version whose gated fields this pack uses, never
+    /// below the version-independent floor. See `predates_schema`.
+    required_schema_version: u32,
     validate_references: bool,
 }
 
@@ -500,7 +506,7 @@ impl Validator {
                         .map_or(0, CallableValuesPayload::record_count),
                 );
             if shard.callable_values.is_some()
-                && self.schema_version < CALLABLE_VALUES_MIN_SCHEMA_VERSION
+                && self.predates_schema(CALLABLE_VALUES_MIN_SCHEMA_VERSION)
             {
                 self.error(
                     "schema.callable_values_version",
@@ -1386,7 +1392,7 @@ impl Validator {
             } => {
                 for (index, fact) in types.iter().enumerate() {
                     if fact.callable_surface_complete
-                        && self.schema_version < CALLABLE_SURFACE_MIN_SCHEMA_VERSION
+                        && self.predates_schema(CALLABLE_SURFACE_MIN_SCHEMA_VERSION)
                     {
                         self.error(
                             "schema.callable_surface_version",
@@ -1513,9 +1519,81 @@ impl Validator {
                             &fact.type_parameters,
                         );
                     }
+                    if !fact.type_parameter_defaults.is_empty()
+                        || !fact.implemented_traits.is_empty()
+                        || !fact.generic_trait_impls.is_empty()
+                    {
+                        self.rust_contract_version(&fact_path);
+                    }
+                    let mut parameters = fact.type_parameters.clone();
+                    parameters.push("Self".to_owned());
+                    if !fact.type_parameter_defaults.is_empty()
+                        && fact.type_parameter_defaults.len() != fact.type_parameters.len()
+                    {
+                        self.error(
+                            "declaration.generic_default_arity",
+                            &fact_path,
+                            "generic defaults must be parallel to type_parameters",
+                        );
+                    }
+                    for (index, default) in fact.type_parameter_defaults.iter().enumerate() {
+                        let default_path = format!("{fact_path}.type_parameter_defaults[{index}]");
+                        match default {
+                            Some(GenericParameterDefault::Type { r#type }) => {
+                                self.type_ref(&default_path, r#type, &parameters)
+                            }
+                            Some(GenericParameterDefault::Const { value }) => {
+                                self.text(&default_path, value)
+                            }
+                            None => {}
+                        }
+                    }
+                    for (index, implementation) in fact.implemented_traits.iter().enumerate() {
+                        self.implemented_trait(
+                            &format!("{fact_path}.implemented_traits[{index}]"),
+                            implementation,
+                            &parameters,
+                        );
+                    }
+                    for (index, implementation) in fact.generic_trait_impls.iter().enumerate() {
+                        let impl_path = format!("{fact_path}.generic_trait_impls[{index}]");
+                        if fact.type_kind != TypeKind::Trait {
+                            self.error(
+                                "declaration.generic_impl_owner",
+                                &impl_path,
+                                "generic trait impls must be owned by the implemented trait",
+                            );
+                        }
+                        self.unique_names(
+                            &format!("{impl_path}.type_parameters"),
+                            &implementation.type_parameters,
+                        );
+                        self.rust_self_pattern(
+                            &impl_path,
+                            &implementation.self_pattern,
+                            &implementation.type_parameters,
+                        );
+                        for bound in &implementation.bounds {
+                            self.type_ref(
+                                &impl_path,
+                                &bound.subject,
+                                &implementation.type_parameters,
+                            );
+                            self.implemented_trait(
+                                &impl_path,
+                                &bound.bound,
+                                &implementation.type_parameters,
+                            );
+                        }
+                        self.implemented_trait(
+                            &impl_path,
+                            &implementation.implementation,
+                            &implementation.type_parameters,
+                        );
+                    }
                     if let Some(bases) = &fact.runtime_bases {
                         let bases_path = format!("{fact_path}.runtime_bases");
-                        if self.schema_version < RUNTIME_BASES_MIN_SCHEMA_VERSION {
+                        if self.predates_schema(RUNTIME_BASES_MIN_SCHEMA_VERSION) {
                             self.error("declaration.runtime_bases_schema_version", &bases_path,
                                 format!("runtime_bases requires schema version {RUNTIME_BASES_MIN_SCHEMA_VERSION}"));
                         }
@@ -1581,6 +1659,21 @@ impl Validator {
                 }
                 for (index, fact) in members.iter().enumerate() {
                     let fact_path = format!("{path}.members[{index}]");
+                    if fact.implemented_trait.is_some() || fact.self_form.is_some() {
+                        self.rust_contract_version(&fact_path);
+                        let mut parameters = self
+                            .type_parameters_by_id
+                            .get(&fact.owner)
+                            .cloned()
+                            .unwrap_or_default();
+                        parameters.push("Self".to_owned());
+                        if let Some(trait_type) = &fact.implemented_trait {
+                            self.type_ref(&fact_path, trait_type, &parameters);
+                        }
+                        if let Some(RustSelfForm::Other { pattern }) = &fact.self_form {
+                            self.rust_self_pattern(&fact_path, pattern, &parameters);
+                        }
+                    }
                     if fact.non_overridable.is_some()
                         && (self.language != "java"
                             || fact.member_kind != MemberKind::Method
@@ -1608,7 +1701,7 @@ impl Validator {
                             continue;
                         };
                         let type_path = format!("{fact_path}.{field_name}");
-                        if self.schema_version < TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION
+                        if self.predates_schema(TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION)
                         {
                             self.error(
                                 "declaration.module_value_type_schema_version",
@@ -1757,7 +1850,7 @@ impl Validator {
                         }
                     }
                     if !fact.exact_return_classes.is_empty() {
-                        if self.schema_version < EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION {
+                        if self.predates_schema(EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION) {
                             self.error(
                                 "declaration.exact_return_classes_schema_version",
                                 format!("{fact_path}.exact_return_classes"),
@@ -2292,7 +2385,7 @@ impl Validator {
         payload: &RuntimeContractsPayload,
         activation: &[ActivationSelector],
     ) {
-        if self.schema_version < RUNTIME_CONTRACTS_MIN_SCHEMA_VERSION {
+        if self.predates_schema(RUNTIME_CONTRACTS_MIN_SCHEMA_VERSION) {
             self.error(
                 "runtime_contracts.schema_version",
                 path,
@@ -2637,7 +2730,7 @@ impl Validator {
             );
         }
         if !summary.target.formals.is_empty() {
-            if self.schema_version < PROCEDURE_FORMALS_MIN_SCHEMA_VERSION {
+            if self.predates_schema(PROCEDURE_FORMALS_MIN_SCHEMA_VERSION) {
                 self.error(
                     "summary.formals_schema_version",
                     format!("{path}.target.formals"),
@@ -2647,7 +2740,7 @@ impl Validator {
                 );
             }
             if summary.target.variadic
-                && self.schema_version < PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION
+                && self.predates_schema(PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION)
             {
                 self.error(
                     "summary.formals_variadic_target",
@@ -2677,7 +2770,7 @@ impl Validator {
                 .filter_map(|(index, formal)| formal.variadic_kind.map(|kind| (index, kind)))
                 .collect::<Vec<_>>();
             if !variadic_formals.is_empty()
-                && self.schema_version < PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION
+                && self.predates_schema(PROCEDURE_VARIADIC_FORMALS_MIN_SCHEMA_VERSION)
             {
                 self.error(
                     "summary.variadic_formals_schema_version",
@@ -2785,7 +2878,7 @@ impl Validator {
         }
 
         if summary.no_concurrency_effects
-            && self.schema_version < NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION
+            && self.predates_schema(NO_CONCURRENCY_EFFECTS_MIN_SCHEMA_VERSION)
         {
             self.error(
                 "summary.no_concurrency_effects_schema_version",
@@ -2840,7 +2933,7 @@ impl Validator {
                 )
             });
         if (has_channel_close_effect || !summary.returned_callables.is_empty())
-            && self.schema_version < CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION
+            && self.predates_schema(CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION)
         {
             self.error(
                 "summary.channel_close_schema_version",
@@ -4121,7 +4214,7 @@ impl Validator {
         if obligations.is_empty() {
             return;
         }
-        if self.schema_version < RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION {
+        if self.predates_schema(RESULT_USE_OBLIGATIONS_MIN_SCHEMA_VERSION) {
             self.error(
                 "summary.result_use_obligations_schema",
                 format!("{path}.result_use_obligations"),
@@ -4796,7 +4889,7 @@ impl Validator {
         for (index, parameter) in signature.parameters.iter().enumerate() {
             let parameter_path = format!("{path}.parameters[{index}]");
             if parameter.role.is_some()
-                && self.schema_version < TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION
+                && self.predates_schema(TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION)
             {
                 self.error(
                     "parameter.role_schema_version",
@@ -4896,6 +4989,75 @@ impl Validator {
         }
     }
 
+    fn rust_contract_version(&mut self, path: &str) {
+        if self.predates_schema(RUST_DECLARATION_CONTRACT_MIN_SCHEMA_VERSION) {
+            self.error(
+                "declaration.rust_contract_schema_version",
+                path,
+                "Rust declaration contracts require schema version 18",
+            );
+        }
+        if self.language != "rust" {
+            self.error(
+                "declaration.rust_contract_language",
+                path,
+                "Rust declaration contracts require language rust",
+            );
+        }
+    }
+
+    fn implemented_trait(
+        &mut self,
+        path: &str,
+        fact: &ImplementedTraitFact,
+        parameters: &[String],
+    ) {
+        self.type_ref(&format!("{path}.trait_type"), &fact.trait_type, parameters);
+        let mut names = std::collections::HashSet::new();
+        for (index, binding) in fact.associated_types.iter().enumerate() {
+            let binding_path = format!("{path}.associated_types[{index}]");
+            self.language_identifier(&binding_path, &binding.name);
+            if !names.insert(&binding.name) {
+                self.error(
+                    "declaration.duplicate_associated_type",
+                    &binding_path,
+                    "duplicate associated type binding",
+                );
+            }
+            self.type_ref(&binding_path, &binding.r#type, parameters);
+        }
+    }
+
+    fn rust_self_pattern(&mut self, path: &str, pattern: &RustSelfPattern, parameters: &[String]) {
+        let mut pending = vec![(pattern, 1)];
+        while let Some((pattern, depth)) = pending.pop() {
+            if depth > self.limits.max_depth {
+                self.error(
+                    "limit.type_depth",
+                    path,
+                    "Rust self pattern exceeded type depth",
+                );
+                continue;
+            }
+            match pattern {
+                RustSelfPattern::Parameter { name } => {
+                    if !parameters.contains(name) {
+                        self.error(
+                            "type.unknown_parameter",
+                            path,
+                            format!("unknown self pattern parameter {name:?}"),
+                        );
+                    }
+                }
+                RustSelfPattern::Reference { inner, .. } => pending.push((inner, depth + 1)),
+                RustSelfPattern::Constructor { owner, arguments } => {
+                    self.type_ref(path, owner, parameters);
+                    pending.extend(arguments.iter().map(|argument| (argument, depth + 1)));
+                }
+            }
+        }
+    }
+
     fn type_ref(&mut self, path: &str, root: &TypeRef, type_parameters: &[String]) {
         let mut stack = vec![(root, 1usize, path.to_owned())];
         while let Some((reference, depth, current_path)) = stack.pop() {
@@ -4908,6 +5070,22 @@ impl Validator {
                 continue;
             }
             match reference {
+                TypeRef::Projection {
+                    owner,
+                    trait_type,
+                    name,
+                    arguments,
+                } => {
+                    self.rust_contract_version(&current_path);
+                    self.language_identifier(&format!("{current_path}.name"), name);
+                    stack.push((owner, depth + 1, format!("{current_path}.owner")));
+                    if let Some(trait_type) = trait_type {
+                        stack.push((trait_type, depth + 1, format!("{current_path}.trait_type")));
+                    }
+                    stack.extend(arguments.iter().enumerate().map(|(index, ty)| {
+                        (ty, depth + 1, format!("{current_path}.arguments[{index}]"))
+                    }));
+                }
                 TypeRef::Named {
                     name, arguments, ..
                 } => {
@@ -4982,7 +5160,9 @@ impl Validator {
                     }
                 }
                 TypeRef::Tuple { elements } => {
-                    if elements.is_empty() {
+                    if elements.is_empty() && self.language == "rust" {
+                        self.rust_contract_version(&current_path);
+                    } else if elements.is_empty() {
                         self.error(
                             "type.empty_tuple",
                             &current_path,
@@ -5022,7 +5202,7 @@ impl Validator {
                     }
                 }
                 TypeRef::Unknown => {
-                    if self.schema_version < UNKNOWN_TYPE_MIN_SCHEMA_VERSION {
+                    if self.predates_schema(UNKNOWN_TYPE_MIN_SCHEMA_VERSION) {
                         self.error(
                             "schema.unknown_type_version",
                             &current_path,
@@ -5786,13 +5966,22 @@ impl Validator {
             .push(Diagnostic::error(code, path, message));
     }
 
+    /// Records that the pack uses a field introduced in schema `minimum` and
+    /// returns whether the pack declares an older version. Every per-field
+    /// version gate goes through here, so the walk that enforces the gates
+    /// also yields the lowest version a pack can be written at (#6251).
+    fn predates_schema(&mut self, minimum: u32) -> bool {
+        self.required_schema_version = self.required_schema_version.max(minimum);
+        self.schema_version < minimum
+    }
+
     /// A reader that accepts more than one schema version must still hold each
     /// pack to the shape its own version number promises. A version-two reader
     /// rejects unknown fields, so a version-two pack carrying `ambient_use`
     /// would load here and fail there, which is the failure the new version
     /// number exists to prevent.
     fn ambient_use_version(&mut self, fact_path: &str) {
-        if self.schema_version < AMBIENT_USE_MIN_SCHEMA_VERSION {
+        if self.predates_schema(AMBIENT_USE_MIN_SCHEMA_VERSION) {
             self.error(
                 "schema.ambient_use_requires_version",
                 format!("{fact_path}.ambient_use"),

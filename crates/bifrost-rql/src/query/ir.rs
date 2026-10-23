@@ -567,6 +567,7 @@ pub enum QueryValueKind {
     StatementReachability,
     PendingCleanupFlow,
     PythonRuleFact,
+    RustMarkerImpl,
     RustPointerFinding,
     Guard,
     SourceSet,
@@ -745,6 +746,7 @@ impl QueryValueKind {
             | Self::StatementReachability
             | Self::PendingCleanupFlow
             | Self::PythonRuleFact
+            | Self::RustMarkerImpl
             | Self::RustPointerFinding
             | Self::Guard
             | Self::SourceSet
@@ -832,6 +834,7 @@ impl QueryValueKind {
             Self::StatementReachability => "statement_reachability",
             Self::PendingCleanupFlow => "pending_cleanup_flow",
             Self::PythonRuleFact => "python_rule_fact",
+            Self::RustMarkerImpl => "rust_marker_impl",
             Self::RustPointerFinding => "rust_pointer_finding",
             Self::Guard => "guard",
             Self::SourceSet => "source_set",
@@ -2057,6 +2060,7 @@ pub enum QueryStep {
     FailureHandlerState,
     StatementReachability,
     PendingCleanupFlows,
+    RustMarkerImplsOf,
     RustPointerFindings,
     GuardsOf,
     TargetOf,
@@ -2712,6 +2716,7 @@ impl QueryStep {
             Self::FailureHandlerState => QueryStepOp::FailureHandlerState,
             Self::StatementReachability => QueryStepOp::StatementReachability,
             Self::PendingCleanupFlows => QueryStepOp::PendingCleanupFlows,
+            Self::RustMarkerImplsOf => QueryStepOp::RustMarkerImplsOf,
             Self::RustPointerFindings => QueryStepOp::RustPointerFindings,
             Self::GuardsOf => QueryStepOp::GuardsOf,
             Self::TargetOf => QueryStepOp::TargetOf,
@@ -2931,6 +2936,7 @@ impl QueryStep {
             QueryStepOp::LoopRelations => Some(Self::LoopRelations),
             QueryStepOp::StatementReachability => Some(Self::StatementReachability),
             QueryStepOp::PendingCleanupFlows => Some(Self::PendingCleanupFlows),
+            QueryStepOp::RustMarkerImplsOf => Some(Self::RustMarkerImplsOf),
             QueryStepOp::RustPointerFindings => Some(Self::RustPointerFindings),
             QueryStepOp::RewritePathsOf => Some(Self::RewritePathsOf(RewritePathFilter::default())),
             QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
@@ -3387,6 +3393,10 @@ impl QueryStep {
             (Self::PendingCleanupFlows, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::PendingCleanupFlow)
             }
+            (
+                Self::RustMarkerImplsOf,
+                QueryValueKind::StructuralMatch | QueryValueKind::Declaration,
+            ) => Some(QueryValueKind::RustMarkerImpl),
             (Self::RustPointerFindings, QueryValueKind::Procedure) => {
                 Some(QueryValueKind::RustPointerFinding)
             }
@@ -3626,6 +3636,7 @@ fn validate_query_steps(
             | QueryStep::StatementReachability
             | QueryStep::PendingCleanupFlows
             | QueryStep::RustPointerFindings => "procedure",
+            QueryStep::RustMarkerImplsOf => "declaration or structural_match",
             QueryStep::GuardsOf => "procedure",
             QueryStep::TargetOf | QueryStep::SourceSetOf => "file",
             QueryStep::TopologyEdgesOf => "build_target",
@@ -4073,7 +4084,24 @@ impl CodeQuerySeed {
                 .is_some_and(Pattern::constrains_boolean_value)
     }
 
-    /// Whether any pattern in this seed filters on AST-backed callable asyncness.
+    /// Whether any pattern in this seed filters on a Rust call's unsafe context.
+    pub fn constrains_unsafe_context(&self) -> bool {
+        self.root.constrains_unsafe_context()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_unsafe_context)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_unsafe_context)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_unsafe_context)
+    }
+
+    /// Whether a pattern constrains AST-backed callable asyncness.
     pub fn constrains_async_callable(&self) -> bool {
         self.root.constrains_async_callable()
             || self
@@ -5422,6 +5450,8 @@ pub struct Pattern {
     pub boolean_value: Option<bool>,
     /// AST-backed async modifier of a callable fact. `None` means unconstrained.
     pub is_async: Option<bool>,
+    /// Rust call-site unsafe context.
+    pub unsafe_context: Option<bool>,
     /// A declaration modifier read from the declaration's structured modifier
     /// nodes. This is a generic source relation, not a language/framework rule.
     pub modifier: Option<DeclarationModifier>,
@@ -5566,6 +5596,7 @@ impl Pattern {
             && self.not_kinds.is_empty()
             && self.name.is_none()
             && self.is_async.is_none()
+            && self.unsafe_context.is_none()
             && self.modifier.is_none()
             && self.string_value.is_none()
             && self.language_rule.is_none()
@@ -5806,7 +5837,12 @@ impl Pattern {
                 .is_none_or(|predicate| predicate.matches(text))
     }
 
-    /// Whether this pattern or a nested pattern constrains callable asyncness.
+    /// Whether this pattern or a nested pattern constrains call unsafe context.
+    pub fn constrains_unsafe_context(&self) -> bool {
+        self.unsafe_context.is_some() || self.any_nested_pattern(Self::constrains_unsafe_context)
+    }
+
+    /// Whether a pattern constrains AST-backed callable asyncness.
     pub fn constrains_async_callable(&self) -> bool {
         self.is_async.is_some() || self.any_nested_pattern(Self::constrains_async_callable)
     }

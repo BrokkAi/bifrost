@@ -2,6 +2,7 @@ use crate::analyzer::common::{
     display_symbol_for_target, identifier_addresses_target,
     language_for_target as code_unit_language,
 };
+
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1167,7 +1168,8 @@ fn alias_segments(language: Language, segments: &[String]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn symbol_selector_leaf(language: Language, input: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn symbol_selector_leaf(language: Language, input: &str) -> Option<String> {
     // A leaf containing whitespace (e.g. the untouched `struct git_refdb`
     // primary reading, kept alongside its tag-stripped variant per #1019) can
     // never be a real indexed identifier, so it cannot be *the* canonical
@@ -1335,16 +1337,16 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Split a client- or source-provided qualified-name path into its canonical
-/// segments, honoring every separator the language uses (`::`, `.`, `\`, `/`,
-/// `+`) plus per-language segment normalization (Go receivers, Rust `r#`
-/// raw-identifier escapes, C++ `operator` tokens). The returned segments are
-/// separator-free and join with `.` to match how indexed fq strings compose,
-/// which is what makes this the structured way to normalize a `::`-qualified
-/// reference before an enclosing-scope walk.
-///
-/// The splitter itself is core-owned: `brokk-bifrost-rust` resolves Rust
-/// use-paths through it and cannot depend on analysis.
+#[doc = " Split a client- or source-provided qualified-name path into its canonical"]
+#[doc = " segments, honoring every separator the language uses (`::`, `.`, `\\`, `/`,"]
+#[doc = " `+`) plus per-language segment normalization (Go receivers, Rust `r#`"]
+#[doc = " raw-identifier escapes, C++ `operator` tokens). The returned segments are"]
+#[doc = " separator-free and join with `.` to match how indexed fq strings compose,"]
+#[doc = " which is what makes this the structured way to normalize a `::`-qualified"]
+#[doc = " reference before an enclosing-scope walk."]
+#[doc = ""]
+#[doc = " The splitter itself is core-owned: `brokk-bifrost-rust` resolves Rust"]
+#[doc = " use-paths through it and cannot depend on analysis."]
 pub(crate) use brokk_bifrost_core::analyzer::symbol_path::{
     parse_symbol_path, parse_symbol_path_fq,
 };
@@ -1399,6 +1401,7 @@ fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(test)]
     #[test]
     fn terminal_segment_prefilter_matches_only_boundary_delimited_occurrences() {
         // The full-scan prefilter must never falsely reject: a query terminal
@@ -1429,6 +1432,7 @@ mod tests {
         assert!(contains_boundary_delimited("héllo.llo", "llo"));
     }
 
+    #[cfg(test)]
     #[test]
     fn parse_symbol_path_fq_renders_to_dot_joined_parse_symbol_path() {
         // The structured input parser must reduce to exactly the legacy
@@ -1459,6 +1463,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn csharp_generic_member_aliases_include_arity_free_forms() {
         for (input, expected) in [
@@ -1481,6 +1486,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn javascript_and_typescript_keep_trailing_dollars_in_identifier_names() {
         for language in [Language::JavaScript, Language::TypeScript] {
@@ -1493,6 +1499,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn java_nested_class_names_keep_the_dollar_split_alias() {
         let variants = symbol_path_variants(Language::Java, "pkg.Outer$Inner");

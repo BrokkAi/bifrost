@@ -270,6 +270,11 @@ mod tests {
             );
             assert!(
                 plan.iter()
+                    .any(|row| row.contains("SEARCH gaps USING PRIMARY KEY (summary_id=?)")),
+                "{state:?}: binding completeness reader must seek unit gaps: {plan:?}"
+            );
+            assert!(
+                plan.iter()
                     .all(|row| !row.contains("AUTOMATIC") && !row.contains("TEMP B-TREE")),
                 "{state:?}: binding completeness reader builds no transient index or sort: {plan:?}"
             );
@@ -2268,20 +2273,42 @@ pub fn enclosing() {
         let changed = workspace.update(&BTreeSet::from([fixture.file("src/two.rs")]));
         {
             let conn = changed.store().unwrap().read_conn().unwrap();
-            let rows: Vec<(bool, String, i64)> = conn.prepare(
-                "SELECT completeness.complete, completeness.gap_subject,
+            let rows: Vec<(bool, String, String, i64)> = conn.prepare(
+                "SELECT completeness.complete, completeness.gap_kind, completeness.gap_subject,
                         json_array_length(gaps.detail, '$.evidence')
                  FROM resolution_unit_summary_versions AS version
                  JOIN rust_resolution_unit_summary_binding_completeness AS completeness USING(summary_id)
-                 JOIN rust_resolution_unit_summary_gaps AS gaps
-                   ON gaps.summary_id = completeness.summary_id
-                  AND gaps.gap_kind = completeness.gap_kind AND gaps.subject = completeness.gap_subject
-                 WHERE version.valid_until IS NULL AND completeness.gap_subject = 'crate::shadowed'",
-            ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                 JOIN rust_resolution_unit_summary_gaps AS gaps USING(summary_id)
+                 WHERE version.valid_until IS NULL AND gaps.gap_kind = 'open_export_inventory'
+                   AND gaps.subject = 'crate::shadowed'",
+            ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
                 .unwrap().collect::<rusqlite::Result<_>>().unwrap();
-            assert_eq!(rows, vec![(false, "crate::shadowed".into(), 2); 3]);
+            assert_eq!(rows, vec![(true, "complete".into(), "".into(), 2); 3]);
         }
         let analyzer = resolve_analyzer::<RustAnalyzer>(changed.analyzer()).unwrap();
+        let completeness = changed
+            .store()
+            .unwrap()
+            .rust_summary_binding_completeness_rows(
+                &analyzer.inner.selected_workspace_snapshots(),
+                &[
+                    "src/lib.rs".into(),
+                    "src/one.rs".into(),
+                    "src/two.rs".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            completeness
+                .iter()
+                .map(|row| (row.rel_path.as_str(), row.complete))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/lib.rs", false),
+                ("src/one.rs", false),
+                ("src/two.rs", false)
+            ],
+        );
         let client = fixture.file("src/lib.rs");
         let selected = crate::hash::HashMap::from_iter([(client.clone(), vec![1])]);
         let mut visited = Vec::new();

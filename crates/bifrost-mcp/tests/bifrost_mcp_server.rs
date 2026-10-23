@@ -10,7 +10,7 @@ use brokk_bifrost_mcp::benchmark_api::{
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use brokk_bifrost_test_macros::hardwon;
 use common::InlineTestProject;
-use common::mcp_wire::{read_line, round_trip_json_line as round_trip, write_line};
+use common::mcp_wire::{DrainedStderr, read_line, round_trip_json_line as round_trip, write_line};
 use git2::{IndexAddOption, Repository, Signature};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -152,7 +152,7 @@ fn run_pack_activation_policy(
         .expect("spawn pack activation MCP server");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     let candidates = round_trip(
         &mut stdin,
@@ -463,7 +463,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     let initialize = round_trip(
@@ -552,6 +552,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "refresh",
             "activate_workspace",
             "get_active_workspace",
+            "list_function_sources",
             "analyze_diff",
             "blast_radius",
             "cyclomatic_complexity",
@@ -1126,7 +1127,7 @@ fn cognitive_complexity_reports_every_supported_language_in_one_mcp_call() {
     let mut child = spawn_server(workspace.root(), "slopcop", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
@@ -1206,7 +1207,7 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -1299,7 +1300,7 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
     let mut child = spawn_server(fixture_root.path(), "extended", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
@@ -1395,7 +1396,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     let mut child = spawn_server(initial.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
@@ -1739,7 +1740,7 @@ fn rmcp_run_policy_malformed_suppressions_fail_before_readiness() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     let response = round_trip(
@@ -1766,7 +1767,7 @@ fn task_capable_rmcp_run_policy_malformed_suppressions_is_not_a_task() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     let response = round_trip(
@@ -1789,7 +1790,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     let mut child = spawn_server(project.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
@@ -2074,7 +2075,7 @@ fn bifrost_mcp_normalizes_absolute_paths_inside_workspace() {
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2165,7 +2166,7 @@ fn bifrost_mcp_reports_absolute_paths_outside_workspace_as_tool_errors() {
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2215,7 +2216,7 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
     let mut child = spawn_server(initial_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2278,7 +2279,7 @@ fn bifrost_mcp_get_summaries_mixed_targets_include_directory_listing() {
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2339,7 +2340,7 @@ fn bifrost_mcp_get_summaries_accepts_go_import_path() {
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2409,7 +2410,7 @@ fn bifrost_mcp_search_symbols_matches_glob_wildcard_patterns() {
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2524,7 +2525,7 @@ fn bifrost_mcp_budgets_large_get_summaries_responses() {
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
@@ -2759,7 +2760,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let initialize = round_trip(
         &mut stdin,
@@ -3035,7 +3036,7 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let initialize = round_trip(
         &mut stdin,
@@ -3283,7 +3284,7 @@ fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let initialize = round_trip(
         &mut stdin,
@@ -3362,7 +3363,7 @@ fn explicit_mcp_root_ignores_codex_sandbox_state() {
     let mut child = spawn_server(explicit_workspace.root(), "symbol", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let initialize = round_trip(
         &mut stdin,
@@ -3417,7 +3418,7 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let initialize = initialize_session(&mut stdin, &mut reader, &mut stderr);
     assert_eq!(
         initialize["result"]["capabilities"]["experimental"]["codex/sandbox-state-meta"],
@@ -3573,7 +3574,7 @@ fn rmcp_host_answers_2026_07_28_discovery_before_any_handshake() {
         .expect("spawn RMCP bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let discover = round_trip(
         &mut stdin,
@@ -3614,7 +3615,7 @@ fn mcp_2026_07_28_clients_get_result_types() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let discover = round_trip(
         &mut stdin,
@@ -3658,7 +3659,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     round_trip(
         &mut stdin,
         &mut reader,
@@ -3742,7 +3743,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     let tools = round_trip(
         &mut stdin,
@@ -3789,7 +3790,7 @@ fn legacy_clients_never_see_a_result_type() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     let call = round_trip(
@@ -3817,7 +3818,8 @@ fn legacy_clients_never_see_a_result_type() {
 
 /// The tools whose `structuredContent` shapes are published as contracts.
 /// published tool answers with a shape that is not yet a declared contract.
-const OUTPUT_SCHEMA_TOOLS: [&str; 9] = [
+const OUTPUT_SCHEMA_TOOLS: [&str; 10] = [
+    "list_function_sources",
     "blast_radius",
     "cyclomatic_complexity",
     "missing_tests",
@@ -3838,7 +3840,7 @@ fn output_schema_reaches_every_supported_revision() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     let listed = round_trip(
@@ -3885,7 +3887,7 @@ fn output_schema_reaches_every_supported_revision() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     round_trip(
         &mut stdin,
         &mut reader,
@@ -3950,7 +3952,7 @@ fn output_schema_describes_real_workspace_and_policy_results() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     let listed = round_trip(
@@ -3963,6 +3965,36 @@ fn output_schema_describes_real_workspace_and_policy_results() {
         .as_array()
         .expect("tools array")
         .clone();
+
+    let functions = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        20,
+        "list_function_sources",
+        json!({"paths": ["Described.java"]}),
+    );
+    assert_eq!(
+        functions["result"]["structuredContent"]["summary"]["record_count"], 1,
+        "{functions}"
+    );
+    let record = &functions["result"]["structuredContent"]["records"][0];
+    assert_eq!(record["name"], "changed");
+    assert_eq!(record["source"], "void changed() {}");
+    assert_eq!(
+        record["blob_oid"],
+        git2::Oid::hash_object(
+            git2::ObjectType::Blob,
+            b"class Described { void changed() {} }\n"
+        )
+        .unwrap()
+        .to_string()
+    );
+    assert_structured_content_matches_advertised_schema(
+        &tools,
+        "list_function_sources",
+        &functions,
+    );
 
     let workspace_result = call_tool(
         &mut stdin,
@@ -4123,7 +4155,7 @@ fn a_held_build_lock_is_reported_as_the_request_phase() {
         .expect("spawn bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     // The workspace build takes the same lock, so let it finish and release
     // before the test takes it.
@@ -4232,7 +4264,7 @@ fn output_schema_describes_search_symbols_hits_bounds_and_overload() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     let listed = round_trip(
@@ -4330,7 +4362,7 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     round_trip(
         &mut stdin,
@@ -4428,7 +4460,7 @@ fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     // Discovery opens the session; there is no initialize and no
     // notifications/initialized anywhere in this exchange.
@@ -4518,7 +4550,7 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     round_trip(
         &mut stdin,
@@ -4695,7 +4727,7 @@ fn progress_token_yields_phase_progress_and_silence_without_it() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     // A string token, echoed as a string.
@@ -4802,7 +4834,7 @@ fn concurrent_progress_tokens_never_cross_route() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     // Both calls are on the wire before either response, so their phase
@@ -4900,7 +4932,7 @@ fn cancellation_with_progress_in_flight_leaves_the_session_healthy() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     // Cancel immediately after sending, so the cancellation lands during
@@ -5180,7 +5212,7 @@ fn mcp_tasks_run_policy_completes_through_a_task_handle() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     let discover = discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
     assert!(
         discover["result"]["capabilities"]["extensions"]
@@ -5242,7 +5274,7 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     round_trip(
         &mut stdin,
         &mut reader,
@@ -5288,7 +5320,7 @@ fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2025-11-25");
     let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
     assert!(
@@ -5311,7 +5343,7 @@ fn mcp_tasks_cancel_settles_cancelled() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     let created = round_trip(
@@ -5360,7 +5392,7 @@ fn mcp_tasks_expire_to_failed() {
         .expect("spawn bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     let created = round_trip(
@@ -5403,7 +5435,7 @@ fn mcp_tasks_handles_die_with_workspace_rebinding() {
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol|extended");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     // Rootless 2026-07-28 binding goes through MRTR: the first call is
@@ -5497,7 +5529,7 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     let mut child = spawn_rootless_server(cwd, "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let refused = round_trip(
         &mut stdin,
@@ -5531,7 +5563,7 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     let mut child = spawn_rootless_server(cwd, "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let mut stateless_call =
         codex_search_symbols_call(0, sandbox_root, "codex-test-thread", "CodexWorkspace");
@@ -5952,7 +5984,7 @@ fn light_lookup_overtakes_long_usage_scan() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     // Warm the lookup once so the measured run is dispatch plus a cache hit,
@@ -6057,16 +6089,14 @@ fn bifrost_mcp_cli_mode_is_rejected() {
 
     for mode in ["cli", "symbol|cli"] {
         let mut child = spawn_server(fixture_root.path(), mode, &[]);
+        let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
         let status = child.wait().expect("wait bifrost");
         assert!(
             !status.success(),
             "bifrost --mcp {mode} should fail to start: {status}"
         );
         let mut stderr_text = String::new();
-        child
-            .stderr
-            .take()
-            .expect("stderr")
+        stderr
             .read_to_string(&mut stderr_text)
             .expect("read stderr");
         assert!(
@@ -6088,7 +6118,7 @@ fn mcp_tasks_unknown_ids_fail_safely() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
 
     for (id, method) in [(1, "tasks/get"), (2, "tasks/update"), (3, "tasks/cancel")] {

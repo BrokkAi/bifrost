@@ -553,6 +553,7 @@ impl ControlRelationTraversalCache {
                 continue;
             }
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,

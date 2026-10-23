@@ -35,6 +35,7 @@ fn activate_rust_pack(
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
                 language: "rust".to_owned(),

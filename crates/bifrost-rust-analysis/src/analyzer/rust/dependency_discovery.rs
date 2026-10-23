@@ -322,6 +322,12 @@ pub fn resolve_rust_semantic_pack_dependencies(
                 ));
                 dependencies.push(stdlib);
             }
+            Err(diagnostic) if diagnostic.code == "rust.toolchain.missing" => {
+                stdlib_expectation = Some(StandardLibraryPackExpectation::approximate(
+                    Language::Rust,
+                    RUST_STDLIB_PACK_ID,
+                ));
+            }
             Err(diagnostic) => {
                 cancelled |= diagnostic.code == "rust.evidence.cancelled";
                 // A cancelled read answers nothing about the pack; every other
@@ -347,7 +353,13 @@ pub fn resolve_rust_semantic_pack_dependencies(
             dependencies_resolved: dependencies.len(),
             informational_evidence: Vec::new(),
         },
-        complete: diagnostics.is_empty() && !cancelled,
+        // Approximate models can supply positive declarations, but an unpinned
+        // toolchain does not establish an exact, complete dependency boundary.
+        complete: diagnostics.is_empty()
+            && !cancelled
+            && !stdlib_expectation
+                .as_ref()
+                .is_some_and(|expectation| expectation.approximate),
         dependencies,
         diagnostics,
         suppressed_diagnostics,
@@ -376,6 +388,24 @@ fn resolve_rust_stdlib_dependency(
         }
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {
+            let legacy_path = project.root().join("rust-toolchain");
+            match std::fs::symlink_metadata(&legacy_path) {
+                Ok(_) => {
+                    return Err(diagnostic(
+                        "rust.toolchain.legacy_pin",
+                        Some(&legacy_path),
+                        "rust-toolchain declares a pin; exact stdlib discovery requires rust-toolchain.toml",
+                    ));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(diagnostic(
+                        "rust.toolchain.metadata",
+                        Some(&legacy_path),
+                        format!("could not inspect rust-toolchain: {error}"),
+                    ));
+                }
+            }
             return Err(diagnostic(
                 "rust.toolchain.missing",
                 Some(&path),
@@ -1319,10 +1349,7 @@ mod tests {
     }
 
     #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "84ee4df01eba: missing rust-toolchain.toml gave no actionable stdlib-pack remediation"
-    )]
-    fn missing_rust_toolchain_reports_stdlib_remediation_requirement() {
+    fn missing_rust_toolchain_requests_approximate_stdlib() {
         let fixture = EvidenceFixture::new();
         let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
         let outcome = resolve_rust_semantic_pack_dependencies(
@@ -1334,12 +1361,10 @@ mod tests {
 
         assert!(!outcome.complete);
         assert!(outcome.dependencies.is_empty());
-        assert_eq!(outcome.diagnostics[0].code, "rust.toolchain.missing");
-        assert!(
-            outcome.diagnostics[0]
-                .message
-                .contains(RUST_STDLIB_TOOLCHAIN_CHANNEL)
-        );
+        assert!(outcome.diagnostics.is_empty());
+        let expectation = outcome.standard_library_pack_expectations().next().unwrap();
+        assert!(expectation.approximate);
+        assert_eq!(expectation.pack_id, RUST_STDLIB_PACK_ID);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use crate::analyzer::go::GoAnalyzer;
 
+use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
@@ -957,7 +958,7 @@ fn go_generic_instantiation_callee_reference_at(
 pub struct GoNativePointRequest<'a> {
     go: &'a GoAnalyzer,
     operation: SelectedResolutionOperation<'a, 'a>,
-    context_id: i64,
+    base_profile: [u8; 32],
     overlay: Option<
         Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
     >,
@@ -992,14 +993,17 @@ impl<'a> GoNativePointRequest<'a> {
         brokk_bifrost_analysis::analyzer::store::resolution_operation::go_method_family::GoMethodFamily,
     >{
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseCandidateOutcome;
+        let path = brokk_bifrost_core::path_utils::rel_path_string(target.source());
+        let (context, profile) = self
+            .operation
+            .go_contexts_for_file(&self.base_profile, &path)?
+            .pop()
+            .expect("target belongs to a context");
         match self.operation.go_reverse_candidate_sites(
             target,
-            self.context_id,
+            context.context_id,
             true,
-            &self
-                .go
-                .native_context_profile()
-                .expect("selected native profile"),
+            &profile,
             cancellation,
         )? {
             GoReverseCandidateOutcome::Ready(candidates) => Ok(candidates.family),
@@ -1040,30 +1044,15 @@ impl<'a> GoNativePointRequest<'a> {
                 message: "selected native declaration identities are not authoritative".into(),
             });
         }
-        let snapshots = go.inner.selected_workspace_snapshots();
-        let (Some(snapshot), Some(profile)) = (snapshots.get("go"), go.native_context_profile())
-        else {
+        let Some(base_profile) = go.native_context_base_profile() else {
             return Ok(GoNativePointRequestOpen::Unavailable {
                 kind: "native_context_unavailable",
-                message: "selected Go package/import context is unavailable".into(),
+                message: "selected Go package/import base profile is unavailable".into(),
             });
         };
-        let Some(context) = go
-            .inner
-            .analyzer_store()
-            .selected_go_context(snapshot, &profile)?
-        else {
-            return Ok(GoNativePointRequestOpen::Unavailable {
-                kind: "native_context_unavailable",
-                message: "selected Go package/import context is unavailable".into(),
-            });
-        };
-        if cancellation.is_cancelled() {
-            return Ok(GoNativePointRequestOpen::Cancelled);
-        }
         let operation = match open_native_point_operation(&go.inner, cancellation)? {
             SelectedResolutionOperationOpenOutcome::Ready(operation) => {
-                (*operation).with_go_model_authority(overlay.clone())
+                (*operation).with_go_model_authority(overlay.clone().map(|overlay| overlay as Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>))
             }
             SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
                 return Ok(GoNativePointRequestOpen::Unavailable {
@@ -1084,7 +1073,7 @@ impl<'a> GoNativePointRequest<'a> {
         Ok(GoNativePointRequestOpen::Ready(Box::new(Self {
             go,
             operation,
-            context_id: context.context_id,
+            base_profile,
             overlay,
             files: HashMap::default(),
             forward_candidate_artifacts: HashMap::default(),
@@ -1094,12 +1083,47 @@ impl<'a> GoNativePointRequest<'a> {
         })))
     }
 
+    /// A file-scoped request binds authority before any answer or fast path.
+    #[doc(hidden)]
+    pub fn open_for_file(
+        go: &'a GoAnalyzer,
+        file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+        overlay: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        cancellation: &CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<GoNativePointRequestOpen<'a>> {
+        let opened = Self::open(go, overlay, cancellation)?;
+        if let GoNativePointRequestOpen::Ready(request) = &opened {
+            let path = brokk_bifrost_core::path_utils::rel_path_string(file);
+            if request
+                .operation
+                .go_context_for_file(&request.base_profile, &path)?
+                .is_none()
+            {
+                return Ok(GoNativePointRequestOpen::Unavailable {
+                    kind: "native_context_unavailable",
+                    message: format!("selected Go context has no workspace source {path}"),
+                });
+            }
+        }
+        Ok(opened)
+    }
+
     /// The selected operation and Go context the unit-summary differential test
     /// uses as the incumbent readers' oracle.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn oracle_for_test(&self) -> (&SelectedResolutionOperation<'a, 'a>, i64) {
-        (&self.operation, self.context_id)
+    pub fn oracle_for_test(
+        &mut self,
+        path: &str,
+    ) -> (&mut SelectedResolutionOperation<'a, 'a>, i64) {
+        let context = self
+            .operation
+            .go_context_for_file(&self.base_profile, path)
+            .expect("select oracle context")
+            .expect("oracle source belongs to a context");
+        (&mut self.operation, context.context_id)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1430,15 +1454,21 @@ impl<'a> GoNativePointRequest<'a> {
         if let Some(context) = self.files.get(path) {
             return Ok(Some(context.clone()));
         }
+        let Some(selected) = self
+            .operation
+            .go_context_for_file(&self.base_profile, path)?
+        else {
+            return Ok(None);
+        };
         let GoPreparedImportContextOutcome::Ready(context) = self
             .operation
-            .go_file_import_context(self.context_id, path, cancellation)?
+            .go_file_import_context(selected.context_id, path, cancellation)?
         else {
             return Ok(None);
         };
         let selected_imports =
             self.operation
-                .go_selected_external_imports(self.context_id, path, cancellation)?;
+                .go_selected_external_imports(selected.context_id, path, cancellation)?;
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -1450,28 +1480,59 @@ impl<'a> GoNativePointRequest<'a> {
         Ok(Some(context))
     }
 
+    fn revalidate_answer<T>(
+        &mut self,
+        answer: BoundedResolution<T>,
+        cancellation: &CancellationToken,
+        unavailable: impl FnOnce(&'static str, String) -> T,
+    ) -> BoundedResolution<T> {
+        let BoundedResolution::Complete { value, work } = answer else {
+            return answer;
+        };
+        let failed =
+            match self
+                .operation
+                .finish_native(value, &ResolutionCompletion::Complete, cancellation)
+            {
+                Ok(SelectedResolutionOperationOutcome::Native(value)) => {
+                    return BoundedResolution::Complete { value, work };
+                }
+                Ok(SelectedResolutionOperationOutcome::Cancelled(_)) => {
+                    return BoundedResolution::Cancelled { work };
+                }
+                Ok(SelectedResolutionOperationOutcome::Stale(reason)) => {
+                    ("native_stale", format!("{reason:?}"))
+                }
+                Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => {
+                    ("native_unavailable", format!("{reason:?}"))
+                }
+                Err(error) => ("native_store_error", error.to_string()),
+            };
+        BoundedResolution::Complete {
+            value: unavailable(failed.0, failed.1),
+            work,
+        }
+    }
+
     pub(crate) fn resolve_type(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        let answer = self.resolve_type_inner(query);
+        self.revalidate_answer(
+            answer,
+            &query.cancellation.cloned().unwrap_or_default(),
+            |kind, message| unavailable_type(query.site, kind, message),
+        )
+    }
+
+    fn resolve_type_inner(
         &mut self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
         let cancellation = query.cancellation.cloned().unwrap_or_default();
         if cancellation.is_cancelled() {
             return BoundedResolution::Cancelled {
-                work: ReceiverAnalysisWork::default(),
-            };
-        }
-        if !self
-            .go
-            .inner
-            .source_matches_selected_native_content(query.file, query.source)
-        {
-            return BoundedResolution::Complete {
-                value: unavailable_type(
-                    query.site,
-                    "native_source_mismatch",
-                    "supplied native reference text differs from the admitted selected source"
-                        .into(),
-                ),
                 work: ReceiverAnalysisWork::default(),
             };
         }
@@ -1500,6 +1561,21 @@ impl<'a> GoNativePointRequest<'a> {
                 };
             }
         };
+        if !self
+            .go
+            .inner
+            .source_matches_selected_native_content(query.file, query.source)
+        {
+            return BoundedResolution::Complete {
+                value: unavailable_type(
+                    query.site,
+                    "native_source_mismatch",
+                    "supplied native reference text differs from the admitted selected source"
+                        .into(),
+                ),
+                work: ReceiverAnalysisWork::default(),
+            };
+        }
         let parsed_tree = query
             .tree
             .is_none()
@@ -1744,27 +1820,6 @@ impl<'a> GoNativePointRequest<'a> {
                 Vec::new(),
             );
         }
-        if !self
-            .go
-            .inner
-            .source_matches_selected_native_content(query.file, query.source)
-        {
-            return (
-                BoundedResolution::Complete {
-                    value: (
-                        unavailable_definition(
-                            query.site,
-                            "native_source_mismatch",
-                            "supplied native reference text differs from the admitted selected source"
-                                .into(),
-                        ),
-                        None,
-                    ),
-                    work: ReceiverAnalysisWork::default(),
-                },
-                Vec::new(),
-            );
-        }
         let path = brokk_bifrost_core::path_utils::rel_path_string(query.file);
         let file_context = match self.file_context(&path, &cancellation) {
             Ok(Some(context)) => context,
@@ -1809,6 +1864,27 @@ impl<'a> GoNativePointRequest<'a> {
                 );
             }
         };
+        if !self
+            .go
+            .inner
+            .source_matches_selected_native_content(query.file, query.source)
+        {
+            return (
+                BoundedResolution::Complete {
+                    value: (
+                        unavailable_definition(
+                            query.site,
+                            "native_source_mismatch",
+                            "supplied native reference text differs from the admitted selected source"
+                                .into(),
+                        ),
+                        None,
+                    ),
+                    work: ReceiverAnalysisWork::default(),
+                },
+                Vec::new(),
+            );
+        }
         let parsed_tree = query
             .tree
             .is_none()
@@ -2163,6 +2239,23 @@ impl<'a> GoNativePointRequest<'a> {
         &mut self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<GoNativeDefinitionResolution> {
+        let result = self.resolve_definition_with_evidence_inner(query);
+        self.revalidate_answer(
+            result,
+            &query.cancellation.cloned().unwrap_or_default(),
+            |kind, message| GoNativeDefinitionResolution {
+                outcome: unavailable_definition(query.site, kind, message),
+                call_application: CallApplicationKind::Unknown,
+                exact_external_call: None,
+                external_callee_identity: None,
+            },
+        )
+    }
+
+    fn resolve_definition_with_evidence_inner(
+        &mut self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<GoNativeDefinitionResolution> {
         let (mut native, selected_imports) = self.resolve_definition_native(query);
         let parsed_tree = query
             .tree
@@ -2263,12 +2356,24 @@ impl<'a> GoNativePointRequest<'a> {
                 work,
             };
         }
-        finish_go_definition_resolution(
+        let answer = finish_go_definition_resolution(
             query,
             self.go,
             self.overlay.clone(),
             selected_imports,
             native,
+        );
+        // Model/import projections can complete after an unavailable native
+        // path; the final request boundary must still revalidate its publication.
+        self.revalidate_answer(
+            answer,
+            &query.cancellation.cloned().unwrap_or_default(),
+            |kind, message| GoNativeDefinitionResolution {
+                outcome: unavailable_definition(query.site, kind, message),
+                exact_external_call: None,
+                call_application: CallApplicationKind::Unknown,
+                external_callee_identity: None,
+            },
         )
     }
 }
@@ -2393,8 +2498,12 @@ pub(crate) fn resolve_go_definition_with_evidence_bounded(
     };
     let cancellation = query.cancellation.cloned().unwrap_or_default();
     let open_started = record_work.then(Instant::now);
-    let opened =
-        GoNativePointRequest::open(go, query.analyzer.semantic_model_overlay(), &cancellation);
+    let opened = GoNativePointRequest::open_for_file(
+        go,
+        query.file,
+        query.analyzer.semantic_model_overlay(),
+        &cancellation,
+    );
     let open_nanos = open_started.map_or(0, |started| started.elapsed().as_nanos());
     let mut request = match opened {
         Ok(GoNativePointRequestOpen::Ready(request)) => request,
@@ -2795,8 +2904,12 @@ pub(crate) fn resolve_go_type_bounded(
     };
     let cancellation = query.cancellation.cloned().unwrap_or_default();
     let open_started = record_work.then(Instant::now);
-    let opened =
-        GoNativePointRequest::open(go, query.analyzer.semantic_model_overlay(), &cancellation);
+    let opened = GoNativePointRequest::open_for_file(
+        go,
+        query.file,
+        query.analyzer.semantic_model_overlay(),
+        &cancellation,
+    );
     let open_nanos = open_started.map_or(0, |started| started.elapsed().as_nanos());
     let mut request = match opened {
         Ok(GoNativePointRequestOpen::Ready(request)) => request,

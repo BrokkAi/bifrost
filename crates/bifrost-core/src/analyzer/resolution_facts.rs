@@ -162,6 +162,49 @@ pub struct ResolutionBindingEventFact {
     pub kind: ResolutionBindingEventKind,
     pub value: Option<ResolutionTypeSlotId>,
     pub authored_declaration: Option<ResolutionSiteId>,
+    /// Direct structured value source; a possible alias, never a binding proof.
+    pub source_reference: Option<ResolutionSiteId>,
+}
+
+/// Evaluation phase for a binding occurrence, not its source inventory ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionBindingEventTimingFact {
+    pub event: u32,
+    pub execution_scope: ResolutionScopeId,
+    pub entry_byte: usize,
+    pub commit_byte: usize,
+    pub commit_phase: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionBindingObservationKind {
+    Immediate,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionBindingObservationFact {
+    pub reference: ResolutionSiteId,
+    pub execution_scope: ResolutionScopeId,
+    pub point_byte: usize,
+    pub kind: ResolutionBindingObservationKind,
+}
+
+/// Syntax only; an attribute/name is a typing constant only after binding proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativePredicateKind {
+    Name,
+    Attribute,
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonNativePredicateFact {
+    pub predicate: ResolutionSiteId,
+    pub kind: PythonNativePredicateKind,
+    pub operand: Option<ResolutionSiteId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -404,6 +447,28 @@ labelled_enum! {
         // Appended to preserve every existing persisted role index.
         ObservedValue => "observed_value",
     }
+}
+
+/// A declaration's value, producer-only until its first reader designs publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionDeclarationValueFact {
+    pub declaration: ResolutionSiteId,
+    pub output: ResolutionTypeSlotId,
+    pub kind: ResolutionDeclarationValueKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionDeclarationValueKind {
+    TypeObject,
+    Callable,
+}
+
+/// A body return observation, producer-only until its first reader designs publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionCallableReturnFact {
+    pub callable: ResolutionSiteId,
+    pub return_site: ResolutionSiteId,
+    pub value: ResolutionTypeSlotId,
 }
 
 /// The type-bearing slot attached to a declaration. The slot's value is
@@ -1665,6 +1730,14 @@ pub enum ResolutionRouteGap {
         name: Option<ResolutionNameId>,
         kind: Option<ResolutionJvmAliasKind>,
     },
+    /// A known binder exports this exact name, but its availability is unproved,
+    /// for example because module initialization may not have reached it.
+    /// This does not allow an unknown writer to bind other names in the scope.
+    UnprovenExport {
+        scope: ResolutionScopeId,
+        name: ResolutionNameId,
+        namespace: ResolutionNamespace,
+    },
 }
 
 /// Binary ownership is supplied by the language producer, never inferred by
@@ -1880,14 +1953,214 @@ pub struct PythonNativeExportSurfaceFact {
 }
 
 /// One source file's normalized, target-independent resolution rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativeParameterKind {
+    PositionalOnly,
+    PositionalOrKeyword,
+    KeywordOnly,
+    VarPositional,
+    VarKeyword,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativeArgumentKind {
+    Positional,
+    Keyword,
+    Star,
+    DoubleStar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativeAnnotationMode {
+    Eager,
+    Deferred,
+    Quoted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativeDecoratorRole {
+    Property,
+    ClassMethod,
+    StaticMethod,
+    PropertyGetter,
+    PropertySetter,
+    PropertyDeleter,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativeMemberRole {
+    OrdinaryFunction,
+    ClassMethodCandidate,
+    StaticMethodCandidate,
+    PropertyCandidate,
+    DescriptorCandidate,
+    OrdinaryValue,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonNativeBaseKind {
+    Plain,
+    Star,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeParameterFact {
+    pub callable: ResolutionSiteId,
+    pub parameter: ResolutionSiteId,
+    pub ordinal: u32,
+    pub kind: PythonNativeParameterKind,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeCallArgumentFact {
+    pub call: ResolutionSiteId,
+    pub ordinal: u32,
+    pub kind: PythonNativeArgumentKind,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeAnnotationFact {
+    pub owner: ResolutionSiteId,
+    pub syntax_site: ResolutionSiteId,
+    pub type_slot: ResolutionTypeSlotId,
+    pub mode: PythonNativeAnnotationMode,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeDecoratorFact {
+    pub declaration: ResolutionSiteId,
+    pub ordinal: u32,
+    pub expression_site: ResolutionSiteId,
+    pub value_slot: ResolutionTypeSlotId,
+    pub role: PythonNativeDecoratorRole,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeMemberRoleFact {
+    pub owner: ResolutionSiteId,
+    pub member: ResolutionSiteId,
+    pub kind: PythonNativeMemberRole,
+    pub callable: Option<ResolutionSiteId>,
+    pub receiver_parameter: Option<ResolutionSiteId>,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeClassFact {
+    pub class: ResolutionSiteId,
+    pub metaclass_expression: Option<ResolutionSiteId>,
+    pub bases_complete: bool,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeBaseOperandFact {
+    pub class: ResolutionSiteId,
+    pub ordinal: u32,
+    pub expression_site: ResolutionSiteId,
+    pub slot: ResolutionTypeSlotId,
+    pub kind: PythonNativeBaseKind,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeClassKeywordFact {
+    pub class: ResolutionSiteId,
+    pub ordinal: u32,
+    pub expression_site: ResolutionSiteId,
+    pub value: ResolutionTypeSlotId,
+    pub name: Option<ResolutionNameId>,
+}
+
+/// Python source observations; candidate roles require later identity proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeReceiverWriteFact {
+    pub site: ResolutionSiteId,
+    pub receiver: ResolutionTypeSlotId,
+    pub value: Option<ResolutionTypeSlotId>,
+}
+
+/// Candidate syntax only. Selected binding authority is proved by consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonMemberForm {
+    Getattr,
+    Setattr,
+    Delattr,
+    DictWrite,
+    DictUpdate,
+    PatchObject,
+    PatchPath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PythonMemberEffect {
+    Read,
+    Write,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonMemberNames {
+    Exact(Vec<ResolutionNameId>),
+    Prefix(ResolutionNameId),
+    Any,
+}
+
+/// File-local dynamic member observation, not a resolved member declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PythonNativeMemberOperationFact {
+    pub site: ResolutionSiteId,
+    pub form: PythonMemberForm,
+    pub effect: PythonMemberEffect,
+    pub callee_reference: Option<ResolutionSiteId>,
+    pub receiver_reference: Option<ResolutionSiteId>,
+    pub receiver_slot: Option<ResolutionTypeSlotId>,
+    pub name_site: ResolutionSiteId,
+    pub names: PythonMemberNames,
+}
+
+/// Compiler context for a possible super call. The callee is never proven by syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PythonNativeSuperContextFact {
+    pub call: ResolutionSiteId,
+    pub callee: ResolutionSiteId,
+    pub callable: Option<ResolutionSiteId>,
+    pub class_cell: Option<ResolutionSiteId>,
+    pub first_parameter: Option<ResolutionSiteId>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileResolutionFacts {
+    pub declaration_values: Vec<ResolutionDeclarationValueFact>,
+    pub callable_returns: Vec<ResolutionCallableReturnFact>,
+    pub python_parameters: Vec<PythonNativeParameterFact>,
+    pub python_call_arguments: Vec<PythonNativeCallArgumentFact>,
+    pub python_annotations: Vec<PythonNativeAnnotationFact>,
+    pub python_decorators: Vec<PythonNativeDecoratorFact>,
+    pub python_member_roles: Vec<PythonNativeMemberRoleFact>,
+    pub python_classes: Vec<PythonNativeClassFact>,
+    pub python_base_operands: Vec<PythonNativeBaseOperandFact>,
+    pub python_class_keywords: Vec<PythonNativeClassKeywordFact>,
+    pub python_receiver_writes: Vec<PythonNativeReceiverWriteFact>,
+    pub python_member_operations: Vec<PythonNativeMemberOperationFact>,
+    pub python_super_contexts: Vec<PythonNativeSuperContextFact>,
+
     pub names: Vec<ResolutionNameFact>,
     pub scopes: Vec<ResolutionScopeFact>,
     pub scope_continuations: Vec<ResolutionScopeContinuationFact>,
     pub binding_slots: Vec<ResolutionBindingSlotFact>,
     pub binding_events: Vec<ResolutionBindingEventFact>,
     pub binding_directives: Vec<ResolutionBindingDirectiveFact>,
+    pub binding_event_timings: Vec<ResolutionBindingEventTimingFact>,
+    pub binding_observations: Vec<ResolutionBindingObservationFact>,
+    pub python_predicates: Vec<PythonNativePredicateFact>,
     pub python_imports: Vec<PythonNativeImportFact>,
     pub python_guards: Vec<PythonNativeGuardFact>,
     pub python_site_guards: Vec<PythonNativeSiteGuardFact>,
@@ -1917,6 +2190,10 @@ pub struct FileResolutionFacts {
     pub jvm_aliases: Vec<ResolutionJvmAliasFact>,
     pub jvm_alias_owner_segments: Vec<ResolutionJvmAliasOwnerSegmentFact>,
     pub identifiers: Vec<PositionedIdentifierFact>,
+    /// Reference sites whose source spelling must remain queryable even when
+    /// no lexical path exists. Names and namespaces come from their positioned
+    /// identifiers. This requests inventory, not a resolved target or export.
+    pub reference_lookup_requests: Vec<ResolutionSiteId>,
     pub additional_definition_namespaces: Vec<ResolutionAdditionalDefinitionNamespaceFact>,
     pub definition_units: Vec<ResolutionDefinitionUnitFact>,
     pub binders: Vec<ResolutionBinderFact>,
@@ -2246,11 +2523,27 @@ impl FileResolutionFacts {
 
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
+            && self.declaration_values.is_empty()
+            && self.callable_returns.is_empty()
+            && self.python_parameters.is_empty()
+            && self.python_call_arguments.is_empty()
+            && self.python_annotations.is_empty()
+            && self.python_decorators.is_empty()
+            && self.python_member_roles.is_empty()
+            && self.python_classes.is_empty()
+            && self.python_base_operands.is_empty()
+            && self.python_class_keywords.is_empty()
+            && self.python_receiver_writes.is_empty()
+            && self.python_member_operations.is_empty()
+            && self.python_super_contexts.is_empty()
             && self.scopes.is_empty()
             && self.scope_continuations.is_empty()
             && self.binding_slots.is_empty()
             && self.binding_events.is_empty()
             && self.binding_directives.is_empty()
+            && self.binding_event_timings.is_empty()
+            && self.binding_observations.is_empty()
+            && self.python_predicates.is_empty()
             && self.python_imports.is_empty()
             && self.python_guards.is_empty()
             && self.python_site_guards.is_empty()
@@ -2280,6 +2573,7 @@ impl FileResolutionFacts {
             && self.jvm_aliases.is_empty()
             && self.jvm_alias_owner_segments.is_empty()
             && self.identifiers.is_empty()
+            && self.reference_lookup_requests.is_empty()
             && self.additional_definition_namespaces.is_empty()
             && self.definition_units.is_empty()
             && self.binders.is_empty()
@@ -2482,11 +2776,36 @@ impl FileResolutionFacts {
                     .map(|name| name.spelling.capacity())
                     .fold(0usize, usize::saturating_add),
             )
+            .saturating_add(rows(&self.declaration_values))
+            .saturating_add(rows(&self.callable_returns))
+            .saturating_add(rows(&self.python_parameters))
+            .saturating_add(rows(&self.python_call_arguments))
+            .saturating_add(rows(&self.python_annotations))
+            .saturating_add(rows(&self.python_decorators))
+            .saturating_add(rows(&self.python_member_roles))
+            .saturating_add(rows(&self.python_classes))
+            .saturating_add(rows(&self.python_base_operands))
+            .saturating_add(rows(&self.python_class_keywords))
+            .saturating_add(rows(&self.python_receiver_writes))
+            .saturating_add(rows(&self.python_member_operations))
+            .saturating_add(
+                self.python_member_operations
+                    .iter()
+                    .map(|row| match &row.names {
+                        PythonMemberNames::Exact(names) => rows(names),
+                        _ => 0,
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(rows(&self.python_super_contexts))
             .saturating_add(rows(&self.scopes))
             .saturating_add(rows(&self.scope_continuations))
             .saturating_add(rows(&self.binding_slots))
             .saturating_add(rows(&self.binding_events))
             .saturating_add(rows(&self.binding_directives))
+            .saturating_add(rows(&self.binding_event_timings))
+            .saturating_add(rows(&self.binding_observations))
+            .saturating_add(rows(&self.python_predicates))
             .saturating_add(rows(&self.python_imports))
             .saturating_add(rows(&self.python_guards))
             .saturating_add(rows(&self.python_site_guards))
@@ -2516,6 +2835,7 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.jvm_aliases))
             .saturating_add(rows(&self.jvm_alias_owner_segments))
             .saturating_add(rows(&self.identifiers))
+            .saturating_add(rows(&self.reference_lookup_requests))
             .saturating_add(rows(&self.additional_definition_namespaces))
             .saturating_add(rows(&self.definition_units))
             .saturating_add(rows(&self.binders))

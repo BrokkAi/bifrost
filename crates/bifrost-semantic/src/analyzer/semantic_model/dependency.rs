@@ -1003,6 +1003,8 @@ pub enum DependencyDiscoveryInformationalEvidence {
 pub struct StandardLibraryPackExpectation {
     pub language: brokk_bifrost_core::analyzer::model::Language,
     pub pack_id: &'static str,
+    /// Select newest catalog pack without claiming exact toolchain evidence.
+    pub approximate: bool,
     pub selection: StandardLibraryPackSelection,
 }
 
@@ -1012,6 +1014,8 @@ pub enum StandardLibraryPackSelection {
     /// declaration. Preparation and the runtime decide whether the pack
     /// activates.
     Declared { dependency_ids: Vec<String> },
+    /// No toolchain pin supplies exact dependency coordinates.
+    Unpinned,
     /// The workspace states nothing that selects the pack, or states it in a
     /// form discovery refuses to read as exact evidence. The reason names what
     /// discovery read and what would select the pack.
@@ -1031,7 +1035,20 @@ impl StandardLibraryPackExpectation {
         Self {
             language,
             pack_id,
+            approximate: false,
             selection: StandardLibraryPackSelection::Declared { dependency_ids },
+        }
+    }
+
+    pub fn approximate(
+        language: brokk_bifrost_core::analyzer::model::Language,
+        pack_id: &'static str,
+    ) -> Self {
+        Self {
+            language,
+            pack_id,
+            approximate: true,
+            selection: StandardLibraryPackSelection::Unpinned,
         }
     }
 
@@ -1043,6 +1060,7 @@ impl StandardLibraryPackExpectation {
         Self {
             language,
             pack_id,
+            approximate: false,
             selection: StandardLibraryPackSelection::NotSelected { reason },
         }
     }

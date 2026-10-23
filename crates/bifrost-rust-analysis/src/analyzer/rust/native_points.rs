@@ -138,12 +138,23 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
         })
     }
 
+    pub(crate) fn retain_exclusive_reader(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::writer::RetainedExclusiveReader {
+        self.rust
+            .inner
+            .analyzer_store()
+            .conn
+            .retain_exclusive_reader()
+    }
+
     pub(crate) fn open(
         &self,
         cancellation: &CancellationToken,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<
         SelectedResolutionOperationOpenOutcome<'analyzer, 'analyzer>,
     > {
+        let _perf_open = brokk_bifrost_core::profiling::scope("perf_dispatch::factory_open");
         if self.overlay_inputs.get().is_none() {
             note_rust_definition_overlay_preparation();
             let inputs = match self

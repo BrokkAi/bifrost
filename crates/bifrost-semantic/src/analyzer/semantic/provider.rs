@@ -1332,7 +1332,8 @@ impl Default for SemanticBudget {
 }
 
 /// Cross-provider accounting for distinct workspace files entered and traversal
-/// steps performed while resolving them. Traversal is non-refusing telemetry.
+/// steps performed while resolving them. Ordinary execution ledgers record
+/// traversal as non-refusing telemetry; a dedicated fixpoint ledger also bounds it.
 ///
 /// The shared ledger is deliberately request-scoped. Nested oracle requests
 /// clone the handle, not the allowance, so dispatch cannot reset the caller's
@@ -1345,6 +1346,7 @@ pub struct SemanticExecutionBudget {
 #[derive(Debug)]
 struct SemanticExecutionBudgetState {
     max_materialized_files: usize,
+    max_traversal_steps: Option<usize>,
 
     materialized_files: Arc<BTreeSet<ProjectFile>>,
     externally_materialized_files: usize,
@@ -1362,6 +1364,7 @@ struct SemanticExecutionBudgetState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticExecutionBudgetSnapshot {
     max_materialized_files: usize,
+    max_traversal_steps: Option<usize>,
 
     materialized_files: Arc<BTreeSet<ProjectFile>>,
     externally_materialized_files: usize,
@@ -1373,6 +1376,7 @@ impl SemanticExecutionBudgetSnapshot {
     fn from_state(state: &SemanticExecutionBudgetState) -> Self {
         Self {
             max_materialized_files: state.max_materialized_files,
+            max_traversal_steps: state.max_traversal_steps,
 
             materialized_files: Arc::clone(&state.materialized_files),
             externally_materialized_files: state.externally_materialized_files,
@@ -1436,6 +1440,7 @@ impl SemanticExecutionBudget {
         Self {
             state: Arc::new(Mutex::new(SemanticExecutionBudgetState {
                 max_materialized_files,
+                max_traversal_steps: None,
 
                 materialized_files: Arc::new(BTreeSet::new()),
                 externally_materialized_files: 0,
@@ -1443,6 +1448,19 @@ impl SemanticExecutionBudget {
                 exhausted: max_materialized_files == 0,
             })),
         }
+    }
+
+    /// A fresh per-fixpoint traversal allowance, independent of other solves.
+    /// The caller's request retains its ordinary file accounting and also
+    /// records the traversal work.
+    pub fn for_fixpoint(max_traversal_steps: usize) -> Self {
+        let execution = Self::new(usize::MAX);
+        execution
+            .state
+            .lock()
+            .expect("semantic execution budget lock")
+            .max_traversal_steps = Some(max_traversal_steps);
+        execution
     }
 
     pub fn work(&self) -> SemanticExecutionWork {
@@ -1471,7 +1489,7 @@ impl SemanticExecutionBudget {
     }
 
     /// Fork an exact child whose new-file allowance is capped for one nested
-    /// consumer. Traversal is telemetry and has no allowance.
+    /// consumer. A dedicated fixpoint's traversal allowance is inherited.
     ///
     /// The pair is captured and the narrower maxima are derived under one
     /// parent lock, so callers cannot mismatch a snapshot and child. Reaching
@@ -1491,6 +1509,7 @@ impl SemanticExecutionBudget {
                 max_materialized_files: state
                     .max_materialized_files
                     .min(used_files.saturating_add(max_new_materialized_files)),
+                max_traversal_steps: state.max_traversal_steps,
                 materialized_files: Arc::clone(&state.materialized_files),
                 externally_materialized_files: state.externally_materialized_files,
                 traversal_steps: state.traversal_steps,
@@ -1506,6 +1525,7 @@ impl SemanticExecutionBudget {
     ) -> Option<SemanticExecutionBudgetCharge> {
         let state = self.state.lock().expect("semantic execution budget lock");
         if state.max_materialized_files > before.max_materialized_files
+            || state.max_traversal_steps != before.max_traversal_steps
             || state.externally_materialized_files < before.externally_materialized_files
             || state.traversal_steps < before.traversal_steps
             || before
@@ -1559,7 +1579,11 @@ impl SemanticExecutionBudget {
             .and_then(|used| used.checked_add(charge.externally_materialized_files))
             .and_then(|used| used.checked_add(charge.materialized_files.len()))?;
         let attempted_traversal = state.traversal_steps.saturating_add(charge.traversal_steps);
-        if attempted_files > state.max_materialized_files {
+        if attempted_files > state.max_materialized_files
+            || state.max_traversal_steps.is_some_and(|limit| {
+                charge.traversal_steps > limit.saturating_sub(state.traversal_steps)
+            })
+        {
             return None;
         }
         Some((attempted_files, attempted_traversal))
@@ -1646,7 +1670,11 @@ impl SemanticExecutionBudget {
             return false;
         };
         let attempted_traversal = state.traversal_steps.saturating_add(traversal_steps);
-        if attempted_files > state.max_materialized_files {
+        if attempted_files > state.max_materialized_files
+            || state
+                .max_traversal_steps
+                .is_some_and(|limit| traversal_steps > limit.saturating_sub(state.traversal_steps))
+        {
             state.exhausted = true;
             return false;
         }

@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
 
     use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ByteBounded;
 
@@ -187,9 +188,9 @@ mod tests {
 
     use brokk_bifrost_go_analysis::analyzer::go::source_storage::CanonicalGoSourceFacts;
 
-    use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
-    use brokk_bifrost_analysis::analyzer::java::source_facts::JavaSourceFacts;
+    use brokk_bifrost_jvm_analysis::analyzer::java::source_facts::JavaSourceFacts;
 
     use brokk_bifrost_js_ts_analysis::analyzer::javascript::JavascriptAdapter;
 
@@ -203,7 +204,7 @@ mod tests {
 
     use brokk_bifrost_rust_analysis::analyzer::rust::adapter::RustAdapter;
 
-    use brokk_bifrost_analysis::analyzer::scala::adapter::ScalaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::scala::adapter::ScalaAdapter;
 
     use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
 
@@ -215,7 +216,7 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use brokk_bifrost_core::analyzer::model::Language;
 
@@ -2496,10 +2497,12 @@ mod tests {
         struct RangeAdapter {
             cancellation: Option<CancellationToken>,
         }
-        impl LanguageAdapter for RangeAdapter {
+        impl StoreLanguageAdapter for RangeAdapter {
             fn language(&self) -> Language {
                 Language::Cpp
             }
+        }
+        impl LanguageAdapter for RangeAdapter {
             fn query_directory(&self) -> &'static str {
                 CppAdapter.query_directory()
             }
@@ -5316,6 +5319,9 @@ mod tests {
         );
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
         let key = TreeSitterAnalyzer::<PhpAdapter>::transient_cache_key(oid, &file);
+        // The query file-state snapshot lives for one query; an analyzer read
+        // that opens its own scope outside a query clears it on entry.
+        let scope = AnalyzerQueryScope::new(&analyzer);
         analyzer
             .query_file_state_snapshot
             .store(Some(Arc::new(HashMap::from_iter([(
@@ -5335,7 +5341,8 @@ mod tests {
                 })
                 .is_none()
         );
-        analyzer.query_file_state_snapshot.store(None);
+        drop(scope);
+        assert!(analyzer.query_file_state_snapshot.load().is_none());
         cache.insert(
             (
                 analyzer.language_generation("php").unwrap(),

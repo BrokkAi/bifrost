@@ -469,6 +469,9 @@ fn project_constant(
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
             jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
             runtime_bases: None,
             ambient_use: None,
             id: owner_id.clone(),
@@ -514,6 +517,8 @@ pub(crate) fn constant_member_fact(
         returns: Some(return_type.clone()),
     };
     MemberFact {
+        implemented_trait: None,
+        self_form: None,
         non_overridable: None,
         ambient_use: None,
         value_type: None,
@@ -822,6 +827,9 @@ fn project_type(
     }
     types.push(TypeFact {
         jvm_inventory: None,
+        type_parameter_defaults: Vec::new(),
+        implemented_traits: Vec::new(),
+        generic_trait_impls: Vec::new(),
         runtime_bases: None,
         ambient_use: None,
         id: owner_id,
@@ -898,6 +906,8 @@ fn project_attribute(
         returns: Some(property_type),
     };
     Ok(MemberFact {
+        implemented_trait: None,
+        self_form: None,
         non_overridable: None,
         ambient_use: None,
         value_type: None,
@@ -1029,6 +1039,8 @@ fn project_method(
             return_type: signature.returns.as_ref(),
         });
         projected.push(MemberFact {
+            implemented_trait: None,
+            self_form: None,
             non_overridable: None,
             ambient_use: None,
             value_type: None,

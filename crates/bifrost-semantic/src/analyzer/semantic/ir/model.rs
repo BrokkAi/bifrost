@@ -1603,8 +1603,8 @@ impl SemanticGapImpacts {
 /// this procedure has selected an exit and cannot resume its normal body. It
 /// covers point-scoped deferred-execution or cleanup-control work whose
 /// registration-time evaluations and ordinary successor are retained. It also
-/// covers a point- or value-scoped exceptional transfer that can run active Go
-/// cleanup code before the panicking function returns, including when that
+/// covers a point- or value-scoped exceptional transfer that can run active
+/// cleanup code (Go deferred functions, Rust destructors) before the panicking function returns, including when that
 /// cleanup recovers the panic. A result-specific control proof may discharge
 /// the marker only relative to an ordinary-body target: either the retained
 /// point is in the strict acyclic history of every exact result establishment,

@@ -512,13 +512,20 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports, from
-`2` through `17`. The field is mandatory: omitted, zero, and unsupported versions
+`2` through `18`. The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
 
-Producers write `17`. Schema seventeen adds `runtime_bases` to Python class
+The newest schema is `18`. Packs generated from pinned artifacts declare the
+lowest schema their content needs, never below `8`, so a reader that predates a
+field still accepts a pack that does not use it.
+
+Schema eighteen retains Rust generic defaults, implemented-trait bindings,
+forwarding impl patterns, method self forms and associated-type projections.
+
+Schema seventeen adds `runtime_bases` to Python class
 facts. An absent claim makes no assertion; an explicit empty list claims a
 runtime root. A populated list claims the exhaustive ordered direct runtime
 bases, using non-nullable, non-parameterized named or declared class references.
@@ -561,7 +568,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v17.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v17.schema.json).
+[`schemas/semantic-model-pack-v18.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v18.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen
@@ -1542,6 +1549,14 @@ Default compilation limits source, each raw shard, and each stored shard to
 16 KiB; and recursive type/template structures to depth 64. Callers can lower
 these limits. Default compiler output is therefore accepted by the matching
 default decoder limits.
+
+The Rust rustdoc source-set producer joins and certifies declarations across
+all input documents before partitioning the result by canonical owner crate.
+Members follow their owner and relations follow their source declaration.
+Every shard has the same activation selectors, so cross-crate references remain
+available together. This partition preserves the per-shard allocation and
+decompression bounds and all pack-wide limits; a larger future crate must
+still satisfy the normal compiler limits.
 
 Decoding checks the manifest and declared sizes before allocation, validates
 the stored digest before decompression, streams DEFLATE into a bounded buffer,

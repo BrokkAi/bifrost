@@ -171,7 +171,7 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     sites_by_node: HashMap<usize, ResolutionSiteId>,
     initialization_scopes: HashMap<ResolutionSiteId, ResolutionScopeId>,
     constructor_headers: HashMap<ResolutionSiteId, WalkContext>,
-    pending_function_types: Vec<(
+    pending_applied_types: Vec<(
         ResolutionTypeSlotId,
         Node<'source>,
         ResolutionScopeId,
@@ -241,7 +241,7 @@ pub(super) fn extract_kotlin_resolution<'source>(
         sites_by_node: HashMap::default(),
         initialization_scopes: HashMap::default(),
         constructor_headers: HashMap::default(),
-        pending_function_types: Vec::new(),
+        pending_applied_types: Vec::new(),
         type_slots_by_node: HashMap::default(),
         expression_slots_by_node: HashMap::default(),
         type_identity_slots: HashMap::default(),
@@ -583,7 +583,7 @@ impl<'source, 'collector, 'declarations>
         self.finish_supertypes(root);
         self.finish_package_references();
         self.finish_scope_wide_activations();
-        self.finish_function_types();
+        self.finish_applied_type_arguments();
         assert_eq!(
             self.site_occurrences.len(),
             self.facts.sites.len(),
@@ -1975,6 +1975,10 @@ impl<'source, 'collector, 'declarations>
         if segments.is_empty() {
             return None;
         }
+        let arguments = segments
+            .last()
+            .and_then(|segment| segment.next_named_sibling())
+            .filter(|node| node.kind() == "type_arguments");
         let path = segments
             .iter()
             .map(|&segment| (segment, kotlin_identifier_text(segment, self.source)))
@@ -1984,6 +1988,10 @@ impl<'source, 'collector, 'declarations>
             self.handled_identifiers.insert(segment.id());
         }
         self.type_slots_by_node.insert(node.id(), slot);
+        if let Some(arguments) = arguments {
+            self.pending_applied_types
+                .push((slot, arguments, context.scope, context.declaration));
+        }
         Some(slot)
     }
 
@@ -2070,6 +2078,27 @@ impl<'source, 'collector, 'declarations>
         if let Some(slot) = self.type_slots_by_node.get(&node.id()).copied() {
             return slot;
         }
+        if node.kind() == "nullable_type" {
+            let mut underlying = node;
+            while matches!(underlying.kind(), "nullable_type" | "parenthesized_type") {
+                let Some(nested) = named_children(underlying)
+                    .into_iter()
+                    .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
+                else {
+                    break;
+                };
+                underlying = nested;
+            }
+            if underlying.kind() == "function_type" {
+                // Nullable function syntax cannot supply a non-null intrinsic
+                // invoke proof. An unknown slot keeps value application possible;
+                // receiver selection carries its own incomplete frontier.
+                let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
+                let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                self.type_slots_by_node.insert(node.id(), slot);
+                return slot;
+            }
+        }
         if node.kind() == "user_type" {
             return self
                 .record_user_type(
@@ -2091,7 +2120,7 @@ impl<'source, 'collector, 'declarations>
             self.type_slots_by_node.insert(node.id(), slot);
             let arity = u32::try_from(kotlin_function_type_arity(node))
                 .expect("Kotlin function type arity fits u32");
-            self.pending_function_types.push((slot, node, scope, owner));
+            self.pending_applied_types.push((slot, node, scope, owner));
             let function_name = self.intern_name(&format!("kotlin.Function{arity}"));
             self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                 output: slot,
@@ -2122,17 +2151,44 @@ impl<'source, 'collector, 'declarations>
         slot
     }
 
-    fn finish_function_types(&mut self) {
-        while let Some((owner, function, scope, declaration)) = self.pending_function_types.pop() {
-            let (mut types, result) = kotlin_function_type_parts(function);
-            types.push(result);
+    fn finish_applied_type_arguments(&mut self) {
+        while let Some((owner, function, scope, declaration)) = self.pending_applied_types.pop() {
+            let types = if function.kind() == "function_type" {
+                let (mut types, result) = kotlin_function_type_parts(function);
+                types.push(result);
+                types
+            } else {
+                assert_eq!(function.kind(), "type_arguments");
+                let Some(types) = named_children(function)
+                    .into_iter()
+                    .map(|projection| {
+                        named_children(projection).into_iter().find(|ty| {
+                            KOTLIN_TYPE_NODE_KINDS.contains(&ty.kind()) || ty.kind() == "user_type"
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    // A star projection has no exact argument type. Do not
+                    // shift the ordinals of later arguments into its place.
+                    continue;
+                };
+                types
+            };
             let arguments = types
                 .into_iter()
                 .map(|ty| self.ensure_type_slot(ty, scope, declaration))
                 .collect::<Vec<_>>();
+            let site = if function.kind() == "function_type" {
+                self.facts.type_slots[owner.index()].site
+            } else {
+                // The nominal head already has a lexical identity producer.
+                // Argument projections must not observe or rebind that name.
+                self.add_site(function, ResolutionSiteKind::TypeReference, scope)
+            };
             crate::call_arguments::publish_jvm_function_type_arguments(
                 &mut self.facts,
                 owner,
+                site,
                 &arguments,
             );
         }
@@ -2166,8 +2222,8 @@ impl<'source, 'collector, 'declarations>
     }
 
     fn record_nullable_type(&mut self, node: Node<'source>, scope: ResolutionScopeId) {
-        // The nullable wrapper is not represented as a separate type dimension;
-        // keep its underlying user-type reference available for navigation.
+        // Nominal nullable types retain their underlying navigation identity;
+        // nullable function syntax cannot publish a non-null invoke proof.
         self.ensure_type_slot(node, scope, None);
     }
 
@@ -2192,6 +2248,26 @@ impl<'source, 'collector, 'declarations>
     ) {
         let scope_fact = self.facts.scopes[scope.index()];
         let site = self.facts.sites[declaration.index()];
+        if matches!(
+            kind,
+            ResolutionBinderKind::Field
+                | ResolutionBinderKind::Local
+                | ResolutionBinderKind::Parameter
+        ) {
+            // Value binders can compete in call lookup through invoke. The
+            // shared reader proves applicability from their declared types.
+            self.facts.additional_definition_namespaces.push(
+                ResolutionAdditionalDefinitionNamespaceFact {
+                    declaration,
+                    namespace: ResolutionNamespace::Callable,
+                    hoisting: if scope_wide {
+                        HoistingClass::ScopeWide
+                    } else {
+                        HoistingClass::SourceOrder
+                    },
+                },
+            );
+        }
         self.facts.binders.push(ResolutionBinderFact {
             declaration,
             scope,

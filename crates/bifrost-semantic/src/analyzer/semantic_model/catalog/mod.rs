@@ -215,7 +215,8 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// changing extraction accounting and the gaps reported by warm productions.
 /// 57: Scala operator-named classes retain indexed declarations and constructors;
 /// local case-class companions cannot publish fabricated global JVM aliases.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 57;
+/// 59: Rust source-set aliases, primitive owners and structured trait contracts (#6542).
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 61;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -1045,7 +1046,8 @@ pub const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 // 10: distinguish a named positional-vararg slot from a keyword collector,
 // matching the formal-layout interpreter while rejecting positional fixed tails.
 #[doc(hidden)]
-pub const SHARD_VALIDATION_VERSION: u32 = 10;
+// 11: validate schema-18 Rust defaults, trait impls and associated projections.
+pub const SHARD_VALIDATION_VERSION: u32 = 11;
 
 #[doc(hidden)]
 pub fn decode_limits_digest(limits: &DecodeLimits) -> String {

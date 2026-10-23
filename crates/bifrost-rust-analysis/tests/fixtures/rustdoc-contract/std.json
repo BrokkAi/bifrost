@@ -1,0 +1,104 @@
+{
+  "root": 0,
+  "crate_version": "1.0.0",
+  "includes_private": true,
+  "index": {
+    "0": {
+      "id": 0,
+      "crate_id": 0,
+      "name": "std",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "module": {
+          "is_crate": true,
+          "items": [
+            1,
+            2
+          ],
+          "is_stripped": false
+        }
+      }
+    },
+    "1": {
+      "id": 1,
+      "crate_id": 0,
+      "name": "Widget",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "ignored::rendered::path",
+          "name": "Widget",
+          "id": 100,
+          "is_glob": false
+        }
+      }
+    },
+    "2": {
+      "id": 2,
+      "crate_id": 0,
+      "name": "data",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "also::ignored",
+          "name": "data",
+          "id": 101,
+          "is_glob": false
+        }
+      }
+    }
+  },
+  "paths": {
+    "0": {
+      "crate_id": 0,
+      "path": [
+        "std"
+      ],
+      "kind": "module"
+    },
+    "100": {
+      "crate_id": 1,
+      "path": [
+        "core",
+        "data",
+        "Widget"
+      ],
+      "kind": "struct"
+    },
+    "101": {
+      "crate_id": 1,
+      "path": [
+        "core",
+        "data"
+      ],
+      "kind": "module"
+    }
+  },
+  "external_crates": {
+    "1": {
+      "name": "core",
+      "html_root_url": null,
+      "path": "core.rlib"
+    }
+  },
+  "format_version": 61,
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "target_features": []
+  }
+}

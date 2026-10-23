@@ -241,6 +241,7 @@ pub(super) struct AssignmentRelationValue {
     pub(super) coverage: EffectCoverage,
     pub(super) reason: Option<&'static str>,
     pub(super) replacement_events: Vec<brokk_bifrost_flow::flow_state::StateEventRow>,
+    pub(super) related: Vec<CodeQueryRelatedSource>,
 }
 
 impl AssignmentRelationValue {
@@ -13008,6 +13009,7 @@ fn record_effect_coverage_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -13038,6 +13040,7 @@ fn record_coverage(
             if !cache.truncated {
                 cache.truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EffectBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -13064,6 +13067,7 @@ fn record_coverage(
                 diagnostic.message = message;
             } else {
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
                     impact: CodeQueryDiagnosticImpact::Incomplete,

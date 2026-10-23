@@ -409,6 +409,9 @@ fn project_type<'tree>(
     }
     types.push(TypeFact {
         jvm_inventory: None,
+        type_parameter_defaults: Vec::new(),
+        implemented_traits: Vec::new(),
+        generic_trait_impls: Vec::new(),
         runtime_bases: None,
         ambient_use: None,
         id: owner_id.clone(),
@@ -502,6 +505,8 @@ fn project_method(
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
+        implemented_trait: None,
+        self_form: None,
         non_overridable: None,
         ambient_use: None,
         value_type: None,
@@ -618,6 +623,8 @@ fn project_call(
                 return_type: signature.returns.as_ref(),
             });
             members.push(MemberFact {
+                implemented_trait: None,
+                self_form: None,
                 non_overridable: None,
                 ambient_use: None,
                 value_type: None,

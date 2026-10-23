@@ -8,11 +8,13 @@ use std::time::Instant;
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
+
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{
     ArtifactVerdict, ArtifactVerdictLog, DerivedArtifactId, DerivedArtifactKind,
     InvalidationReason, RetentionReason,
 };
+
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
@@ -1518,10 +1520,9 @@ fn canonicalize_project_files(files: &mut Vec<ProjectFile>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::analyzer::structural::test_support::content_identity as content;
-    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-    use crate::analyzer::{JavaAnalyzer, TestProject};
-    use std::path::PathBuf;
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -1544,6 +1545,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     /// Milestone J (#2449): the cache is keyed by workspace content, so a
     /// second content builds beside the first instead of rotating it away, and
     /// returning to the first content still hits. That is the cross-branch and
@@ -1625,6 +1627,7 @@ mod tests {
         ));
     }
 
+    #[cfg(test)]
     /// A build whose workspace content moved while it ran is refused rather
     /// than published, even though its key names content the cache would
     /// otherwise be willing to retain.
@@ -1694,6 +1697,7 @@ mod tests {
         assert_eq!(builds.load(Ordering::Relaxed), 2);
     }
 
+    #[cfg(test)]
     #[test]
     fn cancelled_and_late_stale_builds_do_not_publish() {
         let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
@@ -1725,6 +1729,7 @@ mod tests {
         assert_eq!(cache.len_for_test(), 0);
     }
 
+    #[cfg(test)]
     /// Milestone J (#2449): every reuse or rebuild decision is recorded, and a
     /// caller with no content identity widens to a rebuild with the typed
     /// reason rather than reusing a value it cannot prove current.
@@ -1768,6 +1773,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn unavailable_build_can_retry() {
         let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
@@ -1802,6 +1808,7 @@ mod tests {
         ));
     }
 
+    #[cfg(test)]
     #[test]
     fn auto_rejections_keep_incomparable_request_budgets_and_snapshot_failures() {
         let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
@@ -1851,6 +1858,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn same_key_builds_once_and_cancelled_follower_does_not_cancel_leader() {
         let cache = Arc::new(SnapshotDerivedLayerCache::new(1024 * 1024));
@@ -1930,78 +1938,6 @@ mod tests {
             }
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn topology_construction_preflights_fixed_memory_before_resolution() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), "bench/Target.java")
-            .write("package bench; public class Target {}\n")
-            .expect("write target");
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let build = build_direct_import_topology(
-            &analyzer,
-            token,
-            &CancellationToken::default(),
-            DirectImportTopologyLimits {
-                max_files: 100,
-                max_edges: 100,
-                max_retained_bytes: 1,
-            },
-        );
-
-        assert!(matches!(
-            build.outcome,
-            DerivedLayerBuildOutcome::Unavailable {
-                over_budget: true,
-                metrics: DerivedLayerBuildMetrics {
-                    resolved_files: 0,
-                    resolved_edges: 0,
-                    ..
-                },
-                ..
-            }
-        ));
-        assert!(build.fallback.is_none());
-    }
-
-    #[test]
-    fn topology_limits_reject_without_returning_partial_edges() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        ProjectFile::new(root.clone(), PathBuf::from("bench/Target.java"))
-            .write("package bench; public class Target {}\n")
-            .expect("write target");
-        ProjectFile::new(root.clone(), PathBuf::from("bench/Consumer.java"))
-            .write("package bench; import bench.Target; public class Consumer {}\n")
-            .expect("write consumer");
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-
-        let scope = AnalyzerQueryScope::new(&analyzer);
-        let token = scope.token();
-        let outcome = build_direct_import_topology(
-            &analyzer,
-            token,
-            &CancellationToken::default(),
-            DirectImportTopologyLimits {
-                max_files: 100,
-                max_edges: 0,
-                max_retained_bytes: 1024 * 1024,
-            },
-        );
-
-        assert!(matches!(
-            outcome.outcome,
-            DerivedLayerBuildOutcome::Unavailable {
-                over_budget: true,
-                ..
-            }
-        ));
-        assert!(outcome.fallback.is_some());
     }
 }
 

@@ -372,6 +372,7 @@ impl OccurrenceTraversalCache {
                             .message(),
                     };
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -395,6 +396,7 @@ impl OccurrenceTraversalCache {
                         _ => "has no structural facts in this workspace",
                     };
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code,
                         impact: CodeQueryDiagnosticImpact::Incomplete,

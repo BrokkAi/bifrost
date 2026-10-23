@@ -97,6 +97,8 @@ use crate::analyzer::semantic_model::validate::Diagnostic;
 use crate::analyzer::semantic_model::validate::ValidationLimits;
 
 use crate::analyzer::semantic_model::validate::validate_pack;
+
+use crate::analyzer::semantic_model::validate::validate_pack_internal;
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use std::io::Write;
@@ -158,18 +160,45 @@ pub fn compile_source(
     compile_pack(&pack, options)
 }
 
-pub fn compile_pack(
-    pack: &AuthoredSemanticModelPack,
-    options: &CompilerOptions,
-) -> Result<CompiledSemanticModelPack, Vec<Diagnostic>> {
-    let limits = ValidationLimits {
+fn validation_limits(options: &CompilerOptions) -> ValidationLimits {
+    ValidationLimits {
         max_shards: options.max_shards,
         max_records_per_shard: options.max_records_per_shard,
         max_records_per_pack: options.max_records_per_pack,
         max_text_bytes: options.max_text_bytes,
         max_depth: options.max_depth,
-    };
-    let diagnostics = validate_pack(pack, limits);
+    }
+}
+
+/// The lowest schema version that expresses `pack`: the highest per-field
+/// version gate its content meets, and never below the version-independent
+/// floor. A producer writes this instead of the current version so a release
+/// requires only the reader versions its content needs (#6251). Returns the
+/// pack's validation diagnostics when it is invalid at its declared version.
+pub fn lowest_schema_version(
+    pack: &AuthoredSemanticModelPack,
+    options: &CompilerOptions,
+) -> Result<u32, Vec<Diagnostic>> {
+    // Versions below the floor carry an engine range whose meaning a lower
+    // number would change; producers never write them.
+    assert!(
+        pack.schema_version >= VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION,
+        "lowest_schema_version is for version-independent packs, found schema {}",
+        pack.schema_version
+    );
+    let (diagnostics, required) = validate_pack_internal(pack, validation_limits(options), true);
+    if diagnostics.is_empty() {
+        Ok(required)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+pub fn compile_pack(
+    pack: &AuthoredSemanticModelPack,
+    options: &CompilerOptions,
+) -> Result<CompiledSemanticModelPack, Vec<Diagnostic>> {
+    let diagnostics = validate_pack(pack, validation_limits(options));
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }

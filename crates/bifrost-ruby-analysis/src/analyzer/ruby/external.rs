@@ -798,6 +798,8 @@ mod tests {
             is_static: false,
             is_abstract: false,
             is_virtual: false,
+            implemented_trait: None,
+            self_form: None,
             non_overridable: None,
             implicit_operation: None,
             explicit_operation: None,

@@ -12,6 +12,7 @@ fn profile() -> PythonSummaryProfile {
         roots: vec![PathBuf::from("src")],
         ordered: true,
         target_digest: [0; 32],
+        python_version: None,
     }
 }
 fn stage(environment: &PythonNativeEnvironment, fixture: &BuiltInlineTestProject, revision: i64) {
@@ -370,4 +371,80 @@ fn measure_python_environment_reconcile() {
             "measurement must count actual SQL statements"
         );
     }
+}
+
+use brokk_bifrost_test_macros::hardwon;
+
+#[test]
+#[hardwon(
+    "#2053: retained event commits must exclude the current RHS and preserve conditional rebinding arms"
+)]
+fn module_rebindings_retained_temporal_selection() {
+    let source = "def convert(value):\n    return value\nconvert = decorate(convert)\nafter = convert(1)\nif enabled:\n    convert = native\nelse:\n    convert = fallback\nfinal = convert\n";
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file("src/timeline.py", source)
+        .build();
+    let database = fixture.root().join("bindings.db");
+    let environment = PythonNativeEnvironment::open(
+        &database,
+        PythonSummaryProfile {
+            authority: PythonSummaryAuthority::SuppliedAnalysis,
+            observation: PythonSummaryObservation::Runtime,
+            roots: vec![PathBuf::from("src")],
+            ordered: true,
+            target_digest: [0; 32],
+            python_version: None,
+        },
+    )
+    .unwrap();
+    environment.begin(1).unwrap();
+    let project = fixture.project_dyn();
+    for file in project.analyzable_files(Language::Python).unwrap() {
+        environment
+            .stage_source(
+                project.clone(),
+                &file,
+                &project.read_source(&file).unwrap(),
+                1,
+            )
+            .unwrap();
+    }
+    let receipt = environment
+        .reconcile(1, &CancellationToken::default())
+        .unwrap();
+    assert!(receipt.failed.is_empty(), "{receipt:?}");
+    let rhs = source.find("decorate(convert)").unwrap() + "decorate(".len();
+    let after = source.find("convert(1)").unwrap();
+    let final_read = source.rfind("convert").unwrap();
+    let rhs_trace = environment
+        .temporal_binding_trace(1, "src/timeline.py", rhs, "convert")
+        .unwrap();
+    let after_trace = environment
+        .temporal_binding_trace(1, "src/timeline.py", after, "convert")
+        .unwrap();
+    let final_trace = environment
+        .temporal_binding_trace(1, "src/timeline.py", final_read, "convert")
+        .unwrap();
+    let function = format!("Function@{}:", source.find("def convert").unwrap());
+    let assignment = format!("Assign@{}:", source.find("convert = decorate").unwrap());
+    let native = format!("Assign@{}:", source.find("convert = native").unwrap());
+    let fallback = format!("Assign@{}:", source.find("convert = fallback").unwrap());
+    assert!(rhs_trace.contains(&function), "{rhs_trace}");
+    assert!(
+        !rhs_trace.contains(&assignment),
+        "uncommitted write: {rhs_trace}"
+    );
+    assert!(after_trace.contains(&assignment), "{after_trace}");
+    assert!(
+        !after_trace.contains(&function),
+        "shadowed declaration: {after_trace}"
+    );
+    assert!(
+        final_trace.contains(&native) && final_trace.contains(&fallback),
+        "{final_trace}"
+    );
+    assert!(
+        !final_trace.contains(&assignment),
+        "exhaustive arms: {final_trace}"
+    );
 }

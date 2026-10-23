@@ -15,7 +15,7 @@ pub(crate) mod tests {
 
     use brokk_bifrost_analysis::analyzer::semantic::partial_flow::fixpoint::SEED_EVENT;
 
-    use brokk_bifrost_analysis::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows;
+    use brokk_bifrost_analysis::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows as compute_requested_partial_flows;
 
     use brokk_bifrost_analysis::analyzer::semantic::partial_flow::fixpoint::compute_partial_flows_with;
 
@@ -149,6 +149,19 @@ pub(crate) mod tests {
             })
             .expect("the named procedure");
         flows.swap_remove(index)
+    }
+
+    fn compute_partial_flows(
+        procedure: &ProcedureHandle,
+        snapshot: &ValueFlowSnapshot,
+    ) -> ProcedurePartialFlows {
+        let mut budget = SemanticBudget::default();
+        let cancellation = CancellationToken::new();
+        compute_requested_partial_flows(
+            procedure,
+            snapshot,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
     }
 
     fn partial_flows(source: &str, name: &str) -> ProcedurePartialFlows {
@@ -394,8 +407,16 @@ pub(crate) mod tests {
             phase: ExtraPhase::BeforeEffects,
             carrier: ValueFlowEndpoint::for_value(first_argument),
         };
-        let extended =
-            compute_partial_flows_with(&procedure, &snapshot, &[last_result], &[observation], true);
+        let mut fixpoint_budget = SemanticBudget::default();
+        let fixpoint_cancellation = CancellationToken::new();
+        let extended = compute_partial_flows_with(
+            &procedure,
+            &snapshot,
+            &[last_result],
+            &[observation],
+            true,
+            &mut SemanticRequest::new(&mut fixpoint_budget, &fixpoint_cancellation),
+        );
         let back_edge = extended
             .flows
             .iter()
@@ -444,6 +465,7 @@ pub(crate) mod tests {
                 point: ProgramPointId,
                 _phase: ObservationPhase,
                 endpoint: &ValueFlowEndpoint,
+                _request: &mut SemanticRequest<'_>,
             ) -> Result<bool, Self::Error> {
                 self.observations.push((point, endpoint.clone()));
                 Ok(self.blocked.is_none_or(|(blocked_point, blocked_value)| {
@@ -471,9 +493,21 @@ pub(crate) mod tests {
             observations: Vec::new(),
             blocked: None,
         };
-        let result =
-            compute_partial_flows_filtered(&procedure, &snapshot, &[], &[], false, &[], &mut seen)
-                .unwrap();
+        let mut fixpoint_budget = SemanticBudget::default();
+        let fixpoint_cancellation = CancellationToken::new();
+        let mut fixpoint_request =
+            SemanticRequest::new(&mut fixpoint_budget, &fixpoint_cancellation);
+        let result = compute_partial_flows_filtered(
+            &procedure,
+            &snapshot,
+            &[],
+            &[],
+            false,
+            &[],
+            &mut seen,
+            &mut fixpoint_request,
+        )
+        .unwrap();
         assert!(port_flows(&result.partial).iter().any(|(from, to)| {
             **from == PartialFlowPort::Parameter { ordinal: 0 }
                 && **to == PartialFlowPort::NormalReturn
@@ -510,6 +544,7 @@ pub(crate) mod tests {
             false,
             &[],
             &mut blocked,
+            &mut fixpoint_request,
         )
         .unwrap();
         assert!(
@@ -519,5 +554,62 @@ pub(crate) mod tests {
             }),
             "a refused live observation removes the carrier from its continuation"
         );
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#6392: partial-flow propagation had no traversal bound")]
+    fn traversal_refusal_discards_builtin_and_extra_flows_and_replays_as_exhausted() {
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticExecutionBudget;
+
+        let (procedure, snapshot) = procedure_and_snapshot(
+            "pub fn forward(value: u32) -> u32 { sink(value); sink(value); value }\nfn sink(_value: u32) {}\n",
+            "forward",
+        );
+        let seed = input_port_seed(
+            &procedure,
+            &snapshot,
+            &PartialFlowPort::Parameter { ordinal: 0 },
+        )
+        .expect("the parameter seeds at entry");
+        let cancellation = CancellationToken::new();
+        let mut budget = SemanticBudget::default();
+        let execution = SemanticExecutionBudget::new(usize::MAX);
+        let full = compute_partial_flows_with(
+            &procedure,
+            &snapshot,
+            std::slice::from_ref(&seed),
+            &[],
+            false,
+            &mut SemanticRequest::with_execution_budget(&mut budget, &cancellation, &execution),
+        );
+        assert_eq!(full.partial.outcome, PartialFlowOutcome::Complete);
+        assert!(!full.partial.flows.is_empty() && !full.flows.is_empty());
+        let visits = execution.work().traversal_steps;
+        assert!(visits > 1, "the real procedure propagates facts: {full:?}");
+
+        // Refuse the last visit, after earlier call observations already exist.
+        // The fork/replay path must preserve that the solve was exhausted.
+        let limited = SemanticExecutionBudget::for_fixpoint(visits - 1);
+        let (before, child) = limited.fork();
+        let mut budget = SemanticBudget::default();
+        let stopped = compute_partial_flows_with(
+            &procedure,
+            &snapshot,
+            &[seed],
+            &[],
+            false,
+            &mut SemanticRequest::with_execution_budget(&mut budget, &cancellation, &child),
+        );
+        assert_eq!(stopped.partial.outcome, PartialFlowOutcome::ExceededBudget);
+        assert!(
+            stopped.partial.flows.is_empty() && stopped.flows.is_empty(),
+            "{stopped:?}"
+        );
+        assert!(stopped.partial.open && !stopped.partial.relations_complete);
+        let charge = child
+            .charge_since(&before)
+            .expect("the fork records its work");
+        assert!(limited.replay_charge(&before, &charge));
+        assert_eq!(limited.work().traversal_steps, visits - 1);
+        assert!(limited.work().exhausted);
     }
 }

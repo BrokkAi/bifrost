@@ -1122,6 +1122,12 @@ pub struct RustSourceContextFact {
     pub parent: Option<SourceOccurrenceId>,
     pub owner: Option<SourceDeclarationId>,
     pub kind: RustSourceContextKind,
+    /// Ascending start bytes of every `attribute_item` or
+    /// `inner_attribute_item` whose innermost enclosing source context is this
+    /// context and which may expand to code: procedural, derive, `macro_use`,
+    /// prelude-macro, or otherwise unknown attributes. An empty vector is a
+    /// proof that no such attribute occurs in this context.
+    pub expanding_attribute_starts: Vec<usize>,
 }
 
 /// Parser-error state for one source syntax occurrence shared by every source
@@ -1589,6 +1595,17 @@ impl RustItemSourceFacts {
         self.contexts
             .capacity()
             .saturating_mul(std::mem::size_of::<RustSourceContextFact>())
+            .saturating_add(
+                self.contexts
+                    .iter()
+                    .map(|context| {
+                        context
+                            .expanding_attribute_starts
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<usize>())
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
             .saturating_add(macro_inputs)
             .saturating_add(
                 self.macro_definitions

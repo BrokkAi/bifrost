@@ -1946,6 +1946,25 @@ pub fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>
                 for hierarchy in &fact.hierarchy {
                     collect_declared_type_refs(&hierarchy.target, &mut referenced);
                 }
+                for default in fact.type_parameter_defaults.iter().flatten() {
+                    if let crate::analyzer::semantic_model::model::GenericParameterDefault::Type {
+                        r#type,
+                    } = default
+                    {
+                        collect_declared_type_refs(r#type, &mut referenced);
+                    }
+                }
+                for implementation in &fact.implemented_traits {
+                    collect_implemented_trait_refs(implementation, &mut referenced);
+                }
+                for implementation in &fact.generic_trait_impls {
+                    collect_self_pattern_refs(&implementation.self_pattern, &mut referenced);
+                    for bound in &implementation.bounds {
+                        collect_declared_type_refs(&bound.subject, &mut referenced);
+                        collect_implemented_trait_refs(&bound.bound, &mut referenced);
+                    }
+                    collect_implemented_trait_refs(&implementation.implementation, &mut referenced);
+                }
                 for base in fact.runtime_bases.iter().flatten() {
                     collect_declared_type_refs(base, &mut referenced);
                 }
@@ -1973,6 +1992,16 @@ pub fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>
             for fact in members {
                 defined.insert(fact.id.clone());
                 referenced.insert(fact.owner.clone());
+                if let Some(trait_type) = &fact.implemented_trait {
+                    collect_declared_type_refs(trait_type, &mut referenced);
+                }
+                if let Some(crate::analyzer::semantic_model::model::RustSelfForm::Other {
+                    pattern,
+                }) = &fact.self_form
+                {
+                    collect_self_pattern_refs(pattern, &mut referenced);
+                }
+
                 if let Some(signature) = &fact.signature {
                     for parameter in &signature.parameters {
                         collect_declared_type_refs(&parameter.r#type, &mut referenced);
@@ -2049,6 +2078,34 @@ fn valid_inventory_id(id: &str) -> bool {
         is_lower_sha256(target_digest)
     } else {
         validate_identifier(id, 256, true).is_ok()
+    }
+}
+
+fn collect_implemented_trait_refs(
+    fact: &crate::analyzer::semantic_model::model::ImplementedTraitFact,
+    ids: &mut HashSet<String>,
+) {
+    collect_declared_type_refs(&fact.trait_type, ids);
+    for binding in &fact.associated_types {
+        collect_declared_type_refs(&binding.r#type, ids);
+    }
+}
+
+fn collect_self_pattern_refs(
+    pattern: &crate::analyzer::semantic_model::model::RustSelfPattern,
+    ids: &mut HashSet<String>,
+) {
+    use crate::analyzer::semantic_model::model::RustSelfPattern;
+    let mut pending = vec![pattern];
+    while let Some(pattern) = pending.pop() {
+        match pattern {
+            RustSelfPattern::Constructor { owner, arguments } => {
+                collect_declared_type_refs(owner, ids);
+                pending.extend(arguments);
+            }
+            RustSelfPattern::Reference { inner, .. } => pending.push(inner),
+            RustSelfPattern::Parameter { .. } => {}
+        }
     }
 }
 

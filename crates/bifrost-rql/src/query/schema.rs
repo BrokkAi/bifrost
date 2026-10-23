@@ -1031,7 +1031,7 @@ query_step_ops! {
     ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis|member_target_analysis -> receiver_outcome", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into its mandatory terminal outcome row." }
     ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis -> receiver_evidence", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into zero or more parent-linked evidence rows." }
     PointsToCandidates { shape: RowLocal, label: "points_to_candidates", signature: "receiver_analysis -> points_to_candidate", description: "Expand the exact semantic object candidates retained by points_to before receiver/type projection can merge them, preserving each candidate's stable object identity, cardinality, proof, completeness, and set coverage.", semantic: [Procedures, ProgramPoints] }
-    CallShape { shape: RowLocal, label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site, including its structurally decoded callee token and written argument count when available." }
+    CallShape { shape: RowLocal, label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site, including its structurally decoded callee token and written argument count when available. Rust rows also publish callee_provenance (caller_supplied, local_closure, declared, unknown), callee_supplier (parameter ordinal, closure_parameter ordinal, or receiver), callee_type_shape and callee_bounds. Other languages state unsupported provenance." }
     ExactExternalCallee { shape: RowLocal, label: "exact_external_callee", signature: "call_shape -> call_shape", description: "Attach the canonical Python external callee proved by the language resolver for a call shape, when available. Import aliases are resolved from structured import bindings; no callee spelling is treated as proof." }
     CallResults { shape: RowLocal, label: "call_results", signature: "call_shape -> call_result", description: "Project the ordered normal result ports of each exact semantic call represented by a call-shape row. Each row carries the structural site identity, semantic call and procedure identities, zero-based result ordinal, procedure-local value identity, result point, and evidence quality so it can join assignments and guards without inferring source order.", semantic: [Procedures, ProgramPoints] }
     CallArgumentGroups { shape: RowLocal, label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
@@ -1128,6 +1128,7 @@ query_step_ops! {
     LoopRelations { shape: RowLocal, label: "loop_relations", signature: "procedure -> loop_relation", description: "For an exact Java source loop, prove whether its reachable body can reach its own repeat edge before exiting. Rows preserve source and control gaps as open rather than claiming a nonrepeating body.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     StatementReachability { shape: RowLocal, label: "statement_reachability", signature: "procedure -> statement_reachability", description: "Enumerate exact Java statement syntax and its producer-authored CFG entries. A statement is unreachable only when every entry is outside complete bounded entry reachability; source, control, and budget gaps remain open.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     PendingCleanupFlows { shape: RowLocal, label: "pending_cleanup_flows", signature: "procedure -> pending_cleanup_flow", description: "Derive the effect of each lowered finally, ensure, defer, using, with, or resource cleanup on a pending return, throw, break, or continue. Exact override and preservation rows are emitted only when the cleanup-local CFG is exhaustive; missing edges, gaps, mixed outcomes, and unsupported cleanup syntax are explicit unknown/incomplete evidence.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    RustMarkerImplsOf { shape: DerivedValue, label: "rust_marker_impls_of", signature: "declaration -> rust_marker_impl", description: "Enumerate same-file Rust Send/Sync impl parameters, marker bounds, field wrapper uses, shared-reference access, and completeness proofs using bounded syntax and definition lookup.", semantic: [] }
     RustPointerFindings { shape: DerivedValue, label: "rust_pointer_findings", signature: "procedure -> rust_pointer_finding", description: "Run query-local Rust pointer provenance and project accesses whose same-origin scope-end, invalidation, or checked byte extent precedes the access. Rows retain must/may strength, path proof, bounds, and completeness; incomplete coverage stays diagnostic.", semantic: [Procedures, ValueFlow] }
     ControlRelations { shape: RowLocal, label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, procedure-local CFG reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     GuardsOf { shape: RowLocal, label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges and target points. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
@@ -1305,6 +1306,7 @@ macro_rules! rql_forms {
                     | Self::CfgEdgeTarget
                     | Self::Typestate
                     | Self::ValueFlow
+                    | Self::RustMarkerImplsOf
                     | Self::RustPointerFindings
                     | Self::ClassSet
                     | Self::AbsentMember
@@ -1483,6 +1485,7 @@ macro_rules! rql_forms {
                     Self::TextRegex => Some(RqlProperty::TextRegex),
                     Self::BooleanValue => Some(RqlProperty::BooleanValue),
                     Self::Async => Some(RqlProperty::Async),
+                    Self::UnsafeContext => Some(RqlProperty::UnsafeContext),
                     Self::Modifier => Some(RqlProperty::Modifier),
                     Self::Parenthesized => Some(RqlProperty::Parenthesized),
                     Self::IntegerValue => Some(RqlProperty::IntegerValue),
@@ -3024,6 +3027,14 @@ rql_forms! {
         description: (QueryStepOp::PendingCleanupFlows),
         step: PendingCleanupFlows,
     }
+    RustMarkerImplsOf {
+        labels: ["rust-marker-impls-of", "rust_marker_impls_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(rust-marker-impls-of declaration-query)",
+        description: (QueryStepOp::RustMarkerImplsOf),
+        step: RustMarkerImplsOf,
+    }
     RustPointerFindings {
         labels: ["rust-pointer-findings", "rust_pointer_findings"],
         class: Wrapper,
@@ -3114,6 +3125,13 @@ rql_forms! {
         shape: Boolean,
         signature: "(boolean-value true|false)",
         description: "Match a boolean literal by its normalized language-neutral value.",
+    }
+    UnsafeContext {
+        labels: ["unsafe-context", "unsafe_context"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(unsafe-context true|false)",
+        description: "Match a Rust call by whether it is inside an unsafe block or unsafe function. Unsupported on other languages and on non-call patterns.",
     }
     Async {
         labels: ["async"],
@@ -3442,6 +3460,12 @@ rql_properties! {
         shape: Boolean,
         signature: ":boolean-value true|false",
         description: "Match a boolean literal by its normalized language-neutral value.",
+    }
+    UnsafeContext {
+        labels: ["unsafe-context", "unsafe_context"],
+        shape: Boolean,
+        signature: ":unsafe-context true|false",
+        description: "Match a Rust call by whether it is inside an unsafe block or unsafe function. Unsupported on other languages and on non-call patterns.",
     }
     Async {
         labels: ["async"],
@@ -4932,6 +4956,7 @@ json_fields! {
     Kind { label: "kind", shape: KindList, signature: "\"kind\": \"kind\" | [\"kinds\", ...]", description: "Match one or more normalized node kinds." }
     NotKind { label: "not_kind", shape: KindList, signature: "\"not_kind\": \"kind\" | [\"kinds\", ...]", description: "Exclude one or more normalized node kinds." }
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
+    UnsafeContext { label: "unsafe_context", shape: Boolean, signature: "\"unsafe_context\": true | false", description: "Match Rust calls inside unsafe blocks or unsafe functions; unsupported on non-call patterns and other languages." }
     Async { label: "async", shape: Boolean, signature: "\"async\": true | false", description: "Match a callable by its AST-backed async modifier." }
     Modifier { label: "modifier", shape: String, signature: "\"modifier\": \"static\" | \"abstract\"", description: "Match a declaration by a modifier read from its structured modifier nodes." }
     StringValue { label: "string_value", shape: StringPredicate, signature: "\"string_value\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a normalized string literal by its decoded value." }

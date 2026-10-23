@@ -245,13 +245,13 @@ mod go_extraction_tests_more {
 
         use brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH;
 
-        use brokk_bifrost_analysis :: analyzer :: resolution :: fact_reference_edges :: go_extraction_support_1 :: PROJECTOR_SOURCE ;
+        use crate::engine_tests::jvm_fact_reference_support::go_extraction_support_1::PROJECTOR_SOURCE;
 
         use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-        use brokk_bifrost_analysis :: analyzer :: resolution :: fact_reference_edges :: go_extraction_support_1 :: native_edge_catalog ;
+        use crate::engine_tests::jvm_fact_reference_support::go_extraction_support_1::native_edge_catalog;
 
-        use brokk_bifrost_analysis :: analyzer :: resolution :: fact_reference_edges :: go_extraction_support_1 :: native_edge_projection_fixture ;
+        use crate::engine_tests::jvm_fact_reference_support::go_extraction_support_1::native_edge_projection_fixture;
 
         use brokk_bifrost_analysis::analyzer::resolution::fact_reference_edges::stage_selected_reference_edge_batches;
 

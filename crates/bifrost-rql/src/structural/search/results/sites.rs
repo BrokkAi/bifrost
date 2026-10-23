@@ -889,6 +889,11 @@ pub struct CodeQueryCallShape {
     /// `exact_external_callee` query step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_external_callee: Option<String>,
+    /// Rust syntax provenance; unsupported for adapters without this fact.
+    pub callee_provenance: &'static str,
+    pub callee_supplier: Option<String>,
+    pub callee_type_shape: &'static str,
+    pub callee_bounds: Vec<String>,
     pub call_kind: &'static str,
     pub coverage: &'static str,
     pub group_count: usize,

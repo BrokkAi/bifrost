@@ -123,6 +123,21 @@ impl CodeQueryResultValue {
                     },
                 })
             }
+            Self::RustMarkerImpl { value } => {
+                let codes = if value.completeness != "complete" {
+                    vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]
+                } else {
+                    Vec::new()
+                };
+                Some(CodeQueryRowCoverage {
+                    partition: Box::from(value.id.as_str()),
+                    extent: if codes.is_empty() {
+                        CodeQueryRowCoverageExtent::Exhaustive
+                    } else {
+                        CodeQueryRowCoverageExtent::incomplete(codes)
+                    },
+                })
+            }
             Self::RustPointerFinding { value } => {
                 let codes = if value.completeness == "partial" {
                     vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial]

@@ -367,6 +367,7 @@ pub fn materialize(case: &FixtureCase, root: &Path) -> Result<(), FixtureRunErro
 /// cannot drift into an activation that silently selects nothing.
 fn activation_request(language: &dyn FixtureLanguage) -> SemanticModelActivationRequest {
     SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the package version is semver"),
         evidence: vec![SemanticModelActivationEvidence {

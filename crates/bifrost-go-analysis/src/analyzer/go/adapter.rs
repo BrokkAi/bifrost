@@ -26,21 +26,6 @@ use tree_sitter::Tree;
 pub struct GoAdapter;
 
 impl LanguageAdapter for GoAdapter {
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::go::source_publication::SOURCE_STORAGE)
-    }
-
-    fn go_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::go_facts::GO_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::Go
-    }
-
     /// Relative to `brokk-bifrost-go`'s crate root: the `.scm` assets moved with
     /// the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
@@ -60,24 +45,8 @@ impl LanguageAdapter for GoAdapter {
         go_reparse_grammar_gap(source, tree, cancellation)
     }
 
-    fn storage_content_qualifier(
-        &self,
-        _code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
-        content_qualifier: &str,
-    ) -> String {
-        content_qualifier.to_string()
-    }
-
     fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
         false
-    }
-
-    fn storage_file_content_qualifier(&self, content_qualifier: &str) -> String {
-        content_qualifier.to_string()
-    }
-
-    fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
-        canonical_go_package_name(file, content_qualifier)
     }
 
     /// Go import paths are not enumerable from the path alone: an external test
@@ -88,10 +57,6 @@ impl LanguageAdapter for GoAdapter {
     /// symbol-search prefilter.
     fn prefilter_path_package(&self, _file: &ProjectFile) -> Option<String> {
         None
-    }
-
-    fn default_package_anchor(&self) -> Option<brokk_bifrost_core::analyzer::model::PackageAnchor> {
-        Some(brokk_bifrost_core::analyzer::model::PackageAnchor::OwnModule { pop: 0 })
     }
 
     fn workspace_file_package_anchor(
@@ -143,26 +108,6 @@ impl LanguageAdapter for GoAdapter {
             .collect()
     }
 
-    /// A Go declaration always sits in its file's own package, so the file's
-    /// own module is the only anchor this adapter can place. The declared
-    /// `package` clause travels in the content qualifier because the live
-    /// import path alone cannot recover a `_test` suffix or the module-less
-    /// fallback name.
-    fn resolve_package_anchor(
-        &self,
-        anchor: brokk_bifrost_core::analyzer::model::PackageAnchor,
-        content_qualifier: &str,
-        file: &ProjectFile,
-    ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
-        match anchor {
-            brokk_bifrost_core::analyzer::model::PackageAnchor::OwnModule { pop: 0 } => {
-                canonical_go_workspace_package_name(file, content_qualifier)
-                    .map(|package| go_package_fq(&package))
-            }
-            _ => None,
-        }
-    }
-
     fn contains_tests(
         &self,
         _file: &ProjectFile,
@@ -188,6 +133,63 @@ impl LanguageAdapter for GoAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&GO_COGNITIVE_CONFIG)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for GoAdapter {
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::go::source_publication::SOURCE_STORAGE)
+    }
+
+    fn go_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::go_facts::GO_SOURCE_FACTS_VERSION)
+    }
+
+    fn language(&self) -> Language {
+        Language::Go
+    }
+
+    fn storage_content_qualifier(
+        &self,
+        _code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+        content_qualifier: &str,
+    ) -> String {
+        content_qualifier.to_string()
+    }
+
+    fn storage_file_content_qualifier(&self, content_qualifier: &str) -> String {
+        content_qualifier.to_string()
+    }
+
+    fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
+        canonical_go_package_name(file, content_qualifier)
+    }
+
+    fn default_package_anchor(&self) -> Option<brokk_bifrost_core::analyzer::model::PackageAnchor> {
+        Some(brokk_bifrost_core::analyzer::model::PackageAnchor::OwnModule { pop: 0 })
+    }
+
+    /// A Go declaration always sits in its file's own package, so the file's
+    /// own module is the only anchor this adapter can place. The declared
+    /// `package` clause travels in the content qualifier because the live
+    /// import path alone cannot recover a `_test` suffix or the module-less
+    /// fallback name.
+    fn resolve_package_anchor(
+        &self,
+        anchor: brokk_bifrost_core::analyzer::model::PackageAnchor,
+        content_qualifier: &str,
+        file: &ProjectFile,
+    ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
+        match anchor {
+            brokk_bifrost_core::analyzer::model::PackageAnchor::OwnModule { pop: 0 } => {
+                canonical_go_workspace_package_name(file, content_qualifier)
+                    .map(|package| go_package_fq(&package))
+            }
+            _ => None,
+        }
     }
 
     fn produces_canonical_source_facts(&self) -> bool {

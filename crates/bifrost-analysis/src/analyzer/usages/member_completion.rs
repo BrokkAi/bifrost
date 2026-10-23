@@ -5,7 +5,7 @@ use tree_sitter::Node;
 use super::get_definition::parse_tree_for_language;
 use super::get_type::{TypeLookupRequest, TypeLookupStatus, resolve_type_batch};
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelSymbol,
     SemanticModelSymbolKind,
@@ -85,13 +85,14 @@ pub fn complete_members(
     let mut incomplete = outcome.status != TypeLookupStatus::Resolved || outcome.types.len() != 1;
     let go_import_path = (language_for_file(file) == Language::Go)
         .then(|| {
-            language_support(Language::Go)?.imported_package_at_range(
-                analyzer,
-                file,
-                source.as_str(),
-                site.receiver_start_byte,
-                site.receiver_end_byte,
-            )
+            language_support_for_hook(Language::Go, "imported_package_at_range")?
+                .imported_package_at_range(
+                    analyzer,
+                    file,
+                    source.as_str(),
+                    site.receiver_start_byte,
+                    site.receiver_end_byte,
+                )
         })
         .flatten();
     let receiver_is_go_package = go_import_path.is_some();

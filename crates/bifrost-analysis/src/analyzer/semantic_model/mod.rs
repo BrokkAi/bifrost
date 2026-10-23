@@ -91,10 +91,6 @@ pub use brokk_bifrost_semantic::implement_external_artifact_pack_producer;
 
 pub use callable_values::*;
 
-pub(crate) use catalog::activation_catalog_kind;
-
-pub(crate) use catalog::parse_semantic_pack_activation_source_kind;
-
 pub use catalog::*;
 
 pub use compiler::CompilerOptions;
@@ -102,8 +98,6 @@ pub use compiler::CompressionPolicy;
 pub use compiler::compile_pack;
 pub use compiler::compile_source;
 pub use compiler::normalize_callable_values_payload;
-
-pub(crate) use dependency::activation_selector_for_evidence;
 
 pub use dependency::*;
 
@@ -115,13 +109,7 @@ pub use identity::type_declaration_id;
 #[doc(hidden)]
 pub use overlay::symbol_kind_is_callable;
 
-pub(crate) use overlay::type_declarations_equivalent;
-
 pub use overlay::*;
-
-pub(crate) use producer::failed_artifact_production;
-
-pub(crate) use producer::finish_authored_pack_production;
 
 pub(crate) use producer::read_exact_artifact_while;
 
@@ -141,8 +129,6 @@ pub use producer::read_exact_source_set;
 pub use runtime::*;
 
 pub use source::SourceFormat;
-
-pub(crate) use validate::is_canonical_relative_path;
 
 pub use validate::Diagnostic;
 pub use validate::DiagnosticSeverity;

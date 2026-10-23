@@ -796,6 +796,18 @@ class SearchToolsClient:
         payload = self._call_tool_payload("blast_radius", arguments)
         return BlastRadiusResult.from_dict(payload.structured, payload.rendered_text)
 
+    def list_function_sources(
+        self,
+        paths: list[str] | None = None,
+        *,
+        include_tests: bool = True,
+    ) -> dict[str, Any]:
+        """Return indexed callable ranges, blob identities, and exact source text."""
+        arguments: dict[str, Any] = {"include_tests": include_tests}
+        if paths is not None:
+            arguments["paths"] = list(paths)
+        return self._call_tool_payload("list_function_sources", arguments).structured
+
     def cyclomatic_complexity(
         self,
         target: str | None = None,

@@ -48,20 +48,35 @@ taint class, typestate state, and inferred receiver class remain distinct types.
 
 ### Analysis layer
 
-The analysis engine coordinates workspace snapshots, language analyzers,
-structural indexes, usage resolution, semantic lowering, CFG/ICFG construction,
-and semantic-model activation. The multi-analyzer routes each file to the
-appropriate language implementation while presenting shared analyzer
-capabilities to callers.
+`brokk-bifrost-analysis` is the shared engine. It coordinates workspace
+snapshots through the multi-analyzer and owns shared algorithms, structural
+indexes, usage analysis, semantic lowering, CFG/ICFG construction, and the
+bridge code that needs parsing.
+
+Above it, each language family's analysis crate holds its adapter and support:
+`brokk-bifrost-python-analysis`, `brokk-bifrost-rust-analysis`,
+`brokk-bifrost-go-analysis`, `brokk-bifrost-cpp-analysis`,
+`brokk-bifrost-csharp-analysis`, `brokk-bifrost-php-analysis`,
+`brokk-bifrost-ruby-analysis`, `brokk-bifrost-js-ts-analysis` for JavaScript and
+TypeScript, and `brokk-bifrost-jvm-analysis` for Java, Kotlin, and Scala. The
+multi-analyzer routes each file through these adapters while presenting shared
+capabilities to callers. `brokk-bifrost-tools` links all nine families into the
+complete language table and provides the shared product tools.
 
 ### Core and language-knowledge layer
 
-The core crate contains the dependency-free domain model: project files,
+`brokk-bifrost-core` contains the shared domain model: project files,
 languages, code units, structured names and identities, cancellation, compact
-IDs, canonical hashing, and cache-database foundations. Language crates depend
-on that model and implement language-specific knowledge such as imports,
-visibility, hierarchy, declaration extraction, call shapes, and usage
-resolution.
+IDs, canonical hashing, and cache-database foundations. The language-knowledge
+crates depend only on core among Bifrost crates: `brokk-bifrost-jvm`,
+`brokk-bifrost-go`, `brokk-bifrost-rust`, `brokk-bifrost-cpp`,
+`brokk-bifrost-python`, `brokk-bifrost-csharp`, `brokk-bifrost-php`,
+`brokk-bifrost-ruby`, and `brokk-bifrost-js-ts`. They hold syntax helpers,
+language rules, and vocabulary without depending on the analysis engine.
+
+`brokk-bifrost-semantic` builds on core and language knowledge. It owns semantic
+models and the vocabulary used by lowering; algorithms that need the engine
+remain in `brokk-bifrost-analysis`.
 
 Language rules stay in language crates because Java overload applicability,
 Rust module routing, C++ macro-aware identity, and Ruby autoload visibility use
@@ -71,8 +86,11 @@ The adapter and resolver boundary is defined in the
 
 ### Storage layer
 
-The analyzer store is SQLite-backed. It persists content-addressed, queryable
-facts and projects them through workspace-generation views. It also stores the
+`brokk-bifrost-store` owns the SQLite analyzer store and name resolution,
+including their per-language modules. It depends on semantic, core, and the
+language-knowledge crates and sits below the analysis engine. It persists
+content-addressed, queryable facts and projects them through workspace-generation
+views. It also stores the
 complete acyclic class-set dimension of reusable procedure summaries as
 normalized rows with exact dependency and read evidence. A serialized writer
 and bounded reader pool allow writes and snapshot reads to proceed concurrently.
@@ -122,12 +140,15 @@ shows how those indexed facts are published and reused.
 
 ## Dependency boundaries
 
-Dependencies flow upward through the crate structure:
+Dependencies point downward only. From the bottom up, the crate layers are:
 
-- core contains types that every language can share without importing the main
-  analysis engine;
-- language crates contain their own semantic knowledge;
-- analysis composes core, languages, storage, and semantic lowering;
+- core and the language-knowledge crates hold shared types, syntax, language
+  rules, and vocabulary;
+- semantic holds semantic models and lowering vocabulary;
+- store holds the SQLite analyzer store and name resolution;
+- analysis holds the shared engine and parsing-dependent bridges;
+- the nine language-family analysis crates hold adapters and support;
+- tools links every language into the complete table and exposes product tools;
 - flow depends on the semantic-provider contracts from analysis;
 - RQL and policy build typed user-facing operations above analysis and flow;
 - runtime composes the protocol-neutral product surface; and

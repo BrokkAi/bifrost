@@ -1008,3 +1008,33 @@ fn declarations_inside_constructs_left_open_are_recorded_as_recovered() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#3093+673819e1c6fb: parsed namespace levels lost their source facts, so bounded visibility never reached their dependency names"
+)]
+fn parsed_namespace_levels_keep_their_source_facts() {
+    let source =
+        "namespace app { struct Reg { int get(); }; }\nnamespace a::b { struct X { Reg r; }; }\n";
+    let file = ProjectFile::new(std::env::temp_dir(), "namespace-levels.cpp");
+    let parsed = parse_cpp_file(&file, source, &tree(source));
+    let facts = parsed.source_facts.as_ref().unwrap().cpp.as_ref().unwrap();
+    for (module, names) in [
+        ("app", vec!["app", "Reg"]),
+        ("a", vec!["a", "b", "X", "Reg"]),
+        ("a::b", vec!["a", "b", "X", "Reg"]),
+    ] {
+        let id = parsed
+            .source_declaration_units
+            .iter()
+            .find(|(_, unit)| unit.is_module() && unit.fq_name() == module)
+            .unwrap_or_else(|| panic!("{module} module"))
+            .0;
+        let fact = facts
+            .declarations
+            .iter()
+            .find(|fact| fact.declaration == id)
+            .unwrap_or_else(|| panic!("{module} has no source fact"));
+        assert_eq!(fact.dependency_type_names, names, "{module}");
+    }
+}

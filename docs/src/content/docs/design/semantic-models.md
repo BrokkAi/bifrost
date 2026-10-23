@@ -160,6 +160,20 @@ otherwise stale output could appear valid even though the generator changed.
 Hosts supply or resolve an activation request for semantic packs. The ordinary
 analysis path loads that exact set, and the host retains activation diagnostics.
 
+An unpinned Rust workspace explicitly requests approximate standard-library
+facts. Shared activation chooses the newest available `bifrost.rust-stdlib`
+pack by semantic pack version, retaining engine compatibility and review
+controls. It records `approximate` in activation provenance and policy runs
+publish an advisory naming the selected pack and version. This does not supply
+an observed compiler version or artifact digest, or certify a complete exact
+dependency boundary. A declared toolchain pin that
+does not match a pack never falls back to approximate activation.
+
+Source-set producers retain the exact extraction-input digest as production
+identity. That digest does not automatically constrain runtime applicability:
+Rust, Python and JDK source-set producers preserve the caller's activation
+selectors. Individual dependency artifacts can still require exact digests.
+
 ## CSMI interoperability
 
 Bifrost can import and export supported

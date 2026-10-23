@@ -1,0 +1,2009 @@
+use crate::analyzer::jvm::java_artifact::ZipDirectoryStatus;
+
+use crate::analyzer::jvm::java_artifact::zip_directory_status;
+
+use crate::analyzer::jvm::parent_index;
+
+use crate::analyzer::jvm::restrict_effective_visibility;
+
+use crate::analyzer::jvm::take_artifact_record as take_record;
+
+use brokk_bifrost_core::cancellation::CancellationToken;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+
+use brokk_bifrost_jvm::scala::declarations::parse_scala_file;
+
+use crate::analyzer::scala::language;
+
+use brokk_bifrost_jvm::scala::scala_normalize_full_name;
+#[cfg(test)]
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowBoundaryRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowEntryComponent;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowInvocation;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowKind;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowPayload;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowShape;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowSubstitution;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowTiming;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowTransfer;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputBoundaryRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputLocation;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputParameterRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputPhase;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiInputReceiverRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiIntrinsicType;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiIntrinsicTypeKind;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputBoundaryRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputLocation;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputPhase;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputReceiverRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiOutputResultRoot;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiParameterRootRole;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiProjection;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiProjectionStep;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiReceiverRootRole;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiResultRootRole;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiTypeExpression;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::AmbientUseRole;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ArtifactProducerLimits;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ArtifactProduction;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ArtifactProductionRequest;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredPayload;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredShard;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::BoundedProducerDiagnostics;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::CollectionFlowFact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::CollectionFlowsPayload;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::HierarchyFact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::HierarchyKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Locator;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::MemberFact;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::identity::MemberIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::MemberKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Parameter;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ProducerDiagnostic;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ProducerDiagnosticSeverity;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::ReceiverFact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Signature;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeFact;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::identity::TypeIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Visibility;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::identity::member_declaration_id;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact_while;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::identity::type_declaration_id;
+
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+
+use brokk_bifrost_core::analyzer::model::CodeUnit;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::analyzer::scala_facts::{
+    ScalaDeclarationKind, ScalaDeclarationSourceFact, ScalaDeclarationVisibility,
+};
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_jvm::scala::ambient_use::scala_declaration_ambient_use;
+use brokk_bifrost_jvm::scala::graph::syntax::{
+    ScalaCallableRole, ScalaCallableSourceAlternative, ScalaTypeExpressionPath,
+};
+use tree_sitter::Node;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScalaSourceJarPackProducer;
+
+brokk_bifrost_semantic::implement_external_artifact_pack_producer!(
+    ScalaSourceJarPackProducer,
+    produce
+);
+
+impl ScalaSourceJarPackProducer {
+    /// Name-only extraction uses the same recoverable declaration walk as workspace files.
+    /// Body and signature errors do not reject an otherwise named declaration.
+    #[cfg(test)]
+    pub(crate) fn parse_names(&self, source: &str) -> (tree_sitter::Tree, ParsedFile) {
+        let tree = crate::analyzer::jvm::parse_source_tree(
+            language::LANGUAGE.into(),
+            source,
+            "scala inventory grammar",
+        )
+        .expect("source parser returns a tree");
+        let file = ProjectFile::new(std::env::temp_dir(), "inventory.scala");
+        let parsed = parse_scala_file(&file, source, &tree);
+        (tree, parsed)
+    }
+
+    fn produce(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::ScalaSourceJar {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    declaration: None,
+                    message: "Scala producer requires a Scala source JAR artifact".to_owned(),
+                },
+                limits,
+            );
+        }
+        let artifact = match read_exact_artifact_while(&request.path, limits, || {
+            cancellation.is_some_and(CancellationToken::is_cancelled)
+        }) {
+            Ok(artifact) => artifact,
+            Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
+        };
+        self.produce_loaded_artifact(request, limits, cancellation, &artifact)
+    }
+
+    pub fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        if zip_directory_status(artifact.bytes()) == ZipDirectoryStatus::Exceeded {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
+                    code: "limit.archive_directory".to_owned(),
+                    location: None,
+                    declaration: None,
+                    message: "Scala JAR central directory exceeds bounded entry or byte limits"
+                        .to_owned(),
+                },
+                limits,
+            );
+        }
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let entries = match crate::analyzer::jvm::source_archive_entries(
+            artifact,
+            &[".scala"],
+            "scala",
+            usize::MAX,
+            limits,
+            cancellation,
+            &mut diagnostics,
+        ) {
+            Ok(entries) => entries,
+            Err(production) => return *production,
+        };
+
+        let mut types = Vec::new();
+        let mut members = Vec::new();
+        let mut extension_surfaces = Vec::new();
+        let mut collection_flows = Vec::new();
+        let mut constructor_names_by_owner = HashMap::default();
+        let standard_library_artifact = is_scala_standard_library_artifact(request);
+        let mut remaining_records = limits.max_records;
+        let mut record_limit_hit = false;
+        for (entry_name, source) in entries {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return brokk_bifrost_semantic::analyzer::semantic_model::producer::failed_artifact_production(
+                    "artifact.cancelled",
+                    "Scala archive production was cancelled",
+                    limits,
+                );
+            }
+            if remaining_records == 0 {
+                record_limit_hit = true;
+                break;
+            }
+            let Some(parsed) = parse_source_entry(&entry_name, &source, &mut diagnostics) else {
+                continue;
+            };
+            let mut entry_facts = scala_entry_facts(
+                &entry_name,
+                &source,
+                &parsed,
+                &mut remaining_records,
+                &mut record_limit_hit,
+                &mut diagnostics,
+                standard_library_artifact,
+            );
+            types.append(&mut entry_facts.types);
+            members.append(&mut entry_facts.members);
+            extension_surfaces.append(&mut entry_facts.extension_surfaces);
+            collection_flows.append(&mut entry_facts.collection_flows);
+            for (owner, name) in entry_facts.constructor_names_by_owner {
+                if let Some(previous) = constructor_names_by_owner.insert(owner, name.clone()) {
+                    debug_assert_eq!(previous, name);
+                }
+            }
+        }
+        let owners_with_constructors = members
+            .iter()
+            .filter(|member| member.member_kind == MemberKind::Constructor)
+            .map(|member| member.owner.clone())
+            .collect::<brokk_bifrost_core::hash::HashSet<_>>();
+        for (owner, name) in constructor_names_by_owner {
+            if owners_with_constructors.contains(&owner) {
+                continue;
+            }
+            if !take_record(&mut remaining_records, &mut record_limit_hit) {
+                break;
+            }
+            let fact = types
+                .iter()
+                .find(|fact| fact.id == owner)
+                .expect("constructor owner was produced with its source type");
+            members.push(empty_constructor_fact(fact, name));
+        }
+        if record_limit_hit {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    limits.max_records
+                ),
+            );
+        }
+        apply_extension_surfaces(&mut types, extension_surfaces);
+        types.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        members.sort_unstable_by(|left, right| {
+            (&left.owner, &left.name, &left.id).cmp(&(&right.owner, &right.name, &right.id))
+        });
+        for pair in members.windows(2) {
+            debug_assert_ne!(pair[0].id, pair[1].id, "duplicate Scala members: {pair:#?}");
+        }
+        finish_production(
+            request,
+            artifact.sha256(),
+            types,
+            members,
+            collection_flows,
+            diagnostics,
+        )
+    }
+}
+
+fn parse_source_entry(
+    entry_name: &str,
+    source: &str,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> Option<ParsedScalaEntry> {
+    let Some(tree) = crate::analyzer::jvm::parse_source_tree(
+        language::LANGUAGE.into(),
+        source,
+        "tree-sitter Scala language must load",
+    ) else {
+        diagnostics.warning(
+            "scala.source.parse",
+            Some(entry_name.to_owned()),
+            "Scala source entry could not be parsed",
+        );
+        return None;
+    };
+    if tree.root_node().has_error() {
+        diagnostics.warning(
+            "scala.source.parse",
+            Some(entry_name.to_owned()),
+            "Scala source entry contains unsupported or malformed syntax",
+        );
+        return None;
+    }
+    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.scala");
+    let parsed = parse_scala_file(&synthetic_file, source, &tree);
+    Some(ParsedScalaEntry { parsed, tree })
+}
+
+struct ParsedScalaEntry {
+    parsed: ParsedFile,
+    tree: tree_sitter::Tree,
+}
+
+struct ScalaEntryFacts {
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    extension_surfaces: Vec<(Vec<String>, String)>,
+    collection_flows: Vec<CollectionFlowFact>,
+    constructor_names_by_owner: HashMap<String, String>,
+}
+
+fn scala_entry_facts(
+    entry_name: &str,
+    source: &str,
+    entry: &ParsedScalaEntry,
+    remaining_records: &mut usize,
+    record_limit_hit: &mut bool,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    standard_library_artifact: bool,
+) -> ScalaEntryFacts {
+    let tree = &entry.tree;
+    let parsed = &entry.parsed;
+    let parent_by_child = parent_index(parsed);
+    let canonical = parsed
+        .source_facts
+        .as_ref()
+        .expect("Scala primary source facts");
+    let facts = canonical
+        .scala
+        .as_ref()
+        .expect("Scala declaration properties");
+    let facts_by_declaration = facts
+        .declarations
+        .iter()
+        .map(|fact| (fact.declaration, fact))
+        .collect::<HashMap<_, _>>();
+    let mut source_facts = HashMap::default();
+    for (source, unit) in &parsed.source_declaration_units {
+        let fact = facts_by_declaration
+            .get(source)
+            .expect("Scala declaration bridge has source facts");
+        source_facts.entry(unit).or_insert(*fact);
+    }
+    let mut declarations = parsed.declarations().iter().collect::<Vec<_>>();
+    declarations.sort_unstable_by_key(|unit| unit.fq_name());
+    let mut types = Vec::new();
+    let mut type_index_by_name = HashMap::default();
+    let mut type_ids = HashMap::default();
+    let mut type_kinds = HashMap::default();
+    let mut type_parameters_by_declaration = HashMap::default();
+    let mut constructor_names_by_owner = HashMap::default();
+    for declaration in declarations
+        .iter()
+        .copied()
+        .filter(|declaration| declaration.is_class() || parsed.type_aliases.contains(*declaration))
+    {
+        let Some(visibility) = effective_visibility(&source_facts, declaration, &parent_by_child)
+        else {
+            continue;
+        };
+        let Some(range) = parsed
+            .ranges
+            .get(declaration)
+            .and_then(|ranges| ranges.first())
+        else {
+            continue;
+        };
+        let Some(node) = tree
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+        else {
+            continue;
+        };
+        let declaration_source = source_facts
+            .get(&declaration)
+            .expect("Scala artifact declaration has primary source facts");
+        let name = scala_normalize_full_name(&declaration.fq_name());
+        let type_kind = scala_type_kind(
+            declaration_source.kind,
+            parsed.type_aliases.contains(declaration),
+        );
+        let type_id = type_declaration_id(TypeIdentity {
+            ecosystem: "jvm",
+            name: &name,
+        });
+        let generic_facts = declaration_source.generic_owner.as_ref();
+        let type_parameters = generic_facts
+            .map(|facts| facts.type_parameters.clone())
+            .unwrap_or_default();
+        let hierarchy = generic_facts
+            .map(|facts| {
+                facts
+                    .supertypes
+                    .iter()
+                    .map(|supertype| HierarchyFact {
+                        hierarchy_kind: HierarchyKind::Extends,
+                        target: scala_type_ref(supertype, &type_parameters),
+                        declaration_ordinal: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        type_ids.insert(declaration.clone(), type_id.clone());
+        type_kinds.insert(declaration.clone(), type_kind);
+        if matches!(type_kind, TypeKind::Class | TypeKind::Enum) {
+            constructor_names_by_owner.insert(type_id.clone(), declaration.identifier().to_owned());
+        }
+        type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
+        let fact = TypeFact {
+            jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
+            runtime_bases: None,
+            ambient_use: scala_declaration_ambient_use(node),
+            id: type_id,
+            name,
+            type_kind,
+            visibility,
+            is_abstract: type_kind == TypeKind::Trait || declaration_source.is_explicitly_abstract,
+            is_sealed: declaration_source.is_sealed,
+            callable_surface_complete: false,
+            has_explicit_type_terms: false,
+            type_parameters,
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            value_semantics: None,
+            embedded_types: Vec::new(),
+            hierarchy,
+            aliases: Vec::new(),
+            extension_surfaces: Vec::new(),
+            guard: None,
+            locator: Locator::Source {
+                path: entry_name.to_owned(),
+                symbol: Some(declaration.fq_name()),
+            },
+        };
+        if let Some(&existing_index) = type_index_by_name.get(&fact.name) {
+            let existing: &mut TypeFact = &mut types[existing_index];
+            let ambient_use = weaker_ambient_use(existing.ambient_use, fact.ambient_use);
+            if existing.type_kind == TypeKind::Module && fact.type_kind != TypeKind::Module {
+                *existing = fact;
+            }
+            existing.ambient_use = ambient_use;
+            continue;
+        }
+        if !take_record(remaining_records, record_limit_hit) {
+            break;
+        }
+        type_index_by_name.insert(fact.name.clone(), types.len());
+        types.push(fact);
+    }
+
+    let mut members = Vec::new();
+    let mut extension_surfaces = Vec::new();
+    for declaration in declarations.into_iter().filter(|declaration| {
+        (declaration.is_function() || declaration.is_field())
+            && !parsed.type_aliases.contains(*declaration)
+    }) {
+        let Some(owner) = parent_by_child.get(declaration) else {
+            continue;
+        };
+        let Some(owner_id) = type_ids.get(owner) else {
+            continue;
+        };
+        let Some(visibility) = effective_visibility(&source_facts, declaration, &parent_by_child)
+        else {
+            continue;
+        };
+        if !take_record(remaining_records, record_limit_hit) {
+            break;
+        }
+        let Some(range) = parsed
+            .ranges
+            .get(declaration)
+            .and_then(|ranges| ranges.first())
+        else {
+            continue;
+        };
+        let Some(node) = tree
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+        else {
+            continue;
+        };
+        let declaration_source = source_facts
+            .get(&declaration)
+            .expect("Scala artifact declaration has primary source facts");
+        let callable = declaration_source.callable.as_ref();
+        let member_kind = scala_member_kind(declaration, callable);
+        // Exact source formal types still define the declaration identity when
+        // the public flat signature cannot express its parameter-list boundary.
+        let identity_signature = callable.and_then(|callable| {
+            scala_signature(
+                callable,
+                node,
+                source,
+                declaration_source.generic_owner.as_ref(),
+                type_parameters_by_declaration
+                    .get(owner)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
+        });
+        let omit_signature = identity_signature.is_some()
+            && callable.is_some_and(scala_signature_has_unrepresentable_parameter_lists);
+        if omit_signature {
+            diagnostics.absorb(vec![ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                code: "scala.signature.repeated_parameter_list".to_owned(),
+                location: Some(entry_name.to_owned()),
+                source_entry: None,
+                declaration: Some(declaration.fq_name()),
+                message: "Scala callable has a repeated parameter list followed by another parameter list; the flat external signature cannot represent that list boundary, so formal binding was withheld".to_owned(),
+            }]);
+        }
+        let parameter_types = identity_signature
+            .as_ref()
+            .map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.r#type.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let parameter_variadics = identity_signature
+            .as_ref()
+            .map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.variadic)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let generic_arity = identity_signature
+            .as_ref()
+            .map_or(0, |signature| signature.type_parameters.len());
+        let name = declaration.identifier().to_owned();
+        let owner_kind = type_kinds.get(owner).copied().unwrap_or(TypeKind::Class);
+        let is_static = owner_kind == TypeKind::Module;
+        let parameter_arity = identity_signature.as_ref().map_or_else(
+            || {
+                callable.map_or(0, |callable| {
+                    callable
+                        .shape
+                        .iter()
+                        .map(|parameters| parameters.arity.total())
+                        .sum()
+                })
+            },
+            |signature| signature.parameters.len(),
+        );
+        let id = member_declaration_id(MemberIdentity {
+            owner_id,
+            kind: member_kind,
+            is_static,
+            parameter_arity,
+            name: &name,
+            generic_arity,
+            parameter_types: &parameter_types,
+            parameter_variadics: &parameter_variadics,
+            return_type: identity_signature
+                .as_ref()
+                .and_then(|signature| signature.returns.as_ref()),
+        });
+        let signature = if omit_signature {
+            None
+        } else {
+            identity_signature
+        };
+        if let Some(receiver) =
+            callable.and_then(|callable| callable.extension_receiver_type_path.as_ref().cloned())
+        {
+            extension_surfaces.push((receiver, scala_normalize_full_name(&owner.fq_name())));
+        }
+        let is_map_member = standard_library_artifact
+            && owner.fq_name() == "scala.collection.mutable.Map"
+            && !is_static
+            && matches!(member_kind, MemberKind::Method);
+        members.push(MemberFact {
+            implemented_trait: None,
+            self_form: None,
+            non_overridable: None,
+            ambient_use: scala_declaration_ambient_use(node),
+            value_type: None,
+            proxied_type: None,
+            id,
+            owner: owner_id.clone(),
+            name,
+            member_kind,
+            visibility,
+            is_static,
+            is_abstract: declaration_source.is_abstract_callable,
+            is_virtual: member_kind == MemberKind::Method
+                && !is_static
+                && !declaration_source.is_final,
+            implicit_operation: None,
+            explicit_operation: None,
+            callable_family_complete: false,
+            exact_return_classes: Vec::new(),
+            signature,
+            receiver: is_map_member.then_some(ReceiverFact { pointer: false }),
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
+            aliases: Vec::new(),
+            guard: None,
+            locator: Locator::Source {
+                path: entry_name.to_owned(),
+                symbol: Some(declaration.fq_name()),
+            },
+        });
+    }
+    let collection_flows = if standard_library_artifact {
+        collection_flow_facts(&types, &members)
+    } else {
+        Vec::new()
+    };
+    ScalaEntryFacts {
+        types,
+        members,
+        extension_surfaces,
+        collection_flows,
+        constructor_names_by_owner,
+    }
+}
+
+/// A constructor a Scala class declares implicitly. Reaching it means writing
+/// `new Widget` or `Widget(..)`, which spells the imported name, so it carries
+/// no contextual role of its own.
+fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
+    MemberFact {
+        implemented_trait: None,
+        self_form: None,
+        non_overridable: None,
+        ambient_use: Some(AmbientUseRole::NotAmbient),
+        value_type: None,
+        proxied_type: None,
+        id: member_declaration_id(MemberIdentity {
+            owner_id: &owner.id,
+            kind: MemberKind::Constructor,
+            is_static: false,
+            parameter_arity: 0,
+            name: &name,
+            generic_arity: 0,
+            parameter_types: &[],
+            parameter_variadics: &[],
+            return_type: None,
+        }),
+        owner: owner.id.clone(),
+        name,
+        member_kind: MemberKind::Constructor,
+        visibility: owner.visibility,
+        is_static: false,
+        is_abstract: false,
+        is_virtual: false,
+        implicit_operation: None,
+        explicit_operation: None,
+        callable_family_complete: false,
+        exact_return_classes: Vec::new(),
+        signature: Some(Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: None,
+        }),
+        receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
+        aliases: Vec::new(),
+        guard: None,
+        locator: owner.locator.clone(),
+    }
+}
+
+const SCALA_LIBRARY_COORDINATES: [&str; 2] = [
+    "org.scala-lang:scala-library",
+    "org.scala-lang:scala3-library_3",
+];
+const SCALA_MUTABLE_MAP: &str = "scala.collection.mutable.Map";
+
+/// Collection-flow facts are restricted to an exact Scala standard-library
+/// artifact selector. A source declaration named Map in an application or
+/// another library must not inherit the standard collection contract merely
+/// because it has the same terminal name.
+fn is_scala_standard_library_artifact(request: &ArtifactProductionRequest) -> bool {
+    request.activation.iter().any(|selector| {
+        selector.package.as_ref().is_some_and(|package| {
+            SCALA_LIBRARY_COORDINATES.contains(&package.name.as_str()) && package.version.is_some()
+        })
+    })
+}
+
+fn collection_flow_facts(types: &[TypeFact], members: &[MemberFact]) -> Vec<CollectionFlowFact> {
+    let Some(map) = types.iter().find(|fact| {
+        fact.name == SCALA_MUTABLE_MAP
+            && fact.type_kind == TypeKind::Trait
+            && fact.type_parameters.len() == 2
+    }) else {
+        return Vec::new();
+    };
+    let [key_parameter, value_parameter] = map.type_parameters.as_slice() else {
+        unreachable!("Map type parameter count was checked above");
+    };
+    let keyed_shape = || CsmiCollectionFlowShape::Keyed {
+        key: Box::new(collection_value_shape(key_parameter)),
+        value: Box::new(collection_value_shape(value_parameter)),
+        entry_components: Some(vec![
+            CsmiCollectionFlowEntryComponent::Key,
+            CsmiCollectionFlowEntryComponent::Value,
+        ]),
+    };
+    let substitution = || CsmiCollectionFlowSubstitution::ReceiverArguments {
+        declaration: map.id.clone(),
+    };
+    let mut flows = Vec::new();
+    for member in members.iter().filter(|member| {
+        member.owner == map.id
+            && member.member_kind == MemberKind::Method
+            && !member.is_static
+            && member.signature.is_some()
+    }) {
+        let Some(signature) = member.signature.as_ref() else {
+            continue;
+        };
+        let payload = match member.name.as_str() {
+            "apply" if is_map_apply_signature(signature, key_parameter, value_parameter) => Some(
+                map_apply_flow(member, substitution(), keyed_shape(), value_parameter),
+            ),
+            "update" if is_map_update_signature(signature, key_parameter, value_parameter) => Some(
+                map_update_flow(member, substitution(), keyed_shape(), value_parameter),
+            ),
+            "foreach" if is_map_foreach_signature(signature, key_parameter, value_parameter) => {
+                Some(map_foreach_flow(
+                    member,
+                    substitution(),
+                    keyed_shape(),
+                    key_parameter,
+                    value_parameter,
+                ))
+            }
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            flows.push(CollectionFlowFact {
+                callable: member.id.clone(),
+                payload,
+                coverage: Some(Completeness::Complete),
+                provenance: Vec::new(),
+            });
+        }
+    }
+    flows.sort_unstable_by(|left, right| left.callable.cmp(&right.callable));
+    flows
+}
+
+fn collection_value_shape(parameter: &str) -> CsmiCollectionFlowShape {
+    brokk_bifrost_semantic::analyzer::semantic_model::csmi::collection_value_shape(&format!(
+        "type-parameter.{parameter}"
+    ))
+}
+
+fn is_map_apply_signature(signature: &Signature, key: &str, value: &str) -> bool {
+    signature.parameters.len() == 1
+        && signature.parameters[0].r#type.is_type_parameter(key)
+        && signature
+            .returns
+            .as_ref()
+            .is_some_and(|result| result.is_type_parameter(value))
+}
+
+fn is_map_update_signature(signature: &Signature, key: &str, value: &str) -> bool {
+    signature.parameters.len() == 2
+        && signature.parameters[0].r#type.is_type_parameter(key)
+        && signature.parameters[1].r#type.is_type_parameter(value)
+}
+
+fn is_map_foreach_signature(signature: &Signature, key: &str, value: &str) -> bool {
+    let Some(Parameter { r#type, .. }) = signature.parameters.first() else {
+        return false;
+    };
+    let TypeRef::Named {
+        name, arguments, ..
+    } = r#type
+    else {
+        return false;
+    };
+    let Some(TypeRef::Named {
+        name: tuple_name,
+        arguments: tuple_arguments,
+        ..
+    }) = arguments.first()
+    else {
+        return false;
+    };
+    name == "scala.Function1"
+        && tuple_name == "scala.Tuple2"
+        && tuple_arguments.len() == 2
+        && tuple_arguments[0].is_type_parameter(key)
+        && tuple_arguments[1].is_type_parameter(value)
+}
+
+fn map_apply_flow(
+    member: &MemberFact,
+    substitution: CsmiCollectionFlowSubstitution,
+    receiver_shape: CsmiCollectionFlowShape,
+    value_parameter: &str,
+) -> CsmiCollectionFlowPayload {
+    let mut source_projection =
+        brokk_bifrost_semantic::analyzer::semantic_model::csmi::entry_parameter_projection(0);
+    source_projection.steps.push(CsmiProjectionStep {
+        kind: "entry-value".to_owned(),
+        args: None,
+    });
+    CsmiCollectionFlowPayload {
+        kind: CsmiCollectionFlowKind::CollectionFlow,
+        callable: member.id.clone(),
+        receiver_substitution: Some(substitution),
+        roots: vec![
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
+                shape: receiver_shape,
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Output(CsmiOutputBoundaryRoot::Result(
+                    CsmiOutputResultRoot {
+                        phase: CsmiOutputPhase::Output,
+                        role: CsmiResultRootRole::Result,
+                        position: 0,
+                    },
+                )),
+                shape: collection_value_shape(value_parameter),
+            },
+        ],
+        transfers: vec![CsmiCollectionFlowTransfer {
+            source: CsmiInputLocation {
+                root: input_receiver_root(),
+                projection: Some(source_projection),
+            },
+            destination: CsmiOutputLocation {
+                root: CsmiOutputBoundaryRoot::Result(CsmiOutputResultRoot {
+                    phase: CsmiOutputPhase::Output,
+                    role: CsmiResultRootRole::Result,
+                    position: 0,
+                }),
+                projection: None,
+            },
+        }],
+        invocations: Vec::new(),
+    }
+}
+
+fn map_update_flow(
+    member: &MemberFact,
+    substitution: CsmiCollectionFlowSubstitution,
+    receiver_shape: CsmiCollectionFlowShape,
+    value_parameter: &str,
+) -> CsmiCollectionFlowPayload {
+    let mut destination_projection =
+        brokk_bifrost_semantic::analyzer::semantic_model::csmi::entry_parameter_projection(0);
+    destination_projection.steps.push(CsmiProjectionStep {
+        kind: "entry-value".to_owned(),
+        args: None,
+    });
+    CsmiCollectionFlowPayload {
+        kind: CsmiCollectionFlowKind::CollectionFlow,
+        callable: member.id.clone(),
+        receiver_substitution: Some(substitution),
+        roots: vec![
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
+                shape: receiver_shape.clone(),
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Parameter(
+                    CsmiInputParameterRoot {
+                        phase: CsmiInputPhase::Input,
+                        role: CsmiParameterRootRole::Parameter,
+                        position: 1,
+                    },
+                )),
+                shape: collection_value_shape(value_parameter),
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Output(output_receiver_root()),
+                shape: receiver_shape,
+            },
+        ],
+        transfers: vec![CsmiCollectionFlowTransfer {
+            source: CsmiInputLocation {
+                root: CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+                    phase: CsmiInputPhase::Input,
+                    role: CsmiParameterRootRole::Parameter,
+                    position: 1,
+                }),
+                projection: None,
+            },
+            destination: CsmiOutputLocation {
+                root: output_receiver_root(),
+                projection: Some(destination_projection),
+            },
+        }],
+        invocations: Vec::new(),
+    }
+}
+
+fn map_foreach_flow(
+    member: &MemberFact,
+    substitution: CsmiCollectionFlowSubstitution,
+    receiver_shape: CsmiCollectionFlowShape,
+    key_parameter: &str,
+    value_parameter: &str,
+) -> CsmiCollectionFlowPayload {
+    CsmiCollectionFlowPayload {
+        kind: CsmiCollectionFlowKind::CollectionFlow,
+        callable: member.id.clone(),
+        receiver_substitution: Some(substitution),
+        roots: vec![
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
+                shape: receiver_shape,
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Parameter(
+                    CsmiInputParameterRoot {
+                        phase: CsmiInputPhase::Input,
+                        role: CsmiParameterRootRole::Parameter,
+                        position: 0,
+                    },
+                )),
+                shape: CsmiCollectionFlowShape::Value {
+                    r#type: CsmiTypeExpression::Intrinsic(CsmiIntrinsicType {
+                        kind: CsmiIntrinsicTypeKind::Intrinsic,
+                        vocabulary: "ai.brokk.csmi.jvm-symbol".to_owned(),
+                        version: "0.1".to_owned(),
+                        identifier: "scala.Function1".to_owned(),
+                    }),
+                },
+            },
+        ],
+        transfers: Vec::new(),
+        invocations: vec![CsmiCollectionFlowInvocation {
+            callback: CsmiInputLocation {
+                root: CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+                    phase: CsmiInputPhase::Input,
+                    role: CsmiParameterRootRole::Parameter,
+                    position: 0,
+                }),
+                projection: None,
+            },
+            parameters: vec![CsmiCollectionFlowShape::Product {
+                components: vec![
+                    collection_value_shape(key_parameter),
+                    collection_value_shape(value_parameter),
+                ],
+            }],
+            arguments: vec![
+                brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiCollectionFlowArgument {
+                    source: CsmiInputLocation {
+                        root: input_receiver_root(),
+                        projection: Some(entry_all_projection()),
+                    },
+                    parameter: 0,
+                },
+            ],
+            timing: CsmiCollectionFlowTiming::DuringCall,
+        }],
+    }
+}
+
+fn input_receiver_root() -> CsmiInputBoundaryRoot {
+    CsmiInputBoundaryRoot::Receiver(CsmiInputReceiverRoot {
+        phase: CsmiInputPhase::Input,
+        role: CsmiReceiverRootRole::Receiver,
+    })
+}
+
+fn output_receiver_root() -> CsmiOutputBoundaryRoot {
+    CsmiOutputBoundaryRoot::Receiver(CsmiOutputReceiverRoot {
+        phase: CsmiOutputPhase::Output,
+        role: CsmiReceiverRootRole::Receiver,
+    })
+}
+
+fn entry_all_projection() -> CsmiProjection {
+    CsmiProjection {
+        scheme: "csmi.collection-flow".to_owned(),
+        scheme_version: "0.1.0".to_owned(),
+        steps: vec![CsmiProjectionStep {
+            kind: "entry".to_owned(),
+            args: Some(serde_json::json!({"key": {"kind": "all"}})),
+        }],
+    }
+}
+
+fn effective_visibility(
+    source_facts: &HashMap<&CodeUnit, &ScalaDeclarationSourceFact>,
+    declaration: &CodeUnit,
+    parents: &HashMap<CodeUnit, CodeUnit>,
+) -> Option<Visibility> {
+    let enclosing = std::iter::successors(Some(declaration), |candidate| parents.get(*candidate))
+        .map(|candidate| {
+            let fact = source_facts
+                .get(candidate)
+                .expect("Scala artifact owner has primary source facts");
+            Some(match fact.visibility {
+                ScalaDeclarationVisibility::Public => Visibility::Public,
+                ScalaDeclarationVisibility::Protected => Visibility::Protected,
+                ScalaDeclarationVisibility::NonApi => return None,
+            })
+        });
+    restrict_effective_visibility(Visibility::Public, enclosing)
+}
+
+fn scala_type_kind(kind: ScalaDeclarationKind, type_alias: bool) -> TypeKind {
+    if type_alias {
+        return TypeKind::TypeAlias;
+    }
+    match kind {
+        ScalaDeclarationKind::Trait => TypeKind::Trait,
+        ScalaDeclarationKind::Object => TypeKind::Module,
+        ScalaDeclarationKind::Enum | ScalaDeclarationKind::EnumCase => TypeKind::Enum,
+        _ => TypeKind::Class,
+    }
+}
+
+fn scala_member_kind(
+    declaration: &CodeUnit,
+    callable: Option<&ScalaCallableSourceAlternative>,
+) -> MemberKind {
+    if declaration.is_field() {
+        return MemberKind::Property;
+    }
+    if callable.is_some_and(|callable| {
+        matches!(
+            callable.role,
+            ScalaCallableRole::PrimaryConstructor | ScalaCallableRole::SecondaryConstructor
+        )
+    }) {
+        MemberKind::Constructor
+    } else {
+        MemberKind::Method
+    }
+}
+
+fn scala_signature(
+    callable: &ScalaCallableSourceAlternative,
+    callable_node: Node<'_>,
+    source: &str,
+    callable_generic_facts: Option<
+        &brokk_bifrost_jvm::scala::graph::syntax::ScalaGenericOwnerSourceFacts,
+    >,
+    owner_type_parameters: &[String],
+) -> Option<Signature> {
+    if callable.parameter_type_expressions.len() != callable.parameter_defaults.len() {
+        return None;
+    }
+    let type_parameters = callable_generic_facts
+        .map(|facts| facts.type_parameters.clone())
+        .unwrap_or_default();
+    let mut available_type_parameters = owner_type_parameters.to_vec();
+    available_type_parameters.extend(type_parameters.iter().cloned());
+    let expected_parameter_count = callable
+        .parameter_type_expressions
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>();
+    let parameter_names = formal_parameter_slots_for_owner(Language::Scala, callable_node, source)
+        .and_then(|layout| {
+            (layout.slots.len() == expected_parameter_count).then(|| {
+                layout
+                    .slots
+                    .into_iter()
+                    .map(|slot| slot.unique_name().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+        });
+    let mut parameters = Vec::new();
+    let mut ordinal = 0usize;
+    for (list_index, paths) in callable.parameter_type_expressions.iter().enumerate() {
+        let defaults = callable.parameter_defaults.get(list_index)?;
+        if paths.len() != defaults.len() {
+            return None;
+        }
+        let repeated = callable
+            .shape
+            .get(list_index)
+            .is_some_and(|shape| shape.arity.is_repeated());
+        for (parameter_index, path) in paths.iter().enumerate() {
+            let path = path.as_ref()?;
+            parameters.push(Parameter {
+                name: parameter_names
+                    .as_ref()
+                    .and_then(|names| names.get(ordinal))
+                    .cloned()
+                    .flatten(),
+                r#type: scala_type_ref(path, &available_type_parameters),
+                optional: defaults[parameter_index],
+                variadic: repeated && parameter_index + 1 == paths.len(),
+                role: None,
+                passing_mode: Default::default(),
+            });
+            ordinal += 1;
+        }
+    }
+    let returns = callable
+        .return_type_expression
+        .as_ref()
+        .map(|path| scala_type_ref(path, &available_type_parameters));
+    Some(Signature {
+        type_parameters,
+        parameters,
+        returns,
+    })
+}
+
+fn scala_signature_has_unrepresentable_parameter_lists(
+    callable: &ScalaCallableSourceAlternative,
+) -> bool {
+    callable
+        .shape
+        .iter()
+        .enumerate()
+        .any(|(list_index, parameter_list)| {
+            parameter_list.arity.is_repeated() && list_index + 1 < callable.shape.len()
+        })
+}
+
+fn scala_type_ref(path: &ScalaTypeExpressionPath, type_parameters: &[String]) -> TypeRef {
+    if path.segments.len() == 1 && type_parameters.contains(&path.segments[0]) {
+        return TypeRef::TypeParameter {
+            name: path.segments[0].clone(),
+        };
+    }
+    TypeRef::Named {
+        name: path.segments.join("."),
+        arguments: path
+            .arguments
+            .iter()
+            .map(|argument| scala_type_ref(argument, type_parameters))
+            .collect(),
+        nullable: false,
+    }
+}
+
+/// The weaker of two contextual claims that share one published name.
+///
+/// A companion `class` and `object` are two declarations one import binds
+/// together, and this producer publishes them as a single named type record.
+/// `NotAmbient` is therefore a claim about the name, not about one of the two
+/// declarations, and it survives only when both make it: `class Widget` beside
+/// `implicit object Widget` must keep the doubt the object introduces.
+fn weaker_ambient_use(
+    left: Option<AmbientUseRole>,
+    right: Option<AmbientUseRole>,
+) -> Option<AmbientUseRole> {
+    let contextual = |role| matches!(role, Some(AmbientUseRole::Implicit | AmbientUseRole::Given));
+    if contextual(left) {
+        return left;
+    }
+    if contextual(right) {
+        return right;
+    }
+    (left == Some(AmbientUseRole::NotAmbient) && right == Some(AmbientUseRole::NotAmbient))
+        .then_some(AmbientUseRole::NotAmbient)
+}
+
+fn apply_extension_surfaces(types: &mut [TypeFact], surfaces: Vec<(Vec<String>, String)>) {
+    let mut exact = HashMap::default();
+    let mut by_short: HashMap<String, Vec<usize>> = HashMap::default();
+    for (index, fact) in types.iter().enumerate() {
+        exact.insert(fact.name.clone(), index);
+        let short = fact
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&fact.name)
+            .to_owned();
+        by_short.entry(short).or_default().push(index);
+    }
+    for (receiver, surface) in surfaces {
+        let joined = receiver.join(".");
+        let target = exact.get(&joined).copied().or_else(|| {
+            receiver
+                .last()
+                .and_then(|short| by_short.get(short))
+                .filter(|candidates| candidates.len() == 1)
+                .and_then(|candidates| candidates.first().copied())
+        });
+        if let Some(target) = target {
+            types[target].extension_surfaces.push(surface);
+        }
+    }
+    for fact in types {
+        fact.extension_surfaces.sort_unstable();
+        fact.extension_surfaces.dedup();
+    }
+}
+
+fn finish_production(
+    request: &ArtifactProductionRequest,
+    artifact_sha256: &str,
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    collection_flows: Vec<CollectionFlowFact>,
+    mut diagnostics: BoundedProducerDiagnostics,
+) -> ArtifactProduction {
+    if types.is_empty() {
+        diagnostics.error(
+            "scala.archive.no_external_declarations",
+            None,
+            "JAR contains no externally visible Scala declarations",
+        );
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        return ArtifactProduction {
+            artifact_sha256: Some(artifact_sha256.to_owned()),
+            pack: None,
+            completeness: Completeness::Partial,
+            diagnostics,
+            suppressed_diagnostics,
+        };
+    }
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    let shard = AuthoredShard {
+        id: "declarations.scala.external".to_owned(),
+        activation: request.activation.clone(),
+        payload: AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations: Vec::new(),
+        },
+        runtime_values: None,
+        runtime_contracts: None,
+        collection_flows: (!collection_flows.is_empty()).then_some(CollectionFlowsPayload {
+            flows: collection_flows,
+        }),
+        deferred_yields: None,
+        conditional_type_refinements: None,
+        callable_values: None,
+    };
+    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
+        request,
+        artifact_sha256,
+        "bifrost-scala-source-jar",
+        "scala",
+        diagnostics,
+        suppressed_diagnostics,
+        vec![shard],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::analyzer::jvm::scala_artifact::*;
+
+    use brokk_bifrost_semantic::analyzer::semantic_model::compiler::CompilerOptions;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::Provenance;
+
+    use brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_pack;
+
+    use brokk_bifrost_core::hash::HashSet;
+
+    const SCALA_SOURCE: &str = r#"
+package scala.sample
+
+trait Base[A] {
+  protected def transform(value: A): A
+  def visible(value: A): A
+  private def hidden(value: A): A
+}
+
+class Child extends Base[String] {
+  override protected def transform(value: String): String = value
+  val label: String = "child"
+  def create: Child = this
+}
+
+object Child {
+  def create: Child = new Child
+  def `legal name`: String = "child"
+}
+
+trait Annotated[@specialized -A]
+case class Data(value: Int)
+sealed abstract class Family { final def stable(value: Int): Int = value }
+
+object Syntax {
+  extension (value: Child)
+    def display: String = value.label
+}
+"#;
+
+    fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {
+        request_for_version(path, "2.13.0")
+    }
+
+    fn request_for_version(path: std::path::PathBuf, version: &str) -> ArtifactProductionRequest {
+        brokk_bifrost_analysis::test_support::jvm_source_jar_request(
+            path,
+            ExternalArtifactKind::ScalaSourceJar,
+            "bifrost.scala.fixture",
+            "scala",
+            "org.scala-lang:scala-library",
+            version,
+            Vec::new(),
+            Provenance {
+                source: "fixture source archive".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+        )
+    }
+
+    fn source_jar(entries: &[(&str, &str)]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        brokk_bifrost_analysis::test_support::zip_helpers::write_zip_unwrap_to(
+            file.as_file_mut(),
+            entries,
+            zip::write::SimpleFileOptions::default(),
+        );
+        file
+    }
+
+    #[test]
+    fn scala_source_jar_produces_structured_public_and_protected_api() {
+        let jar = source_jar(&[("scala/sample/Api.scala", SCALA_SOURCE)]);
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request(jar.path().to_owned()),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert_eq!(production.completeness, Completeness::Complete);
+        let pack = production.pack.unwrap();
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        assert!(
+            types
+                .iter()
+                .any(|fact| fact.name == "scala.sample.Base" && fact.type_kind == TypeKind::Trait)
+        );
+        let child = types
+            .iter()
+            .find(|fact| fact.name == "scala.sample.Child")
+            .unwrap();
+        assert_eq!(
+            types
+                .iter()
+                .filter(|fact| fact.name == "scala.sample.Child")
+                .count(),
+            1,
+            "class and companion should share one source-level type surface"
+        );
+        assert!(
+            child
+                .hierarchy
+                .iter()
+                .any(|fact| matches!(&fact.target, TypeRef::Named { name, .. } if name == "Base"))
+        );
+        assert!(
+            child
+                .extension_surfaces
+                .iter()
+                .any(|surface| surface == "scala.sample.Syntax"),
+            "types={types:#?}; members={members:#?}"
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.name == "transform" && fact.visibility == Visibility::Protected)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.name == "visible" && fact.visibility == Visibility::Public)
+        );
+        assert!(!members.iter().any(|fact| fact.name == "hidden"));
+        assert!(types.iter().any(|fact| {
+            fact.name == "scala.sample.Family" && fact.is_abstract && fact.is_sealed
+        }));
+        assert!(
+            members
+                .iter()
+                .any(|fact| { fact.name == "stable" && !fact.is_virtual })
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.name == "label" && fact.member_kind == MemberKind::Property)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.name == "display" && fact.is_static)
+        );
+        let creates = members
+            .iter()
+            .filter(|fact| fact.owner == child.id && fact.name == "create")
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 2);
+        assert!(creates.iter().any(|fact| fact.is_static));
+        assert!(creates.iter().any(|fact| !fact.is_static));
+        assert_ne!(creates[0].id, creates[1].id);
+        assert!(members.iter().any(|fact| fact.name == "`legal name`"));
+        let child_constructors = members
+            .iter()
+            .filter(|fact| fact.owner == child.id && fact.member_kind == MemberKind::Constructor)
+            .collect::<Vec<_>>();
+        assert_eq!(child_constructors.len(), 1);
+        assert_eq!(
+            child_constructors[0]
+                .signature
+                .as_ref()
+                .expect("primary constructor signature")
+                .parameters
+                .len(),
+            0
+        );
+        let annotated = types
+            .iter()
+            .find(|fact| fact.name == "scala.sample.Annotated")
+            .unwrap();
+        assert_eq!(annotated.type_parameters, ["A"]);
+        let data = types
+            .iter()
+            .find(|fact| fact.name == "scala.sample.Data")
+            .unwrap();
+        assert!(members.iter().any(|fact| {
+            fact.owner == data.id
+                && fact.member_kind == MemberKind::Constructor
+                && fact
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.parameters.len() == 1)
+        }));
+        assert!(!members.iter().any(|fact| {
+            fact.owner == data.id && matches!(fact.name.as_str(), "copy" | "productElement")
+        }));
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon(
+        "#1547: Tree-sitter Scala source with compound and by-name/variadic signatures must yield distinct callable identities"
+    )]
+    fn scala_source_jar_preserves_compound_and_variadic_overload_identity() {
+        let source = r#"
+package sample
+trait Overloads[A] {
+  def select(value: List[A]): A
+  def select(value: Vector[A]): A
+  def append(value: A): Unit
+  def append(values: A*): Unit
+  def ensuring(cond: Boolean, msg: => Any): A
+  def ensuring(cond: A => Boolean, msg: => Any): A
+}
+"#;
+        let jar = source_jar(&[("sample/Overloads.scala", source)]);
+        let pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(jar.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("Scala producer should emit declaration facts");
+        };
+
+        for name in ["select", "append", "ensuring"] {
+            let overloads = members
+                .iter()
+                .filter(|member| member.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(overloads.len(), 2, "members={members:#?}");
+            assert_ne!(overloads[0].id, overloads[1].id);
+            assert!(overloads.iter().all(|member| member.signature.is_some()));
+        }
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    #[hardwon(
+        "#4709: curried Scala `xs: T*)(y: U)` flattened into a positional formal after a vararg and failed native pack validation"
+    )]
+    fn scala_source_jar_withholds_unrepresentable_repeated_parameter_lists() {
+        let source = r#"
+package sample
+trait RepeatedLists {
+  def ordinaryAfter(values: String*)(suffix: String): String = suffix
+  def contextualAfter(values: String*)(implicit suffix: String): String = suffix
+  def finalVararg(values: String*): String = ""
+  def ordinary(value: String, suffix: String): String = value
+}
+"#;
+        let jar = source_jar(&[("sample/RepeatedLists.scala", source)]);
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request(jar.path().to_owned()),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(
+            production
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "scala.signature.repeated_parameter_list")
+                .count(),
+            2
+        );
+        for declaration in [
+            "sample.RepeatedLists.ordinaryAfter",
+            "sample.RepeatedLists.contextualAfter",
+        ] {
+            let diagnostic = production
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.declaration.as_deref() == Some(declaration))
+                .expect("unrepresentable signature warning");
+            assert!(diagnostic.source_entry.is_none());
+            assert_eq!(
+                diagnostic.location.as_deref(),
+                Some("sample/RepeatedLists.scala")
+            );
+        }
+
+        let pack = production.pack.unwrap();
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let owner = types
+            .iter()
+            .find(|fact| fact.name == "sample.RepeatedLists")
+            .expect("RepeatedLists owner");
+        let ordinary_after = members
+            .iter()
+            .find(|member| member.name == "ordinaryAfter")
+            .expect("ordinaryAfter member");
+        assert!(ordinary_after.signature.is_none());
+        assert!(
+            members
+                .iter()
+                .find(|member| member.name == "contextualAfter")
+                .expect("contextualAfter member")
+                .signature
+                .is_none()
+        );
+
+        let string_type = || TypeRef::Named {
+            name: "String".to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let parameter_types = [string_type(), string_type()];
+        let return_type = string_type();
+        assert_eq!(
+            ordinary_after.id,
+            member_declaration_id(MemberIdentity {
+                owner_id: &owner.id,
+                kind: MemberKind::Method,
+                is_static: false,
+                parameter_arity: 2,
+                name: "ordinaryAfter",
+                generic_arity: 0,
+                parameter_types: &parameter_types,
+                parameter_variadics: &[true, false],
+                return_type: Some(&return_type),
+            })
+        );
+
+        for name in ["finalVararg", "ordinary"] {
+            let member = members
+                .iter()
+                .find(|member| member.name == name)
+                .expect("positive-control member");
+            assert!(member.signature.is_some(), "{name} signature");
+        }
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn scala_source_jar_does_not_emit_flow_for_withheld_signature() {
+        let source = r#"
+package scala.collection.mutable
+trait Map[K, V] {
+  def apply(keys: K*)(key: K): V = ???
+}
+"#;
+        let jar = source_jar(&[("scala/collection/mutable/Map.scala", source)]);
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request(jar.path().to_owned()),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.unwrap();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        assert!(
+            members
+                .iter()
+                .find(|member| member.name == "apply")
+                .is_some_and(|member| member.signature.is_none())
+        );
+        assert!(pack.shards[0].collection_flows.is_none());
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn scala_source_jar_preserves_infix_type_overloads_in_anonymous_class() {
+        let source = r#"
+package sample
+trait Evidence
+new Evidence {
+  def compose[C](value: C <:< Any): C = value
+  def compose[C](value: C =:= Any): C = value
+}
+"#;
+        let jar = source_jar(&[("sample/Evidence.scala", source)]);
+        let pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(jar.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let overloads = members
+            .iter()
+            .filter(|member| member.name == "compose")
+            .collect::<Vec<_>>();
+
+        assert_eq!(overloads.len(), 2, "members={members:#?}");
+        assert_ne!(overloads[0].id, overloads[1].id);
+        assert!(overloads.iter().all(|member| member.signature.is_some()));
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn scala_source_jar_is_deterministic_across_archive_order_and_path() {
+        let first = source_jar(&[
+            ("z/Second.scala", "package sample\nclass Second"),
+            ("a/First.scala", "package sample\nclass First"),
+        ]);
+        let mut second = tempfile::NamedTempFile::new().unwrap();
+        std::io::copy(&mut std::fs::File::open(first.path()).unwrap(), &mut second).unwrap();
+        let first_pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(first.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let second_pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(second.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let first_compiled = compile_pack(&first_pack, &Default::default()).unwrap();
+        let second_compiled = compile_pack(&second_pack, &Default::default()).unwrap();
+
+        assert_eq!(
+            first_compiled.manifest.semantic_sha256,
+            second_compiled.manifest.semantic_sha256
+        );
+        assert_eq!(
+            first_compiled.manifest_bytes,
+            second_compiled.manifest_bytes
+        );
+        assert_eq!(first_compiled.shards, second_compiled.shards);
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_SCALA_STDLIB_SOURCE_JAR pointing to a pinned source JAR"]
+    fn pinned_scala_standard_library_source_smoke() {
+        let path = std::env::var_os("BIFROST_SCALA_STDLIB_SOURCE_JAR")
+            .map(std::path::PathBuf::from)
+            .expect("set BIFROST_SCALA_STDLIB_SOURCE_JAR");
+        let version = std::env::var("BIFROST_SCALA_STDLIB_VERSION")
+            .expect("set BIFROST_SCALA_STDLIB_VERSION");
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request_for_version(path, &version),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.expect("real Scala source JAR pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala source producer must emit declaration facts");
+        };
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap_or_else(|errors| {
+            for error in &errors {
+                if let Some(index) = error
+                    .path
+                    .strip_prefix("$.shards[0].payload.members[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    eprintln!("invalid member: {:#?}", members[index]);
+                }
+                if let Some(index) = error
+                    .path
+                    .strip_prefix("$.shards[0].payload.types[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    eprintln!("invalid type: {:#?}", types[index]);
+                }
+            }
+            panic!("pack compilation failed: {errors:#?}");
+        });
+        eprintln!(
+            "Scala source smoke: types={}, members={}, stored_bytes={}, raw_bytes={}, completeness={:?}, diagnostics={:#?}",
+            types.len(),
+            members.len(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.stored_size)
+                .sum::<u64>(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.raw_size)
+                .sum::<u64>(),
+            production.completeness,
+            production.diagnostics
+        );
+        for expected in [
+            "scala.Any",
+            "scala.AnyRef",
+            "scala.AnyVal",
+            "scala.Predef",
+            "scala.collection.Iterable",
+        ] {
+            assert!(
+                types.iter().any(|fact| fact.name == expected),
+                "missing {expected}; diagnostics={:#?}",
+                production.diagnostics
+            );
+        }
+        assert!(
+            members.iter().any(|fact| fact.name == "hashCode"),
+            "scala.Any.hashCode should come from source; diagnostics={:#?}",
+            production.diagnostics
+        );
+    }
+
+    #[test]
+    fn scala_standard_library_map_emits_collection_flow_contracts() {
+        let source = r#"
+package scala.collection.mutable
+trait Map[K, V] {
+  def apply(key: K): V
+  def update(key: K, value: V): Unit
+  def foreach[U](f: ((K, V)) => U): Unit
+}
+"#;
+        let jar = source_jar(&[("scala/collection/mutable/Map.scala", source)]);
+        let pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(jar.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let map = types
+            .iter()
+            .find(|fact| fact.name == SCALA_MUTABLE_MAP)
+            .expect("exact standard Map declaration");
+        assert_eq!(map.type_parameters, ["K", "V"]);
+        let map_members = members
+            .iter()
+            .filter(|member| member.owner == map.id)
+            .collect::<Vec<_>>();
+        assert!(
+            map_members
+                .iter()
+                .filter(|member| matches!(member.name.as_str(), "apply" | "update" | "foreach"))
+                .all(|member| member.receiver.is_some())
+        );
+        let parameter_names = |name: &str| {
+            map_members
+                .iter()
+                .find(|member| member.name == name)
+                .and_then(|member| member.signature.as_ref())
+                .map(|signature| {
+                    signature
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| panic!("missing structured signature for {name}"))
+        };
+        assert_eq!(
+            parameter_names("update"),
+            [Some("key".to_owned()), Some("value".to_owned())]
+        );
+        assert_eq!(parameter_names("foreach"), [Some("f".to_owned())]);
+
+        let flows = pack.shards[0]
+            .collection_flows
+            .as_ref()
+            .expect("standard Map gets collection-flow facts");
+        assert_eq!(flows.flows.len(), 3, "flows={flows:#?}");
+        let flow = |name: &str| {
+            let member = map_members
+                .iter()
+                .find(|member| member.name == name)
+                .expect("modeled Map member");
+            flows
+                .flows
+                .iter()
+                .find(|flow| flow.callable == member.id)
+                .unwrap_or_else(|| panic!("missing collection flow for {name}"))
+        };
+
+        let apply = flow("apply");
+        assert_eq!(
+            apply.payload.receiver_substitution,
+            Some(CsmiCollectionFlowSubstitution::ReceiverArguments {
+                declaration: map.id.clone()
+            })
+        );
+        assert_eq!(apply.payload.transfers.len(), 1);
+        assert_eq!(
+            apply.payload.transfers[0].destination.root,
+            CsmiOutputBoundaryRoot::Result(CsmiOutputResultRoot {
+                phase: CsmiOutputPhase::Output,
+                role: CsmiResultRootRole::Result,
+                position: 0,
+            })
+        );
+        assert_eq!(
+            apply.payload.transfers[0]
+                .source
+                .projection
+                .as_ref()
+                .unwrap()
+                .steps
+                .iter()
+                .map(|step| step.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["entry", "entry-value"]
+        );
+
+        let update = flow("update");
+        assert_eq!(update.payload.transfers.len(), 1);
+        assert!(matches!(
+            update.payload.transfers[0].source.root,
+            CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot { position: 1, .. })
+        ));
+        assert!(matches!(
+            update.payload.transfers[0].destination.root,
+            CsmiOutputBoundaryRoot::Receiver(_)
+        ));
+
+        let foreach = flow("foreach");
+        let invocation = foreach
+            .payload
+            .invocations
+            .first()
+            .expect("foreach publishes a callback boundary");
+        assert_eq!(invocation.parameters.len(), 1);
+        assert!(matches!(
+            invocation.parameters[0],
+            CsmiCollectionFlowShape::Product { ref components }
+                if components.len() == 2
+        ));
+        assert_eq!(invocation.arguments.len(), 1);
+        assert_eq!(
+            invocation.arguments[0]
+                .source
+                .projection
+                .as_ref()
+                .unwrap()
+                .steps[0]
+                .args,
+            Some(serde_json::json!({"key": {"kind": "all"}}))
+        );
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn scala_non_library_map_does_not_inherit_standard_collection_flow() {
+        let source = r#"
+package example
+trait Map[K, V] {
+  def apply(key: K): V
+  def update(key: K, value: V): Unit
+  def foreach[U](f: ((K, V)) => U): Unit
+}
+"#;
+        let jar = source_jar(&[("example/Map.scala", source)]);
+        let mut request = request(jar.path().to_owned());
+        request.activation[0]
+            .package
+            .as_mut()
+            .expect("fixture package selector")
+            .name = "com.example:maps".to_owned();
+        let pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(&request, &ArtifactProducerLimits::default())
+            .pack
+            .unwrap();
+        assert!(pack.shards[0].collection_flows.is_none());
+    }
+
+    #[test]
+    fn scala_visibility_uses_access_modifier_nodes() {
+        let source = "class Surface { protected def inherited: Int = 1; private def hidden: Int = 2; def public: Int = 3 }";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "Visibility.scala");
+        let parsed = parse_scala_file(&file, source, &tree);
+        let visibility = parsed
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .scala
+            .as_ref()
+            .unwrap()
+            .declarations
+            .iter()
+            .filter(|fact| fact.callable.is_some())
+            .map(|fact| fact.visibility)
+            .collect::<HashSet<_>>();
+        assert!(visibility.contains(&ScalaDeclarationVisibility::Public));
+        assert!(visibility.contains(&ScalaDeclarationVisibility::Protected));
+        assert!(visibility.contains(&ScalaDeclarationVisibility::NonApi));
+    }
+}

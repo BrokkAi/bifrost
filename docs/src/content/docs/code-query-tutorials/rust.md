@@ -126,6 +126,63 @@ Calls written inside macro arguments are included in the query results.
 }
 ```
 
+## Callee provenance and unsafe calls
+
+`call-shape` exposes four Rust callee columns independently of dispatch resolution:
+
+| Column | Meaning |
+| --- | --- |
+| `callee_provenance` | `caller_supplied`, `local_closure`, `declared`, or `unknown`; `unsupported` for languages that do not publish provenance. |
+| `callee_supplier` | `parameter N`, `closure_parameter N`, or `receiver`; null when no supplier is identified. Parameter ordinals start at zero and exclude `self`. |
+| `callee_type_shape` | `fn_bound_generic`, `trait_bound_generic`, `dyn_trait`, `impl_trait`, `fn_pointer`, `nominal`, or `unknown`. |
+| `callee_bounds` | An array of written trait paths, such as `["FnMut"]` or `["Runner"]`. |
+
+Classification uses the nearest lexical binding, including shadowing. Function
+parameters with inline or `where` bounds containing `Fn`, `FnMut`, or `FnOnce`
+are `caller_supplied` with `fn_bound_generic`; other generic trait bounds use
+`trait_bound_generic`. `dyn Trait`, `impl Trait`, and function-pointer parameters
+use `dyn_trait`, `impl_trait`, and `fn_pointer` respectively. Reference layers
+are ignored. Closure parameters are caller-supplied, with `unknown` shape when
+untyped. Trait `self` and generic receivers are also caller-supplied. A nominal
+parameter has provenance `declared` and shape `nominal`.
+
+`T: Trait` is caller-supplied because the caller chooses the concrete `T` and
+therefore the method implementation. This remains true when dispatch can list
+workspace implementations: provenance describes who supplies the code, while
+dispatch describes possible targets.
+
+A local initialized directly with a closure is `local_closure`. A named function
+or path is `declared`. Other local initializers and callable fields remain
+`unknown`: following their values requires value-flow analysis. In particular,
+this fixture's call is `local_closure`, despite its parameter's bound:
+
+```rust
+fn shadowed<F: Fn()>(f: F) {
+    let f = || {};
+    f();
+}
+```
+
+Rust call patterns also accept Boolean `:unsafe-context` (`unsafe_context` in
+JSON). True selects calls inside an `unsafe` block or an `unsafe fn`; false
+selects calls outside either context. Other pattern kinds reject the property,
+and other languages report the existing unsupported-property diagnostic.
+
+This query selects caller-supplied calls in unsafe contexts, a starting point
+for panic-safety checks involving uninitialized memory:
+
+```lisp
+(filter :where ((callee_provenance eq caller_supplied))
+  (call-shape (language rust (call :unsafe-context true))))
+```
+
+A panic-safety policy must additionally establish the hazardous ordering. The
+regression policy joins these calls through `call-results` to calls to `set_len`
+or `assume_init` in the same procedure, then uses `control-relations` dominance
+to require initialization-state publication before the callback. It reports the
+callback after `set_len`, and excludes callbacks before `set_len`, local
+closures, and named helpers. The query above alone does not prove a defect.
+
 ## Async functions and await points
 
 The callable's AST-backed `:async true` property scopes the query to the async
@@ -661,3 +718,75 @@ impl QueryRoot for QueryLeaf {
   "truncated": false
 }
 ```
+
+## Unsafe Send and Sync impl bounds
+
+`rust_marker_impls_of` (also spelled `rust-marker-impls-of`) enumerates
+positive `Send` and `Sync` impls for selected Rust structs, enums, and unions.
+These marker impls require `unsafe` in Rust. The relation publishes facts for
+policies to inspect; it does not decide whether an impl is sound.
+
+```lisp
+(rust-marker-impls-of (language rust (class)))
+```
+
+Each `rust_marker_impl` row describes one impl type parameter, its positional
+mapping to a declaration parameter, its inline and where-clause bounds, and
+its uses in the declaration's fields. An impl without type parameters still
+emits a row with `parameter = null`. `impl_range` anchors the impl header.
+Every row has `impl_coverage = "same_file"`: the relation searches the
+selected declaration's file, including nested modules and function bodies,
+but does not enumerate impls in other files. A clean result therefore does
+not prove the absence of unsafe impls elsewhere.
+
+Marker identity uses definition lookup first. When standard-library
+declarations are unavailable, the fallback reads structured paths and import
+bindings. The `trait_proof` values distinguish these cases:
+
+| Proof | Identity evidence |
+| --- | --- |
+| `resolved` | Definition lookup identifies `core::marker::Send` or `std::marker::Send`, or the corresponding `Sync` declaration. |
+| `prelude_name` | An unshadowed `Send` or `Sync` path, or its exact `core::marker` / `std::marker` path, is recognized in the declaring file. |
+| `import_alias` | A single-segment name has exactly one same-file import binding to the standard marker, such as `use std::marker::Send as S2`. Multiple bindings or other import targets do not qualify. |
+
+The same identity rules apply to marker bounds and `PhantomData` field heads.
+Resolvable workspace traits can imply markers through their declared
+supertraits. This syntax traversal visits at most 16 traits per bound and
+respects the query's work and source limits. Unresolved supertraits and
+unsupported external traits leave `bounds_proof = "open"`; unknown facts
+must not be treated as missing bounds.
+
+`uses` records each field and the wrappers surrounding its type-parameter
+use. `stored` is true when at least one use has neither a `phantom` wrapper
+nor a function-type (`fn`) wrapper. Thus `PhantomData<T>` and a function
+return type alone do not count as storing `T`, while `*const T` and
+`*mut T` do. `shared_ref_only` is true when every stored use has a shared
+reference (`ref`) as its outermost wrapper. `&T` qualifies; `&mut T` and
+`Box<&T>` do not. Policies use this flag together with `stored`.
+
+A policy should report only rows with `completeness = "complete"`, using
+these conditions:
+
+- For `trait = "send"`: `stored AND NOT has_send_bound AND NOT
+  (shared_ref_only AND has_sync_bound)`.
+- For `trait = "sync"`: `stored AND NOT has_sync_bound AND NOT
+  has_send_bound AND shared_access != "none"`.
+
+`shared_access` is `touches` when a shared-reference method accesses a field
+storing the parameter or lets its receiver escape, including macro uses,
+unknown method calls, and calls to shared helpers that touch. It is `none`
+when every shared method is analyzed without access, and `unknown` when
+method syntax or the query budget prevents that conclusion. Send rows use
+`not_applicable`. Exclusive receivers are excluded; methods implemented for a
+reference self type count as shared. Associated functions accepting a shared
+reference to the type are analyzed in the same way.
+
+The Sync condition accepts a Send bound alone because a lock-like type can
+be Sync when its protected value only needs to be Send, as with
+`std::sync::Mutex<T>`. Requiring Sync for every stored parameter would flag
+these valid impls. This rule favors precision: it does not analyze whether
+an arbitrary wrapper actually provides that protection, and can therefore
+miss unsound Sync impls that already have a Send bound. Macros or syntax
+errors in field types leave the uses open and the row incomplete; they do
+not support a finding under this rule. This relation supplies the Send/Sync
+slice of #3855; its other declaration-linkage obligations remain separate.

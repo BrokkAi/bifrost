@@ -220,8 +220,9 @@ pub fn rename_symbol(
         });
     }
 
-    if let Some(provider) = brokk_bifrost_analysis::analyzer::languages::language_support(
+    if let Some(provider) = brokk_bifrost_analysis::analyzer::languages::language_support_for_hook(
         language_for_file(target.source()),
+        "rename_provider",
     )
     .and_then(|support| support.rename_provider())
     {

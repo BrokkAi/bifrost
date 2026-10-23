@@ -31,13 +31,13 @@ mod ruby_extraction_tests {
 
     use brokk_bifrost_cpp_analysis::analyzer::cpp::adapter::CppAdapter;
 
-    use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
     use brokk_bifrost_python_analysis::analyzer::python::adapter::PythonAdapter;
 
     use brokk_bifrost_ruby_analysis::analyzer::ruby::adapter::RubyAdapter;
 
-    use brokk_bifrost_analysis::analyzer::scala::adapter::ScalaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::scala::adapter::ScalaAdapter;
 
     use brokk_bifrost_js_ts_analysis::analyzer::typescript::TypescriptAdapter;
 

@@ -133,6 +133,7 @@ impl PythonFactDiagnostics {
             .insert((code, language, message.clone(), source.clone()))
         {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: Some(source),
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1359,6 +1360,7 @@ pub(super) fn apply_plan_step(
         &mut state.cpp_expression_cache,
         &mut state.cpp_class_fact_cache,
         &mut state.cpp_class_declaration_cache,
+        &mut state.rust_marker_impls_cache,
         &mut state.callable_metrics_cache,
         &mut state.failure_handler_state_cache,
         &mut state.topology_cache,
@@ -1391,6 +1393,7 @@ pub(super) fn apply_plan_step(
         state.import_graph = None;
         state.import_graph_content = None;
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1628,6 +1631,7 @@ pub(super) fn invalid_plan_result(
         truncated: false,
         session_subset,
         diagnostics: vec![CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
             impact: CodeQueryDiagnosticImpact::Invalid,
@@ -1890,6 +1894,7 @@ pub(super) fn query_analysis_context_error_result(
         truncated: true,
         session_subset,
         diagnostics: vec![CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1914,6 +1919,7 @@ pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnosti
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::Cancelled,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1958,6 +1964,7 @@ pub(super) fn apply_pipeline_step<'a>(
         ProjectFile,
         Arc<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>>,
     >,
+    rust_marker_impls_cache: &mut rust_marker_impls::RustMarkerImplsCache,
     callable_metrics_cache: &mut HashMap<
         ProjectFile,
         Option<
@@ -2083,6 +2090,7 @@ pub(super) fn apply_pipeline_step<'a>(
         cpp_expression_cache,
         cpp_class_fact_cache,
         cpp_class_declaration_cache,
+        rust_marker_impls_cache,
         callable_metrics_cache,
         failure_handler_state_cache,
         topology_cache,
@@ -2138,6 +2146,7 @@ fn apply_call_bindings_pipeline_step(
         });
         if let Err(error) = service.prefetch_call_bindings(&mut call_cache.bindings, candidates) {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticProviderFailed,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2175,6 +2184,7 @@ fn apply_call_bindings_pipeline_step(
             })
         {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2282,6 +2292,7 @@ fn apply_pipeline_step_general<'a>(
         ProjectFile,
         Arc<Vec<brokk_bifrost_core::analyzer::cpp_facts::CppDeclarationSourceFact>>,
     >,
+    rust_marker_impls_cache: &mut rust_marker_impls::RustMarkerImplsCache,
     callable_metrics_cache: &mut HashMap<
         ProjectFile,
         Option<
@@ -2369,6 +2380,7 @@ fn apply_pipeline_step_general<'a>(
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired)
         {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2392,6 +2404,7 @@ fn apply_pipeline_step_general<'a>(
                 .is_some_and(|receiver| !resolved_call_receiver_is_resolved(receiver)))
     {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
             impact: CodeQueryDiagnosticImpact::Invalid,
@@ -2409,6 +2422,7 @@ fn apply_pipeline_step_general<'a>(
             || filter.proof != ResolvedCallProof::Exact)
     {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
             impact: CodeQueryDiagnosticImpact::Invalid,
@@ -2533,6 +2547,9 @@ fn apply_pipeline_step_general<'a>(
             if release_effect_file_windows {
                 call_cache.effects.release_file_window();
             }
+            if let Some(semantic) = semantic.as_mut() {
+                semantic.release_definition_operations();
+            }
             return (output, true, receiver_truncated);
         }
         let mut opened_result_contract_file = false;
@@ -2607,6 +2624,7 @@ fn apply_pipeline_step_general<'a>(
                 Err(message) => {
                     exhausted = true;
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2791,6 +2809,7 @@ fn apply_pipeline_step_general<'a>(
             let (result, interrupted) = match semantic.as_mut() {
                 None => {
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2827,6 +2846,7 @@ fn apply_pipeline_step_general<'a>(
                             // truncation plumbing so it cannot be mistaken for a clean
                             // empty keyed-read relation.
                             diagnostics.push(CodeQueryDiagnostic {
+                                related: Vec::new(),
                                 source: None,
                                 code: CodeQueryDiagnosticCode::SemanticProviderFailed,
                                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -3350,6 +3370,33 @@ fn apply_pipeline_step_general<'a>(
                 .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
+            (PipelineValue::StructuralMatch(seed), QueryStep::RustMarkerImplsOf) => {
+                let declaration =
+                    enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations).0;
+                match declaration {
+                    Some(declaration) => rust_marker_impls::expansions(
+                        analyzer,
+                        rust_marker_impls_cache,
+                        &declaration.unit,
+                        budget,
+                        limits,
+                        cancellation,
+                        diagnostics,
+                    ),
+                    None => Vec::new(),
+                }
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::RustMarkerImplsOf) => {
+                rust_marker_impls::expansions(
+                    analyzer,
+                    rust_marker_impls_cache,
+                    &declaration.unit,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                )
+            }
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
                 QueryStep::RustPointerFindings,
@@ -4304,6 +4351,7 @@ fn apply_pipeline_step_general<'a>(
                         && diagnostic.message == "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete"
                 }) {
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -4515,6 +4563,7 @@ fn apply_pipeline_step_general<'a>(
                                     && diagnostic.message == message
                             }) {
                                 diagnostics.push(CodeQueryDiagnostic {
+                                    related: Vec::new(),
                                     source: None,
                                     code,
                                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -6037,6 +6086,10 @@ fn apply_pipeline_step_general<'a>(
         }
     }
 
+    if let Some(semantic) = semantic.as_mut() {
+        semantic.release_definition_operations();
+    }
+
     if window_semantic_artifacts {
         if artifact_window_has_policy_row {
             semantic
@@ -6089,6 +6142,7 @@ fn apply_pipeline_step_general<'a>(
 
     if filter_witnessed_candidate && !filter_selected_candidate {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallBindingSelectorRejected,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -6111,6 +6165,7 @@ fn apply_pipeline_step_general<'a>(
 
     for language in unsupported_languages {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedImportAnalysis,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -6137,6 +6192,7 @@ fn apply_pipeline_step_general<'a>(
                     paths.sort_unstable();
                     paths.dedup();
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::DynamicImportTarget,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -6179,6 +6235,7 @@ fn apply_pipeline_step_general<'a>(
             )
         };
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,

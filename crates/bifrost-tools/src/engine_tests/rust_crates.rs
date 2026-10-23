@@ -1790,7 +1790,7 @@ mod tests {
         conn.execute(derivation::MODULE_DECLARATIONS_SQL, [])
             .unwrap();
         conn.execute(derivation::ROOT_SOURCES_SQL, []).unwrap();
-        conn.execute(derivation::IMPL_SOURCES_SQL, []).unwrap();
+        conn.execute(&derivation::IMPL_SOURCES_SQL, []).unwrap();
         derivation::derive_bindings_for_plan(&conn, "2021").unwrap();
         conn.execute(derivation::ROUTES_SQL.as_str(), []).unwrap();
         conn.execute(derivation::LOCAL_REEXPORT_STEPS_SQL, [])
@@ -2102,6 +2102,14 @@ mod tests {
                             Integer(2),
                             text("src/lib.rs"),
                             Integer(0),
+                        ],
+                        "rust_crate_inherent_impls_insert" => vec![
+                            Integer(id), Integer(root_blob), Integer(0), text("src/lib.rs"),
+                            Integer(root_blob), Integer(2), text("src/lib.rs"), Integer(0),
+                        ],
+                        "rust_crate_unresolved_inherent_impls_insert" => vec![
+                            Integer(id), text("Unbound"), Integer(root_blob), Integer(3),
+                            text("src/lib.rs"), Null, text("unbound"), text("crate::elsewhere"),
                         ],
                         "rust_crate_decided_item_macros_insert" => {
                             vec![Integer(id), Integer(root_blob), Integer(0), text("always")]

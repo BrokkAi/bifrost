@@ -306,6 +306,12 @@ pub(super) fn prepare_seed_access(
             return scan_access(state, scoped_file_count, None);
         }
         if cache.build_in_flight(content_identity) {
+            if let Some(profile) = &mut state.profile {
+                profile.access_path.index_build_in_flight_fallbacks = profile
+                    .access_path
+                    .index_build_in_flight_fallbacks
+                    .saturating_add(1);
+            }
             // Somebody else is already building this snapshot's postings --
             // normally the host's background warm. Following it would bill
             // this request for a whole-snapshot build it did not start, and
@@ -695,6 +701,7 @@ pub(super) fn execute_occurrence_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -815,6 +822,7 @@ pub(super) fn execute_environment_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -926,6 +934,7 @@ pub(super) fn execute_materialization_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1020,6 +1029,7 @@ pub(super) fn execute_path_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1108,6 +1118,7 @@ fn push_recovered_syntax_diagnostic(
         message.push_str(&line);
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1367,6 +1378,7 @@ fn push_comparison_chain_roles_diagnostic(
     }
     // No matcher or capture state was evaluated by this negative proof.
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1506,6 +1518,7 @@ pub(super) fn execute_seed(
                 .into_diagnostics(language)
                 .into_iter()
                 .map(|diagnostic| CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1588,6 +1601,7 @@ pub(super) fn execute_seed(
             && (explicitly_requested || scoped_languages.contains(&language))
         {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::MissingStructuralAdapter,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2190,6 +2204,7 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.visibility_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2202,6 +2217,7 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.parameter_types_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2217,6 +2233,7 @@ pub(super) fn execute_seed(
         .get()
     {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2229,6 +2246,7 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.string_literal_value_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2241,6 +2259,7 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.local_value_unresolved.get() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2262,6 +2281,7 @@ pub(super) fn execute_seed(
             "workspace content changed during structural posting replay".to_string()
         });
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,

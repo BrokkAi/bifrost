@@ -105,9 +105,10 @@ use brokk_bifrost_cpp::graph::resolver::{
     declaration_declarator, field_declared_binding, field_initializer_holds_subobject,
     guard_requirements_hold_at_reference, is_c_offsetof_member_node,
     is_c_sizeof_expression_type_candidate, is_c_source_file, is_type_shaped_template_argument_name,
-    preprocessor_guard_environment, recovered_c_new_expression_argument_at,
-    recovered_macro_decorated_declarator_type, same_logical_symbol, same_visible_symbol,
-    select_alias_spelling_with_agreed_targets, type_owner_of,
+    preprocessor_guard_environment, recovered_c_block_call_envelope,
+    recovered_c_new_expression_argument_at, recovered_macro_decorated_declarator_type,
+    same_logical_symbol, same_visible_symbol, select_alias_spelling_with_agreed_targets,
+    type_owner_of,
 };
 use brokk_bifrost_cpp::graph::resolver::{
     cpp_tag_specifier_ancestors_before_type_reference_context, cpp_tag_specifier_declares_name,
@@ -1637,7 +1638,10 @@ fn resolve_cpp_bounded_in_session(
             resolve_cpp_bounded_member(provider, file, source, root, field)
         }
         Some(CppReferenceNode::Call(call)) => {
-            let Some(function) = call.child_by_field_name("function") else {
+            let Some(function) = call
+                .child_by_field_name("function")
+                .or_else(|| call.child_by_field_name("declarator"))
+            else {
                 return no_definition(
                     "unsupported_cpp_reference_shape",
                     "C++ call expression has no structured function",
@@ -1751,6 +1755,18 @@ fn cpp_bounded_reference_node<'tree>(
             break;
         }
         current = parent;
+    }
+
+    // A C call with a Clang block literal argument parses under the
+    // macro-declaration grammar as a bogus `function_definition` whose
+    // declarator holds the callee and the argument prefix. The declarator plays
+    // the call's role; its parameter list is the argument list.
+    if current.kind() == "identifier"
+        && let Some(declarator) = current.parent()
+        && declarator.child_by_field_name("declarator") == Some(current)
+        && recovered_c_block_call_envelope(declarator).is_some()
+    {
+        return Some(CppReferenceNode::Call(declarator));
     }
 
     match current.kind() {
@@ -3218,6 +3234,18 @@ pub fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             continue;
         }
         break;
+    }
+
+    // A C call with a Clang block literal argument parses under the
+    // macro-declaration grammar as a bogus `function_definition` whose
+    // declarator holds the callee and the argument prefix. The declarator plays
+    // the call's role; its parameter list is the argument list.
+    if current.kind() == "identifier"
+        && let Some(declarator) = current.parent()
+        && declarator.child_by_field_name("declarator") == Some(current)
+        && recovered_c_block_call_envelope(declarator).is_some()
+    {
+        return Some(CppReferenceNode::Call(declarator));
     }
 
     match current.kind() {
@@ -4720,72 +4748,120 @@ fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool
 }
 
 /// Recover a class-template binder when an unmatched namespace-closing macro
-/// makes tree-sitter detach the qualified class specialization from its
-/// `template <...>` head. In this error shape the template head is the class
-/// specifier's immediately preceding `ERROR` sibling. Tree-sitter still keeps
-/// the `template`, angle-bracket, `typename`/`class`, and parameter identifier
-/// children, so the binder remains recoverable without parsing source text.
+/// makes tree-sitter detach a qualified class specialization from its
+/// `template <...>` head. The head's `template` and `<` tokens stay together
+/// in an `ERROR` node, which takes one of two positions:
+///
+/// - the immediately preceding sibling of the class specifier, when the class
+///   still parses as its own declaration-sequence item;
+/// - a preceding sibling inside the same enclosing construct, when the macro
+///   is read as a `macro_modifier` that absorbs the whole specialization into
+///   one recovered declaration. The parameter tokens then follow the `ERROR`
+///   node as siblings and descendants of the declaration's other children.
+///
+/// Tree-sitter keeps every head token, so the binders are read as the CST
+/// tokens between `<` and the first `>`, without parsing source text.
 fn cpp_fragmented_class_template_parameter_reference(
     node: Node<'_>,
     source: &str,
     name: &str,
 ) -> bool {
-    let mut class = node;
-    loop {
-        if matches!(
-            class.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) {
-            break;
+    let mut item = node;
+    while let Some(parent) = item.parent() {
+        let item_is_sequence_entry = matches!(
+            parent.kind(),
+            "translation_unit"
+                | "declaration_list"
+                | "field_declaration_list"
+                | "compound_statement"
+        );
+        let mut preceding = item.prev_named_sibling();
+        while let Some(sibling) = preceding {
+            if let Some(open) = cpp_recovered_template_head_open(sibling)
+                && cpp_recovered_template_head_binds(open, node, source, name)
+            {
+                return true;
+            }
+            if item_is_sequence_entry {
+                break;
+            }
+            preceding = sibling.prev_named_sibling();
         }
-        let Some(parent) = class.parent() else {
-            return false;
-        };
-        if parent.kind() == "translation_unit" {
+        if item_is_sequence_entry {
             return false;
         }
-        class = parent;
+        item = parent;
     }
-    let Some(error) = class.prev_named_sibling() else {
-        return false;
-    };
-    if error.kind() != "ERROR" || error.end_byte() > class.start_byte() {
-        return false;
-    }
+    false
+}
 
+/// The `<` that opens a recovered template head: the first `<` child after the
+/// last `template` child of an `ERROR` node.
+fn cpp_recovered_template_head_open(error: Node<'_>) -> Option<Node<'_>> {
+    if error.kind() != "ERROR" {
+        return None;
+    }
     let children = (0..error.child_count())
         .filter_map(|index| error.child(index))
         .collect::<Vec<_>>();
-    let Some(template_index) = children
+    let template_index = children
         .iter()
-        .rposition(|child| child.kind() == "template")
-    else {
-        return false;
-    };
-    let Some(open_index) = children[template_index + 1..]
+        .rposition(|child| child.kind() == "template")?;
+    children[template_index + 1..]
         .iter()
-        .position(|child| child.kind() == "<")
-        .map(|index| template_index + 1 + index)
-    else {
-        return false;
-    };
-    let Some(close_index) = children[open_index + 1..]
-        .iter()
-        .position(|child| child.kind() == ">")
-        .map(|index| open_index + 1 + index)
-    else {
-        return false;
-    };
-    children[open_index + 1..close_index]
-        .windows(2)
-        .any(|pair| {
-            (matches!(
-                pair[0].kind(),
+        .find(|child| child.kind() == "<")
+        .copied()
+}
+
+/// Whether the tokens after a recovered head's `<`, up to its first `>` and
+/// before `reference`, bind `name` with a `typename`/`class` keyword or a
+/// parameter type immediately before it. Tokens are CST leaves in document
+/// order, except that a `placeholder_type_specifier` is one token.
+fn cpp_recovered_template_head_binds(
+    open: Node<'_>,
+    reference: Node<'_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    let mut previous: Option<Node<'_>> = None;
+    let mut current = cpp_next_token_after(open);
+    while let Some(token) = current {
+        if token.start_byte() >= reference.start_byte() {
+            return false;
+        }
+        if token.kind() == ">" {
+            return false;
+        }
+        if let Some(binder_head) = previous
+            && (matches!(
+                binder_head.kind(),
                 "primitive_type" | "type_identifier" | "placeholder_type_specifier"
-            ) || matches!(cpp_node_text(pair[0], source), "typename" | "class"))
-                && matches!(pair[1].kind(), "identifier" | "type_identifier")
-                && cpp_node_text(pair[1], source) == name
-        })
+            ) || matches!(cpp_node_text(binder_head, source), "typename" | "class"))
+            && matches!(token.kind(), "identifier" | "type_identifier")
+            && cpp_node_text(token, source) == name
+        {
+            return true;
+        }
+        previous = Some(token);
+        current = cpp_next_token_after(token);
+    }
+    false
+}
+
+fn cpp_next_token_after(token: Node<'_>) -> Option<Node<'_>> {
+    let mut ancestor = token;
+    let mut next = loop {
+        if let Some(sibling) = ancestor.next_sibling() {
+            break sibling;
+        }
+        ancestor = ancestor.parent()?;
+    };
+    while next.kind() != "placeholder_type_specifier"
+        && let Some(child) = next.child(0)
+    {
+        next = child;
+    }
+    Some(next)
 }
 
 /// Recover the lexical template binder when preprocessing inside an out-of-line
@@ -4873,6 +4949,7 @@ fn cpp_template_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
     let candidate = node
         .child_by_field_name("name")
         .or_else(|| node.child_by_field_name("declarator"))
+        .or_else(|| brokk_bifrost_cpp::declarations::cpp_recovered_type_parameter_name(node))
         .or_else(|| {
             node.named_children(&mut node.walk()).find(|child| {
                 matches!(
@@ -5788,7 +5865,12 @@ fn resolve_cpp_call(
     evidence: &mut CallEvidence,
 ) -> DefinitionLookupOutcome {
     let ctx_dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
-    let Some(function) = call.child_by_field_name("function") else {
+    // A recovered block-literal call keeps the callee in the bogus
+    // declarator's `declarator` field rather than a call's `function` field.
+    let Some(function) = call
+        .child_by_field_name("function")
+        .or_else(|| call.child_by_field_name("declarator"))
+    else {
         return no_definition("no_function_name", "C++ call expression has no function");
     };
     let call_arity = ctx
@@ -7480,7 +7562,7 @@ fn cpp_is_non_reference_preprocessor_recovery_tail_token(node: Node<'_>) -> bool
     let Some(top_level) = cpp_translation_unit_child(node) else {
         return false;
     };
-    if top_level.kind() != "ERROR" && !cpp_has_error_ancestor_before_translation_unit(node) {
+    if top_level.kind() != "ERROR" && !cpp_has_recovery_ancestor_before_translation_unit(node) {
         return false;
     }
     if !cpp_is_recovered_preprocessor_tail_segment(top_level) {
@@ -7499,18 +7581,22 @@ fn cpp_is_non_reference_preprocessor_recovery_tail_token(node: Node<'_>) -> bool
     false
 }
 
-fn cpp_has_error_ancestor_before_translation_unit(mut node: Node<'_>) -> bool {
+/// Whether `node` sits inside recovered syntax below its top-level segment:
+/// an `ERROR`, or the `macro_modifier` / `macro_modifier_declarator` wrapper the
+/// macro-declaration grammar admits only where the parse would otherwise fail.
+/// Grammar 0.24.4 reads the CIRCL `MULXQ 24+a, R14, R15 \` tail as a clean
+/// `macro_modifier` chain inside a `declaration` with a missing `;`, so the
+/// registers no longer have an `ERROR` ancestor (#1186).
+fn cpp_has_recovery_ancestor_before_translation_unit(mut node: Node<'_>) -> bool {
     loop {
         let Some(parent) = node.parent() else {
             return false;
         };
-        if parent.kind() == "translation_unit" {
-            return false;
+        match parent.kind() {
+            "translation_unit" => return false,
+            "ERROR" | "macro_modifier" | "macro_modifier_declarator" => return true,
+            _ => node = parent,
         }
-        if parent.kind() == "ERROR" {
-            return true;
-        }
-        node = parent;
     }
 }
 

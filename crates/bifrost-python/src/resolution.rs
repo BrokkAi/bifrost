@@ -18,6 +18,8 @@ use tree_sitter::Node;
 mod exports;
 mod guards;
 mod imports;
+mod temporal;
+mod typed;
 
 struct Scope<'tree> {
     node: Node<'tree>,
@@ -34,6 +36,7 @@ struct Producer<'source, 'collector> {
     declarations: Vec<(ResolutionSiteId, SourceDeclarationId)>,
     names: HashMap<String, ResolutionNameId>,
     node_guards: HashMap<usize, u32>,
+    iteration_guards: HashMap<usize, u32>,
 }
 
 impl Producer<'_, '_> {
@@ -65,7 +68,24 @@ impl Producer<'_, '_> {
     ) -> ResolutionSiteId {
         let site = self.site(node, scope, kind);
         let text = &self.source[node.byte_range()];
-        let name = self.facts.intern_name(&mut self.names, text);
+        // The semantic identifier is compiler-mangled; the independent source
+        // occurrence/declaration bridge retains its original public spelling.
+        // Header expressions execute outside the class body being defined.
+        let lookup = if text.starts_with("__") && !text.ends_with("__") && !text.contains('.') {
+            find_ancestor(node, |class| {
+                class.kind() == "class_definition"
+                    && class.child_by_field_name("body").is_some_and(|body| {
+                        body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+                    })
+            })
+            .and_then(|class| class.child_by_field_name("name"))
+            .map(|class| self.source[class.byte_range()].trim_start_matches('_'))
+            .filter(|class| !class.is_empty())
+            .map_or_else(|| text.to_owned(), |class| format!("_{class}{text}"))
+        } else {
+            text.to_owned()
+        };
+        let name = self.facts.intern_name(&mut self.names, &lookup);
         self.facts.identifiers.push(PositionedIdentifierFact {
             site,
             name,
@@ -114,6 +134,7 @@ pub(super) fn produce<'source, 'unit>(
         declarations: Vec::new(),
         names: HashMap::default(),
         node_guards: HashMap::default(),
+        iteration_guards: HashMap::default(),
     };
     let units = units
         .map(|(declaration, unit)| (*declaration, unit))
@@ -193,7 +214,12 @@ pub(super) fn produce<'source, 'unit>(
         if let Some(guard) = guard {
             node_guards.insert(node.id(), guard);
         }
-        let child_guards = guards::child_guards(&mut p, node, current, guard);
+        let guard_scope = if is_comprehension(node.kind()) {
+            body_scope.expect("comprehension execution scope")
+        } else {
+            current
+        };
+        let child_guards = guards::child_guards(&mut p, node, guard_scope, guard);
         let children = named_children_iter(node).collect::<Vec<_>>();
         if is_comprehension(node.kind())
             && let Some(first) = children
@@ -413,32 +439,39 @@ pub(super) fn produce<'source, 'unit>(
                 }
                 Some(authored)
             }
-            _ => None,
+            ResolutionBindingEventKind::Delete | ResolutionBindingEventKind::Annotation => None,
+            _ => {
+                let authored = p.identifier(
+                    token,
+                    scope,
+                    ResolutionSiteKind::ValueDeclaration,
+                    ResolutionIdentifierRole::Declaration,
+                    ResolutionNamespace::Value,
+                );
+                let declaration_node = if matches!(
+                    kind,
+                    ResolutionBindingEventKind::Assign | ResolutionBindingEventKind::Augment
+                ) {
+                    find_ancestor(operation, |node| node.kind() == "expression_statement")
+                        .unwrap_or(operation)
+                } else {
+                    token
+                };
+                let declaration = p.collector.declare_node(declaration_node, Some(token));
+                p.declarations.push((authored, declaration));
+                if let Some(unit) = units.get(&declaration) {
+                    p.facts.definition_units.push(ResolutionDefinitionUnitFact {
+                        declaration: authored,
+                        unit: (*unit).clone(),
+                    });
+                } else {
+                    p.facts
+                        .add_gap(authored, ResolutionGapKind::UnsupportedScopeOrBinder);
+                }
+                Some(authored)
+            }
         };
-        let value = if matches!(
-            kind,
-            ResolutionBindingEventKind::Delete | ResolutionBindingEventKind::Annotation
-        ) {
-            None
-        } else {
-            let rhs = operation
-                .child_by_field_name("right")
-                .or_else(|| operation.child_by_field_name("value"))
-                .unwrap_or(token);
-            let site = p.site(
-                rhs,
-                execution_scope,
-                ResolutionSiteKind::UnsupportedExpression,
-            );
-            let id = p
-                .facts
-                .allocate_type_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-            p.facts.gaps.push(ResolutionGapFact::new(
-                site,
-                ResolutionGapKind::UnsupportedExpressionType,
-            ));
-            Some(id)
-        };
+        let value = None;
         let ordinal = dense_ordinal(p.facts.binding_events.len(), "Python binding events");
         event_by_token.insert(token.id(), ordinal);
         p.facts.binding_events.push(ResolutionBindingEventFact {
@@ -448,7 +481,9 @@ pub(super) fn produce<'source, 'unit>(
             kind,
             value,
             authored_declaration: authored,
+            source_reference: None,
         });
+        temporal::timing(&mut p, ordinal, operation, execution_scope, false);
         if kind == ResolutionBindingEventKind::Exception {
             let ordinal = dense_ordinal(p.facts.binding_events.len(), "Python cleanup events");
             p.facts.binding_events.push(ResolutionBindingEventFact {
@@ -458,11 +493,13 @@ pub(super) fn produce<'source, 'unit>(
                 kind: ResolutionBindingEventKind::Delete,
                 value: None,
                 authored_declaration: None,
+                source_reference: None,
             });
+            temporal::timing(&mut p, ordinal, operation, execution_scope, true);
         }
     }
     exports::produce(&mut p, &nodes, &node_scopes, &event_by_token);
-    for node in nodes {
+    for node in nodes.iter().copied() {
         let scope = node_scopes[&node.id()];
         match node.kind() {
             "import_statement" | "import_from_statement" => {
@@ -584,11 +621,6 @@ pub(super) fn produce<'source, 'unit>(
                     .parent()
                     .is_some_and(|parent| is_field_child(parent, node, "attribute"))
                 {
-                    let object = node
-                        .parent()
-                        .expect("attribute parent")
-                        .child_by_field_name("object")
-                        .expect("attribute receiver");
                     p.identifier(
                         node,
                         scope,
@@ -596,18 +628,6 @@ pub(super) fn produce<'source, 'unit>(
                         ResolutionIdentifierRole::Reference,
                         ResolutionNamespace::Value,
                     );
-                    let receiver_site =
-                        p.site(object, scope, ResolutionSiteKind::UnsupportedExpression);
-                    let receiver = p
-                        .facts
-                        .allocate_type_slot(receiver_site, ResolutionTypeSlotRole::ExpressionValue);
-                    p.facts
-                        .identifiers
-                        .last_mut()
-                        .expect("member identifier")
-                        .qualifier = Some(receiver);
-                    p.facts
-                        .add_gap(receiver_site, ResolutionGapKind::UnsupportedExpressionType);
                     continue;
                 }
                 // Import paths and aliases remain the structural import producer's
@@ -638,15 +658,8 @@ pub(super) fn produce<'source, 'unit>(
                     );
                 }
             }
-            "string" if python_node_is_in_annotation(node) => {
-                let site = p.site(node, scope, ResolutionSiteKind::UnsupportedExpression);
-                p.facts
-                    .add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
-                p.facts.add_reference_enumeration_gap(
-                    site,
-                    ResolutionGapKind::UnsupportedScopeOrBinder,
-                );
-            }
+            // Typed annotation production owns quoted references and their slots.
+            "string" if python_node_is_in_annotation(node) => {}
             "type_parameter" | "type_alias_statement" => {
                 let site = p.site(node, scope, ResolutionSiteKind::UnsupportedExpression);
                 p.facts
@@ -656,7 +669,7 @@ pub(super) fn produce<'source, 'unit>(
                     ResolutionGapKind::UnsupportedScopeOrBinder,
                 );
             }
-            "call" => p.gap(node, scope, ResolutionGapKind::UnsupportedExpressionType),
+
             "ERROR" => p.gap(node, scope, ResolutionGapKind::MalformedSyntax),
             _ => {}
         }
@@ -668,7 +681,22 @@ pub(super) fn produce<'source, 'unit>(
             ResolutionGapKind::MalformedSyntax,
         );
     }
+    typed::produce(
+        &mut p,
+        &nodes,
+        &node_scopes,
+        &scope_by_node,
+        &event_by_token,
+    );
     imports::finish(&mut p);
+    temporal::finish(&mut p, &scopes);
+    p.facts.reference_lookup_requests.extend(
+        p.facts
+            .identifiers
+            .iter()
+            .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
+            .map(|identifier| identifier.site),
+    );
     guards::validate(&p.facts);
     (p.facts, p.occurrences, p.declarations)
 }

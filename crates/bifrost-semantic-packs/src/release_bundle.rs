@@ -39,6 +39,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::AnalyzerConfig;
+use brokk_bifrost_analysis::analyzer::FileSetProject;
+use brokk_bifrost_analysis::analyzer::Language;
+use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic_model::GoPinnedPackage as AnalysisGoPinnedPackage;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AcquisitionReceiptRelease, AcquisitionReceiptSource, ActivationSelector, ArtifactEncoding,
@@ -55,15 +59,18 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
     SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeOutcome,
     SemanticPackCatalog, acquire_active_semantic_models, compile_exact_dependency_production,
-    compile_pack, decode_manifest, decode_validated_shard_for_manifest,
+    compile_pack, decode_manifest, decode_validated_shard_for_manifest, lowest_schema_version,
     pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
     resolve_active_semantic_models, verify_recorded_generated_production_digest,
 };
-use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, FileSetProject, JavaJarPackProducer, JdkSourceArchiveLayout,
-    JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,
-    KotlinSourceJarPackProducer, Language, ScalaSourceJarPackProducer, WorkspaceAnalyzer,
-};
+use brokk_bifrost_jvm_analysis::analyzer::JavaJarPackProducer;
+use brokk_bifrost_jvm_analysis::analyzer::JdkSourceArchiveLayout;
+use brokk_bifrost_jvm_analysis::analyzer::JdkSourceArchivePackProducer;
+use brokk_bifrost_jvm_analysis::analyzer::JdkVersion;
+use brokk_bifrost_jvm_analysis::analyzer::JvmDependencyPackAdapter;
+use brokk_bifrost_jvm_analysis::analyzer::KotlinSourceJarPackProducer;
+use brokk_bifrost_jvm_analysis::analyzer::ScalaSourceJarPackProducer;
+
 use brokk_bifrost_go_analysis::GoModulePackProducer;
 use brokk_bifrost_js_ts_analysis::TypeScriptDeclarationPackProducer;
 use brokk_bifrost_php_analysis::analyzer::php::{
@@ -900,6 +907,7 @@ fn generate_one(
 
     let started = Instant::now();
     let cancellation = CancellationToken::default();
+    let compiler_options = CompilerOptions::default();
     let (authored, diagnostics, suppressed_rejects) = match &spec.kind {
         PinnedPackKind::AuthoredSemanticModel { .. } => (
             read_authored_semantic_model(spec, &artifact, &input.spec_path)?,
@@ -929,7 +937,7 @@ fn generate_one(
                 &cancellation,
                 &artifact,
             );
-            let authored = production.pack.ok_or_else(|| {
+            let mut authored = production.pack.ok_or_else(|| {
                 BundleError::new(format!(
                     "pack production failed: {}",
                     render_diagnostics(&production.diagnostics)
@@ -940,6 +948,16 @@ fn generate_one(
                     "producer did not retain the pinned artifact identity",
                 ));
             }
+            // Producers write the current schema version. A release pack
+            // declares the lowest version its content needs instead, so the
+            // release requires only readers that content actually needs and
+            // older engines can still select it (#6251). Compilation below
+            // validates again at the lowered version. Authored packs keep the
+            // version their author chose.
+            authored.schema_version =
+                lowest_schema_version(&authored, &compiler_options).map_err(|diagnostics| {
+                    BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
+                })?;
             (
                 authored,
                 production.diagnostics,
@@ -951,7 +969,6 @@ fn generate_one(
             )
         }
     };
-    let compiler_options = CompilerOptions::default();
     let compiled = compile_pack(&authored, &compiler_options)
         .and_then(|compiled| {
             if matches!(&spec.kind, PinnedPackKind::PythonStub { .. }) {
@@ -2193,6 +2210,7 @@ fn measure_runtime(
         })
         .collect();
     let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: env!("CARGO_PKG_VERSION")
             .parse()
             .expect("crate package version is valid semver"),
@@ -2546,13 +2564,6 @@ fn read_release_bundle_index(output_root: &Path) -> Result<ReleaseBundleIndex, B
             index.schema_version
         )));
     }
-    if index.generator != current_release_generator() {
-        return Err(BundleError::new(format!(
-            "release bundle generator {:?} is not the current generator {:?}",
-            index.generator,
-            current_release_generator()
-        )));
-    }
     ensure_unique_pack_identities(&index.packs)?;
     ensure_unique_generated_productions(&index.generated_productions)?;
     Ok(index)
@@ -2621,21 +2632,34 @@ fn verify_release_bundle_for_generation(
     output_root: &Path,
     current_cache_version: u32,
 ) -> Result<ReleaseBundle, BundleError> {
-    // Generation and merge consume only bundles whose generated productions
-    // are current for this build. The gate reads the index alone and runs
-    // before any asset, so an incompatible bundle is rejected without the
-    // checksum pass or any manifest and shard decode (#3364).
-    ensure_generated_productions_are_current(output_root, current_cache_version)?;
+    // Generation and merge consume only bundles this build generated, with
+    // generated productions current for it. The gate reads the index alone
+    // and runs before any asset, so an incompatible bundle is rejected
+    // without the checksum pass or any manifest and shard decode (#3364).
+    ensure_bundle_is_current(output_root, current_cache_version)?;
     Ok(verify_release_bundle_for_cache_version(output_root, current_cache_version)?.bundle)
 }
 
-/// Reject a bundle whose generated productions are not current for this
-/// build, reading only `index.json`.
-fn ensure_generated_productions_are_current(
+/// Reject a bundle that another generator produced or whose generated
+/// productions are not current for this build, reading only `index.json`.
+///
+/// Only publication (`verify`, generation and merge) requires this. Install
+/// and acquisition admit a bundle from any generator: the index format,
+/// each curated pack's schema version and the per-entry generated-production
+/// staleness decide what this build can use, so a pack release is not
+/// confined to the engine that generated it (#6251).
+fn ensure_bundle_is_current(
     output_root: &Path,
     current_cache_version: u32,
 ) -> Result<(), BundleError> {
     let index = read_release_bundle_index(output_root)?;
+    if index.generator != current_release_generator() {
+        return Err(BundleError::new(format!(
+            "release bundle generator {:?} is not the current generator {:?}",
+            index.generator,
+            current_release_generator()
+        )));
+    }
     for reuse in generated_production_reuse(&index.generated_productions, current_cache_version)? {
         match reuse {
             GeneratedProductionReuse::Eligible => {}
@@ -2697,13 +2721,6 @@ fn merge_release_bundles_for_cache_version(
         .collect::<Result<Vec<_>, _>>()?;
     prepare_merge_output(output_root, input_roots)?;
     for (input_root, bundle) in input_roots.iter().zip(bundles) {
-        if bundle.index.generator != generator {
-            return Err(BundleError::new(format!(
-                "input bundle {} uses incompatible generator {:?}",
-                input_root.display(),
-                bundle.index.generator
-            )));
-        }
         let input_measurements =
             read_measurements(&input_root.join("measurements.json"), &bundle.index)?;
         for pack in &bundle.index.packs {
@@ -4841,6 +4858,7 @@ mod tests {
         let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
             &stale_catalog,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
                     language: query.language.clone(),
@@ -5456,6 +5474,105 @@ mod tests {
         assert!(verify_release_bundle(&first).is_err());
     }
 
+    /// A pack release must outlive the engine that generated it. Install
+    /// admits a bundle by its index format and each pack's schema version;
+    /// only publication (`verify`, generation and merge) requires this build's
+    /// generator.
+    #[test]
+    #[hardwon("#6251: a bundle from one engine's generator was rejected by every other engine")]
+    fn bundle_from_another_generator_installs_but_is_not_published() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("scala-library-sources.jar");
+        write_zip(
+            &artifact,
+            &[(
+                "scala/Core.scala",
+                "package scala\ntrait Any\nobject Predef { def identity[A](value: A): A = value }\n",
+            )],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let spec = fixture.path().join("scala.json");
+        let pinned = pinned_spec(
+            "scala-library-fixture",
+            "2.13.16",
+            "maven",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "scala-library-sources.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/scala-library-sources.jar".to_owned()),
+                container: None,
+            },
+            "scala",
+            "org.scala-lang:scala-library",
+            vec![PinnedLookupQuery::Type {
+                name: "scala.Any".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let root = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &root,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: artifact,
+            }],
+        )
+        .unwrap();
+        let pack = &bundle.index.packs[0];
+        let (manifest, _) = read_compiled_manifest(&root, &pack.pack_id, &pack.manifest).unwrap();
+        assert!(
+            manifest.schema_version < SEMANTIC_MODEL_SCHEMA_VERSION,
+            "a producer's pack declares the lowest schema its content needs, found {}",
+            manifest.schema_version
+        );
+
+        // Restamp the bundle as another engine's output, keeping it
+        // internally consistent and checksummed.
+        let other = ReleaseGenerator {
+            name: current_release_generator().name,
+            version: "0.0.1".to_owned(),
+        };
+        let mut index = bundle.index.clone();
+        index.generator = other.clone();
+        let mut rejects = bundle.rejects.clone();
+        rejects.generator = other.clone();
+        let mut measurements: ReleaseBundleMeasurements =
+            serde_json::from_slice(&fs::read(root.join("measurements.json")).unwrap()).unwrap();
+        measurements.generator = other;
+        fs::write(root.join("index.json"), json_bytes(&index).unwrap()).unwrap();
+        fs::write(root.join("rejects.json"), json_bytes(&rejects).unwrap()).unwrap();
+        fs::write(
+            root.join("measurements.json"),
+            json_bytes(&measurements).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(root.join("SHA256SUMS")).unwrap();
+        write_checksums(&root, &index).unwrap();
+
+        assert_installed_bundle_resolves_type(
+            &root,
+            package_activation_request(
+                "scala",
+                "maven",
+                "org.scala-lang:scala-library",
+                "scala",
+                "2.13.16",
+                Some("jvm"),
+                Some(pack.artifact.sha256.clone()),
+            ),
+            "scala.Any",
+        );
+        let error = verify_release_bundle(&root).unwrap_err().to_string();
+        assert!(error.contains("is not the current generator"), "{error}");
+        let merged = fixture.path().join("merged");
+        let error = merge_release_bundles(&merged, &[root])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not the current generator"), "{error}");
+    }
+
     #[test]
     fn python_stub_tree_bundle_round_trips_through_generate_verify_install() {
         let fixture = tempdir().unwrap();
@@ -5542,6 +5659,7 @@ mod tests {
         let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
             &catalog,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
                     language: "python".to_owned(),
@@ -5881,6 +5999,7 @@ mod tests {
     ) -> SemanticModelActivationRequest {
         let version = Version::parse(version).unwrap();
         SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
             evidence: vec![SemanticModelActivationEvidence {
                 language: language.to_owned(),
@@ -6329,6 +6448,7 @@ mod tests {
         let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
             &catalog,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
                     language: "kotlin".to_owned(),

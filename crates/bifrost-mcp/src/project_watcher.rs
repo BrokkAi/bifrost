@@ -106,6 +106,15 @@ impl ProjectChangeWatcher {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_pending_files(&self, files: &[ProjectFile]) -> bool {
+        let pending = self
+            .pending
+            .lock()
+            .expect("project watcher pending state poisoned");
+        !pending.requires_full_refresh && files.iter().all(|file| pending.files.contains(file))
+    }
+
     /// Cheap peek at whether a subsequent `take_changed_files` would return a
     /// non-empty delta, without draining it. Locks only the watcher's own
     /// pending-state mutex, never the caller's session lock, so callers can

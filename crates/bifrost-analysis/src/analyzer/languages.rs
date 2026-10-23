@@ -10,61 +10,39 @@ use crate::analyzer::common::language_for_target;
 use crate::analyzer::loop_facts::LoopSyntax;
 
 use crate::analyzer::semantic::ids::LengthDelimitedDigest;
-
 use crate::analyzer::semantic::ids::StableDigest;
-
 use crate::analyzer::semantic::ids::WorkspaceRelativePath;
 
 use crate::analyzer::semantic::BarrierObservation;
-
 use crate::analyzer::semantic::FormalParameterPassingMode;
-
 use crate::analyzer::semantic::ProcedureKind;
-
 use crate::analyzer::semantic::SemanticLocator;
-
 use crate::analyzer::semantic::SemanticProviderError;
-
 use crate::analyzer::semantic::SemanticRequest;
-
 use crate::analyzer::semantic::StablePackageValueScope;
-
 use crate::analyzer::semantic::ValueTypeBarrierDecision;
-
 use crate::analyzer::semantic::ValueTypeBarrierReason;
-
 use crate::analyzer::semantic::ValueTypePredicate;
 
 use crate::analyzer::store::LimitedQueryRows;
 
 use crate::analyzer::usages::get_definition::BoundedResolution;
-
 use crate::analyzer::usages::get_definition::DefinitionLookupOutcome;
-
 use crate::analyzer::usages::get_definition::ExactExternalCallProof;
 
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 
 use crate::analyzer::usages::inverted_edges::JsTsScopedUsageEdges;
-
 use crate::analyzer::usages::inverted_edges::UsageEdgeBuildResult;
-
 use crate::analyzer::usages::inverted_edges::UsageEdgeWeights;
-
 use crate::analyzer::usages::inverted_edges::UsageEdges;
-
 use crate::analyzer::usages::inverted_edges::UsageEdgesCache;
-
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
 
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-
 use crate::analyzer::usages::receiver_analysis::ReceiverFacts;
-
 use crate::analyzer::usages::receiver_analysis::ReceiverFileCtx;
-
 use crate::analyzer::usages::receiver_analysis::ReceiverFileFacts;
-
 use crate::analyzer::usages::receiver_analysis::ReceiverFileSetup;
 
 use crate::analyzer::usages::receiver_sites::ReceiverSiteInputMode;
@@ -74,51 +52,35 @@ use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 
 use crate::analyzer::usages::GraphUsageAnalyzer;
-
 use crate::analyzer::usages::UsageAnalyzer;
-
 use crate::analyzer::usages::UsageHit;
 
 use crate::analyzer::BoundedDefinitionLookup;
-
 use crate::analyzer::CodeUnit;
-
 use crate::analyzer::ForwardQueryProvider;
-
 use crate::analyzer::IAnalyzer;
-
 use crate::analyzer::Language;
-
 use crate::analyzer::ProjectFile;
-
 use crate::analyzer::Range;
-
 use crate::analyzer::SignatureMetadata;
-
 use crate::analyzer::resolve_analyzer;
-
 use crate::analyzer::structural;
 
 use crate::cancellation::CancellationToken;
 
 use crate::hash::HashMap;
-
 use crate::hash::HashSet;
 
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use brokk_bifrost_core::analyzer::fq_name::FqName;
-
 use brokk_bifrost_core::analyzer::fq_name::SegmentKind;
-
 use brokk_bifrost_core::analyzer::fq_name::joined_segments;
-
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 
 use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
-
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use std::any::Any;
@@ -301,12 +263,14 @@ pub fn with_resolved_analyzer<T: Any, R>(
     resolve_analyzer::<T>(analyzer).map(query)
 }
 
-pub(crate) enum ExternalTypeBoundaryEvidence {
+#[doc(hidden)]
+pub enum ExternalTypeBoundaryEvidence {
     Unresolved,
     Indexed(Option<String>),
 }
 
-pub(crate) fn classify_jvm_external_boundary_evidence(
+#[doc(hidden)]
+pub fn classify_jvm_external_boundary_evidence(
     type_evidence: ExternalTypeBoundaryEvidence,
     resolve_member: impl FnOnce() -> Option<String>,
     declared_unindexed: impl FnOnce() -> bool,
@@ -397,7 +361,8 @@ pub struct DeclarationNavigationOccurrence {
     pub role: DeclarationNavigationRole,
 }
 /// AST-level helper that returns the identifier introduced by one pattern node.
-pub(crate) type PatternBindingNameProvider =
+#[doc(hidden)]
+pub type PatternBindingNameProvider =
     for<'tree> fn(tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>>;
 
 /// Syntax roles one language supplies for procedure-local source proofs:
@@ -444,21 +409,7 @@ pub type AssignmentValueTypeSpelling = fn(
 ) -> Option<String>;
 
 #[doc(hidden)]
-pub trait LanguageSupport: Send + Sync {
-    fn selected_graph_fallback_active(&self, _analyzer: &dyn IAnalyzer) -> bool {
-        false
-    }
-
-    fn selected_graph_fallback_exclusion(
-        &self,
-        _analyzer: &dyn IAnalyzer,
-        _file: &ProjectFile,
-        _modules: &[brokk_bifrost_go::packages::GoModuleRoot],
-    ) -> Option<crate::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason>
-    {
-        None
-    }
-
+pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send + Sync {
     /// Workspace-aware imports; None keeps the delegate's own answer.
     fn workspace_imported_code_units(
         &self,
@@ -558,16 +509,6 @@ pub trait LanguageSupport: Send + Sync {
         _call: &crate::analyzer::semantic::SemanticCallSite,
     ) -> Option<crate::analyzer::semantic::ClassIdentity> {
         None
-    }
-
-    /// Prepare bounded static dependency evidence from already selected snapshots.
-    fn selected_dependency_file_evidence(
-        &self,
-        _root: &std::path::Path,
-        _selected: &[(ProjectFile, crate::analyzer::ProjectSourceSnapshot)],
-        _limits: &crate::analyzer::semantic_model::DependencyFileEvidenceLimits,
-    ) -> crate::analyzer::semantic_model::DependencyFileEvidence {
-        crate::analyzer::semantic_model::DependencyFileEvidence::default()
     }
 
     /// A build ecosystem provider, registered even without source files of this language.
@@ -676,56 +617,6 @@ pub trait LanguageSupport: Send + Sync {
         )
     }
 
-    /// Select a component from a structurally identified operand. Shared code
-    /// owns named-type traversal, demand, completion and result assembly.
-    fn type_component_projection(
-        &self,
-        transfer: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind,
-        constructor: Option<
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind,
-        >,
-        _intrinsic: Option<crate::analyzer::resolution::universe::UniverseEntry>,
-        operand: crate::analyzer::resolution::ResolutionSlotValue,
-    ) -> Option<TypeComponentProjection> {
-        use brokk_bifrost_core::analyzer::resolution_facts::{
-            ResolutionTypeComponentKind as Component, ResolutionTypeConstructorKind as Constructor,
-            ResolutionTypeTransferKind as Transfer,
-        };
-        if operand.ty().indirection() != 0 {
-            return None;
-        }
-        let kind = match (transfer, constructor) {
-            (
-                Transfer::ComponentValue,
-                Some(
-                    Constructor::Array
-                    | Constructor::Slice
-                    | Constructor::Sequence
-                    | Constructor::Channel,
-                ),
-            )
-            | (Transfer::ComponentKey, Some(Constructor::Channel)) => Component::Element,
-            (Transfer::ComponentElement | Transfer::ComponentKey | Transfer::ComponentValue, _) => {
-                transfer.component_kind().expect("component transfer")
-            }
-            _ => return None,
-        };
-        Some(TypeComponentProjection {
-            selection: TypeComponentSelection::Component(kind),
-            addressable: None,
-        })
-    }
-
-    /// Whether source provenance proves a complete discovery horizon. This
-    /// limits source-half lookup, never declaration visibility or root closure.
-    fn root_source_horizon(
-        &self,
-        _source: Option<crate::analyzer::resolution::SelectedResolutionMountOrdinal>,
-        _has_transient_sources: bool,
-    ) -> crate::analyzer::store::resolution_operation::RootSourceHorizon {
-        crate::analyzer::store::resolution_operation::RootSourceHorizon::Universal
-    }
-
     /// Prove that workspace writes and escapes cannot replace a module member.
     /// None means the bounded query did not complete or has no language proof.
     fn workspace_module_member_mutation_free(
@@ -748,6 +639,20 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    fn selected_graph_fallback_active(&self, _analyzer: &dyn IAnalyzer) -> bool {
+        false
+    }
+
+    fn selected_graph_fallback_exclusion(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _modules: &[brokk_bifrost_go::packages::GoModuleRoot],
+    ) -> Option<crate::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason>
+    {
+        None
+    }
+
     /// Return the workspace-relative root of an unnamed module boundary that
     /// excludes this source file from language graph admission.
     fn unnamed_module_root_for_file(
@@ -755,20 +660,6 @@ pub trait LanguageSupport: Send + Sync {
         _analyzer: &dyn IAnalyzer,
         _file: &ProjectFile,
     ) -> Option<std::path::PathBuf> {
-        None
-    }
-
-    /// Canonical spelling for a constructor over a resolved builtin element.
-    /// Shared evaluation owns completion and identity interning.
-    fn intrinsic_sequence_type(
-        &self,
-        _element: crate::analyzer::resolution::universe::UniverseEntry,
-        _constructor: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind,
-        _length: Option<&str>,
-    ) -> Option<(
-        brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind,
-        String,
-    )> {
         None
     }
 
@@ -804,14 +695,6 @@ pub trait LanguageSupport: Send + Sync {
     /// registered language hooks instead of reaching into a language module.
     fn external_inventory_providers(&self, _analyzer: &dyn IAnalyzer) -> Vec<String> {
         Vec::new()
-    }
-
-    /// The language-owned argument mapping, applicability, and specificity rules
-    /// used by selected call resolution. `None` uses positional mapping only.
-    fn call_applicability_adapter(
-        &self,
-    ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
-        None
     }
 
     /// The qualified name that the one explicit, non-wildcard import visible
@@ -964,6 +847,28 @@ pub trait LanguageSupport: Send + Sync {
         &self,
         _config: &mut crate::analyzer::AnalyzerConfig,
         _project_root: &std::path::Path,
+    ) -> Result<(), crate::analyzer::store::StoreError> {
+        Ok(())
+    }
+
+    /// Reconcile source-owned build membership after a workspace revision changes.
+    fn reconcile_workspace_build_context(
+        &self,
+        _workspace: &crate::analyzer::WorkspaceAnalyzer,
+        _changed: Option<&std::collections::BTreeSet<crate::analyzer::ProjectFile>>,
+    ) -> Result<(), crate::analyzer::store::StoreError> {
+        Ok(())
+    }
+
+    /// Republish tool-derived context after a live workspace snapshot update.
+    /// Languages without external-tool context need no additional update step.
+    fn refresh_updated_workspace_context(
+        &self,
+        _workspace: &crate::analyzer::WorkspaceAnalyzer,
+        _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
+        _config: &crate::analyzer::AnalyzerConfig,
+        _limits: &crate::analyzer::semantic_model::DependencyPackLimits,
+        _cancellation: &crate::CancellationToken,
     ) -> Result<(), crate::analyzer::store::StoreError> {
         Ok(())
     }
@@ -1121,6 +1026,7 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_definition_call_target_batch(
         &self,
         analyzer: &dyn crate::analyzer::IAnalyzer,
@@ -1128,6 +1034,7 @@ pub trait LanguageSupport: Send + Sync {
         requests: Vec<crate::analyzer::usages::get_definition::DefinitionLookupRequest>,
         file: crate::analyzer::ProjectFile,
         source: std::sync::Arc<str>,
+        primary_tree: Option<tree_sitter::Tree>,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Vec<crate::analyzer::usages::get_definition::CallTargetLookupOutcome> {
         crate::analyzer::usages::get_definition::resolve_generic_call_target_batch(
@@ -1136,6 +1043,7 @@ pub trait LanguageSupport: Send + Sync {
             requests,
             file,
             source,
+            primary_tree,
             cancellation,
         )
     }
@@ -1203,6 +1111,10 @@ pub trait LanguageSupport: Send + Sync {
     ) {
     }
 
+    /// `primary_tree`, when supplied, was parsed for this exact source using
+    /// the ordinary file parser. Overrides that transform source must select
+    /// their own tree rather than accepting it as their definition tree.
+    #[allow(clippy::too_many_arguments)]
     fn definition_tree(
         &self,
         _analyzer: &dyn crate::analyzer::IAnalyzer,
@@ -1210,8 +1122,11 @@ pub trait LanguageSupport: Send + Sync {
         file: &crate::analyzer::ProjectFile,
         language: crate::analyzer::Language,
         source: &str,
+        primary_tree: Option<&tree_sitter::Tree>,
     ) -> Option<tree_sitter::Tree> {
-        crate::analyzer::usages::get_definition::parse_tree_for_language(file, language, source)
+        primary_tree.cloned().or_else(|| {
+            crate::analyzer::usages::get_definition::parse_tree_for_language(file, language, source)
+        })
     }
 
     fn definition_batch_resolver<'a>(
@@ -1241,6 +1156,30 @@ pub trait LanguageSupport: Send + Sync {
         crate::analyzer::usages::get_definition::DefinitionResolution,
     > {
         unreachable!("unsupported language handled before definition dispatch")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_receiver_query(
+        &self,
+        _service: &crate::analyzer::usages::receiver_query::ReceiverQueryService<'_>,
+        _operation: crate::analyzer::usages::receiver_query::ReceiverQueryOperation,
+        _file: &ProjectFile,
+        _range: crate::analyzer::Range,
+        _input: crate::analyzer::usages::receiver_query::ReceiverQueryInput,
+        _budget: crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        _cancellation: Option<&crate::CancellationToken>,
+        _indexed_source: Option<String>,
+    ) -> Option<
+        Result<
+            crate::analyzer::usages::receiver_query::ReceiverQueryReport,
+            crate::analyzer::usages::receiver_query::ReceiverQueryError,
+        >,
+    > {
+        None
+    }
+
+    fn call_reference_candidate_override(&self, _node: tree_sitter::Node<'_>) -> Option<bool> {
+        None
     }
 
     fn definition_call_reference_candidate(&self, _node: tree_sitter::Node<'_>) -> bool {
@@ -1433,20 +1372,6 @@ pub trait LanguageSupport: Send + Sync {
     ) -> Option<
         &'static dyn crate::analyzer::structural::reference_edges::SelectedInverseReferenceProvider,
     > {
-        None
-    }
-
-    /// This language's reader of the macro rows its producer sealed into a
-    /// selected blob, or `None` when the language publishes no macro rows.
-    ///
-    /// Selected resolution replays macro invocations from persisted rows, and
-    /// the rows belong to the producing language, so the operation asks the
-    /// mount's support for this reader instead of calling a language module's
-    /// storage directly.
-    fn selected_macro_source_rows(
-        &self,
-    ) -> Option<&'static dyn crate::analyzer::store::resolution_operation::SelectedMacroSourceRows>
-    {
         None
     }
 
@@ -1824,13 +1749,6 @@ pub trait LanguageSupport: Send + Sync {
     #[cfg(any(test, feature = "test-support"))]
     fn native_rollout_points(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         None
-    }
-
-    /// Whether a workspace-relative path is a build configuration input this
-    /// language captures by exact bytes (for example go.mod or a Gradle build
-    /// file), for the selected configuration and its overlay guards.
-    fn is_configuration_input_path(&self, _path: &std::path::Path) -> bool {
-        false
     }
 
     /// Class-set type-propagation adapter for this language, or `None` when the
@@ -2296,7 +2214,8 @@ pub fn edge_passes() -> Vec<EdgePassEntry> {
     for id in EdgePassId::ALL {
         let mut entry: Option<EdgePassEntry> = None;
         for language in Language::ANALYZABLE {
-            let support = language_support(language).expect("analyzable languages are registered");
+            let support = language_support_for_hook(language, "reference_plugin")
+                .expect("analyzable languages are registered");
             let backend = support.reference_plugin().graph;
             if backend.id() != id {
                 continue;
@@ -2755,9 +2674,10 @@ pub struct ImportedExternalCallee {
 }
 
 impl ImportedExternalCallee {
+    #[doc(hidden)]
     /// An expansion whose language proved the callee text but no exact
     /// declaration-side call shape.
-    pub(crate) fn text(canonical_callee: impl Into<String>) -> Self {
+    pub fn text(canonical_callee: impl Into<String>) -> Self {
         Self {
             canonical_callee: canonical_callee.into(),
             exact_external_call: None,
@@ -2846,7 +2766,8 @@ pub(crate) fn candidate_augmentation(ctx: &CandidateCtx<'_>) -> Option<Candidate
         return None;
     }
     let augmentation =
-        language_support(language_for_target(ctx.target))?.candidate_augmentation(ctx)?;
+        language_support_for_hook(language_for_target(ctx.target), "candidate_augmentation")?
+            .candidate_augmentation(ctx)?;
     (!augmentation.is_empty()).then_some(augmentation)
 }
 
@@ -2923,6 +2844,19 @@ impl LanguageTable {
             supports: supports.into_boxed_slice(),
         }
     }
+
+    /// Upcast the same validated implementations for the lower store boundary.
+    #[doc(hidden)]
+    pub fn store_supports(&self) -> crate::analyzer::store::StoreLanguageTable {
+        let mut table: crate::analyzer::store::StoreLanguageTable =
+            [None; Language::ANALYZABLE.len()];
+        for &support in &self.supports {
+            let language = support.knowledge().language();
+            let index = language_index(language).expect("validated language support");
+            table[index] = Some(support as &dyn crate::analyzer::store::StoreLanguageSupport);
+        }
+        table
+    }
 }
 
 // Production binaries link only the tools definition, complete by construction;
@@ -2935,26 +2869,14 @@ static LANGUAGE_SUPPORT: std::sync::OnceLock<
     [Option<&'static dyn LanguageSupport>; Language::ANALYZABLE.len()],
 > = std::sync::OnceLock::new();
 
-fn language_index(language: Language) -> Option<usize> {
-    Some(match language {
-        Language::None => return None,
-        Language::Java => 0,
-        Language::Go => 1,
-        Language::Cpp => 2,
-        Language::JavaScript => 3,
-        Language::TypeScript => 4,
-        Language::Python => 5,
-        Language::Rust => 6,
-        Language::Php => 7,
-        Language::Scala => 8,
-        Language::CSharp => 9,
-        Language::Ruby => 10,
-        Language::Kotlin => 11,
-    })
-}
+use crate::analyzer::store::language_support::language_index;
 
 #[doc(hidden)]
 pub fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(support) = neutral_fixture::support(language) {
+        return Some(support);
+    }
     let index = language_index(language)?;
     let table = LANGUAGE_SUPPORT.get_or_init(|| {
         let mut table = [None; Language::ANALYZABLE.len()];
@@ -2966,6 +2888,21 @@ pub fn language_support(language: Language) -> Option<&'static dyn LanguageSuppo
         table
     });
     table[index]
+}
+
+/// Resolve hook support, distinguishing an absent language from default hooks.
+#[doc(hidden)]
+pub fn language_support_for_hook(
+    language: crate::analyzer::Language,
+    hook: &str,
+) -> Option<&'static dyn LanguageSupport> {
+    if language == crate::analyzer::Language::None {
+        return None;
+    }
+    Some(
+        language_support(language)
+            .unwrap_or_else(|| panic!("unregistered language {language:?} for hook {hook}")),
+    )
 }
 
 #[doc(hidden)]
@@ -3018,3 +2955,108 @@ pub(crate) fn build_model_providers()
 pub use crate::analyzer::resolution::registry_vocabulary::{
     ModeledExternalPackageIdentity, TypeComponentProjection, TypeComponentSelection,
 };
+
+/// Implementations actually linked into this binary, including partial test tables.
+#[doc(hidden)]
+pub fn registered_language_supports() -> impl Iterator<Item = &'static dyn LanguageSupport> {
+    __brokk_bifrost_language_supports_v1()
+        .supports
+        .iter()
+        .copied()
+}
+
+/// Neutral hook support scoped to a shared-algorithm test's fixture.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod neutral_fixture {
+    use super::*;
+    use std::cell::RefCell;
+    thread_local! {
+        static OVERLAYS: RefCell<Vec<Vec<Language>>> = const { RefCell::new(Vec::new()) };
+    }
+    struct NeutralFakeLanguageSupport;
+    impl crate::analyzer::store::StoreLanguageSupport for NeutralFakeLanguageSupport {}
+    impl LanguageSupport for NeutralFakeLanguageSupport {
+        fn build_analyzer(
+            &self,
+            _project: Arc<dyn crate::analyzer::Project>,
+            _config: crate::analyzer::AnalyzerConfig,
+            _store_context: crate::analyzer::AnalyzerStoreContext,
+            _progress: Option<crate::analyzer::BuildProgress>,
+        ) -> Result<
+            crate::analyzer::multi_analyzer::AnalyzerDelegate,
+            crate::analyzer::store::StoreError,
+        > {
+            unimplemented!("neutral rules fixtures do not build analyzers")
+        }
+        fn forward_query_provider<'a>(
+            &self,
+            _analyzer: &'a dyn IAnalyzer,
+        ) -> Option<&'a dyn ForwardQueryProvider> {
+            None
+        }
+        fn declaration_ranges_limited(
+            &self,
+            _analyzer: &dyn IAnalyzer,
+            _unit: &CodeUnit,
+            _limit: usize,
+        ) -> Option<LimitedQueryRows<Range>> {
+            None
+        }
+        fn knowledge(&self) -> &'static dyn LanguageKnowledge {
+            unimplemented!("neutral rules fixtures do not supply language knowledge")
+        }
+        fn ecosystem(&self) -> UsageEcosystem {
+            UsageEcosystem::Unknown
+        }
+        fn reference_usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+            unimplemented!("neutral rules fixtures do not supply usage strategies")
+        }
+        fn reference_graph_backend(&self) -> LanguageGraphBackend {
+            unimplemented!("neutral rules fixtures do not supply graph backends")
+        }
+    }
+    pub struct NeutralRulesFixture {
+        depth: usize,
+        _store: crate::analyzer::store::language_support::neutral_fixture::NeutralRulesFixture,
+    }
+    pub fn neutral_rules_fixture(languages: &[Language]) -> NeutralRulesFixture {
+        let store =
+            crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(
+                languages,
+            );
+        let depth = OVERLAYS.with(|overlays| {
+            let mut overlays = overlays.borrow_mut();
+            overlays.push(languages.to_vec());
+            overlays.len()
+        });
+        NeutralRulesFixture {
+            depth,
+            _store: store,
+        }
+    }
+    impl Drop for NeutralRulesFixture {
+        fn drop(&mut self) {
+            OVERLAYS.with(|overlays| {
+                let mut overlays = overlays.borrow_mut();
+                assert_eq!(
+                    overlays.len(),
+                    self.depth,
+                    "neutral fixture guards must drop in nesting order"
+                );
+                overlays.pop().expect("live neutral fixture overlay");
+            });
+        }
+    }
+    pub(super) fn support(language: Language) -> Option<&'static dyn LanguageSupport> {
+        OVERLAYS
+            .with(|overlays| {
+                overlays
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .any(|languages| languages.contains(&language))
+            })
+            .then_some(&NeutralFakeLanguageSupport as &dyn LanguageSupport)
+    }
+}

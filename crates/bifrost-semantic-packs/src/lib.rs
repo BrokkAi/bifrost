@@ -660,6 +660,7 @@ mod tests {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
                     .expect("crate version is semver"),
@@ -1048,6 +1049,7 @@ func TestValue(t *testing.T) {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
                     .expect("crate version is semver"),
@@ -1137,6 +1139,7 @@ func TestValue(t *testing.T) {
             &mixed_catalog,
             None,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
                     .expect("crate version is semver"),

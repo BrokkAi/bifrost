@@ -2713,6 +2713,19 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         out.push_str(&format!("  reason: {}\n", sanitize_terminal_text(reason)));
                     }
                 }
+                CodeQueryResultValue::RustMarkerImpl { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let parameter = value.parameter.as_deref().map(sanitize_terminal_text);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} (parameter={:?}; stored={}; send_bound={}; sync_bound={}; completeness={})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "Rust marker impl:", use_color),
+                        value.trait_kind, parameter, value.stored,
+                        value.has_send_bound, value.has_sync_bound, value.completeness,
+                    ));
+                }
                 CodeQueryResultValue::RustPointerFinding { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(

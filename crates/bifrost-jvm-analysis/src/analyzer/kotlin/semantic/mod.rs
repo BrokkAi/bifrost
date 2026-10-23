@@ -1,0 +1,467 @@
+//! Kotlin lowering into the language-neutral executable-semantics IR
+//! (issue #1241).
+//!
+//! This module interprets tree-sitter nodes directly. Graph construction,
+//! abrupt-completion routing, cleanup specialization, and physical adjacency
+//! storage remain owned by the shared semantic substrate.
+//!
+//! Kotlin's grammar is expression-oriented and field-poor, so the shapes this
+//! module depends on are read positionally through [`syntax`], which reuses the
+//! shared Kotlin readers in [`brokk_bifrost_jvm::kotlin::syntax`] rather than
+//! re-deriving them.
+//!
+//! Deliberate, documented omissions at this boundary:
+//!
+//! * `suspend` is lowered as an ordinary immediate call. The
+//!   continuation-passing rewrite a `suspend` body receives is
+//!   compiler-generated, so every `suspend` callable carries a
+//!   procedure-scoped `AsyncSuspendResume` gap instead of claiming Rust's
+//!   deferred-invocation semantics.
+//! * Infix, operator-convention, and indexing calls (`a to b`, `a + b`,
+//!   `a[i]`) are evaluated as opaque operations with a point-scoped `Calls`
+//!   gap. Publishing them as call sites would create permanently unresolvable
+//!   rows, because exact call dispatch only recognizes `call_expression` and
+//!   `constructor_invocation`.
+//! * Primary-constructor parameter default expressions
+//!   (`class C(val x: Int = compute())`) are lowered as `Initializer`
+//!   procedures over the default expression itself, so the calls inside one are
+//!   ordinary call sites. *When* a default runs — it executes only at a
+//!   construction that omits the argument, interleaved with property
+//!   initializers and `init` blocks — stays a procedure-scoped gap, because the
+//!   schedule is a property of each construction site rather than of the
+//!   declaration.
+//! * A Kotlin script's free top-level statements are not lowered. Declared
+//!   callables inside a `.kts` file — including `val x = …` initializers —
+//!   enumerate exactly as they do in a `.kt` file; only the implicit script
+//!   body is absent, because it has no declaration of its own.
+
+use brokk_bifrost_semantic::analyzer::semantic::inventory::*;
+
+use brokk_bifrost_semantic::analyzer::semantic::lowering::*;
+
+use tree_sitter::Node;
+
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
+use brokk_bifrost_analysis::analyzer::semantic::cfg::{
+    CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
+    ScopeBinding, ScopeFrameId,
+};
+
+use brokk_bifrost_semantic::analyzer::semantic::service::ProgramSemanticsLowerer;
+
+use brokk_bifrost_semantic::analyzer::semantic::service::SemanticAdapterIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic::*;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+
+use brokk_bifrost_core::analyzer::tree_walk::WalkControl;
+
+use brokk_bifrost_core::analyzer::tree_walk::try_walk_named_tree_preorder;
+
+use crate::analyzer::KotlinAnalyzer;
+
+use brokk_bifrost_core::analyzer::model::Language;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::hash::HashMap;
+
+use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_jvm::kotlin::syntax::KotlinScalarType;
+use brokk_bifrost_jvm::kotlin::value_classes::{
+    KotlinActualEvidence, KotlinAdaptationIncomplete, KotlinAdaptationOutcome, KotlinCalleeBinding,
+    KotlinCarrier, KotlinConstructorSelection, KotlinUnderlyingMatch, KotlinValueAdaptation,
+    KotlinValueAdaptationFact, KotlinValueClassId, KotlinValueClassIndex, KotlinWrittenType,
+    kotlin_written_type_is_function, literal_type_names,
+};
+
+/// Bumped for #2851: `@JvmInline` value-class construction, underlying
+/// projection, and JVM carrier boxing/unboxing now publish identity-separating
+/// transfers instead of ordinary local flow and a wrapper allocation.
+///
+/// Bumped for #3664: a capture slot whose enclosing procedure publishes no
+/// binding now carries a typed `Captures` gap instead of failing the
+/// capture-contract validator.
+///
+/// Bumped for #3551: typed Kotlin scalar bindings, literal values, and
+/// primitive guard facts are published to the semantic IR.
+///
+/// Bumped for the compound indexed-assignment gap contract: operator and
+/// indexed-set conventions now share one point-scoped Calls gap.
+///
+/// Bumped for Kotlin Batch 6: the semantic identity now accompanies the
+/// Kotlin B1/A6 syntax hooks and their conservative result boundaries.
+// Bumping this rotates every public wire id hashed from the adapter
+// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
+// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
+// change; the code-query tutorial pages elide such ids (#5016).
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v14";
+
+impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
+
+struct KotlinSemanticLowerer;
+
+impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
+    fn identity(&self) -> SemanticAdapterIdentity {
+        SemanticAdapterIdentity::for_adapter(
+            "kotlin",
+            ADAPTER_VERSION,
+            b"kotlin-intrafile-execution-defaults-v1",
+            DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        )
+    }
+
+    fn capabilities(&self) -> SemanticCapabilities {
+        kotlin_capabilities()
+    }
+
+    fn lower(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        budget: &SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+        let (mut specs, initial_work, inventory_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    inventory_work,
+                } => (value, initial_work, inventory_work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
+        if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: inventory_work,
+            });
+        }
+        for index in 0..specs.len() {
+            if cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: inventory_work,
+                });
+            }
+            let can_capture_receiver = specs[index]
+                .lexical_parent
+                .and_then(|parent| specs.get(parent.index()))
+                .is_some_and(|parent| {
+                    parent.captures_receiver
+                        || (!parent.properties.is_static
+                            && matches!(
+                                parent.kind,
+                                ProcedureKind::Method
+                                    | ProcedureKind::Constructor
+                                    | ProcedureKind::Initializer
+                                    | ProcedureKind::Accessor
+                            ))
+                });
+            specs[index].captures_receiver &= can_capture_receiver;
+        }
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.callable.id(),
+                    NestedProcedureTarget {
+                        id: spec.id,
+                        receiver_capture_destination: spec
+                            .captures_receiver
+                            .then_some(RECEIVER_CAPTURE_DESTINATION),
+                        captures: spec
+                            .captures
+                            .iter()
+                            .map(|capture| LexicalCaptureSource {
+                                name: capture.name.into(),
+                                declaration_start: capture.declaration_start,
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let Ok(constructible_types) = collect_constructible_types(prepared, cancellation) else {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: inventory_work,
+            });
+        };
+        let Ok(value_classes) = KotlinValueClassIndex::build(
+            prepared.tree().root_node(),
+            prepared.source(),
+            &mut || cancellation.is_cancelled(),
+        ) else {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: inventory_work,
+            });
+        };
+
+        // A nested callable's capture slot only has a lexical-parent binding
+        // when that parent publishes one while lowering its own closure
+        // creation. Kotlin lowers a local `fun` as a direct call and never
+        // creates a closure value for it, so such a target keeps its slot but
+        // reports a typed capture gap (#3664). Parents lower before children,
+        // so bindings published so far cover every target the child expects.
+        let mut bound_capture_targets = HashSet::default();
+        lower_procedure_batch(
+            &specs,
+            initial_work,
+            budget,
+            cancellation,
+            |spec, staged_budget, cancellation| {
+                let capture_binding_expected = bound_capture_targets.contains(&spec.id);
+                let lowered = lower_procedure(
+                    prepared,
+                    spec,
+                    &procedure_targets,
+                    &constructible_types,
+                    &value_classes,
+                    capture_binding_expected,
+                    staged_budget,
+                    cancellation,
+                )?;
+                bound_capture_targets
+                    .extend(lowered.0.captures.iter().map(|capture| capture.target));
+                Ok(lowered)
+            },
+        )
+    }
+}
+
+fn kotlin_capabilities() -> SemanticCapabilities {
+    let mut builder = SemanticCapabilities::builder();
+    for capability in [
+        SemanticCapability::Procedures,
+        SemanticCapability::EntryBoundary,
+        SemanticCapability::NormalExitBoundary,
+        SemanticCapability::ExceptionalExitBoundary,
+        SemanticCapability::BasicBlocks,
+        SemanticCapability::ProgramPoints,
+        SemanticCapability::ReturnFlow,
+        SemanticCapability::NormalCallContinuation,
+        SemanticCapability::ExceptionalCallContinuation,
+    ] {
+        builder = builder.complete(capability);
+    }
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Assignments,
+        SemanticCapability::Values,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::FieldMemory,
+        // Kotlin's top-level and `object` properties are static, but which of
+        // the two a `receiver.name` selection reads is exactly the identity the
+        // property-memory gap defers, so static access is partial rather than
+        // absent.
+        SemanticCapability::StaticMemory,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
+        SemanticCapability::Captures,
+        SemanticCapability::CallableReferences,
+        SemanticCapability::DeferredExecution,
+        SemanticCapability::NonLocalControl,
+        // `Partial` states the exact limit: every decision the condition
+        // lowering reaches gets a row, but only a constant boolean -- through
+        // any number of `!` and parenthesis wrappers -- is normalized, and
+        // everything else is recorded `Opaque`. Conditional edges the adapter
+        // synthesizes outside condition lowering, such as the safe-call and
+        // elvis null gates and the `for` header's exit test, publish no guard
+        // row at all (#2443).
+        SemanticCapability::GuardFacts,
+    ] {
+        builder = builder.partial(capability);
+    }
+    // Explicitly unsupported, each for a source-level reason:
+    //
+    // * `AsyncSuspendResume` — `suspend` is a modifier, not a suspension
+    //   operator. Every suspension point is compiler-generated, so each
+    //   `suspend` callable carries a procedure-scoped gap and no adapter-side
+    //   suspend/resume pair is invented.
+    // * `GeneratorSuspension` — `sequence { yield(…) }` is library code, not
+    //   syntax; `yield` is an ordinary call inside a lambda.
+    // * `ConcurrentSpawn` — `launch`/`async` are library calls flowing through
+    //   `Calls` and `DeferredExecution`, matching Java's treatment of executors.
+    // * `ResourceManagement` — Kotlin has no resource syntax at all. `use { … }`
+    //   is an ordinary stdlib higher-order call, already represented as a call
+    //   site plus a lambda procedure, so claiming partial resource management
+    //   would describe a construct the language does not have.
+    for capability in [
+        SemanticCapability::AsyncSuspendResume,
+        SemanticCapability::GeneratorSuspension,
+        SemanticCapability::ConcurrentSpawn,
+        SemanticCapability::ResourceManagement,
+    ] {
+        builder = builder.unsupported(capability);
+    }
+    builder.build()
+}
+
+mod control;
+mod inventory;
+mod syntax;
+
+pub(crate) use crate::analyzer::kotlin::semantic::syntax::PROCEDURE_SYNTAX_ROLES;
+#[cfg(test)]
+mod tests;
+mod values;
+
+use crate::analyzer::kotlin::semantic::control::lower_procedure;
+
+use crate::analyzer::kotlin::semantic::inventory::LexicalCaptureSource;
+
+use crate::analyzer::kotlin::semantic::inventory::NestedProcedureTarget;
+
+use crate::analyzer::kotlin::semantic::inventory::ProcedureBody;
+
+use crate::analyzer::kotlin::semantic::inventory::ProcedureEnumeration;
+
+use crate::analyzer::kotlin::semantic::inventory::ProcedureSpec;
+
+use crate::analyzer::kotlin::semantic::inventory::collect_constructible_types;
+
+use crate::analyzer::kotlin::semantic::inventory::enumerate_procedures;
+
+type KotlinLoweringError = ProcedureLoweringError;
+
+type EdgeTarget = ControlTarget;
+
+#[derive(Debug, Clone, Copy)]
+enum Work<'tree> {
+    Statement {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    LabeledStatement {
+        node: Node<'tree>,
+        label: &'tree str,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    Expression {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    Condition {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+}
+
+impl<'tree> Work<'tree> {
+    const fn condition(
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    ) -> Self {
+        Self::Condition {
+            node,
+            entry,
+            when_true,
+            when_false,
+            scope,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupRegion<'tree> {
+    id: CleanupRegionId,
+    body: Node<'tree>,
+    outer_scope: ScopeFrameId,
+}
+
+struct LoweringContext<'tree, 'targets> {
+    prepared: &'tree PreparedSyntaxTree,
+    session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// Kotlin primitive scalar types proven for local and parameter values.
+    scalar_types: HashMap<ValueId, KotlinScalarType>,
+    /// Mutable local bindings, used to keep captured writes open.
+    mutable_locals: HashSet<ValueId>,
+    /// Locals declared `by` a delegate. Reading or assigning one calls the
+    /// delegate's `getValue` or `setValue`, which is not a binding access.
+    delegated_locals: HashSet<ValueId>,
+    /// Nested callables a bare name in this body can denote: a local `fun`, or
+    /// a lambda bound to a local `val`. These are the only Kotlin callees whose
+    /// target is provable without whole-program dispatch.
+    local_callables: HashMap<Box<str>, NestedProcedureTarget>,
+    /// Classes this file declares, so a bare `Box(input)` call can be published
+    /// as the allocation it provably is.
+    constructible_types: &'targets HashSet<Box<str>>,
+    /// The file's `@JvmInline` value classes and the carrier each written type
+    /// selects (#2851).
+    value_classes: &'targets KotlinValueClassIndex<'tree>,
+    /// The JVM carrier each local and parameter holds. Only bindings a value
+    /// class reaches are recorded; everything else is absent, which reads as
+    /// [`KotlinCarrier::Unrelated`].
+    carriers: HashMap<ValueId, KotlinCarrier>,
+    /// The type node each local and parameter writes, for the member lookups a
+    /// field store needs.
+    declared_types: HashMap<ValueId, Node<'tree>>,
+    /// The return type this procedure's declaration writes, when it writes one.
+    declared_return_type: Option<Node<'tree>>,
+    receiver: Option<ValueId>,
+    captured_receiver: Option<ValueId>,
+    captured_bindings: HashMap<Box<str>, ValueId>,
+    /// The label a `return@label` may name to leave *this* procedure, set for a
+    /// lambda that is a labelled or trailing argument.
+    boundary_label: Option<&'tree str>,
+    /// Whether this procedure is a lambda, whose bare `return` is a non-local
+    /// return through an inline caller rather than a return from the lambda.
+    is_lambda: bool,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    cleanups: Vec<CleanupRegion<'tree>>,
+}
+
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
+}
+
+fn lexical_capture_destination(
+    captures_receiver: bool,
+    capture_index: usize,
+) -> Result<MemoryLocationId, KotlinLoweringError> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::lexical_capture_destination(
+        captures_receiver,
+        capture_index,
+        "Kotlin",
+    )
+}

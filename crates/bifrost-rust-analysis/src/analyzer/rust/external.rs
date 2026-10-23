@@ -646,6 +646,7 @@ mod tests {
 
         let request = second
             .compose_activation_request(SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: Vec::new(),
                 controls: Vec::new(),
@@ -787,6 +788,7 @@ mod tests {
         ] {
             let request = outcome
                 .compose_activation_request(SemanticModelActivationRequest {
+                    approximate_standard_libraries: Vec::new(),
                     bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                     evidence: Vec::new(),
                     controls: Vec::new(),

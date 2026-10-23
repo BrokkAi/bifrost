@@ -6,6 +6,7 @@ pub mod cyclomatic_complexity_diff;
 pub mod diff_analysis;
 pub mod diff_scoring;
 pub mod file_tools;
+pub mod function_sources;
 pub mod model_context;
 pub mod relevance;
 pub mod searchtools;
@@ -31,10 +32,12 @@ pub mod native_resolution_test_support {
         build_selected_unscoped_usage_graph,
     };
     pub use brokk_bifrost_analysis::native_resolution_test_support::*;
+    pub use brokk_bifrost_jvm_analysis::native_resolution_test_support::*;
 }
 
 #[cfg(test)]
-mod engine_tests;
+#[doc(hidden)]
+pub mod engine_tests;
 
 // Engine fixture paths used by relocated unit-test modules.
 #[cfg(test)]
@@ -44,3 +47,15 @@ mod language_registry;
 
 #[cfg(test)]
 use brokk_bifrost_rust_analysis::analyzer;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod language_test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod selection_fixture_support;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod store_test_support;

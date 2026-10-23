@@ -18,6 +18,7 @@ pub mod inline_project;
 
 pub mod analyzer;
 
+#[cfg(test)]
 #[doc(hidden)]
 pub mod language_registry;
 // `cache_gc` and `path_utils` keep a module here rather than a re-export: each
@@ -28,7 +29,6 @@ pub mod cache_gc;
 pub mod navigation;
 pub mod path_utils;
 pub use brokk_bifrost_core::process;
-pub use brokk_bifrost_store as store;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -66,156 +66,78 @@ pub use analyzer::resolution::seed_key_profile;
 /// Usage APIs and compatibility exports assembled above the language implementations.
 pub mod usages {
 
-    pub use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
-
-    pub use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
-
     pub use crate::analyzer::usages::*;
 }
 pub use analyzer::AnalyzerConfig;
-
 pub use analyzer::AnalyzerDefinitionLookup;
-
 pub use analyzer::AnalyzerDelegate;
-
 pub use analyzer::BIFROST_IGNORE_FILE_NAME;
-
 pub use analyzer::CapabilityProvider;
-
 pub use analyzer::CloneSmell;
-
 pub use analyzer::CloneSmellWeights;
-
 pub use analyzer::CodeBaseMetrics;
-
 pub use analyzer::CodeUnit;
-
 pub use analyzer::CodeUnitIndex;
-
 pub use analyzer::CodeUnitType;
-
 pub use analyzer::DeclarationInfo;
-
 pub use analyzer::DeclarationKind;
-
 pub use analyzer::DependencyPackActivationOutcome;
-
 pub use analyzer::DependencyPackEcosystem;
-
 pub use analyzer::DependencyPackEcosystemOutcome;
-
 pub use analyzer::DependencyPackWorkspaceContext;
-
 pub use analyzer::DispatchHierarchyExpansion;
-
 pub use analyzer::EmptyAnalyzer;
-
 pub use analyzer::ExceptionHandlingAnalysis;
-
 pub use analyzer::ExceptionHandlingSmell;
-
 pub use analyzer::ExceptionSmellWeights;
-
 pub use analyzer::FileSetProject;
-
 pub use analyzer::FilesystemProject;
 
 pub use analyzer::IAnalyzer;
-
 pub use analyzer::ImportAnalysisProvider;
-
 pub use analyzer::ImportInfo;
-
 pub use analyzer::ImportReachability;
-
 pub use analyzer::IngestedSource;
-
-pub use analyzer::JavaAnalyzer;
-
 pub use analyzer::JvmAnalyzerConfig;
-
 pub use analyzer::JvmDependencyDiscoveryConfig;
-
 pub use analyzer::JvmDependencyDiscoveryMode;
-
 pub use analyzer::JvmExternalArtifact;
-
 pub use analyzer::JvmExternalDependencies;
-
 pub use analyzer::JvmMavenCoordinate;
-
 pub use analyzer::JvmStandardLibraryDiscoveryConfig;
-
-pub use analyzer::KotlinAnalyzer;
-
 pub use analyzer::Language;
-
 pub use analyzer::MultiAnalyzer;
-
 pub use analyzer::MultiRootProject;
-
 pub use analyzer::OverlayProject;
-
 pub use analyzer::ParseCompleteness;
-
 pub use analyzer::ParseError;
-
 pub use analyzer::ParseErrorKind;
-
 pub use analyzer::PhpAnalyzerConfig;
-
 pub use analyzer::PhpDependencyApiEvidence;
-
 pub use analyzer::Project;
-
 pub use analyzer::ProjectCoverage;
-
 pub use analyzer::ProjectFile;
-
 pub use analyzer::PythonSemanticModelWorkspaceContext;
-
 pub use analyzer::Range;
-
 pub use analyzer::RubyAnalyzerConfig;
-
 pub use analyzer::RubyDependencyApiEvidence;
-
 pub use analyzer::RubyGemApiArtifact;
-
-pub use analyzer::ScalaAnalyzer;
-
 pub use analyzer::SourceContent;
-
 pub use analyzer::SourceIngestionError;
-
 pub use analyzer::SourceIngestionKind;
-
 pub use analyzer::SubsetCoverage;
-
 pub use analyzer::TestAssertionAnalysis;
-
 pub use analyzer::TestAssertionSmell;
-
 pub use analyzer::TestAssertionWeights;
-
 pub use analyzer::TestDetectionProvider;
-
 pub use analyzer::TestProject;
-
 pub use analyzer::TreeSitterAnalyzer;
-
 pub use analyzer::TypeAliasProvider;
-
 pub use analyzer::TypeHierarchyProvider;
-
 pub use analyzer::WorkspaceAnalyzer;
-
 pub use analyzer::WorkspaceFileListingCache;
-
 pub use analyzer::collect_workspace_files;
-
 pub use analyzer::ensure_global_rayon_pool;
-
 pub use analyzer::ingest_source_bytes;
 
 pub use cancellation::CancellationToken;
@@ -226,6 +148,8 @@ pub use navigation::NavigationOperation;
 /// Shipped builds do not expose this module.
 #[cfg(any(test, feature = "test-support"))]
 pub mod native_resolution_test_support {
+    pub use crate::analyzer::resolution::test_support::fixture_fragment;
+
     #[test]
     #[ignore = "one-file native smoke run with an external per-file timeout"]
     fn python_environment_native_smoke_file() {
@@ -242,8 +166,6 @@ pub mod native_resolution_test_support {
         println!("native smoke {}: {counts:?}", file.rel_path().display());
     }
 
-    pub use crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes as jmod_module_info_class_bytes;
-
     pub use crate::analyzer::resolution::*;
 
     pub use crate::analyzer::store::python_unit_summaries::PythonSummaryAuthority;
@@ -254,16 +176,6 @@ pub mod native_resolution_test_support {
     pub use crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageRankingBuildOutcome;
     pub use crate::analyzer::usages::workspace_graph::SelectedWorkspaceUsageRankingGraph;
     pub use crate::analyzer::usages::workspace_graph::build_selected_workspace_usage_ranking_graph;
-
-    pub use crate::analyzer::JavaNativeCallRelations;
-    pub use crate::analyzer::JavaNativeRenameProvider;
-    pub use crate::analyzer::JavaNativeSelectedInverseProvider;
-    pub use crate::analyzer::JavaNativeSelectedReferenceIndex;
-    pub use crate::analyzer::JavaNativeUsageStrategy;
-    pub use crate::analyzer::JavaSelectedReverseOutcome;
-    pub use crate::analyzer::java_native_incoming_calls;
-    pub use crate::analyzer::java_native_rename;
-    pub use crate::analyzer::java_selected_inverse_for;
 
     pub use crate::analyzer::NativeAssignmentValueProbe;
     pub use crate::analyzer::NativeTypeProbe;
@@ -301,7 +213,191 @@ pub mod native_resolution_test_support {
     pub use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotRole;
     pub use brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind;
 
+    pub use brokk_bifrost_python::intrinsics as python_intrinsics;
+
+    /// Raw engine universe identities for language-table integration goldens.
+    pub fn universe_identity_digests(language: Language) -> Vec<(String, [u8; 32])> {
+        crate::analyzer::resolution::universe::identity_digests(language)
+    }
+
     pub use brokk_bifrost_rust::cargo_routes::rust_static_string_literal;
+
+    /// Exercise the dormant Python source provider through the real scheduler
+    /// and publisher, using the environment's exact retained profile/revision.
+    pub fn python_native_route_probe(
+        publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
+        project: &dyn crate::analyzer::Project,
+        revision: i64,
+    ) -> crate::analyzer::store::Result<String> {
+        with_python_native_operation(
+            publication,
+            project,
+            revision,
+            |operation, summary, cancellation| {
+                operation.python_native_route_probe(
+                    summary,
+                    publication.profile.python_version,
+                    cancellation,
+                )
+            },
+        )
+    }
+
+    /// Selected implicit-root and intrinsic inventory integration golden.
+    pub fn python_native_builtin_hierarchy_probe(
+        publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
+        project: &dyn crate::analyzer::Project,
+        revision: i64,
+    ) -> crate::analyzer::store::Result<String> {
+        with_python_native_operation(
+            publication,
+            project,
+            revision,
+            |operation, summary, cancellation| {
+                operation.python_native_builtin_hierarchy_probe(
+                    summary,
+                    publication.profile.python_version,
+                    cancellation,
+                )
+            },
+        )
+    }
+
+    /// Nomination receipts only: forward confirmation and members remain open.
+    pub fn python_native_reverse_nomination_probe(
+        publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
+        project: &dyn crate::analyzer::Project,
+        revision: i64,
+        targets: &[crate::CodeUnit],
+    ) -> crate::analyzer::store::Result<String> {
+        with_python_native_operation(
+            publication,
+            project,
+            revision,
+            |operation, summary, cancellation| {
+                operation.python_native_reverse_nomination_probe(summary, targets, cancellation)
+            },
+        )
+    }
+
+    fn with_python_native_operation<T>(
+        publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
+        project: &dyn crate::analyzer::Project,
+        revision: i64,
+        action: impl FnOnce(
+            &crate::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+            i64,
+            &crate::CancellationToken,
+        ) -> crate::analyzer::store::Result<T>,
+    ) -> crate::analyzer::store::Result<T> {
+        use crate::analyzer::store::resolution_operation::{
+            SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+        };
+        use crate::analyzer::store::resolution_publication::{
+            ResolutionContentInput, ResolutionContentPublicationOutcome,
+        };
+        use crate::analyzer::store::resolution_selection::{
+            SelectedResolutionContentMountRequest, SelectedResolutionLanguage,
+            SelectedResolutionOverlayMask,
+        };
+        let summary = publication.selected_summary(revision)?.ok_or_else(|| {
+            crate::analyzer::store::StoreError::new("no selected Python environment summary")
+        })?;
+        let mut snapshot = publication.snapshot.clone();
+        snapshot.revision = revision;
+        let mut snapshots = crate::analyzer::store::WorkspaceSnapshots::default();
+        snapshots.insert("python".into(), snapshot.clone());
+        let languages = [SelectedResolutionLanguage::new("python", Language::Python)];
+        let cancellation = crate::CancellationToken::default();
+        // Native publication intentionally does not populate production file
+        // versions. Select the exact admitted source content behind this
+        // environment rather than opening an empty workspace projection.
+        let members = {
+            let connection = publication.store.read_conn()?;
+            let mut statement = connection.prepare(
+                "SELECT members.rel_path,blob.blob_oid
+                 FROM resolution_unit_summary_members members
+                 JOIN blobs blob ON blob.id=members.blob_id
+                 WHERE members.summary_id=?1 ORDER BY members.member_ordinal",
+            )?;
+            statement
+                .query_map([summary], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut mounts = Vec::with_capacity(members.len());
+        let mut masks = Vec::with_capacity(members.len());
+        for (rel_path, oid) in members {
+            let file = project
+                .file_by_rel_path(std::path::Path::new(&rel_path))
+                .ok_or_else(|| {
+                    crate::analyzer::store::StoreError::new(format!(
+                        "native source is not in the selected Project: {rel_path}"
+                    ))
+                })?;
+            let source = project.read_source(&file).map_err(|error| {
+                crate::analyzer::store::StoreError::new(format!(
+                    "read selected native source {rel_path}: {error}"
+                ))
+            })?;
+            let base_digest =
+                brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(source.as_bytes());
+            masks.push(SelectedResolutionOverlayMask::replacement(
+                "python",
+                rel_path.clone(),
+            ));
+            let oid = git2::Oid::from_str(&oid)?;
+            let content = publication.store.admit_cached_selected_content(
+                &snapshot,
+                &rel_path,
+                oid,
+                &ResolutionContentInput::Parsed {
+                    content_oid: oid,
+                    semantic_language: Language::Python,
+                },
+                &cancellation,
+            )?;
+            let ResolutionContentPublicationOutcome::Ready(content) = content else {
+                return Err(crate::analyzer::store::StoreError::new(format!(
+                    "Python selected content: {content:?}"
+                )));
+            };
+            mounts.push(
+                SelectedResolutionContentMountRequest::new(
+                    content.into_parts().0,
+                    crate::analyzer::store::WorkspaceFileRow {
+                        rel_path,
+                        blob_oid: oid,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_counterfactual_base_content_digest(base_digest),
+            );
+        }
+        let input = SelectedResolutionOperationInput::new(
+            project,
+            &snapshot.workspace_id,
+            &snapshots,
+            &languages,
+            &masks,
+        )
+        .with_content_mounts(mounts);
+        match publication
+            .store
+            .open_selected_resolution_operation(input, &cancellation)?
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => {
+                action(&operation, summary, &cancellation)
+            }
+            outcome => Err(crate::analyzer::store::StoreError::new(format!(
+                "Python route selection: {outcome:?}"
+            ))),
+        }
+    }
 
     /// One fixture identity per label, for a differential suite that needs
     /// distinct identities and no catalog. See `SemanticId::for_test`.
@@ -317,11 +413,6 @@ pub mod native_resolution_test_support {
     /// See [`fixture_semantic`].
     pub fn fixture_path_id(label: &str) -> PartialPathId {
         PartialPathId::for_test(label)
-    }
-
-    /// See [`fixture_semantic`].
-    pub fn fixture_fragment(label: &[u8]) -> BindingFragmentId {
-        BindingFragmentId::for_test(label)
     }
 
     /// One lowered artifact and the catalog that numbered it, for a
@@ -610,7 +701,7 @@ pub mod native_resolution_test_support {
         )
     }
 
-    fn parse_resolution_facts(
+    pub(super) fn parse_resolution_facts(
         file: &brokk_bifrost_core::analyzer::ProjectFile,
         source: &str,
         language: tree_sitter::Language,

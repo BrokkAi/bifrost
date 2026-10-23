@@ -2381,7 +2381,12 @@ mod result_use_tests {
 
     #[test]
     fn lambda_tail_and_recovered_syntax_are_open() {
-        let source = "int f(); void run() { auto value = [] { return f(); }; f(,); }";
+        // The macro-declaration grammar splits a bare `f(,)` into an
+        // identifier and a separate ERROR with no call expression at all, so
+        // the recovered call is spelled `f(+)` here: it still produces a
+        // call_expression whose argument list carries the ERROR that marks
+        // the syntax as recovered.
+        let source = "int f(); void run() { auto value = [] { return f(); }; f(+); }";
         let tree = tree(source);
         assert!(tree.root_node().has_error());
         let calls = calls(&tree, source);

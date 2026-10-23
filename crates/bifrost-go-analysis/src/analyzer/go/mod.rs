@@ -21,6 +21,141 @@ pub mod native_graph;
 pub(super) mod native_outgoing;
 #[doc(hidden)]
 pub mod native_points;
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for GoSupport {
+    fn go_member_definition_namespaces(
+        &self,
+        kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind,
+    ) -> Option<brokk_bifrost_analysis::analyzer::resolution::GoDefinitionNamespaces> {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
+        let bits = match kind {
+            ResolutionMemberKind::Field => 2,
+            ResolutionMemberKind::Method => 2 | 4,
+            _ => return None,
+        };
+        Some(brokk_bifrost_analysis::analyzer::resolution::GoDefinitionNamespaces::member(bits))
+    }
+
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("go.mod" | "go.sum" | "go.work" | "go.work.sum")
+        ) || path.ends_with(std::path::Path::new("vendor/modules.txt"))
+    }
+    fn root_source_horizon_follows_provenance(&self) -> bool {
+        true
+    }
+    fn call_applicability_adapter(
+        &self,
+    ) -> Option<
+        &'static dyn brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::CallApplicabilityAdapter,
+    >
+{
+        Some(&call_applicability::GO_CALL_APPLICABILITY_ADAPTER)
+    }
+    fn type_component_projection(
+        &self,
+        transfer: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind,
+        constructor: Option<
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind,
+        >,
+        intrinsic: Option<brokk_bifrost_analysis::analyzer::resolution::universe::UniverseEntry>,
+        operand: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::TypeComponentProjection> {
+        use brokk_bifrost_analysis::analyzer::languages::{
+            TypeComponentProjection, TypeComponentSelection as Selection,
+        };
+        use brokk_bifrost_analysis::analyzer::resolution::universe::GoRangeType;
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            ResolutionTypeComponentKind as Component, ResolutionTypeConstructorKind as Constructor,
+            ResolutionTypeTransferKind as Transfer,
+        };
+
+        let pointer = operand.ty().indirection();
+        if pointer != 0 && !(pointer == 1 && constructor == Some(Constructor::Array)) {
+            return None;
+        }
+        let mut addressable = None;
+        let selection = match transfer {
+            Transfer::ComponentIndex => {
+                addressable = Some(match constructor {
+                    Some(Constructor::Slice) => true,
+                    Some(Constructor::Array) => pointer == 1 || operand.addressable() == Some(true),
+                    _ => false,
+                });
+                match constructor {
+                    Some(Constructor::Array | Constructor::Slice) => {
+                        Selection::Component(Component::Element)
+                    }
+                    Some(Constructor::Map) => Selection::Component(Component::Value),
+                    None if intrinsic
+                        .is_some_and(|entry| entry.range_type == Some(GoRangeType::String)) =>
+                    {
+                        Selection::Intrinsic("byte")
+                    }
+                    _ => return None,
+                }
+            }
+            Transfer::ComponentCommaOkValue if constructor == Some(Constructor::Map) => {
+                addressable = Some(false);
+                Selection::Component(Component::Value)
+            }
+            Transfer::ComponentCommaOkValue => return None,
+            Transfer::ComponentIndexOk if constructor == Some(Constructor::Map) => {
+                Selection::Intrinsic("bool")
+            }
+            Transfer::ComponentIndexOk => return None,
+            Transfer::ComponentSlice => match constructor {
+                Some(Constructor::Slice) => Selection::Operand,
+                Some(Constructor::Array) if pointer == 1 || operand.addressable() == Some(true) => {
+                    Selection::Constructed
+                }
+                None if intrinsic.is_some_and(|entry| entry.spelling == "untyped string") => {
+                    Selection::Intrinsic("string")
+                }
+                None if intrinsic
+                    .is_some_and(|entry| entry.range_type == Some(GoRangeType::String)) =>
+                {
+                    Selection::Operand
+                }
+                _ => return None,
+            },
+            Transfer::ComponentKey => match constructor {
+                Some(Constructor::Array | Constructor::Slice | Constructor::Sequence) => {
+                    Selection::Intrinsic("int")
+                }
+                Some(Constructor::Map) => Selection::Component(Component::Key),
+                Some(Constructor::Channel) => Selection::Component(Component::Element),
+                None => match intrinsic.and_then(|entry| entry.range_type) {
+                    Some(GoRangeType::String) => Selection::Intrinsic("int"),
+                    Some(GoRangeType::Integer) => Selection::Operand,
+                    _ => return None,
+                },
+            },
+            Transfer::ComponentValue => match constructor {
+                Some(
+                    Constructor::Array
+                    | Constructor::Slice
+                    | Constructor::Sequence
+                    | Constructor::Channel,
+                ) => Selection::Component(Component::Element),
+                Some(Constructor::Map) => Selection::Component(Component::Value),
+                None if intrinsic
+                    .is_some_and(|entry| entry.range_type == Some(GoRangeType::String)) =>
+                {
+                    Selection::Intrinsic("rune")
+                }
+                _ => return None,
+            },
+            Transfer::ComponentElement => Selection::Component(Component::Element),
+            _ => unreachable!("only component transfers reach component selection"),
+        };
+        Some(TypeComponentProjection {
+            selection,
+            addressable,
+        })
+    }
+}
+
 #[cfg(test)]
 mod native_qualifier_tests;
 pub(super) mod native_rename;
@@ -291,7 +426,7 @@ pub struct GoAnalyzer {
     inner: TreeSitterAnalyzer<GoAdapter>,
     memo_caches: GoMemoCaches,
     #[doc(hidden)]
-    pub native_context_profile: std::sync::RwLock<Option<[u8; 32]>>,
+    pub active_base_profile: std::sync::RwLock<Option<[u8; 32]>>,
     #[doc(hidden)]
     pub build_selection_error: std::sync::RwLock<String>,
 }
@@ -333,29 +468,37 @@ pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
     // Reconcile under the same selected snapshot and profile as production.
     let snapshots = analyzer.inner.selected_workspace_snapshots();
     let snapshot = snapshots.get("go").expect("selected Go snapshot");
-    let profile = analyzer
-        .native_context_profile()
-        .expect("selected Go native context profile");
+    let base = analyzer
+        .native_context_base_profile()
+        .expect("selected Go base profile");
     let store = analyzer.inner.analyzer_store();
-    let context = store
-        .selected_go_context(snapshot, &profile)
-        .expect("read selected Go context")
-        .expect("selected Go package context");
-    let report = store
-        .reconcile_unit_summaries(
-            snapshot,
-            brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
-                context_id: context.context_id,
-                profile,
-            },
-            &brokk_bifrost_core::cancellation::CancellationToken::new(),
-        )
-        .expect("reconcile summaries after persisting selected Go sources");
-    assert!(
-        report.failed.is_empty(),
-        "selected Go summary reconciliation failed: {:?}",
-        report.failed
-    );
+    let mut contexts = std::collections::BTreeMap::new();
+    for file in analyzer.get_analyzed_files() {
+        let path = brokk_bifrost_core::path_utils::rel_path_string(&file);
+        for (context, profile) in store
+            .go_contexts_for_file(snapshot, &base, &path)
+            .expect("selected Go contexts")
+        {
+            contexts.insert(context.context_id, profile);
+        }
+    }
+    for (context_id, profile) in contexts {
+        let report = store
+            .reconcile_unit_summaries(
+                snapshot,
+                brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
+                    context_id,
+                    profile,
+                },
+                &brokk_bifrost_core::cancellation::CancellationToken::new(),
+            )
+            .expect("reconcile summaries after persisting selected Go sources");
+        assert!(
+            report.failed.is_empty(),
+            "selected Go summary reconciliation failed: {:?}",
+            report.failed
+        );
+    }
 }
 
 impl Clone for GoAnalyzer {
@@ -363,7 +506,12 @@ impl Clone for GoAnalyzer {
         Self {
             inner: self.inner.clone(),
             memo_caches: self.memo_caches.clone(),
-            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
+            active_base_profile: std::sync::RwLock::new(
+                *self
+                    .active_base_profile
+                    .read()
+                    .expect("Go base profile lock poisoned"),
+            ),
             build_selection_error: std::sync::RwLock::new(
                 self.build_selection_error().unwrap_or_default(),
             ),
@@ -433,7 +581,7 @@ impl GoAnalyzer {
         if outcome.canonical.is_none() {
             // A failed discovery must not keep a previous tool profile active.
             *self
-                .native_context_profile
+                .active_base_profile
                 .write()
                 .expect("Go profile lock poisoned") = None;
             self.refresh_source_inventory()?;
@@ -444,7 +592,7 @@ impl GoAnalyzer {
     pub(crate) fn fallback_graph_exclusion(
         &self,
         file: &ProjectFile,
-        modules: &[brokk_bifrost_go::packages::GoModuleRoot],
+        _modules: &[brokk_bifrost_go::packages::GoModuleRoot],
     ) -> Option<brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason>
 {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason;
@@ -469,14 +617,7 @@ impl GoAnalyzer {
                 module_path: brokk_bifrost_core::path_utils::workspace_relative_slash_path(root),
             });
         }
-        modules
-            .iter()
-            .filter(|module| file.parent().starts_with(&module.workspace_dir))
-            .max_by_key(|module| module.workspace_dir.components().count())
-            .filter(|module| !module.workspace_dir.as_os_str().is_empty())
-            .map(|module| GraphFileSkipReason::OutsideSelectedModules {
-                module_path: module.import_path.clone(),
-            })
+        None
     }
 
     pub(crate) fn update_all_with_progress(
@@ -488,7 +629,12 @@ impl GoAnalyzer {
         Self {
             inner,
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
+            active_base_profile: std::sync::RwLock::new(
+                *self
+                    .active_base_profile
+                    .read()
+                    .expect("Go base profile lock poisoned"),
+            ),
             build_selection_error: std::sync::RwLock::new(
                 self.build_selection_error().unwrap_or_default(),
             ),
@@ -506,11 +652,43 @@ impl GoAnalyzer {
     }
 
     #[doc(hidden)]
-    pub fn native_context_profile(&self) -> Option<[u8; 32]> {
+    pub fn native_context_base_profile(&self) -> Option<[u8; 32]> {
         *self
-            .native_context_profile
+            .active_base_profile
             .read()
-            .expect("Go profile lock poisoned")
+            .expect("Go base profile lock poisoned")
+    }
+
+    #[doc(hidden)]
+    pub fn context_profile_for_file(&self, path: &str) -> Option<[u8; 32]> {
+        let base = self.native_context_base_profile()?;
+        let snapshots = self.inner.selected_workspace_snapshots();
+        let snapshot = snapshots.get("go")?;
+        match self
+            .inner
+            .analyzer_store()
+            .go_contexts_for_file(snapshot, &base, path)
+        {
+            Ok(mut contexts) => {
+                assert!(
+                    contexts.len() <= 1,
+                    "one workspace source belongs to one domain: {contexts:?}"
+                );
+                contexts.pop().map(|(_, profile)| profile)
+            }
+            Err(error) => {
+                self.inner.record_store_error(error);
+                None
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn context_profile_for_test(&self) -> Option<[u8; 32]> {
+        self.get_analyzed_files().iter().find_map(|file| {
+            self.context_profile_for_file(&brokk_bifrost_core::path_utils::rel_path_string(file))
+        })
     }
 
     #[doc(hidden)]
@@ -522,10 +700,22 @@ impl GoAnalyzer {
         if self.inner.selected_workspace_snapshots().get("go") != Some(snapshot) {
             return false;
         }
+        let base=self.inner.analyzer_store().read_conn().and_then(|conn| {
+            conn.query_row("SELECT base_profile_digest FROM go_context_selections WHERE workspace_id=?1 AND generation=?2 AND profile_digest=?3",
+                rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),profile],
+                |row|Ok(row.get::<_,Vec<u8>>(0)?.try_into().expect("schema checks base profile width"))).map_err(Into::into)
+        });
+        let base = match base {
+            Ok(base) => base,
+            Err(error) => {
+                self.inner.record_store_error(error);
+                return false;
+            }
+        };
         *self
-            .native_context_profile
+            .active_base_profile
             .write()
-            .expect("Go profile lock poisoned") = Some(profile);
+            .expect("Go base profile lock poisoned") = Some(base);
         true
     }
 
@@ -535,7 +725,7 @@ impl GoAnalyzer {
         use brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile;
         let profile = source_inventory_profile();
         if self
-            .native_context_profile()
+            .native_context_base_profile()
             .is_some_and(|active| active != profile)
         {
             return Ok(());
@@ -598,7 +788,12 @@ impl GoAnalyzer {
         Self {
             inner: self.inner.clone_with_project(project),
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
+            active_base_profile: std::sync::RwLock::new(
+                *self
+                    .active_base_profile
+                    .read()
+                    .expect("Go base profile lock poisoned"),
+            ),
             build_selection_error: std::sync::RwLock::new(
                 self.build_selection_error().unwrap_or_default(),
             ),
@@ -615,7 +810,7 @@ impl GoAnalyzer {
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, GoAdapter, config),
             memo_caches: GoMemoCaches::new(memo_budget),
-            native_context_profile: std::sync::RwLock::new(None),
+            active_base_profile: std::sync::RwLock::new(None),
             build_selection_error: std::sync::RwLock::new(
                 "Go build selection discovery has not run".into(),
             ),
@@ -645,7 +840,7 @@ impl GoAnalyzer {
             |inner, memo_budget| Self {
                 inner,
                 memo_caches: GoMemoCaches::new(memo_budget),
-                native_context_profile: std::sync::RwLock::new(None),
+                active_base_profile: std::sync::RwLock::new(None),
                 build_selection_error: std::sync::RwLock::new(
                     "Go build selection discovery has not run".into(),
                 ),
@@ -1163,6 +1358,10 @@ impl CodeUnitIndex for GoAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
+    }
+
+    delegate_inner_methods! {
         fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
@@ -1413,7 +1612,12 @@ impl IAnalyzer for GoAnalyzer {
         Self {
             inner: self.inner.update(changed_files),
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-            native_context_profile: std::sync::RwLock::new(self.native_context_profile()),
+            active_base_profile: std::sync::RwLock::new(
+                *self
+                    .active_base_profile
+                    .read()
+                    .expect("Go base profile lock poisoned"),
+            ),
             build_selection_error: std::sync::RwLock::new(
                 self.build_selection_error().unwrap_or_default(),
             ),
@@ -1819,22 +2023,23 @@ impl LanguageSupport for GoSupport {
         use crate::analyzer::go::native_points::GoNativePointRequestOpen;
         let go = resolve_analyzer::<crate::analyzer::go::GoAnalyzer>(analyzer)
             .ok_or("assignment-value probe has no Go analyzer")?;
-        let mut go_request = match GoNativePointRequest::open(go, None, cancellation)
-            .map_err(|error| error.to_string())?
-        {
-            GoNativePointRequestOpen::Ready(request) => request,
-            GoNativePointRequestOpen::Unavailable { kind, message } => {
-                return Ok(Some(BoundedResolution::Complete {
-                    value: unavailable_assignment_value_probe(site, kind, message),
-                    work: ReceiverAnalysisWork::default(),
-                }));
-            }
-            GoNativePointRequestOpen::Cancelled => {
-                return Ok(Some(BoundedResolution::Cancelled {
-                    work: ReceiverAnalysisWork::default(),
-                }));
-            }
-        };
+        let mut go_request =
+            match GoNativePointRequest::open_for_file(go, query.file, None, cancellation)
+                .map_err(|error| error.to_string())?
+            {
+                GoNativePointRequestOpen::Ready(request) => request,
+                GoNativePointRequestOpen::Unavailable { kind, message } => {
+                    return Ok(Some(BoundedResolution::Complete {
+                        value: unavailable_assignment_value_probe(site, kind, message),
+                        work: ReceiverAnalysisWork::default(),
+                    }));
+                }
+                GoNativePointRequestOpen::Cancelled => {
+                    return Ok(Some(BoundedResolution::Cancelled {
+                        work: ReceiverAnalysisWork::default(),
+                    }));
+                }
+            };
         let locator = SelectedSemanticLocator::for_reference_range(
             "go",
             rel_path_string(&request.file),
@@ -1955,122 +2160,6 @@ impl LanguageSupport for GoSupport {
         )
     }
 
-    fn type_component_projection(
-        &self,
-        transfer: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind,
-        constructor: Option<
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind,
-        >,
-        intrinsic: Option<brokk_bifrost_analysis::analyzer::resolution::universe::UniverseEntry>,
-        operand: brokk_bifrost_analysis::analyzer::resolution::model::ResolutionSlotValue,
-    ) -> Option<brokk_bifrost_analysis::analyzer::languages::TypeComponentProjection> {
-        use brokk_bifrost_analysis::analyzer::languages::TypeComponentProjection;
-
-        use brokk_bifrost_analysis::analyzer::languages::TypeComponentSelection as Selection;
-
-        use brokk_bifrost_analysis::analyzer::resolution::universe::GoRangeType;
-        use brokk_bifrost_core::analyzer::resolution_facts::{
-            ResolutionTypeComponentKind as Component, ResolutionTypeConstructorKind as Constructor,
-            ResolutionTypeTransferKind as Transfer,
-        };
-
-        let pointer = operand.ty().indirection();
-        if pointer != 0 && !(pointer == 1 && constructor == Some(Constructor::Array)) {
-            return None;
-        }
-        let mut addressable = None;
-        let selection = match transfer {
-            Transfer::ComponentIndex => {
-                addressable = Some(match constructor {
-                    Some(Constructor::Slice) => true,
-                    Some(Constructor::Array) => pointer == 1 || operand.addressable() == Some(true),
-                    _ => false,
-                });
-                match constructor {
-                    Some(Constructor::Array | Constructor::Slice) => {
-                        Selection::Component(Component::Element)
-                    }
-                    Some(Constructor::Map) => Selection::Component(Component::Value),
-                    None if intrinsic
-                        .is_some_and(|entry| entry.range_type == Some(GoRangeType::String)) =>
-                    {
-                        Selection::Intrinsic("byte")
-                    }
-                    _ => return None,
-                }
-            }
-            Transfer::ComponentCommaOkValue if constructor == Some(Constructor::Map) => {
-                addressable = Some(false);
-                Selection::Component(Component::Value)
-            }
-            Transfer::ComponentCommaOkValue => return None,
-            Transfer::ComponentIndexOk if constructor == Some(Constructor::Map) => {
-                Selection::Intrinsic("bool")
-            }
-            Transfer::ComponentIndexOk => return None,
-            Transfer::ComponentSlice => match constructor {
-                Some(Constructor::Slice) => Selection::Operand,
-                Some(Constructor::Array) if pointer == 1 || operand.addressable() == Some(true) => {
-                    Selection::Constructed
-                }
-                None if intrinsic.is_some_and(|entry| entry.spelling == "untyped string") => {
-                    Selection::Intrinsic("string")
-                }
-                None if intrinsic
-                    .is_some_and(|entry| entry.range_type == Some(GoRangeType::String)) =>
-                {
-                    Selection::Operand
-                }
-                _ => return None,
-            },
-            Transfer::ComponentKey => match constructor {
-                Some(Constructor::Array | Constructor::Slice | Constructor::Sequence) => {
-                    Selection::Intrinsic("int")
-                }
-                Some(Constructor::Map) => Selection::Component(Component::Key),
-                Some(Constructor::Channel) => Selection::Component(Component::Element),
-                None => match intrinsic.and_then(|entry| entry.range_type) {
-                    Some(GoRangeType::String) => Selection::Intrinsic("int"),
-                    Some(GoRangeType::Integer) => Selection::Operand,
-                    _ => return None,
-                },
-            },
-            Transfer::ComponentValue => match constructor {
-                Some(
-                    Constructor::Array
-                    | Constructor::Slice
-                    | Constructor::Sequence
-                    | Constructor::Channel,
-                ) => Selection::Component(Component::Element),
-                Some(Constructor::Map) => Selection::Component(Component::Value),
-                None if intrinsic
-                    .is_some_and(|entry| entry.range_type == Some(GoRangeType::String)) =>
-                {
-                    Selection::Intrinsic("rune")
-                }
-                _ => return None,
-            },
-            Transfer::ComponentElement => Selection::Component(Component::Element),
-            _ => unreachable!("only component transfers reach component selection"),
-        };
-        Some(TypeComponentProjection {
-            selection,
-            addressable,
-        })
-    }
-
-    fn root_source_horizon(
-        &self,
-        source: Option<brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedResolutionMountOrdinal>,
-        has_transient_sources: bool,
-    ) -> brokk_bifrost_analysis::analyzer::store::resolution_operation::source_demand::RootSourceHorizon{
-        use brokk_bifrost_analysis::analyzer::store::resolution_operation::source_demand::RootSourceHorizon;
-        match source {
-            Some(source) if !has_transient_sources => RootSourceHorizon::Bounded(vec![source]),
-            _ => RootSourceHorizon::Universal,
-        }
-    }
-
     fn native_member_attribution(
         &self,
         context: &brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeMemberContext,
@@ -2153,13 +2242,6 @@ impl LanguageSupport for GoSupport {
         Some(&native_points::GoNativeRolloutPoints)
     }
 
-    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
-        matches!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("go.mod" | "go.sum" | "go.work" | "go.work.sum")
-        ) || path.ends_with(std::path::Path::new("vendor/modules.txt"))
-    }
-
     fn selected_graph_fallback_active(&self, analyzer: &dyn IAnalyzer) -> bool {
         resolve_analyzer::<GoAnalyzer>(analyzer)
             .expect("Go stage has a Go analyzer")
@@ -2187,12 +2269,6 @@ impl LanguageSupport for GoSupport {
             .workspace_path_index()
             .unnamed_module_root(file)
             .map(std::path::Path::to_path_buf)
-    }
-
-    fn call_applicability_adapter(
-        &self,
-    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::CallApplicabilityAdapter>{
-        Some(&call_applicability::GO_CALL_APPLICABILITY_ADAPTER)
     }
 
     fn stable_package_function_value_proof(
@@ -2299,6 +2375,61 @@ impl LanguageSupport for GoSupport {
         Some(&dependency_packs::GoDependencyResolver)
     }
 
+    fn reconcile_workspace_build_context(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer,
+        changed: Option<&BTreeSet<ProjectFile>>,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        let Some(go) = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()) else {
+            return Ok(());
+        };
+        if let Some(changed)=changed && !changed.iter().any(|file| file.rel_path().extension().is_some_and(|extension|extension=="go")
+            || <Self as brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport>::is_configuration_input_path(self,file.rel_path())) {return Ok(());}
+        let limits =
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default();
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        if changed.is_some() {
+            dependency_packs::reconcile_go_dependencies_after_edit(
+                workspace,
+                go.inner.analyzer_config(),
+                &limits,
+                &cancellation,
+            )?;
+        } else {
+            dependency_packs::reconcile_selected_go_domains(
+                workspace,
+                go.inner.analyzer_config(),
+                &limits,
+                &cancellation,
+                dependency_packs::GoReconciliationTrigger::ExplicitRefresh,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn refresh_updated_workspace_context(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer,
+        changed_files: &BTreeSet<ProjectFile>,
+        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        if !changed_files.iter().any(|file| {
+            Language::from_path(file.rel_path()) == Language::Go
+                || self.is_file_dependency_input(file.rel_path())
+        }) {
+            return Ok(());
+        }
+        dependency_packs::reconcile_go_dependencies_after_edit(
+            workspace,
+            config,
+            limits,
+            cancellation,
+        )?;
+        Ok(())
+    }
+
     fn resolve_workspace_dependencies(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
@@ -2378,6 +2509,7 @@ impl LanguageSupport for GoSupport {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_definition_call_target_batch(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
@@ -2387,6 +2519,7 @@ impl LanguageSupport for GoSupport {
         >,
         file: brokk_bifrost_core::analyzer::model::ProjectFile,
         source: std::sync::Arc<str>,
+        _primary_tree: Option<tree_sitter::Tree>,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
     ) -> Vec<brokk_bifrost_analysis::analyzer::usages::get_definition::CallTargetLookupOutcome>
     {
@@ -2810,6 +2943,7 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
 }
 
 mod dependency_packs {
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome;
 
@@ -2899,11 +3033,49 @@ mod dependency_packs {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum GoReconciliationTrigger {
+        DependencyActivation,
+        SourceChange,
+        ExplicitRefresh,
+    }
+
     pub(crate) fn resolve_selected_go_dependencies(
         workspace: &WorkspaceAnalyzer,
         config: &AnalyzerConfig,
         limits: &DependencyPackLimits,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<DependencyDiscoveryOutcome> {
+        reconcile_selected_go_domains(
+            workspace,
+            config,
+            limits,
+            cancellation,
+            GoReconciliationTrigger::DependencyActivation,
+        )
+    }
+
+    pub(super) fn reconcile_go_dependencies_after_edit(
+        workspace: &WorkspaceAnalyzer,
+        config: &AnalyzerConfig,
+        limits: &DependencyPackLimits,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<DependencyDiscoveryOutcome> {
+        reconcile_selected_go_domains(
+            workspace,
+            config,
+            limits,
+            cancellation,
+            GoReconciliationTrigger::SourceChange,
+        )
+    }
+
+    pub(super) fn reconcile_selected_go_domains(
+        workspace: &WorkspaceAnalyzer,
+        config: &AnalyzerConfig,
+        limits: &DependencyPackLimits,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+        trigger: GoReconciliationTrigger,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<DependencyDiscoveryOutcome> {
         use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
 
@@ -2960,6 +3132,7 @@ mod dependency_packs {
                 brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION], |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?.try_into().expect("schema checks profile digest width"),
                         brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextIdentity {
+                            revision: snapshot.revision,
                             selection_id:row.get(1)?,context_id:row.get(2)?,
                             publication_digest:row.get::<_, Vec<u8>>(3)?.try_into().expect("schema checks publication digest width"),
                         }))
@@ -2967,82 +3140,291 @@ mod dependency_packs {
         } else {
             Vec::new()
         };
-        let mut discovered = crate::analyzer::go::dependency_discovery::discover_go_packages(
+        let Some(selected) = snapshot.as_ref() else {
+            return Ok(DependencyDiscoveryOutcome::complete(Vec::new()));
+        };
+        if config.go.dependency_discovery.mode == GoDependencyDiscoveryMode::Disabled {
+            let discovered = crate::analyzer::go::dependency_discovery::discover_go_packages(
+                &config.go,
+                project,
+                limits,
+                Some(cancellation),
+            );
+            if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer())
+            {
+                go.record_build_selection(&discovered)?;
+            }
+            return Ok(discovered.semantic_packs);
+        }
+        let domains = store.go_discovery_domain_inputs(selected, project.root())?;
+        let base_environment = crate::analyzer::go::dependency_discovery::domain_environment(
             &config.go,
             project,
-            limits,
-            Some(cancellation),
+            &Default::default(),
+            cancellation,
         );
-        if let Some(go) = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
-            crate::analyzer::GoAnalyzer,
-        >(workspace.analyzer())
-        {
-            go.record_build_selection(&discovered)?;
+        let base_environment = match base_environment {
+            Ok(environment) => environment,
+            Err(_) => {
+                let discovered = crate::analyzer::go::dependency_discovery::discover_go_packages(
+                    &config.go,
+                    project,
+                    limits,
+                    Some(cancellation),
+                );
+                if let Some(go) = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                    crate::analyzer::GoAnalyzer,
+                >(workspace.analyzer())
+                {
+                    go.record_build_selection(&discovered)?;
+                }
+                return Ok(discovered.semantic_packs);
+            }
+        };
+        let root_key = domains
+            .iter()
+            .filter(|(domain, _)| domain.directory.is_empty())
+            .max_by_key(|(domain, _)| !domain.gowork_path.is_empty())
+            .map(|(domain, _)| (domain.directory.clone(), domain.gowork_path.clone()));
+        let base_template = crate::analyzer::go::dependency_discovery::GoPackageDiscovery {
+            domain: Default::default(),
+            input_digest: None,
+            failure: None,
+            packages: Vec::new(),
+            goos: config
+                .go
+                .dependency_discovery
+                .goos
+                .clone()
+                .unwrap_or_else(|| base_environment.goos.clone()),
+            goarch: config
+                .go
+                .dependency_discovery
+                .goarch
+                .clone()
+                .unwrap_or_else(|| base_environment.goarch.clone()),
+            environment: base_environment.clone(),
+            build_tags: config.go.dependency_discovery.build_tags.clone(),
+            workspace_patterns: config.go.dependency_discovery.workspace_patterns.clone(),
+            vendor: false,
+        };
+        store.close_absent_go_domains(
+            selected,
+            brokk_bifrost_analysis::analyzer::store::go_package_context::base_profile_digest(
+                &base_template,
+            ),
+            &domains,
+        )?;
+        if domains.is_empty() {
+            if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer())
+            {
+                *go.active_base_profile
+                    .write()
+                    .expect("Go base profile lock poisoned") = None;
+                go.refresh_source_inventory()?;
+            }
+            return Ok(if trigger == GoReconciliationTrigger::SourceChange {
+                DependencyDiscoveryOutcome::complete(Vec::new())
+            } else {
+                crate::analyzer::go::dependency_discovery::discover_go_packages(
+                    &config.go,
+                    project,
+                    limits,
+                    Some(cancellation),
+                )
+                .semantic_packs
+            });
         }
-        let Some(canonical) = discovered.canonical.take() else {
-            return Ok(discovered.semantic_packs);
-        };
-        let selected_snapshot = snapshot.clone();
-        let profile = profile_digest(&canonical);
-        let publication = match (snapshot, before) {
-            (Some(snapshot), Some(GoInputObservationOutcome::Ready(before))) => {
-                let expected = prior_heads
+        if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer()) {
+            *go.active_base_profile
+                .write()
+                .expect("Go base profile lock poisoned") = Some(
+                brokk_bifrost_analysis::analyzer::store::go_package_context::base_profile_digest(
+                    &base_template,
+                ),
+            );
+            go.build_selection_error
+                .write()
+                .expect("Go build selection lock poisoned")
+                .clear();
+        }
+        let width = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(8);
+        let mut aggregate = DependencyDiscoveryOutcome::complete(Vec::new());
+        let mut worker_failures = Vec::new();
+        for chunk in domains.chunks(width) {
+            let outcomes = std::thread::scope(|scope| {
+                let handles=chunk.iter().map(|(domain,input_digest)| {
+                    let base_environment=base_environment.clone();
+                    let root_key=&root_key;
+                    scope.spawn(move || -> brokk_bifrost_analysis::analyzer::store::Result<_> {
+                        use crate::analyzer::go::dependency_discovery::{domain_environment, discover_domain, GoPackageDiscovery};
+                        let mut environment=base_environment;
+                        environment.gowork=if domain.gowork_path.is_empty(){"off".into()}else{project.root().join(&domain.gowork_path).to_string_lossy().into_owned()};
+                        let mut canonical=GoPackageDiscovery {
+                            domain:domain.clone(),input_digest:Some(*input_digest),failure:None,packages:Vec::new(),
+                            goos:config.go.dependency_discovery.goos.clone().unwrap_or_else(||environment.goos.clone()),
+                            goarch:config.go.dependency_discovery.goarch.clone().unwrap_or_else(||environment.goarch.clone()),
+                            environment,build_tags:config.go.dependency_discovery.build_tags.clone(),
+                            workspace_patterns:config.go.dependency_discovery.workspace_patterns.clone(),vendor:false,
+                        };
+                        let profile=profile_digest(&canonical);
+                        if let Some(context)=store.go_context_for_reconciliation(selected,&profile)? {
+                            let conn=store.read_conn()?;
+                            let (digest,complete):(Vec<u8>,bool)=conn.query_row("SELECT input_digest,complete FROM go_context_publications WHERE context_id=?1",[context.context_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                            let root=root_key.as_ref().is_some_and(|key|key.0==domain.directory && key.1==domain.gowork_path);
+                            let force=trigger==GoReconciliationTrigger::ExplicitRefresh
+                                || (trigger==GoReconciliationTrigger::DependencyActivation && (root || !complete));
+                            if digest.as_slice()==input_digest && !force {
+                                return Ok((domain.clone(),None,Some((context,profile))));
+                            }
+                        }
+                        let mut discovered=match domain_environment(&config.go,project,domain,cancellation) {
+                            Ok(environment)=>discover_domain(&config.go,project,limits,cancellation,domain,environment),
+                            Err(error)=>{
+                                canonical.failure=Some(error.clone());
+                                let mut semantic_packs=DependencyDiscoveryOutcome::complete(Vec::new());
+                                semantic_packs.complete=false;
+                                semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
+                                    severity:brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Error,
+                                    code:"go.env_failed".into(),dependency_id:None,location:None,message:error,
+                                });
+                                crate::analyzer::go::dependency_discovery::GoDiscoveryOutcome {canonical:Some(canonical.clone()),semantic_packs}
+                            }
+                        };
+                        if discovered.canonical.is_none() && !cancellation.is_cancelled() {
+                            canonical.failure=Some(discovered.semantic_packs.diagnostics.first().map(|diagnostic|diagnostic.message.clone()).unwrap_or_else(||"Go domain discovery unavailable".into()));
+                            discovered.canonical=Some(canonical);
+                        }
+                        if let Some(canonical)=discovered.canonical.as_mut() {
+                            canonical.input_digest=Some(*input_digest);
+                            if let Some(error)=discovered.semantic_packs.diagnostics.iter().find(|diagnostic|diagnostic.code=="go.list_failed") {
+                                canonical.failure=Some(error.message.clone());
+                            }
+                        }
+                        Ok((domain.clone(),Some(discovered),None))
+                    })
+                }).collect::<Vec<_>>();
+                // Join every scoped worker even when a sibling fails or panics.
+                handles
                     .into_iter()
-                    .find_map(|(prior_profile, identity)| {
-                        (prior_profile == profile).then_some(identity)
-                    });
-                match store.observe_go_context_inputs(&snapshot, project, cancellation)? {
-                    GoInputObservationOutcome::Ready(after) => store.publish_go_package_context(
-                        snapshot,
-                        project.root().to_path_buf(),
-                        expected,
-                        &before,
-                        &after,
-                        canonical,
-                        cancellation,
-                    )?,
-                    GoInputObservationOutcome::InputsChanged => {
-                        GoContextPublicationOutcome::InputsChanged
+                    .map(|handle| match handle.join() {
+                        Ok(result) => result,
+                        Err(panic) => Err(
+                            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                                "Go domain worker in {chunk:?} panicked: {}",
+                                panic
+                                    .downcast_ref::<String>()
+                                    .map(String::as_str)
+                                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| format!("{panic:?}"))
+                            )),
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for outcome in outcomes {
+                let (domain, discovered, reused) = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        worker_failures.push(error.to_string());
+                        continue;
                     }
-                    GoInputObservationOutcome::Cancelled => GoContextPublicationOutcome::Cancelled,
+                };
+                if let Some((identity, profile)) = reused {
+                    match store.reconcile_unit_summaries(selected,brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries{context_id:identity.context_id,profile},cancellation) {
+                        Ok(report) if report.failed.is_empty()=>{},
+                        report=>eprintln!("go.unit_summary_failed: domain {domain:?}, reconciliation {report:?}"),
+                    }
+                    if root_key
+                        .as_ref()
+                        .is_some_and(|key| key.0 == domain.directory && key.1 == domain.gowork_path)
+                        && let Some(go) =
+                            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                                crate::analyzer::GoAnalyzer,
+                            >(workspace.analyzer())
+                    {
+                        go.activate_native_context_profile(selected, profile);
+                    }
+                    continue;
                 }
-            }
-            (_, Some(GoInputObservationOutcome::Cancelled)) => {
-                GoContextPublicationOutcome::Cancelled
-            }
-            _ => GoContextPublicationOutcome::InputsChanged,
-        };
-        let publication = match publication {
-            GoContextPublicationOutcome::Published(identity) => {
-                let activated = selected_snapshot.as_ref().is_some_and(|snapshot| {
-                    brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
-                        crate::analyzer::GoAnalyzer,
-                    >(workspace.analyzer())
-                    .is_some_and(|go| go.activate_native_context_profile(snapshot, profile))
-                });
-                if activated {
-                    GoContextPublicationOutcome::Published(identity)
-                } else {
-                    GoContextPublicationOutcome::InputsChanged
-                }
-            }
-            other => other,
-        };
-        match publication {
-            GoContextPublicationOutcome::Published(identity) => {
-                brokk_bifrost_core::profiling::note_with(|| {
-                    format!("go.native_context published={identity:?}")
-                });
-                // The head is the membership authority the unit summaries are
-                // derived from, so they are reconciled after it and never before.
-                let snapshot = selected_snapshot
-                    .as_ref()
-                    .expect("a published Go context was selected at a snapshot");
-                // The summaries are optional (readers fall back), so a store error
-                // here is a diagnostic, not a failure of the activation whose head
-                // was already published.
-                let timing = brokk_bifrost_core::profiling::scope("go.unit_summaries.reconcile");
-                let reconciliation = store.reconcile_unit_summaries(
+                let mut discovered = discovered.expect("a domain was reused or discovered");
+                let Some(canonical) = discovered.canonical.take() else {
+                    aggregate.complete &= discovered.semantic_packs.complete;
+                    continue;
+                };
+                let selected_snapshot = snapshot.clone();
+                let profile = profile_digest(&canonical);
+                let publication = match (snapshot.clone(), before.clone()) {
+                    (Some(snapshot), Some(GoInputObservationOutcome::Ready(before))) => {
+                        let expected =
+                            prior_heads
+                                .iter()
+                                .cloned()
+                                .find_map(|(prior_profile, identity)| {
+                                    (prior_profile == profile).then_some(identity)
+                                });
+                        match store.observe_go_context_inputs(&snapshot, project, cancellation)? {
+                            GoInputObservationOutcome::Ready(after) => store
+                                .publish_go_package_context(
+                                    snapshot,
+                                    project.root().to_path_buf(),
+                                    expected,
+                                    &before,
+                                    &after,
+                                    canonical,
+                                    cancellation,
+                                )?,
+                            GoInputObservationOutcome::InputsChanged => {
+                                GoContextPublicationOutcome::InputsChanged
+                            }
+                            GoInputObservationOutcome::Cancelled => {
+                                GoContextPublicationOutcome::Cancelled
+                            }
+                        }
+                    }
+                    (_, Some(GoInputObservationOutcome::Cancelled)) => {
+                        GoContextPublicationOutcome::Cancelled
+                    }
+                    _ => GoContextPublicationOutcome::InputsChanged,
+                };
+                let publication = match publication {
+                    GoContextPublicationOutcome::Published(identity) => {
+                        let activated = !root_key.as_ref().is_some_and(|key| {
+                            key.0 == domain.directory && key.1 == domain.gowork_path
+                        }) || selected_snapshot.as_ref().is_some_and(|snapshot| {
+                            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                                crate::analyzer::GoAnalyzer,
+                            >(workspace.analyzer())
+                            .is_some_and(|go| go.activate_native_context_profile(snapshot, profile))
+                        });
+                        if activated {
+                            GoContextPublicationOutcome::Published(identity)
+                        } else {
+                            GoContextPublicationOutcome::InputsChanged
+                        }
+                    }
+                    other => other,
+                };
+                match publication {
+                    GoContextPublicationOutcome::Published(identity) => {
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!("go.native_context published={identity:?}")
+                        });
+                        // The head is the membership authority the unit summaries are
+                        // derived from, so they are reconciled after it and never before.
+                        let snapshot = selected_snapshot
+                            .as_ref()
+                            .expect("a published Go context was selected at a snapshot");
+                        // The summaries are optional (readers fall back), so a store error
+                        // here is a diagnostic, not a failure of the activation whose head
+                        // was already published.
+                        let timing =
+                            brokk_bifrost_core::profiling::scope("go.unit_summaries.reconcile");
+                        let reconciliation = store.reconcile_unit_summaries(
                     snapshot,
                     brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
                         context_id: identity.context_id,
@@ -3050,40 +3432,64 @@ mod dependency_packs {
                     },
                     cancellation,
                 );
-                drop(timing);
-                brokk_bifrost_core::profiling::note_with(|| {
-                    format!("go.unit_summaries reconciled={reconciliation:?}")
-                });
-                let failure = match &reconciliation {
-                    Ok(reconciliation) if reconciliation.failed.is_empty() => None,
-                    Ok(reconciliation) => Some(format!(
-                        "Go unit summaries were not published for {:?}",
-                        reconciliation.failed
-                    )),
-                    Err(error) => Some(format!("Go unit summaries were not reconciled: {error}")),
-                };
-                if let Some(message) = failure {
-                    discovered.semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
+                        drop(timing);
+                        brokk_bifrost_core::profiling::note_with(|| {
+                            format!("go.unit_summaries reconciled={reconciliation:?}")
+                        });
+                        let failure = match &reconciliation {
+                            Ok(reconciliation) if reconciliation.failed.is_empty() => None,
+                            Ok(reconciliation) => Some(format!(
+                                "Go unit summaries were not published for {:?}",
+                                reconciliation.failed
+                            )),
+                            Err(error) => {
+                                Some(format!("Go unit summaries were not reconciled: {error}"))
+                            }
+                        };
+                        if let Some(message) = failure {
+                            discovered.semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
                         severity: brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
                         code: "go.unit_summary_failed".into(), dependency_id: None, location: None,
                         message,
                     });
-                }
-            }
-            GoContextPublicationOutcome::Cancelled => {
-                discovered.semantic_packs.cancelled = true;
-                discovered.semantic_packs.complete = false;
-            }
-            GoContextPublicationOutcome::InputsChanged => {
-                discovered.semantic_packs.complete = false;
-                discovered.semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
+                        }
+                    }
+                    GoContextPublicationOutcome::Cancelled => {
+                        discovered.semantic_packs.cancelled = true;
+                        discovered.semantic_packs.complete = false;
+                    }
+                    GoContextPublicationOutcome::InputsChanged => {
+                        discovered.semantic_packs.complete = false;
+                        discovered.semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
                     severity: brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
                     code: "go.native_context_inputs_changed".into(), dependency_id:None, location:None,
                     message:"Go source or configuration no longer matches the selected revision; native package context was not published".into(),
                 });
+                    }
+                }
+                if root_key
+                    .as_ref()
+                    .is_some_and(|key| key.0 == domain.directory && key.1 == domain.gowork_path)
+                {
+                    aggregate = discovered.semantic_packs;
+                }
             }
         }
-        Ok(discovered.semantic_packs)
+        if root_key.is_none() && trigger != GoReconciliationTrigger::SourceChange {
+            aggregate = crate::analyzer::go::dependency_discovery::discover_go_packages(
+                &config.go,
+                project,
+                limits,
+                Some(cancellation),
+            )
+            .semantic_packs;
+        }
+        if !worker_failures.is_empty() {
+            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                format!("Go domain workers failed: {worker_failures:?}"),
+            ));
+        }
+        Ok(aggregate)
     }
 }
 

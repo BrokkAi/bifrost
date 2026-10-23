@@ -95,6 +95,7 @@ mod tests {
         let graph = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -196,6 +197,7 @@ mod tests {
         let graph = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -277,6 +279,7 @@ mod tests {
         let graph = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -376,6 +379,7 @@ mod tests {
         let graph = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -453,6 +457,7 @@ mod tests {
         let graph = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -535,6 +540,7 @@ mod tests {
             "the fixture publishes both declarations before its facts are removed"
         );
         let params = || UsageGraphParams {
+            include_same_owner: false,
             include_tests: true,
             paths: None,
             depth: 1,
@@ -689,6 +695,7 @@ mod tests {
         let rooted = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: Some(vec!["part0/src/lib.rs".to_string()]),
                 depth: 1,
@@ -709,6 +716,7 @@ mod tests {
         let unrooted = usage_graph(
             &rust,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
@@ -1828,6 +1836,7 @@ mod tests {
             let graph = usage_graph(
                 analyzer,
                 UsageGraphParams {
+                    include_same_owner: false,
                     include_tests: true,
                     paths: paths.clone(),
                     depth: 1,

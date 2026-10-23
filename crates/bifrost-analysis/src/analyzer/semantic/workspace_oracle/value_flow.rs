@@ -20,141 +20,78 @@
 //! parse time.
 
 use crate::analyzer::languages::PredeclaredBuiltinQueryStep;
-
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 
 use crate::analyzer::semantic::workspace_oracle::common::Interruption;
-
 use crate::analyzer::semantic::workspace_oracle::common::WorkStager;
-
 use crate::analyzer::semantic::workspace_oracle::common::dedup_evidence;
-
 use crate::analyzer::semantic::workspace_oracle::common::evidence_handle;
-
 use crate::analyzer::semantic::workspace_oracle::common::evidence_quality;
-
 use crate::analyzer::semantic::workspace_oracle::common::internal_contract;
-
 use crate::analyzer::semantic::workspace_oracle::common::value_handle;
 
 use crate::analyzer::semantic::workspace_oracle::RuntimeKeyedReadResult;
-
 use crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
 
 use crate::analyzer::semantic::AbstractObjectIdentity;
-
 use crate::analyzer::semantic::AccessPath;
-
 use crate::analyzer::semantic::AccessPathRoot;
-
 use crate::analyzer::semantic::AccessSelector;
-
 use crate::analyzer::semantic::BindingOriginIndex;
-
 use crate::analyzer::semantic::CallArgumentEndpoint;
-
 use crate::analyzer::semantic::CallArgumentExpansion;
-
 use crate::analyzer::semantic::CallArgumentMapping;
-
 use crate::analyzer::semantic::CallArgumentMember;
-
 use crate::analyzer::semantic::CallBinding;
-
 use crate::analyzer::semantic::CallBindings;
-
 use crate::analyzer::semantic::CallPassingMode;
-
 use crate::analyzer::semantic::CallableTarget;
-
 use crate::analyzer::semantic::CallableTargetResolution;
-
 use crate::analyzer::semantic::CallerReceiverBinding;
-
 use crate::analyzer::semantic::CandidateCoverage;
-
 use crate::analyzer::semantic::CaptureSource;
-
 use crate::analyzer::semantic::DispatchCandidate;
-
 use crate::analyzer::semantic::EvidenceCompleteness;
-
 use crate::analyzer::semantic::FormalMultiplicity;
-
 use crate::analyzer::semantic::HeapOracle;
-
 use crate::analyzer::semantic::ImplicitArgumentKind;
-
 use crate::analyzer::semantic::IndexSelector;
-
 use crate::analyzer::semantic::MemoryLocationId;
-
 use crate::analyzer::semantic::MemoryLocationKind;
-
 use crate::analyzer::semantic::ObjectCardinality;
-
 use crate::analyzer::semantic::OracleCallContext;
-
 use crate::analyzer::semantic::OracleLimits;
-
 use crate::analyzer::semantic::ProcedureCallBoundary;
-
 use crate::analyzer::semantic::ProcedureHandle;
-
 use crate::analyzer::semantic::ProcedurePortHandle;
-
 use crate::analyzer::semantic::ProcedurePortKind;
-
 use crate::analyzer::semantic::ProcedureReceiverBinding;
-
 use crate::analyzer::semantic::ProgramPointHandle;
-
 use crate::analyzer::semantic::ProgramPointId;
-
 use crate::analyzer::semantic::ScopedSemanticLocator;
-
 use crate::analyzer::semantic::SemanticCapability;
-
 use crate::analyzer::semantic::SemanticEffect;
-
 use crate::analyzer::semantic::SemanticGapDischarge;
-
 use crate::analyzer::semantic::SemanticGapImpact;
-
 use crate::analyzer::semantic::SemanticGapKind;
-
 use crate::analyzer::semantic::SemanticGapSubject;
-
 use crate::analyzer::semantic::SemanticLocator;
-
 use crate::analyzer::semantic::SemanticOutcome;
-
 use crate::analyzer::semantic::SemanticProviderError;
-
 use crate::analyzer::semantic::SemanticRequest;
-
 use crate::analyzer::semantic::SemanticValueKind;
-
 use crate::analyzer::semantic::SemanticWork;
-
 use crate::analyzer::semantic::ValueFlowKind;
-
 use crate::analyzer::semantic::ValueFlowOracle;
-
 use crate::analyzer::semantic::ValueFlowSnapshot;
-
 use crate::analyzer::semantic::ValueId;
-
 use crate::analyzer::semantic::ValueTransfer;
-
 use crate::analyzer::semantic::constructor_call_result;
-
 use crate::analyzer::semantic::gap_certifies_canonical_index_identity;
 
 pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::value_flow::*;
 
 use std::collections::HashMap;
-
 use std::collections::HashSet;
 
 use std::sync::Arc;
@@ -636,8 +573,10 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         staged: &mut WorkStager,
         cancellation: &crate::CancellationToken,
     ) -> Result<bool, Interruption> {
-        let Some(support) = language_support(procedure.artifact().key().language().language())
-        else {
+        let Some(support) = language_support_for_hook(
+            procedure.artifact().key().language().language(),
+            "predeclared_builtin_shadow_status_limited",
+        ) else {
             return Ok(false);
         };
         let mut interrupted = None;
@@ -720,7 +659,10 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         else {
             return Ok(refuted);
         };
-        let Some(support) = crate::analyzer::languages::language_support(language) else {
+        let Some(support) = crate::analyzer::languages::language_support_for_hook(
+            language,
+            "call_cannot_reach_catch_parameter",
+        ) else {
             return Ok(refuted);
         };
         let Some((file, source)) =
@@ -2141,8 +2083,10 @@ mod tests {
 
     use crate::analyzer::semantic::workspace_oracle::value_flow::*;
 
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2835: unproven relation evidence masked stronger typed gap quality")]
     fn typed_gap_quality_dominates_unproven_relation_evidence() {
@@ -2159,6 +2103,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2835: quality arbitration must retain the unproven relation floor")]
     fn unproven_relation_evidence_keeps_its_existing_quality_floor() {
@@ -2177,6 +2122,7 @@ mod tests {
         assert_eq!(merge_relation_quality(None, false), None);
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#1407: nested Java/TypeScript access-path cycles did not terminate safely")]
     fn cyclic_load_origins_terminate_with_summary() {
@@ -2226,6 +2172,7 @@ mod tests {
         assert_eq!(draft.tail, AccessPathTail::Summary);
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#1407: ambiguous nested loads must retain the access path as their summary")]
     fn ambiguous_load_origin_summarizes_access_path() {
@@ -2261,6 +2208,7 @@ mod tests {
         assert_eq!(draft.tail, AccessPathTail::Summary);
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#5113: visits to existing memory locations were charged against retained rows")]
     fn nested_access_path_work_never_spends_the_memory_location_grant() {

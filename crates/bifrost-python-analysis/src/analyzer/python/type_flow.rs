@@ -5288,21 +5288,7 @@ fn object_member_lookup(
 }
 
 fn is_builtin_value_class(class: &ClassIdentity) -> bool {
-    matches!(
-        class.qualified_name(),
-        "types.NoneType"
-            | "builtins.bool"
-            | "builtins.int"
-            | "builtins.float"
-            | "builtins.str"
-            | "builtins.bytes"
-            | "builtins.list"
-            | "builtins.tuple"
-            | "builtins.dict"
-            | "builtins.set"
-            | "builtins.frozenset"
-            | "builtins.object"
-    )
+    brokk_bifrost_python::intrinsics::has_fixed_value_class_surface(class.qualified_name())
 }
 
 /// A partial model can prove a direct positive member declaration even when

@@ -115,7 +115,7 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
 
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use brokk_bifrost_core::analyzer::CodeUnitIndex;
@@ -408,8 +408,14 @@ mod tests {
             admitted_callers: HashSet::from_iter([caller.source().clone()]),
             skipped_callers: Default::default(),
             build_selection_unavailable: None,
+            domain_discovery_failures: Vec::new(),
             unresolved_names: Some(BTreeSet::new()),
+            withheld_references: Vec::new(),
+            same_owner_edges: Vec::new(),
             edges: vec![CanonicalWorkspaceUsageProjectedEdge {
+                same_owner_sites: Vec::new(),
+                unproven_same_owner_sites: Vec::new(),
+                unproven_sites: Vec::new(),
                 from,
                 to,
                 counts,
@@ -467,11 +473,14 @@ mod tests {
         SelectedWorkspaceUsageGraphProjection {
             nodes: projection.nodes,
             edges: projection.edges,
+            same_owner_edges: projection.same_owner_edges,
             raw_proven_inbound: projection.raw_proven_inbound,
             admitted_callers: projection.admitted_callers,
             skipped_callers: Default::default(),
             build_selection_unavailable: None,
+            domain_discovery_failures: Vec::new(),
             unresolved_names: projection.unresolved_names,
+            withheld_references: projection.withheld_references,
             forward_completeness: projection.forward_completeness,
             kind_projection_complete: projection.kind_projection_complete,
             generation: CANONICAL_GENERATION,
@@ -530,6 +539,18 @@ mod tests {
             // Repeated raw rows do not increase inbound evidence. An unproven
             // site contributes uncertainty but never a public/ranking edge.
             rows.push(rows[0].clone());
+            for offset in [30_000, 30_001, 30_001] {
+                let mut ownerless = canonical_row(
+                    file,
+                    test_range(offset, offset + 1, 8),
+                    caller,
+                    &target,
+                    Some(ReferenceKind::MethodCall),
+                    UsageProof::Proven,
+                );
+                ownerless.site.enclosing = None;
+                rows.push(ownerless);
+            }
             rows.push(canonical_row(
                 file,
                 test_range(90, 91, 6),
@@ -600,6 +621,10 @@ mod tests {
             assert_eq!(merged.declaration_files, original.declaration_files);
             assert_eq!(merged.truncated_inbound, original.truncated_inbound);
             assert_eq!(merged.unproven_inbound, original.unproven_inbound);
+            assert_eq!(
+                merged.proven_non_graph_inbound_by_file,
+                original.proven_non_graph_inbound_by_file
+            );
         }
         let target_index = aggregate
             .nodes
@@ -611,6 +636,18 @@ mod tests {
             2 * (MAX_CALLSITES / 2 + 1)
         );
         assert_eq!(aggregate.nodes[target_index].unproven_inbound, 2);
+        assert_eq!(
+            aggregate.nodes[target_index]
+                .proven_non_graph_inbound_by_file
+                .len(),
+            2
+        );
+        assert!(
+            aggregate.nodes[target_index]
+                .proven_non_graph_inbound_by_file
+                .values()
+                .all(|count| *count == 2)
+        );
         assert!(aggregate.nodes[target_index].truncated_inbound.is_some());
         assert!(
             aggregate.edges.iter().all(|edge| edge.counts.calls == 1
@@ -1132,7 +1169,18 @@ mod tests {
             .unwrap();
         initial[other_index].unproven_inbound = 3;
         initial[other_index].truncated_inbound = Some(MAX_CALLSITES + 1);
-        let projection = remapping_projection(&caller, &target, UsageReferenceKind::Call);
+        let caller_index = initial
+            .iter()
+            .position(|node| node.primary == caller)
+            .unwrap();
+        initial[caller_index]
+            .proven_non_graph_inbound_by_file
+            .insert(caller.source().clone(), 2);
+        let mut projection = remapping_projection(&caller, &target, UsageReferenceKind::Call);
+        let caller_index = projection.edges[0].from;
+        projection.nodes[caller_index]
+            .proven_non_graph_inbound_by_file
+            .insert(caller.source().clone(), 3);
         let graph = WorkspaceUsageGraph {
             nodes: initial,
             edges: Vec::new(),
@@ -1149,6 +1197,11 @@ mod tests {
             panic!("same-generation mixed graph must merge");
         };
         assert_eq!(merged.nodes.len(), 3);
+        assert_eq!(
+            merged.nodes[node_index(&merged, &caller)].proven_non_graph_inbound_by_file
+                [caller.source()],
+            5
+        );
         assert_eq!(merged.edges.len(), 1);
         assert_eq!(
             merged.nodes[merged.edges[0].from].key.id,
@@ -1380,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_projection_preserves_sorted_sites_and_proof_only_topology() {
+    fn canonical_projection_preserves_sorted_sites_and_separates_ranking_topology() {
         let caller_file = test_file("src/Caller.java");
         let other_file = test_file("src/Other.java");
         let target_file = test_file("src/Target.java");
@@ -1457,8 +1510,12 @@ mod tests {
         ));
 
         assert_eq!(forward.edges, reverse.edges);
-        assert_eq!(1, forward.edges.len());
-        let edge = &forward.edges[0];
+        assert_eq!(2, forward.edges.len());
+        let edge = forward
+            .edges
+            .iter()
+            .find(|edge| !edge.sites.is_empty())
+            .expect("proven ranking edge");
         assert!(
             forward.nodes[edge.from]
                 .declaration_ids
@@ -1473,11 +1530,18 @@ mod tests {
         assert_eq!(1, edge.counts.types);
         assert_eq!(vec![(caller_file.clone(), 7), (caller_file, 8)], edge.sites);
         assert_eq!(1, forward.nodes[edge.to].unproven_inbound);
-        assert!(forward.edges.iter().all(|edge| {
-            !forward.nodes[edge.from]
-                .declaration_ids
-                .contains(&other.declaration_id())
-        }));
+        let candidate = forward
+            .edges
+            .iter()
+            .find(|edge| {
+                forward.nodes[edge.from]
+                    .declaration_ids
+                    .contains(&other.declaration_id())
+            })
+            .expect("unproven public candidate");
+        assert!(candidate.sites.is_empty());
+        assert_eq!(candidate.counts.total(), 0);
+        assert_eq!(candidate.unproven_sites, vec![(other_file, 9)]);
     }
 
     #[test]
@@ -2026,10 +2090,6 @@ mod tests {
         let target = test_unit(&target_file, CodeUnitType::Class, "Target");
         let field_target = test_unit(&target_file, CodeUnitType::Field, "Target.value");
         let field_source = test_unit(&field_source_file, CodeUnitType::Field, "FieldSource.value");
-        let catalog = canonical_catalog([
-            (caller.clone(), vec![test_range(0, 80, 1)]),
-            (target.clone(), vec![test_range(0, 80, 1)]),
-        ]);
         let mut rows = vec![canonical_row(
             &caller_file,
             test_range(100, 106, 7),
@@ -2057,22 +2117,46 @@ mod tests {
             UsageProof::Unproven,
         ));
 
-        let graph =
-            complete_canonical_graph(reduce_canonical_reference_edges_to_workspace_usage_graph(
-                catalog,
-                &rows,
-                &EdgeCompleteness::Complete,
-                &BTreeSet::from([UsageEcosystem::Jvm]),
-                &CancellationToken::default(),
-            ));
-        let target = node_index(&graph, &target);
+        let mut ownerless = canonical_row(
+            &caller_file,
+            test_range(200, 206, 10),
+            &caller,
+            &target,
+            Some(ReferenceKind::MethodCall),
+            UsageProof::Proven,
+        );
+        ownerless.site.enclosing = None;
+        rows.push(ownerless.clone());
+        rows.push(ownerless.clone());
+        ownerless.proof = UsageProof::Unproven;
+        ownerless.site.range = test_range(210, 216, 11);
+        rows.push(ownerless);
+
+        let graph = projected_inventory(
+            [caller, target.clone()],
+            HashSet::from_iter([caller_file.clone(), field_source_file.clone()]),
+            &rows,
+        );
+        let target = graph
+            .nodes
+            .iter()
+            .position(|node| node.primary == target)
+            .unwrap();
         assert_eq!(graph.nodes.len(), 2, "fields are not rankable graph nodes");
         assert_eq!(
             graph.nodes[target].truncated_inbound,
             Some(MAX_CALLSITES + 1),
             "proven field-owned sites count toward the target cap before caller-node rejection"
         );
-        assert_eq!(graph.nodes[target].unproven_inbound, 1);
+        assert_eq!(graph.nodes[target].unproven_inbound, 2);
+        assert_eq!(graph.raw_proven_inbound[target], MAX_CALLSITES + 1);
+        assert_eq!(
+            graph.nodes[target].proven_non_graph_inbound_by_file,
+            std::collections::BTreeMap::from([
+                (caller_file, 1),
+                (field_source_file, MAX_CALLSITES + 1)
+            ])
+        );
         assert!(graph.edges.is_empty(), "field owners never add topology");
     }
 

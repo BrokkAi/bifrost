@@ -47,6 +47,26 @@ request that fails parsing or validation produces a typed outcome and exits
 `invalid-configuration`; invalid repository URLs, digests, SemVer versions, or
 version requirements use `invalid-source`.
 
+## Check admission without acquiring
+
+`bifrost pack-admission` reports which releases `prepare-open-packs` would
+select for a request, without downloading or installing them:
+
+```sh
+bifrost pack-admission --cache-dir DIR --request-path request.json
+```
+
+It uses the same discovery, credentials, environment settings, engine
+compatibility, dependency and qualification checks. Any pack can be the root,
+including `bifrost.public.packs`, which acquisition installs only as a
+dependency of a rules release. The command prints an outcome document to
+standard output. With `status: "admitted"`, `selection` holds the selection
+reason and the root and dependency releases with their manifest digests. With
+`status: "failed"`, `failure` uses the failure classes below. It exits `0`
+when a release is admitted, `1` for a typed failure, and `2` for an invocation
+error. The release gate runs it to check that a candidate engine admits a
+published release of every pack stream.
+
 ## Request document
 
 A request uses `request_schema_version: 1`, a root `pack_id`, its GitHub

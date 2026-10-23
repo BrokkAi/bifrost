@@ -116,7 +116,7 @@ Boundaries](/data-boundaries/) for where the cache lives.
 | Symbols and summaries | `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `classify_test_files(...)` |
 | Declarations, definitions, and types | `get_declarations_by_location(...)`, `get_definitions_by_location(...)`, `get_definitions_by_reference(...)`, `get_type_by_location(...)` |
 | Usages and graph | `scan_usages_by_reference(...)`, `scan_usages_by_location(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)` |
-| Diff review | `analyze_diff(...)`, `blast_radius(...)`, `cyclomatic_complexity(...)`, `missing_tests(...)` |
+| Diff review | `list_function_sources(...)`, `analyze_diff(...)`, `blast_radius(...)`, `cyclomatic_complexity(...)`, `missing_tests(...)` |
 | Code query | `query_code(...)` |
 | Files | `get_file_contents(...)`, `search_file_contents(...)`, `find_files_containing(...)` |
 | Code quality | `compute_cyclomatic_complexity(...)`, `compute_cognitive_complexity(...)`, `report_comment_density_for_code_unit(...)`, `report_comment_density_for_files(...)`, `report_exception_handling_smells(...)`, `report_test_assertion_smells(...)`, `report_structural_clone_smells(...)`, `report_long_method_and_god_object_smells(...)`, `report_dead_code_and_unused_abstraction_smells(...)`, `report_secret_like_code(...)`, `analyze_git_hotspots(...)` |
@@ -180,6 +180,11 @@ does not prove that no build, data, or workflow validation applies to changed
 paths outside analyzer coverage. The `compilation_scope_unresolved` reason
 keeps the proven partial evidence and reports that a language compilation
 boundary could not be fully established.
+
+`list_function_sources(paths=None, *, include_tests=True)` returns the structured
+function inventory as a dictionary: `records` contain identities, indexed blob
+OIDs, declaration coordinates, and exact source including attached comments;
+`summary` reports file/record counts and skipped files.
 
 `cyclomatic_complexity(target=None, *, base=None, include_tests=False)` returns
 `CyclomaticComplexityDiffResult` for functions that the selected endpoints

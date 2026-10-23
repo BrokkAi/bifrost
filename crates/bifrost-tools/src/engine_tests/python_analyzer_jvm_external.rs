@@ -11,7 +11,7 @@ mod python_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use brokk_bifrost_core::analyzer::config::JvmExternalDependencies;
 
@@ -30,7 +30,7 @@ mod python_extraction_tests {
     use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use brokk_bifrost_analysis::analyzer::jvm::external::python_test_support::ExternalJarFixture;
+    use brokk_bifrost_jvm_analysis::analyzer::jvm::external::python_test_support::ExternalJarFixture;
 
     #[test]
     fn java_dependency_discovery_routes_manifest_changes_through_multi_analyzer() {

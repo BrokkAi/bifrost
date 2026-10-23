@@ -1,7 +1,6 @@
 //! Analyzer-owned call relations shared by query traversal and LSP call hierarchy.
 
 use std::sync::Arc;
-
 use std::sync::Mutex;
 
 /// One caller file's speculative native answers, keyed by the exact callee
@@ -27,19 +26,12 @@ pub struct PrefetchedCallFile {
 }
 
 use super::FuzzyResult;
-
 use super::UsageFinder;
-
 use super::UsageHit;
-
 use super::UsageHitKind;
-
 use super::UsageProof;
-
 use super::UsageProofAuthority;
-
 use super::UsageQueryCompletion;
-
 use super::proof_rank;
 
 use crate::analyzer::common::language_for_file;
@@ -47,21 +39,16 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 
 use crate::analyzer::languages::ExternalCalleeFileEvidence;
-
 use crate::analyzer::languages::ExternalCalleeSite;
-
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 
 use crate::analyzer::lexical_definitions::FormalParameterLayout;
-
 use crate::analyzer::lexical_definitions::PythonMethodBinding;
-
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 
 use crate::analyzer::read_ledger::ReadLedger;
 
 use crate::analyzer::semantic::ContentIdentity;
-
 use crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity;
 
 use crate::analyzer::structural::FileFacts;
@@ -69,91 +56,58 @@ use crate::analyzer::structural::FileFacts;
 use crate::analyzer::structural::resolution::BoundaryStatus;
 
 use crate::analyzer::usages::call_binding::OrdinaryFormalSlots;
-
 use crate::analyzer::usages::call_binding::canonical_parameter_name;
 
 use crate::analyzer::usages::call_shape::call_shapes_in_file;
 
 use crate::analyzer::usages::get_definition::CallApplicationKind;
-
 use crate::analyzer::usages::get_definition::CallSiteSyntax;
-
 use crate::analyzer::usages::get_definition::CallSyntaxKind;
-
 use crate::analyzer::usages::get_definition::CallTargetLookupOutcome;
-
 use crate::analyzer::usages::get_definition::DefinitionLookupOutcome;
-
 use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
-
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
 use crate::analyzer::usages::get_definition::ExactCallReference;
-
 use crate::analyzer::usages::get_definition::ExactCallReferenceGap;
-
 use crate::analyzer::usages::get_definition::ExactExternalCallProof;
-
 use crate::analyzer::usages::get_definition::GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND;
-
 use crate::analyzer::usages::get_definition::IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC;
-
 use crate::analyzer::usages::get_definition::LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND;
-
 use crate::analyzer::usages::get_definition::PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC;
-
 use crate::analyzer::usages::get_definition::PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC;
-
 use crate::analyzer::usages::get_definition::call_reference_ranges_in_tree;
-
 use crate::analyzer::usages::get_definition::call_reference_requires_point_lookup;
-
 use crate::analyzer::usages::get_definition::call_site_syntax_for_reference;
-
 use crate::analyzer::usages::get_definition::exact_call_reference_for_call;
-
 use crate::analyzer::usages::get_definition::is_adjudicated_answer_diagnostic_kind;
-
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
-
 use crate::analyzer::usages::get_definition::range_is_call_keyword_label;
-
-use crate::analyzer::usages::get_definition::resolve_call_target_batch_with_source;
-
 use crate::analyzer::usages::get_definition::resolve_definition_batch_with_source;
+use crate::analyzer::usages::get_definition::{
+    resolve_call_target_batch_with_source, resolve_call_target_batch_with_source_tree,
+};
 
 use crate::analyzer::usages::python_class_hierarchy::PythonHierarchyOutcome;
 
 use crate::analyzer::AnalyzerQueryScope;
-
 use crate::analyzer::CodeUnit;
-
 use crate::analyzer::DispatchExtensibility;
-
 use crate::analyzer::IAnalyzer;
-
 use crate::analyzer::Language;
-
 use crate::analyzer::ProjectFile;
-
 use crate::analyzer::QueryScope;
-
 use crate::analyzer::Range;
-
 use crate::analyzer::capture_query_reads;
-
 use crate::analyzer::replay_query_reads;
 
 use crate::cancellation::CancellationToken;
 
 use crate::hash::HashMap;
-
 use crate::hash::HashSet;
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
-
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -410,7 +364,6 @@ pub struct CallDispatchLanguageRequest<'a> {
 }
 
 use brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest;
-
 use brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxStop;
 
 /// File-local syntax authority shared by serial and batched exact dispatch.
@@ -1051,7 +1004,8 @@ impl CallBindingCache {
         let mut languages = HashSet::default();
         for (file, _) in &files {
             if languages.insert(file.language())
-                && let Some(support) = language_support(file.language())
+                && let Some(support) =
+                    language_support_for_hook(file.language(), "prefetch_selected_call_targets")
                 && let Some(result) = support.prefetch_selected_call_targets(
                     workspace,
                     &files,
@@ -1485,6 +1439,26 @@ impl CallDispatchSession {
         max_candidates: usize,
         cancellation: Option<&CancellationToken>,
     ) -> CallDispatchLookup {
+        self.dispatch_at_bounded_with_operation(
+            analyzer,
+            token,
+            call_span,
+            max_candidates,
+            cancellation,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_at_bounded_with_operation<'a>(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
+        call_span: &Range,
+        max_candidates: usize,
+        cancellation: Option<&CancellationToken>,
+        definition_session: Option<&mut super::get_definition::ScalarCallTargetSession<'a>>,
+    ) -> CallDispatchLookup {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return CallDispatchLookup {
                 cancelled: true,
@@ -1569,7 +1543,7 @@ impl CallDispatchSession {
             cancellation,
             work,
         };
-        if let Some(lookup) = language_support(self.language)
+        if let Some(lookup) = language_support_for_hook(self.language, "call_relation_provider")
             .and_then(|support| support.call_relation_provider())
             .and_then(|provider| provider.dispatch_special_call_site(language_request))
         {
@@ -1659,9 +1633,11 @@ impl CallDispatchSession {
                 token,
                 &self.file,
                 Arc::clone(&self.exact_source),
+                &syntax.primary,
                 tree,
                 &references,
                 cancellation,
+                definition_session,
             );
             let cancelled =
                 batch.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
@@ -1757,7 +1733,9 @@ fn refine_selector_call_target_at_call(
     callee_range: &Range,
     cancellation: Option<&CancellationToken>,
 ) {
-    if let Some(support) = language_support(language_for_file(file)) {
+    if let Some(support) =
+        language_support_for_hook(language_for_file(file), "refine_selector_call_target")
+    {
         support.refine_selector_call_target(
             lookup,
             analyzer,
@@ -1885,7 +1863,7 @@ impl CallRelationService {
         let mut resolvable = Vec::with_capacity(call_spans.len());
         for (index, call_span) in call_spans.iter().enumerate() {
             let tree = syntax.tree(call_span);
-            if let Some(lookup) = language_support(language)
+            if let Some(lookup) = language_support_for_hook(language, "call_relation_provider")
                 .and_then(|support| support.call_relation_provider())
                 .and_then(|provider| {
                     provider.dispatch_special_call_site(CallDispatchLanguageRequest {
@@ -1944,8 +1922,10 @@ impl CallRelationService {
             file,
             Arc::clone(&exact_source),
             &syntax.primary,
+            &syntax.primary,
             &references,
             cancellation,
+            None,
         );
         // One memo for the whole file: every site below classifies its callee
         // against the same exact source and admitted syntax forest.
@@ -2152,8 +2132,9 @@ impl CallRelationService {
                 ..CallRelationResult::default()
             });
         }
-        if let Some(provider) = language_support(language_for_file(target.source()))
-            .and_then(|support| support.call_relation_provider())
+        if let Some(provider) =
+            language_support_for_hook(language_for_file(target.source()), "call_relation_provider")
+                .and_then(|support| support.call_relation_provider())
         {
             let mut answer = provider.incoming(analyzer, target, limits, cancellation);
             answer.proof_authority = provider.proof_authority();
@@ -2357,8 +2338,9 @@ impl CallRelationService {
         if !is_call_relation_unit(caller) {
             return CallRelationResult::default();
         }
-        if let Some(provider) = language_support(language_for_file(caller.source()))
-            .and_then(|support| support.call_relation_provider())
+        if let Some(provider) =
+            language_support_for_hook(language_for_file(caller.source()), "call_relation_provider")
+                .and_then(|support| support.call_relation_provider())
         {
             let mut answer = provider.outgoing(analyzer, caller, limits, cancellation);
             answer.proof_authority = provider.proof_authority();
@@ -2458,8 +2440,10 @@ impl CallRelationService {
             caller.source(),
             Arc::clone(&source),
             &tree,
+            &tree,
             &candidates,
             cancellation,
+            None,
         );
         let mut sites = Vec::new();
         let mut syntax_cache = CallSyntaxCache::default();
@@ -2611,14 +2595,17 @@ fn call_target_boundary_evidence(
 /// every range in the caller. Cancellation may shorten the lower-level result
 /// vector, so pairing is retained explicitly rather than silently assuming
 /// one outcome per request.
-fn resolve_call_references_with_source(
-    analyzer: &dyn IAnalyzer,
+#[allow(clippy::too_many_arguments)]
+fn resolve_call_references_with_source<'a>(
+    analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
     source: Arc<str>,
+    primary_tree: &tree_sitter::Tree,
     tree: &tree_sitter::Tree,
     references: &[Range],
     cancellation: Option<&CancellationToken>,
+    definition_session: Option<&mut super::get_definition::ScalarCallTargetSession<'a>>,
 ) -> CallReferenceResolutionBatch {
     let requests = references
         .iter()
@@ -2631,14 +2618,25 @@ fn resolve_call_references_with_source(
                 .then_some(range.end_byte),
         })
         .collect();
-    let outcomes = resolve_call_target_batch_with_source(
-        analyzer,
-        token,
-        requests,
-        file.clone(),
-        source,
-        cancellation,
-    );
+    let outcomes = match definition_session {
+        Some(session) => session.resolve(
+            token,
+            requests,
+            file.clone(),
+            source,
+            primary_tree,
+            cancellation,
+        ),
+        None => resolve_call_target_batch_with_source_tree(
+            analyzer,
+            token,
+            requests,
+            file.clone(),
+            source,
+            Some(primary_tree.clone()),
+            cancellation,
+        ),
+    };
     let resolved = references.iter().copied().zip(outcomes).collect::<Vec<_>>();
     CallReferenceResolutionBatch {
         resolved,
@@ -2784,9 +2782,12 @@ fn expand_imported_external_callee_with_prefetched(
                 identity.clone(),
             )
         }),
-        None => language_support(language_for_file(file)).and_then(|support| {
-            support.expand_imported_external_callee(analyzer, file, text, site)
-        }),
+        None => {
+            language_support_for_hook(language_for_file(file), "expand_imported_external_callee")
+                .and_then(|support| {
+                    support.expand_imported_external_callee(analyzer, file, text, site)
+                })
+        }
     };
     let Some(expanded) = expanded else {
         return ExpandedExternalCallee::unproven(outcome);
@@ -3256,7 +3257,7 @@ fn refine_resolved_call_target_proofs(
     if lookup.status != Some(DefinitionLookupStatus::Resolved) || lookup.targets.is_empty() {
         return;
     }
-    language_support(language)
+    language_support_for_hook(language, "refine_resolved_call_targets")
         .expect("every resolved call language has registered support")
         .refine_resolved_call_targets(analyzer, token, file, site, &mut lookup.targets);
 }
@@ -3317,12 +3318,8 @@ fn csharp_normalized_static_owner(
     let analyzer = analyzer?;
     let (owner, member) =
         crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
-    let is_static = language_support(language)?.external_member_is_static(
-        analyzer,
-        analyzer.semantic_model_overlay(),
-        &owner,
-        &member,
-    );
+    let is_static = language_support_for_hook(language, "external_member_is_static")?
+        .external_member_is_static(analyzer, analyzer.semantic_model_overlay(), &owner, &member);
     is_static
         .is_some_and(|is_static| is_static)
         .then(|| owner.into_boxed_str())
@@ -3388,7 +3385,10 @@ pub fn canonical_external_callee(
     if language == Language::Go {
         return Some(callee_text.to_owned());
     }
-    let support = language_support(language)?;
+    let support = language_support_for_hook(
+        language,
+        "knowledge.publishes_single_segment_external_owners",
+    )?;
     if !support
         .knowledge()
         .publishes_single_segment_external_owners()
@@ -3951,9 +3951,9 @@ pub fn is_call_relation_binding(
     target: &CodeUnit,
 ) -> bool {
     is_call_relation_unit(target)
-        && !language_support(language).is_some_and(|support| {
-            support.call_relation_target_is_conversion(site_kind, namespace, target)
-        })
+        && !language_support_for_hook(language, "call_relation_target_is_conversion").is_some_and(
+            |support| support.call_relation_target_is_conversion(site_kind, namespace, target),
+        )
 }
 
 fn range_key(range: &Range) -> (usize, usize, usize, usize) {
@@ -3982,32 +3982,264 @@ fn sort_and_dedup_sites(sites: &mut Vec<CallSite>) {
 #[doc(hidden)]
 pub mod test_support;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod registry_fixture_support {
+    use super::test_support::*;
+    use super::*;
+    use crate::analyzer::AnalyzerQueryScope;
+
+    use crate::analyzer::Language;
+    use crate::analyzer::QueryScope;
+    use crate::analyzer::TestProject;
+
+    /// A Kotlin workspace whose only external evidence is one activated
+    /// declaration-facts pack. Discovery is explicitly disabled so the
+    /// resolver-proven identity can come only from the pack's declaration.
+    #[doc(hidden)]
+    pub struct KotlinExternalMemberFixture {
+        _temp: tempfile::TempDir,
+        #[doc(hidden)]
+        pub analyzer: crate::analyzer::WorkspaceAnalyzer,
+        #[doc(hidden)]
+        pub root: std::path::PathBuf,
+    }
+    impl KotlinExternalMemberFixture {
+        #[doc(hidden)]
+        pub fn new(source: &str) -> Self {
+            use crate::analyzer::semantic_model::{
+                CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+                SemanticModelActivationEvidence, SemanticModelActivationRequest,
+                SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+                SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+                SessionPackSource, SessionPackSourceKind, SourceFormat,
+                acquire_active_semantic_models_with_evidence, compile_source,
+            };
+
+            use crate::analyzer::{
+                AnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
+                JvmDependencyDiscoveryMode, JvmStandardLibraryDiscoveryConfig, WorkspaceAnalyzer,
+            };
+
+            let temp = tempfile::tempdir().expect("temp dir");
+            let root = temp.path().canonicalize().expect("canonical temp dir");
+            ProjectFile::new(root.clone(), "App.kt")
+                .write(source)
+                .expect("write Kotlin fixture");
+
+            let type_id = "fixture.kotlin.external.ext";
+            let pack = serde_json::json!({
+                "schema_version": 2,
+                "pack_id": "fixture.kotlin-external",
+                "version": "1.0.0",
+                "producer": { "name": "kotlin-dispatch-fixture", "version": "1.0.0" },
+                "language": "kotlin",
+                "ecosystem": "maven",
+                "compatibility": { "bifrost": "*", "toolchains": [] },
+                "provenance": { "source": "fixture" },
+                "license": "NOASSERTION",
+                "completeness": "partial",
+                "safety": { "generated_code_only": false, "review_required": false },
+                "shards": [{
+                    "id": "declarations.fixture.kotlin-external",
+                    "activation": [{ "package": { "name": "com.example.ext" } }],
+                    "payload": {
+                        "kind": "declaration_facts",
+                        "types": [{
+                            "id": type_id,
+                            "name": "com.example.ext.Ext",
+                            "type_kind": "class",
+                            "visibility": "public",
+                            "hierarchy": [],
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "fixture-source",
+                                "symbol": "com.example.ext.Ext"
+                            }
+                        }],
+                        "members": [{
+                            "id": "fixture.kotlin.external.ext.wrap",
+                            "owner": type_id,
+                            "name": "wrap",
+                            "member_kind": "method",
+                            "visibility": "public",
+                            "is_static": false,
+                            "signature": {
+                                "type_parameters": [],
+                                "parameters": [{
+                                    "name": "value",
+                                    "type": {
+                                        "kind": "named",
+                                        "name": "kotlin.String",
+                                        "arguments": [],
+                                        "nullable": false
+                                    },
+                                    "optional": false,
+                                    "variadic": false
+                                }],
+                                "returns": {
+                                    "kind": "named",
+                                    "name": "kotlin.String",
+                                    "arguments": [],
+                                    "nullable": false
+                                }
+                            },
+                            "locator": {
+                                "kind": "artifact",
+                                "path": "fixture-source",
+                                "symbol": "com.example.ext.Ext.wrap"
+                            }
+                        }],
+                        "relations": []
+                    }
+                }]
+            });
+            let pack = compile_source(
+                SourceFormat::Json,
+                &serde_json::to_vec(&pack).expect("serialize Kotlin declaration fixture"),
+                &CompilerOptions::default(),
+            )
+            .unwrap_or_else(|diagnostics| {
+                panic!("Kotlin declaration fixture must compile: {diagnostics:#?}")
+            });
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+                .expect("open ephemeral semantic-pack catalog");
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: "fixture.kotlin-external".to_owned(),
+                    },
+                )
+                .expect("register Kotlin declaration fixture");
+
+            let project = TestProject::new(root.clone(), Language::Kotlin);
+            let config = AnalyzerConfig {
+                jvm: JvmAnalyzerConfig {
+                    dependency_discovery: JvmDependencyDiscoveryConfig {
+                        mode: JvmDependencyDiscoveryMode::Disabled,
+                        ..JvmDependencyDiscoveryConfig::default()
+                    },
+                    standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                        discover_java_home: false,
+                        ..JvmStandardLibraryDiscoveryConfig::default()
+                    },
+                    ..JvmAnalyzerConfig::default()
+                },
+                ..AnalyzerConfig::default()
+            };
+            let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::new(project), config)
+                .expect("build ephemeral Kotlin workspace");
+
+            let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
+                bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                    .expect("crate version parses"),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "kotlin".to_owned(),
+                    ecosystem: "maven".to_owned(),
+                    package: Some(crate::analyzer::semantic_model::CatalogCoordinate {
+                        name: "com.example.ext".to_owned(),
+                        version: None,
+                    }),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: vec![SemanticModelActivationControl {
+                    scope: SemanticModelControlScope::Workspace,
+                    action: SemanticModelControlAction::Enable,
+                    selector: SemanticModelPackSelector {
+                        pack_id: "fixture.kotlin-external".to_owned(),
+                        version: None,
+                        manifest_digest: None,
+                    },
+                }],
+                limits: SemanticModelRuntimeLimits::default(),
+            };
+            let SemanticModelRuntimeOutcome::Ready { .. } =
+                acquire_active_semantic_models_with_evidence(
+                    analyzer.analyzer(),
+                    &catalog,
+                    None,
+                    &request,
+                    None,
+                    &CancellationToken::new(),
+                )
+            else {
+                panic!("Kotlin declaration fixture must activate");
+            };
+            assert!(analyzer.analyzer().semantic_model_overlay().is_some());
+
+            Self {
+                _temp: temp,
+                analyzer,
+                root,
+            }
+        }
+    }
+    #[doc(hidden)]
+    pub fn dispatch_kotlin_call(source: &str, call: &str) -> CallDispatchLookup {
+        let fixture = KotlinExternalMemberFixture::new(source);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.root, "App.kt"),
+                call_span: call_span(source, call),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        )
+    }
+    #[doc(hidden)]
+    pub fn dispatch_kotlin_external_member(callee: &str) {
+        let imported = callee == "Ext.wrap";
+        let import = imported.then_some("import com.example.ext.Ext\n\n");
+        let call = format!("{callee}(value)");
+        let source = format!(
+            "package app\n\n{}fun caller(value: String): String = {call}\n",
+            import.unwrap_or_default(),
+        );
+        let lookup = dispatch_kotlin_call(&source, &call);
+
+        assert!(
+            lookup.targets.is_empty(),
+            "an external declaration is not a workspace target: {lookup:#?}"
+        );
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("com.example.ext.Ext.wrap".into()),
+                normalized_static_owner: None,
+                external_callee_identity: None,
+            }],
+            "the resolver-proven external member must retain its package-rooted identity: {lookup:#?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::test_support::*;
-
     use super::*;
 
     use crate::analyzer::CodeUnitType;
 
     use crate::analyzer::Language;
 
-    use crate::analyzer::TestProject;
-
     use crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic;
-
     use crate::analyzer::usages::get_definition::DefinitionLookupOutcome;
-
-    use crate::analyzer::AnalyzerQueryScope;
-
-    use crate::analyzer::QueryScope;
-
-    use crate::test_support::AnalyzerFixture;
 
     use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
 
     use std::collections::BTreeSet;
 
+    #[cfg(test)]
     #[test]
     fn incomplete_call_hits_preserve_proof_and_semantic_diagnostics() {
         let file = ProjectFile::new(std::env::temp_dir(), "incomplete_calls.rs");
@@ -4049,6 +4281,7 @@ mod tests {
         assert!(diagnostics[0].message.contains("unsupported_reference"));
     }
 
+    #[cfg(test)]
     #[brokk_bifrost_test_macros::hardwon(
         "65290303b8a6: C++ navigation uncertainty used to discard candidate call targets instead of retaining them as unproven"
     )]
@@ -4138,57 +4371,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scala_outgoing_relations_keep_nested_partial_function_and_given_calls_separate() {
-        let source = r#"
-package example
-
-object Calls {
-  def nestedCall(): Int = 1
-  def matchCall(): Int = 2
-  def directCall(): Int = 3
-
-  def outer(value: Int): Int = {
-    val partial: PartialFunction[Int, Int] = { case _ => nestedCall() }
-    given generated: Int = nestedCall()
-    val matched = value match { case _ => matchCall() }
-    directCall()
-  }
-}
-"#;
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Scala, &[("Calls.scala", source)]);
-        let analyzer = fixture.analyzer.analyzer();
-        let caller = analyzer
-            .definitions("example.Calls$.outer")
-            .next()
-            .expect("Scala caller");
-
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let relation = CallRelationService::outgoing_bounded(
-            analyzer,
-            token,
-            &caller,
-            generous_limits(),
-            None,
-        );
-        let callees = relation
-            .sites
-            .iter()
-            .map(|site| site.callee.fq_name())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            callees,
-            vec![
-                "example.Calls$.matchCall".to_string(),
-                "example.Calls$.directCall".to_string(),
-            ],
-            "{relation:#?}"
-        );
-    }
-
+    #[cfg(test)]
     #[brokk_bifrost_test_macros::hardwon(
         "adf896b7d160: ambiguous TypeScript dispatch dropped candidate declarations and empty-boundary status evidence"
     )]
@@ -4352,6 +4535,7 @@ object Calls {
         }
     }
 
+    #[cfg(test)]
     #[brokk_bifrost_test_macros::hardwon(
         "#2579: unresolved residuals lost a structured target needed to bind modeled effects"
     )]
@@ -4415,6 +4599,7 @@ object Calls {
         );
     }
 
+    #[cfg(test)]
     #[brokk_bifrost_test_macros::hardwon(
         "2b11cc505fc4: a Kotlin receiver expression could be mistaken for a package-rooted external identity"
     )]
@@ -4438,313 +4623,7 @@ object Calls {
         }
     }
 
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2823: Kotlin unknown receiver chain stays without an external identity when structured receiver resolution is incomplete"
-    )]
-    #[test]
-    fn kotlin_unknown_receiver_chain_stays_identityless() {
-        let source = r#"package app
-
-class Holder(val value: MissingType)
-
-fun caller(holder: Holder): String = holder.value.toString()
-"#;
-        let call = "holder.value.toString()";
-        let fixture = AnalyzerFixture::new_for_language(Language::Kotlin, &[("App.kt", source)]);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let lookup = CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            scope.token(),
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.project_root(), "App.kt"),
-                call_span: call_span(source, call),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        );
-
-        assert!(lookup.targets.is_empty(), "{lookup:#?}");
-        assert!(
-            lookup.boundaries.iter().all(|boundary| !matches!(
-                boundary,
-                CallDispatchBoundaryKind::External {
-                    callee_text: Some(_),
-                    ..
-                }
-            )),
-            "an unknown Kotlin receiver chain must not become bindable: {lookup:#?}"
-        );
-    }
-
-    /// A Kotlin workspace whose only external evidence is one activated
-    /// declaration-facts pack. Discovery is explicitly disabled so the
-    /// resolver-proven identity can come only from the pack's declaration.
-    struct KotlinExternalMemberFixture {
-        _temp: tempfile::TempDir,
-        analyzer: crate::analyzer::WorkspaceAnalyzer,
-        root: std::path::PathBuf,
-    }
-
-    impl KotlinExternalMemberFixture {
-        fn new(source: &str) -> Self {
-            use crate::analyzer::semantic_model::{
-                CatalogOptions, CompilerOptions, SemanticModelActivationControl,
-                SemanticModelActivationEvidence, SemanticModelActivationRequest,
-                SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
-                SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-                SessionPackSource, SessionPackSourceKind, SourceFormat,
-                acquire_active_semantic_models_with_evidence, compile_source,
-            };
-            use crate::analyzer::{
-                AnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-                JvmDependencyDiscoveryMode, JvmStandardLibraryDiscoveryConfig, WorkspaceAnalyzer,
-            };
-
-            let temp = tempfile::tempdir().expect("temp dir");
-            let root = temp.path().canonicalize().expect("canonical temp dir");
-            ProjectFile::new(root.clone(), "App.kt")
-                .write(source)
-                .expect("write Kotlin fixture");
-
-            let type_id = "fixture.kotlin.external.ext";
-            let pack = serde_json::json!({
-                "schema_version": 2,
-                "pack_id": "fixture.kotlin-external",
-                "version": "1.0.0",
-                "producer": { "name": "kotlin-dispatch-fixture", "version": "1.0.0" },
-                "language": "kotlin",
-                "ecosystem": "maven",
-                "compatibility": { "bifrost": "*", "toolchains": [] },
-                "provenance": { "source": "fixture" },
-                "license": "NOASSERTION",
-                "completeness": "partial",
-                "safety": { "generated_code_only": false, "review_required": false },
-                "shards": [{
-                    "id": "declarations.fixture.kotlin-external",
-                    "activation": [{ "package": { "name": "com.example.ext" } }],
-                    "payload": {
-                        "kind": "declaration_facts",
-                        "types": [{
-                            "id": type_id,
-                            "name": "com.example.ext.Ext",
-                            "type_kind": "class",
-                            "visibility": "public",
-                            "hierarchy": [],
-                            "locator": {
-                                "kind": "artifact",
-                                "path": "fixture-source",
-                                "symbol": "com.example.ext.Ext"
-                            }
-                        }],
-                        "members": [{
-                            "id": "fixture.kotlin.external.ext.wrap",
-                            "owner": type_id,
-                            "name": "wrap",
-                            "member_kind": "method",
-                            "visibility": "public",
-                            "is_static": false,
-                            "signature": {
-                                "type_parameters": [],
-                                "parameters": [{
-                                    "name": "value",
-                                    "type": {
-                                        "kind": "named",
-                                        "name": "kotlin.String",
-                                        "arguments": [],
-                                        "nullable": false
-                                    },
-                                    "optional": false,
-                                    "variadic": false
-                                }],
-                                "returns": {
-                                    "kind": "named",
-                                    "name": "kotlin.String",
-                                    "arguments": [],
-                                    "nullable": false
-                                }
-                            },
-                            "locator": {
-                                "kind": "artifact",
-                                "path": "fixture-source",
-                                "symbol": "com.example.ext.Ext.wrap"
-                            }
-                        }],
-                        "relations": []
-                    }
-                }]
-            });
-            let pack = compile_source(
-                SourceFormat::Json,
-                &serde_json::to_vec(&pack).expect("serialize Kotlin declaration fixture"),
-                &CompilerOptions::default(),
-            )
-            .unwrap_or_else(|diagnostics| {
-                panic!("Kotlin declaration fixture must compile: {diagnostics:#?}")
-            });
-            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-                .expect("open ephemeral semantic-pack catalog");
-            catalog
-                .register_session_pack(
-                    &pack,
-                    &SessionPackSource {
-                        kind: SessionPackSourceKind::Embedded,
-                        source_id: "fixture.kotlin-external".to_owned(),
-                    },
-                )
-                .expect("register Kotlin declaration fixture");
-
-            let project = TestProject::new(root.clone(), Language::Kotlin);
-            let config = AnalyzerConfig {
-                jvm: JvmAnalyzerConfig {
-                    dependency_discovery: JvmDependencyDiscoveryConfig {
-                        mode: JvmDependencyDiscoveryMode::Disabled,
-                        ..JvmDependencyDiscoveryConfig::default()
-                    },
-                    standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
-                        discover_java_home: false,
-                        ..JvmStandardLibraryDiscoveryConfig::default()
-                    },
-                    ..JvmAnalyzerConfig::default()
-                },
-                ..AnalyzerConfig::default()
-            };
-            let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::new(project), config)
-                .expect("build ephemeral Kotlin workspace");
-
-            let request = SemanticModelActivationRequest {
-                bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
-                    .expect("crate version parses"),
-                evidence: vec![SemanticModelActivationEvidence {
-                    language: "kotlin".to_owned(),
-                    ecosystem: "maven".to_owned(),
-                    package: Some(crate::analyzer::semantic_model::CatalogCoordinate {
-                        name: "com.example.ext".to_owned(),
-                        version: None,
-                    }),
-                    module: None,
-                    toolchain: None,
-                    target: None,
-                    configuration: None,
-                    artifact_sha256: None,
-                }],
-                controls: vec![SemanticModelActivationControl {
-                    scope: SemanticModelControlScope::Workspace,
-                    action: SemanticModelControlAction::Enable,
-                    selector: SemanticModelPackSelector {
-                        pack_id: "fixture.kotlin-external".to_owned(),
-                        version: None,
-                        manifest_digest: None,
-                    },
-                }],
-                limits: SemanticModelRuntimeLimits::default(),
-            };
-            let SemanticModelRuntimeOutcome::Ready { .. } =
-                acquire_active_semantic_models_with_evidence(
-                    analyzer.analyzer(),
-                    &catalog,
-                    None,
-                    &request,
-                    None,
-                    &CancellationToken::new(),
-                )
-            else {
-                panic!("Kotlin declaration fixture must activate");
-            };
-            assert!(analyzer.analyzer().semantic_model_overlay().is_some());
-
-            Self {
-                _temp: temp,
-                analyzer,
-                root,
-            }
-        }
-    }
-
-    fn dispatch_kotlin_call(source: &str, call: &str) -> CallDispatchLookup {
-        let fixture = KotlinExternalMemberFixture::new(source);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        CallRelationService::dispatch_at_bounded(
-            fixture.analyzer.analyzer(),
-            scope.token(),
-            &ExactCallLocation {
-                file: ProjectFile::new(fixture.root, "App.kt"),
-                call_span: call_span(source, call),
-            },
-            Arc::from(source),
-            generous_limits(),
-            None,
-        )
-    }
-
-    fn dispatch_kotlin_external_member(callee: &str) {
-        let imported = callee == "Ext.wrap";
-        let import = imported.then_some("import com.example.ext.Ext\n\n");
-        let call = format!("{callee}(value)");
-        let source = format!(
-            "package app\n\n{}fun caller(value: String): String = {call}\n",
-            import.unwrap_or_default(),
-        );
-        let lookup = dispatch_kotlin_call(&source, &call);
-
-        assert!(
-            lookup.targets.is_empty(),
-            "an external declaration is not a workspace target: {lookup:#?}"
-        );
-        assert_eq!(
-            lookup.boundaries,
-            vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("com.example.ext.Ext.wrap".into()),
-                normalized_static_owner: None,
-                external_callee_identity: None,
-            }],
-            "the resolver-proven external member must retain its package-rooted identity: {lookup:#?}"
-        );
-    }
-
-    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2823: An imported Kotlin external member resolves through an activated declaration pack and publishes the canonical package identity"
-    )]
-    #[test]
-    fn kotlin_imported_external_member_publishes_resolver_proven_identity() {
-        dispatch_kotlin_external_member("Ext.wrap");
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#2823: A fully qualified Kotlin external member resolves to the same pack-backed identity without an import binder"
-    )]
-    #[test]
-    fn kotlin_fully_qualified_external_member_publishes_resolver_proven_identity() {
-        dispatch_kotlin_external_member("com.example.ext.Ext.wrap");
-    }
-
-    #[test]
-    fn kotlin_concrete_receiver_local_binding_publishes_external_identity() {
-        let source = "package app\n\nimport com.example.ext.Ext\n\nfun caller(value: String): String {\n    val ext = Ext(value)\n    return ext.wrap(value)\n}\n";
-        let call = "ext.wrap(value)";
-        let lookup = dispatch_kotlin_call(source, call);
-
-        assert!(
-            lookup.targets.is_empty(),
-            "an external declaration is not a workspace target: {lookup:#?}"
-        );
-        assert_eq!(
-            lookup.status,
-            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
-            "the external receiver must report the import-boundary status: {lookup:#?}"
-        );
-        assert_eq!(
-            lookup.boundaries,
-            vec![CallDispatchBoundaryKind::External {
-                callee_text: Some("com.example.ext.Ext.wrap".into()),
-                normalized_static_owner: None,
-                external_callee_identity: None,
-            }],
-            "a caller-local value constructed from the imported external type must keep its package-rooted identity: {lookup:#?}"
-        );
-    }
-
+    #[cfg(test)]
     #[test]
     fn ambiguous_outgoing_advisory_requires_every_candidate_to_survive() {
         let temp = tempfile::tempdir().expect("temp dir");

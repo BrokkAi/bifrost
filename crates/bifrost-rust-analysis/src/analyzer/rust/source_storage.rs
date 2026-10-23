@@ -436,7 +436,8 @@ impl RustSourceStorage for AnalyzerStore {
             let mut context_indices = HashMap::default();
             let mut statement = tx.prepare_cached(
                 "SELECT occurrence_id, ordinal, parent_occurrence_id,
-                        owner_declaration_id, context_kind
+                        owner_declaration_id, context_kind,
+                        json(expanding_attribute_starts)
                    FROM source_rust_item_contexts
                   WHERE blob_id = ?1 ORDER BY ordinal",
             )?;
@@ -481,11 +482,31 @@ impl RustSourceStorage for AnalyzerStore {
                     }
                     _ => {}
                 }
+                let expanding_attribute_starts = row
+                    .get::<_, Option<String>>(5)?
+                    .ok_or_else(|| {
+                        StoreError::new(format!(
+                            "published Rust blob has unavailable expanding-attribute context facts: context={context:?}"
+                        ))
+                    })?;
+                let expanding_attribute_starts: Vec<usize> =
+                    serde_json::from_str(&expanding_attribute_starts).map_err(|error| {
+                        StoreError::corrupt(format!(
+                            "invalid Rust expanding-attribute context starts for context={context:?}: {error}"
+                        ))
+                    })?;
+                assert!(
+                    expanding_attribute_starts
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1]),
+                    "Rust expanding-attribute context starts ascend: context={context:?}, starts={expanding_attribute_starts:?}"
+                );
                 let fact = RustSourceContextFact {
                     context,
                     parent,
                     owner,
                     kind,
+                    expanding_attribute_starts,
                 };
                 if context_indices.insert(context, ordinal).is_some() {
                     return Err(StoreError::new(format!(

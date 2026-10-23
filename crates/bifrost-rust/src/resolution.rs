@@ -372,6 +372,7 @@ pub(crate) struct RustResolutionBuilder<'source> {
     lowered_type_application_arguments: HashSet<(ResolutionTypeSlotId, u32)>,
     consumed_subtrees: HashSet<usize>,
     pending_glob_imports: Vec<ResolutionSiteId>,
+    conditional_imports: HashSet<ResolutionSiteId>,
     // Syntax primitive seeds are provisional until all hoisted binders and
     // imports in this blob have been collected. Literal seeds are never here.
     pending_primitive_seeds: Vec<PendingPrimitiveSeed>,
@@ -524,6 +525,7 @@ impl<'source> RustResolutionBuilder<'source> {
             lowered_type_application_arguments: HashSet::new(),
             consumed_subtrees: HashSet::new(),
             pending_glob_imports: Vec::new(),
+            conditional_imports: HashSet::new(),
             pending_primitive_seeds: Vec::new(),
             pending_primitive_nominal_slots: Vec::new(),
             extern_crate_bindings: Vec::new(),
@@ -7632,6 +7634,9 @@ impl<'source> RustResolutionBuilder<'source> {
             }
 
             let site = self.add_site(node, ResolutionSiteKind::ImportDeclaration, root_scope);
+            if projected.cfg_condition != RustCfgCondition::Always {
+                self.conditional_imports.insert(site);
+            }
             self.facts.root_imports.push(ResolutionRootImportFact {
                 site,
                 root_scope,
@@ -7793,10 +7798,13 @@ impl<'source> RustResolutionBuilder<'source> {
     }
 
     fn lower_glob_import_demands(&mut self) {
+        // An unconditional named import wins in every selected cfg context.
+        // Conditional imports keep their glob alternatives until selection.
         let explicit_demands = self
             .facts
             .root_import_demands
             .iter()
+            .filter(|demand| !self.conditional_imports.contains(&demand.import_site))
             .map(|demand| {
                 (
                     self.facts.sites[demand.import_site.index()].scope,
@@ -10702,7 +10710,18 @@ pub(crate) fn rust_item_effective_attributes<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<Vec<RustEffectiveItemAttribute<'tree>>> {
-    let mut pending = crate::syntax::outer_attributes(node)
+    rust_effective_attributes(crate::syntax::outer_attributes(node), source)
+}
+
+/// Return the effective attributes authored by `attribute_items`, recursively
+/// expanding each `cfg_attr` payload with an explicit worklist. A malformed
+/// attribute shape returns `None`.
+fn rust_effective_attributes<'tree>(
+    attribute_items: impl IntoIterator<Item = Node<'tree>>,
+    source: &str,
+) -> Option<Vec<RustEffectiveItemAttribute<'tree>>> {
+    let mut pending = attribute_items
+        .into_iter()
         .map(|attribute_item| {
             let attribute = attribute_item.named_child(0)?;
             let path = attribute.named_child(0)?;
@@ -10730,6 +10749,58 @@ pub(crate) fn rust_item_effective_attributes<'tree>(
         }
     }
     Some(effective)
+}
+
+/// Built-in attributes rustc resolves before path-based scope lookup.
+///
+/// A same-named import is an ambiguity error rather than a shadowing macro, and
+/// none of these attributes expands to code. `test`, `global_allocator` and
+/// `alloc_error_handler` are absent because they are prelude attribute macros
+/// that an import can shadow.
+const RUST_INERT_BUILTIN_ATTRIBUTES: &[&str] = &[
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "doc",
+    "repr",
+    "deprecated",
+    "must_use",
+    "inline",
+    "cold",
+    "track_caller",
+    "target_feature",
+    "no_mangle",
+    "export_name",
+    "link_name",
+    "link",
+    "link_section",
+    "used",
+    "non_exhaustive",
+    "path",
+    "macro_export",
+    "automatically_derived",
+    "panic_handler",
+    "proc_macro",
+    "proc_macro_attribute",
+    "proc_macro_derive",
+    "ignore",
+    "should_panic",
+];
+
+/// Whether an `unsafe(...)` attribute wrapper contains a built-in codegen
+/// attribute rather than a procedural macro that can replace the item.
+fn rust_unsafe_attribute_is_inert(arguments: Option<Node<'_>>, source: &str) -> bool {
+    arguments
+        .and_then(|arguments| arguments.named_child(0))
+        .is_some_and(|inner| {
+            inner.kind() == "identifier"
+                && matches!(
+                    rust_node_text(inner, source),
+                    "no_mangle" | "export_name" | "link_section" | "naked"
+                )
+        })
 }
 
 /// Parse a `cfg_attr` token tree's comma-separated inner attribute groups.
@@ -10839,15 +10910,7 @@ fn rust_item_attribute_boundary(node: Node<'_>, source: &str) -> RustItemAttribu
             "macro_use" if node.kind() == "mod_item" => {}
             // Rust's unsafe attribute wrapper contains a built-in codegen
             // attribute, not a procedural macro that can replace this item.
-            "unsafe"
-                if attribute
-                    .arguments
-                    .and_then(|arguments| arguments.named_child(0))
-                    .is_some_and(|inner| {
-                        inner.kind() == "identifier"
-                            && matches!(rust_node_text(inner, source),
-                                "no_mangle" | "export_name" | "link_section" | "naked")
-                    }) => {}
+            "unsafe" if rust_unsafe_attribute_is_inert(attribute.arguments, source) => {}
             "derive" => boundary = RustItemAttributeBoundary::GeneratedSurface,
             "serde" => {
                 if rust_item_has_serde_derive(node, source) {
@@ -10869,45 +10932,21 @@ fn rust_item_attribute_boundary(node: Node<'_>, source: &str) -> RustItemAttribu
                     "a cfg-owned Rust item is handled before attribute boundaries"
                 );
             }
-            "allow"
-            | "warn"
-            | "deny"
-            | "forbid"
-            | "expect"
-            | "doc"
-            | "repr"
-            | "deprecated"
-            | "must_use"
-            | "inline"
-            | "cold"
-            | "track_caller"
-            | "target_feature"
-            | "no_mangle"
-            | "export_name"
-            | "link_name"
-            | "link"
-            | "link_section"
-            | "used"
-            | "non_exhaustive"
-            | "path"
-            | "macro_export"
-            | "automatically_derived"
-            | "global_allocator"
-            | "panic_handler"
-            | "alloc_error_handler"
-            // The three procedural-macro entry-point attributes are built in.
-            // They mark the function as a macro the crate publishes; they do
-            // not replace it, and the body below them is the body rustc
-            // compiles. Treating them as unknown skipped the declaration, so a
-            // proc-macro crate exported nothing at all and
-            // `rocket_codegen::routes` was a name no crate row carried.
-            | "proc_macro"
-            | "proc_macro_attribute"
-            | "proc_macro_derive"
-            // Test-harness controls are inert: they do not replace the body.
-            | "ignore"
-            | "should_panic"
-            | "test" => {}
+            // These three are prelude attribute macros that an import can
+            // shadow, so they remain hazards for the expansion proof, but the
+            // boundary still accepts them as inert: they do not replace the
+            // authored declaration.
+            "global_allocator" | "alloc_error_handler" | "test" => {}
+            // Everything else in the built-in list is inert, including the
+            // three procedural-macro entry-point attributes (`proc_macro`,
+            // `proc_macro_attribute`, `proc_macro_derive`). They mark the
+            // function as a macro the crate publishes; they do not replace it,
+            // and the body below them is the body rustc compiles. Treating them
+            // as unknown skipped the declaration, so a proc-macro crate
+            // exported nothing at all and `rocket_codegen::routes` was a name
+            // no crate row carried. Test-harness controls (`ignore`,
+            // `should_panic`) are inert too: they do not replace the body.
+            name if RUST_INERT_BUILTIN_ATTRIBUTES.contains(&name) => {}
             _ => {
                 if has_nonempty_derive && !rust_item_scope_binds(node, source, name) {
                     conditional_helpers.push(name.to_owned());
@@ -10924,6 +10963,50 @@ fn rust_item_attribute_boundary(node: Node<'_>, source: &str) -> RustItemAttribu
         RustItemAttributeBoundary::ConditionalDeriveHelpers(conditional_helpers)
     } else {
         boundary
+    }
+}
+
+/// Whether one source `attribute_item` or `inner_attribute_item` may expand to
+/// code.
+///
+/// The published start bytes feed a textual macro-scope closure proof: a
+/// reverse-inventory resolver needs to know that no earlier attribute in a
+/// lexical scope prefix can generate a `macro_rules!`. An attribute shape this
+/// function cannot classify is therefore a hazard, not inert. Malformed
+/// attributes are hazards too.
+pub(crate) fn rust_attribute_item_can_expand(attribute_item: Node<'_>, source: &str) -> bool {
+    let Some(attributes) = rust_effective_attributes(std::iter::once(attribute_item), source)
+    else {
+        return true;
+    };
+    attributes
+        .iter()
+        .any(|attribute| !rust_effective_attribute_is_inert(attribute, source))
+}
+
+/// Whether one effective attribute provably expands to no code.
+///
+/// Tool attributes, `cfg` (which only removes code), the inert built-ins, and
+/// the inert `unsafe(...)` codegen wrapper are safe. Everything else,
+/// including `derive`, `macro_use`, the prelude attribute macros, scoped paths
+/// and unknown names, may expand to code.
+fn rust_effective_attribute_is_inert(
+    attribute: &RustEffectiveItemAttribute<'_>,
+    source: &str,
+) -> bool {
+    let path = &attribute.path;
+    if rust_tool_attribute_path(path, source) {
+        return true;
+    }
+    if path.len() != 1 || path[0].kind() != "identifier" {
+        return false;
+    }
+    let name = strip_raw_identifier_prefix(rust_node_text(path[0], source).trim());
+    match name {
+        "cfg" => true,
+        "unsafe" => rust_unsafe_attribute_is_inert(attribute.arguments, source),
+        name if RUST_INERT_BUILTIN_ATTRIBUTES.contains(&name) => true,
+        _ => false,
     }
 }
 

@@ -4,7 +4,7 @@ use crate::analyzer::common::IdentifierSeek;
 use crate::analyzer::common::decorated_identifier_seeks;
 use crate::analyzer::common::language_for_file;
 
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 
 use crate::analyzer::lexical_definitions::LexicalBindingResolution;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
@@ -15,18 +15,11 @@ use crate::analyzer::read_ledger::ReadKey;
 
 use crate::analyzer::usages::common::namespace_prefixes;
 
-use crate::analyzer::usages::inverted_edges::first_precise;
-
-use crate::analyzer::usages::local_inference::LocalInferenceConfig;
-use crate::analyzer::usages::local_inference::LocalInferenceEngine;
-
-use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
 
 pub(crate) use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 pub(crate) use crate::analyzer::usages::reference_site::SourceLocationRequest;
 pub(crate) use crate::analyzer::usages::reference_site::resolve_reference_site_with_line_starts;
-pub(crate) use crate::analyzer::usages::reference_site::smallest_named_node_covering;
 
 use crate::analyzer::QueryScope;
 use crate::analyzer::QueryToken;
@@ -46,11 +39,10 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::CodeUnit;
 use crate::analyzer::DispatchExtensibility;
 use crate::analyzer::IAnalyzer;
-use crate::analyzer::ImportAnalysisProvider;
+
 use crate::analyzer::Language;
 use crate::analyzer::ProjectFile;
 use crate::analyzer::Range;
-use crate::analyzer::resolve_analyzer;
 
 use crate::cancellation::CancellationToken;
 
@@ -64,7 +56,6 @@ use crate::path_utils::rel_path_string;
 use crate::profiling;
 
 use crate::text_utils::compute_line_starts;
-use crate::text_utils::find_line_index_for_offset;
 
 use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
 use brokk_bifrost_core::analyzer::weighted_cache::weight_source_text;
@@ -187,7 +178,8 @@ pub fn record_external_member_identity(
     *slot = Some(identity);
 }
 
-fn record_companion_owner<S: std::hash::BuildHasher>(
+#[doc(hidden)]
+pub fn record_companion_owner<S: std::hash::BuildHasher>(
     companion_of: &mut std::collections::HashMap<CodeUnit, CodeUnit, S>,
     owner: &CodeUnit,
     companion: &CodeUnit,
@@ -200,12 +192,6 @@ fn record_companion_owner<S: std::hash::BuildHasher>(
 #[doc(hidden)]
 pub mod call_sites;
 
-pub mod java;
-
-pub(crate) mod kotlin;
-
-pub mod scala;
-
 #[doc(hidden)]
 pub fn member_precedence_tier(depth: usize) -> PrecedenceTier {
     if depth == 0 {
@@ -216,11 +202,13 @@ pub fn member_precedence_tier(depth: usize) -> PrecedenceTier {
 }
 pub mod trace;
 
-pub(crate) fn record_native_external_route(name: String) {
+#[doc(hidden)]
+pub fn record_native_external_route(name: String) {
     trace::record_named_boundary(name);
 }
 
-pub(crate) fn record_native_external_route_with_target(name: String, target: String) {
+#[doc(hidden)]
+pub fn record_native_external_route_with_target(name: String, target: String) {
     trace::record_named_boundary_with_target(name, target);
 }
 
@@ -239,9 +227,6 @@ pub(crate) use call_sites::call_site_syntax_for_reference;
 pub(crate) use call_sites::exact_call_reference_for_call;
 pub(crate) use call_sites::is_call_reference_range_in_tree;
 pub(crate) use call_sites::range_is_call_keyword_label;
-
-pub(crate) use kotlin::kotlin_import_model_outcome;
-pub(crate) use kotlin::kotlin_package_reference_outcome;
 
 pub(crate) use resolution_session::BoundedResolution;
 pub(crate) use resolution_session::ResolutionSession;
@@ -725,7 +710,9 @@ pub struct ExactExternalCallProof {
     /// The source module's configured, prepared JDK artifact, retained only
     /// after the selected callee declaration names the same exact artifact.
     /// A separate model and dispatch check is still required for an obligation.
-    source_jdk_artifact: Option<crate::analyzer::semantic_model::SemanticModelActivationEvidence>,
+    #[doc(hidden)]
+    pub source_jdk_artifact:
+        Option<crate::analyzer::semantic_model::SemanticModelActivationEvidence>,
     /// Exact PyPI artifact resolved for this Python callable from installed
     /// artifact state joined to an active semantic profile, and promoted only
     /// by matching defining-binding and provider tokens.
@@ -744,7 +731,8 @@ pub struct ExactExternalCallProof {
 
 impl ExactExternalCallProof {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_external_member_identity(
+    #[doc(hidden)]
+    pub fn with_external_member_identity(
         mut self,
         identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
     ) -> Self {
@@ -753,7 +741,8 @@ impl ExactExternalCallProof {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn external_member_identity(
+    #[doc(hidden)]
+    pub fn external_member_identity(
         &self,
     ) -> Option<&crate::analyzer::resolution::ExternalMemberIdentity> {
         self.external_member_identity.as_ref()
@@ -925,16 +914,13 @@ impl ExactExternalCallProof {
         Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
     }
 
+    #[doc(hidden)]
     /// An instance call whose external declaration proved one applicable
     /// signature for the written value receiver.
     ///
     /// Java instance methods can be overridden, so the selected signature does
     /// not prove that dispatch is closed.
-    pub(crate) fn java_bound_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    pub fn java_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -943,15 +929,12 @@ impl ExactExternalCallProof {
         Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
     }
 
+    #[doc(hidden)]
     /// A type-qualifier call whose external declaration proved one static
     /// signature. The receiver shape is the proof that no written value
     /// participates; it does not by itself close every other declaration of
     /// the same name.
-    pub(crate) fn java_static_external_member(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    pub fn java_static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external receiver owner must be named"
@@ -986,13 +969,10 @@ impl ExactExternalCallProof {
         Self::bound_receiver(format!("{owner}.{member}"), parameter_count)
     }
 
+    #[doc(hidden)]
     /// An external Java constructor has no written receiver. Its declaration
     /// and arity are proved independently of argument conversion and behavior.
-    pub(crate) fn java_external_constructor(
-        owner: &str,
-        member: &str,
-        parameter_count: u32,
-    ) -> Self {
+    pub fn java_external_constructor(owner: &str, member: &str, parameter_count: u32) -> Self {
         assert!(
             !owner.is_empty(),
             "an external constructor owner must be named"
@@ -1160,7 +1140,8 @@ impl ExactExternalCallProof {
         &self.canonical_callee
     }
 
-    pub(crate) fn with_source_jdk_artifact(
+    #[doc(hidden)]
+    pub fn with_source_jdk_artifact(
         mut self,
         artifact: Option<crate::analyzer::semantic_model::SemanticModelActivationEvidence>,
     ) -> Self {
@@ -1185,7 +1166,8 @@ impl ExactExternalCallProof {
         self
     }
 
-    pub(crate) fn source_jdk_artifact(
+    #[doc(hidden)]
+    pub fn source_jdk_artifact(
         &self,
     ) -> Option<&crate::analyzer::semantic_model::SemanticModelActivationEvidence> {
         self.source_jdk_artifact.as_ref()
@@ -1272,7 +1254,8 @@ pub struct CallEvidence {
 
 impl CallEvidence {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn native_java_selected() -> Self {
+    #[doc(hidden)]
+    pub fn native_java_selected() -> Self {
         Self {
             authority: DefinitionResolutionAuthority::NativeJavaSelected,
             ..Self::default()
@@ -1280,7 +1263,8 @@ impl CallEvidence {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_native_java_external_call(
+    #[doc(hidden)]
+    pub fn with_native_java_external_call(
         mut self,
         proof: ExactExternalCallProof,
         owner: &str,
@@ -1301,11 +1285,8 @@ impl CallEvidence {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_native_java_external_member_identity(
-        mut self,
-        owner: &str,
-        member: &str,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn with_native_java_external_member_identity(mut self, owner: &str, member: &str) -> Self {
         self.external_callee_identity = Some(ResolverOwnedExternalCalleeIdentity::new(
             Language::Java,
             owner.to_owned(),
@@ -1315,7 +1296,8 @@ impl CallEvidence {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn with_native_java_source_call(
+    #[doc(hidden)]
+    pub fn with_native_java_source_call(
         mut self,
         call_application: CallApplicationKind,
         dispatch_extensibility: Option<DispatchExtensibility>,
@@ -1325,13 +1307,13 @@ impl CallEvidence {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub const fn call_application(&self) -> CallApplicationKind {
         self.call_application
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
         self.dispatch_extensibility
@@ -1343,7 +1325,7 @@ impl CallEvidence {
         self.exact_external_call.as_ref()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn external_callee_identity(&self) -> Option<&ResolverOwnedExternalCalleeIdentity> {
         self.external_callee_identity.as_ref()
@@ -1887,6 +1869,17 @@ fn resolve_navigation_requests<'a>(
 /// factory remain owned by that language for the duration of this query.
 #[doc(hidden)]
 pub trait DefinitionBatchResolver<'a> {
+    /// Extend this batch's existing operation to its enclosing dispatch file window.
+    fn retain_file_operation(&mut self) {}
+
+    /// Release reader-backed operation state before a caller needs store writes.
+    fn release_file_operation(&mut self) {}
+
+    /// Conservative boundary before generic analysis may check out store reads.
+    fn release_before_store_read(&mut self) {
+        self.release_file_operation();
+    }
+
     fn precompute(
         &mut self,
         analyzer: &dyn IAnalyzer,
@@ -2084,7 +2077,7 @@ fn record_definition_probe_reads(
         identifier,
     ));
     analyzer.record_read(ReadKey::index(IndexFamily::DefinitionExact, &site.text));
-    let normalized = language_support(language)
+    let normalized = language_support_for_hook(language, "forward_query_provider")
         .and_then(|support| support.forward_query_provider(analyzer))
         .map_or_else(
             || site.text.clone(),
@@ -2150,8 +2143,11 @@ fn resolve_definition_resolutions<'a>(
             .is_some_and(|first| requests.iter().all(|request| request.file == first.file));
     let mut definition_batch = reusable_definition_batch
         .then(|| {
-            language_support(language_for_file(&requests[0].file))
-                .and_then(|support| support.definition_batch_resolver(analyzer, cancellation))
+            language_support_for_hook(
+                language_for_file(&requests[0].file),
+                "definition_batch_resolver",
+            )
+            .and_then(|support| support.definition_batch_resolver(analyzer, cancellation))
         })
         .flatten();
 
@@ -2212,7 +2208,8 @@ fn resolve_definition_resolutions<'a>(
             if let Some(remaining) = remaining_file_requests.get_mut(&file) {
                 *remaining -= 1;
                 if *remaining == 0
-                    && let Some(support) = language_support(language)
+                    && let Some(support) =
+                        language_support_for_hook(language, "release_definition_file")
                 {
                     support.release_definition_file(context, &file);
                 }
@@ -2333,23 +2330,13 @@ pub fn resolve_value_identity_with_source(
         if resolved.is_some() {
             return resolved;
         }
-        return language_support(language_for_file(&file))?.definition_value_identity(
-            analyzer,
-            &request,
-            &file,
-            &source,
-            cancellation,
-        );
+        return language_support_for_hook(language_for_file(&file), "definition_value_identity")?
+            .definition_value_identity(analyzer, &request, &file, &source, cancellation);
     }
 
     if outcome.status == DefinitionLookupStatus::InvalidLocation {
-        return language_support(language_for_file(&file))?.definition_value_identity(
-            analyzer,
-            &request,
-            &file,
-            &source,
-            cancellation,
-        );
+        return language_support_for_hook(language_for_file(&file), "definition_value_identity")?
+            .definition_value_identity(analyzer, &request, &file, &source, cancellation);
     }
 
     if outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary
@@ -2384,13 +2371,8 @@ pub fn resolve_value_identity_with_source(
             aliases: symbol.aliases.clone(),
         });
     }
-    language_support(language_for_file(&file))?.definition_value_identity(
-        analyzer,
-        &request,
-        &file,
-        &source,
-        cancellation,
-    )
+    language_support_for_hook(language_for_file(&file), "definition_value_identity")?
+        .definition_value_identity(analyzer, &request, &file, &source, cancellation)
 }
 
 #[doc(hidden)]
@@ -2468,7 +2450,10 @@ pub fn navigation_declaration_site_targets(
 ) -> Vec<NavigationTarget> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    match language_support(language_for_file(candidate.source())) {
+    match language_support_for_hook(
+        language_for_file(candidate.source()),
+        "definition_declaration_site_targets",
+    ) {
         Some(support) => {
             support.definition_declaration_site_targets(analyzer, token, candidate, operation)
         }
@@ -2492,8 +2477,11 @@ pub fn allocation_binds_by_reference_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file))
-        .and_then(|support| support.allocation_binds_by_reference_at_offset(file, source, offset))
+    language_support_for_hook(
+        language_for_file(file),
+        "allocation_binds_by_reference_at_offset",
+    )
+    .and_then(|support| support.allocation_binds_by_reference_at_offset(file, source, offset))
 }
 
 /// Whether the allocation expression at `offset` boxes a reference payload
@@ -2509,9 +2497,11 @@ pub fn allocation_boxes_reference_payload_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file)).and_then(|support| {
-        support.allocation_boxes_reference_payload_at_offset(file, source, offset)
-    })
+    language_support_for_hook(
+        language_for_file(file),
+        "allocation_boxes_reference_payload_at_offset",
+    )
+    .and_then(|support| support.allocation_boxes_reference_payload_at_offset(file, source, offset))
 }
 
 /// Whether one exact indexed Go callable result binds by reference.
@@ -2526,7 +2516,11 @@ pub fn result_binds_by_reference_at_ordinal(
     declaration: &CodeUnit,
     ordinal: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file)).and_then(|support| {
+    language_support_for_hook(
+        language_for_file(file),
+        "result_binds_by_reference_at_ordinal",
+    )
+    .and_then(|support| {
         support.result_binds_by_reference_at_ordinal(analyzer, file, source, declaration, ordinal)
     })
 }
@@ -2541,7 +2535,11 @@ pub fn parameter_binds_by_reference_at_span(
     end: usize,
     ordinal: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file)).and_then(|support| {
+    language_support_for_hook(
+        language_for_file(file),
+        "parameter_binds_by_reference_at_span",
+    )
+    .and_then(|support| {
         support.parameter_binds_by_reference_at_span(file, source, start, end, ordinal)
     })
 }
@@ -2556,7 +2554,11 @@ pub fn parameter_preserves_backing_at_span(
     end: usize,
     ordinal: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file)).and_then(|support| {
+    language_support_for_hook(
+        language_for_file(file),
+        "parameter_preserves_backing_at_span",
+    )
+    .and_then(|support| {
         support.parameter_preserves_backing_at_span(file, source, start, end, ordinal)
     })
 }
@@ -2572,7 +2574,11 @@ pub fn parameter_boxes_reference_payload_at_span(
     end: usize,
     ordinal: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file)).and_then(|support| {
+    language_support_for_hook(
+        language_for_file(file),
+        "parameter_boxes_reference_payload_at_span",
+    )
+    .and_then(|support| {
         support.parameter_boxes_reference_payload_at_span(file, source, start, end, ordinal)
     })
 }
@@ -2587,7 +2593,11 @@ pub fn parameter_is_reference_free_at_ordinal(
     declaration: &CodeUnit,
     ordinal: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file)).and_then(|support| {
+    language_support_for_hook(
+        language_for_file(file),
+        "parameter_is_reference_free_at_ordinal",
+    )
+    .and_then(|support| {
         support.parameter_is_reference_free_at_ordinal(analyzer, file, source, declaration, ordinal)
     })
 }
@@ -2601,9 +2611,11 @@ pub fn modeled_method_selection_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<String> {
-    language_support(language_for_file(file)).and_then(|support| {
-        support.modeled_method_selection_at_offset(analyzer, file, source, offset)
-    })
+    language_support_for_hook(
+        language_for_file(file),
+        "modeled_method_selection_at_offset",
+    )
+    .and_then(|support| support.modeled_method_selection_at_offset(analyzer, file, source, offset))
 }
 
 /// Whether the Go lexical binding declared at `offset` may be created more
@@ -2618,7 +2630,7 @@ pub fn lexical_binding_repeats_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<bool> {
-    language_support(language_for_file(file))
+    language_support_for_hook(language_for_file(file), "lexical_binding_repeats_at_offset")
         .and_then(|support| support.lexical_binding_repeats_at_offset(file, source, offset))
 }
 
@@ -2635,7 +2647,7 @@ pub fn declaration_site_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<CodeUnit> {
-    language_support(language_for_file(file))
+    language_support_for_hook(language_for_file(file), "declaration_site_at_offset")
         .and_then(|support| support.declaration_site_at_offset(analyzer, file, source, offset))
 }
 
@@ -2645,7 +2657,11 @@ pub fn navigation_declaration_site_at_offset(
     source: &str,
     offset: usize,
 ) -> Option<CodeUnit> {
-    language_support(language_for_file(file)).and_then(|support| {
+    language_support_for_hook(
+        language_for_file(file),
+        "navigation_declaration_site_at_offset",
+    )
+    .and_then(|support| {
         support.navigation_declaration_site_at_offset(analyzer, file, source, offset)
     })
 }
@@ -2671,6 +2687,153 @@ pub fn resolve_definition_batch_with_source_and_cancellation(
     )
 }
 
+// One file window retains owned preparation; request guards remain per lookup.
+pub(crate) struct ScalarCallTargetSession<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    resolver: Option<Box<dyn DefinitionBatchResolver<'a> + 'a>>,
+    initialized: bool,
+    disabled: bool,
+    memo: Option<ScalarDefinitionMemo>,
+}
+
+struct ScalarDefinitionMemo {
+    language_state: HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
+    sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
+    trees: HashMap<(ProjectFile, Language), Option<Tree>>,
+    primary_source_tree: Option<(ProjectFile, Tree)>,
+    line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
+    enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
+}
+
+impl<'a> ScalarCallTargetSession<'a> {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            analyzer,
+            resolver: None,
+            initialized: false,
+            disabled: false,
+            memo: None,
+        }
+    }
+
+    pub(crate) fn release_before_store_read(&mut self) {
+        if let Some(resolver) = &mut self.resolver {
+            resolver.release_before_store_read();
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.resolver.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve(
+        &mut self,
+        token: QueryToken<'_>,
+        requests: Vec<DefinitionLookupRequest>,
+        file: ProjectFile,
+        source: Arc<str>,
+        primary_tree: &Tree,
+        cancellation: Option<&CancellationToken>,
+    ) -> Vec<CallTargetLookupOutcome> {
+        let _timing = profiling::scope("get_definition::resolve_call_target_batch");
+        assert_eq!(
+            requests.len(),
+            1,
+            "file-window dispatch retains scalar demand"
+        );
+        let analyzer = self.analyzer;
+        if !self.initialized {
+            self.resolver =
+                language_support_for_hook(language_for_file(&file), "definition_batch_resolver")
+                    .and_then(|support| support.definition_batch_resolver(analyzer, cancellation));
+            self.initialized = true;
+            if let Some(resolver) = &mut self.resolver {
+                resolver.retain_file_operation();
+            } else {
+                self.disabled = true;
+            }
+        }
+        if self.disabled {
+            return resolve_call_target_batch_with_source_tree(
+                analyzer,
+                token,
+                requests,
+                file,
+                source,
+                Some(primary_tree.clone()),
+                cancellation,
+            );
+        }
+        // Request guards are recreated on demand; only the context's owned
+        // memo state survives. The bounded reader's incomplete-read flag is
+        // request-local too. A QueryToken must never borrow an owned guard
+        // in the same struct, nor be extended beyond its actual scope.
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+        if let Some(memo) = self.memo.take() {
+            context.language_state = memo.language_state;
+            context.sources = memo.sources;
+            context.trees = memo.trees;
+            context.primary_source_tree = memo.primary_source_tree;
+            context.line_starts = memo.line_starts;
+            context.enclosing_owner_chains = memo.enclosing_owner_chains;
+        } else {
+            context.sources.insert(file.clone(), Ok(source));
+            context.primary_source_tree = Some((file.clone(), primary_tree.clone()));
+        }
+        let _deadline = cancellation
+            .map(|cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation));
+        record_definition_batch_probe_reads(analyzer, &mut context, &requests);
+        let outcomes = resolve_call_target_requests(
+            analyzer,
+            token,
+            &mut context,
+            requests,
+            cancellation,
+            self.resolver
+                .as_mut()
+                .map(|batch| batch.as_mut() as &mut dyn DefinitionBatchResolver<'a>),
+        );
+        // Release any reader that excludes other store access at the lookup
+        // boundary, before the caller expands targets or starts another lookup.
+        self.release_before_store_read();
+        if cancellation.is_some_and(CancellationToken::is_cancelled)
+            || scope.store_error().is_some()
+            || context.read_scope.store_error().is_some()
+            || outcomes.iter().any(|outcome| {
+                outcome.outcome.diagnostics.iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic.kind.as_str(),
+                        "native_stale" | "native_store_error"
+                    )
+                })
+            })
+        {
+            self.disabled = true;
+            self.resolver = None;
+            self.memo = None;
+            return outcomes;
+        }
+        self.memo = Some(ScalarDefinitionMemo {
+            language_state: context.language_state,
+            sources: context.sources,
+            trees: context.trees,
+            primary_source_tree: context.primary_source_tree,
+            line_starts: context.line_starts,
+            enclosing_owner_chains: context.enclosing_owner_chains,
+        });
+        outcomes
+    }
+}
+
+impl Drop for ScalarCallTargetSession<'_> {
+    fn drop(&mut self) {
+        self.resolver = None;
+        self.memo = None;
+    }
+}
+
 pub fn resolve_call_target_batch_with_source(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2679,22 +2842,56 @@ pub fn resolve_call_target_batch_with_source(
     source: Arc<str>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<CallTargetLookupOutcome> {
+    resolve_call_target_batch_with_source_tree(
+        analyzer,
+        token,
+        requests,
+        file,
+        source,
+        None,
+        cancellation,
+    )
+}
+
+/// Resolve against an exact source and its primary parser tree. Language hooks
+/// retain ownership of any transformed definition tree, such as Python's
+/// stitched tree; an embedded call tree is not a primary source tree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_call_target_batch_with_source_tree(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    primary_tree: Option<Tree>,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<CallTargetLookupOutcome> {
     let _scope = profiling::scope("get_definition::resolve_call_target_batch");
     if profiling::enabled() {
         profiling::note(format!("request_count={}", requests.len()));
     }
-    match language_support(language_for_file(&file)) {
+    match language_support_for_hook(
+        language_for_file(&file),
+        "resolve_definition_call_target_batch",
+    ) {
         Some(support) => support.resolve_definition_call_target_batch(
             analyzer,
             token,
             requests,
             file,
             source,
+            primary_tree,
             cancellation,
         ),
-        None => {
-            resolve_generic_call_target_batch(analyzer, token, requests, file, source, cancellation)
-        }
+        None => resolve_generic_call_target_batch(
+            analyzer,
+            token,
+            requests,
+            file,
+            source,
+            primary_tree,
+            cancellation,
+        ),
     }
 }
 
@@ -2704,11 +2901,13 @@ pub(crate) fn resolve_generic_call_target_batch(
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
+    primary_tree: Option<Tree>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<CallTargetLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
     context.sources.insert(file.clone(), Ok(source));
+    context.primary_source_tree = primary_tree.map(|tree| (file.clone(), tree));
     debug_assert!(
         requests.iter().all(|request| request.file == file),
         "one call-target source batch must contain requests for that source file"
@@ -2773,7 +2972,7 @@ pub(crate) fn resolve_generic_call_target_batch(
     record_definition_batch_probe_reads(analyzer, &mut context, &requests);
     let mut definition_batch = (!requests.is_empty())
         .then(|| {
-            language_support(language_for_file(&file))
+            language_support_for_hook(language_for_file(&file), "definition_batch_resolver")
                 .and_then(|support| support.definition_batch_resolver(analyzer, cancellation))
         })
         .flatten();
@@ -2867,7 +3066,6 @@ pub fn resolve_call_reference_definition_with_source(
 pub struct DefinitionBatchContext<'a: 'token, 'token> {
     #[doc(hidden)]
     pub route: DefinitionBatchRoute,
-
     #[doc(hidden)]
     pub analyzer: &'a dyn IAnalyzer,
     /// Proof that the batch's request scope is open for the batch's whole life
@@ -2881,6 +3079,7 @@ pub struct DefinitionBatchContext<'a: 'token, 'token> {
     #[doc(hidden)]
     pub sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
+    primary_source_tree: Option<(ProjectFile, Tree)>,
     #[doc(hidden)]
     pub line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     // Covers visibility construction as well as candidate lookup. Incomplete
@@ -2906,6 +3105,7 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
             language_state: HashMap::default(),
             sources: HashMap::default(),
             trees: HashMap::default(),
+            primary_source_tree: None,
             line_starts: HashMap::default(),
             read_scope: AnalyzerQueryScope::new(analyzer),
             enclosing_owner_chains: HashMap::default(),
@@ -2923,7 +3123,8 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
             .expect("definition language state matches its type key")
     }
 
-    fn language_state_ref<T: Default + 'static>(&self) -> &T {
+    #[doc(hidden)]
+    pub fn language_state_ref<T: Default + 'static>(&self) -> &T {
         self.language_state
             .get(&std::any::TypeId::of::<T>())
             .expect("definition language state was initialized")
@@ -2949,8 +3150,20 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
         self.trees
             .entry((file.clone(), language))
             .or_insert_with(|| {
-                language_support(language).and_then(|support| {
-                    support.definition_tree(self.analyzer, self.token, file, language, source)
+                language_support_for_hook(language, "definition_tree").and_then(|support| {
+                    support.definition_tree(
+                        self.analyzer,
+                        self.token,
+                        file,
+                        language,
+                        source,
+                        self.primary_source_tree
+                            .as_ref()
+                            .and_then(|(tree_file, tree)| {
+                                (tree_file == file && language == language_for_file(file))
+                                    .then_some(tree)
+                            }),
+                    )
                 })
             })
             .clone()
@@ -3020,7 +3233,7 @@ pub fn focused_reference_site(
         tree.map(Tree::root_node),
     )?;
     Ok(match tree {
-        Some(tree) => match language_support(language) {
+        Some(tree) => match language_support_for_hook(language, "definition_site_for_focus") {
             Some(support) => support.definition_site_for_focus(
                 site,
                 tree,
@@ -3114,7 +3327,7 @@ pub fn resolve_one_with_evidence<'a>(
             .into();
         }
     };
-    let site = match language_support(language)
+    let site = match language_support_for_hook(language, "definition_lexical_site")
         .expect("supported definition language")
         .definition_lexical_site(analyzer, context, &request, &source, tree.as_ref(), site)
     {
@@ -3136,7 +3349,7 @@ pub fn resolve_one_with_evidence<'a>(
             identifier,
         )
         .or_else(|| {
-            language_support(language).and_then(|support| {
+            language_support_for_hook(language, "definition_lexical_fallback").and_then(|support| {
                 support.definition_lexical_fallback(
                     analyzer,
                     token,
@@ -3159,27 +3372,31 @@ pub fn resolve_one_with_evidence<'a>(
         }
     }
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(resolution) = language_support(language).and_then(|support| {
-        let query = crate::analyzer::languages::BoundedReceiverQuery {
-            analyzer,
-            file: &request.file,
-            source: &source,
-            tree: tree.as_ref(),
-            site: &site,
-            budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-            cancellation,
-        };
-        support.trial_definition(query)
-    }) {
+    if let Some(resolution) =
+        language_support_for_hook(language, "trial_definition").and_then(|support| {
+            let query = crate::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file: &request.file,
+                source: &source,
+                tree: tree.as_ref(),
+                site: &site,
+                budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                cancellation,
+            };
+            support.trial_definition(query)
+        })
+    {
         return resolution;
     }
-    let native_points =
-        language_support(language).and_then(|support| support.default_definition_points());
-    // The Scala native trial is selectable only in test builds.
+    let native_points = language_support_for_hook(language, "default_definition_points")
+        .and_then(|support| support.default_definition_points());
     #[cfg(any(test, feature = "test-support"))]
     let native_points = native_points.or_else(|| {
         (language == Language::Scala && std::env::var_os("BIFROST_TRIAL_NATIVE_SCALA").is_some())
-            .then(|| language_support(language).and_then(|support| support.native_rollout_points()))
+            .then(|| {
+                language_support_for_hook(language, "native_rollout_points")
+                    .and_then(|support| support.native_rollout_points())
+            })
             .flatten()
     });
     if let Some(native_points) = native_points {
@@ -3216,7 +3433,8 @@ pub fn resolve_one_with_evidence<'a>(
         };
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
-    let support = language_support(language).expect("supported definition language");
+    let support = language_support_for_hook(language, "resolve_definition_dispatch")
+        .expect("supported definition language");
     let resolution = match definition_batch {
         Some(batch) => batch.resolve_definition_dispatch(
             analyzer,
@@ -3537,7 +3755,7 @@ pub fn navigation_lookup_outcome(
             // that symbol's body or conditional-family representative below.
             // Explicit Ambiguous outcomes also cover base-subobject and receiver
             // uncertainty; selecting one occurrence cannot discharge those proofs.
-            let selection = language_support(language)
+            let selection = language_support_for_hook(language, "definition_navigation_selection")
                 .expect("supported navigation language")
                 .definition_navigation_selection(
                     context,
@@ -3570,7 +3788,10 @@ pub fn navigation_lookup_outcome(
                 .cloned()
                 .flat_map(|code_unit| match operation {
                     NavigationOperation::Declaration => {
-                        match language_support(language_for_file(code_unit.source())) {
+                        match language_support_for_hook(
+                            language_for_file(code_unit.source()),
+                            "definition_associated_navigation_targets",
+                        ) {
                             Some(support) => support.definition_associated_navigation_targets(
                                 analyzer, token, code_unit, operation,
                             ),
@@ -3970,7 +4191,8 @@ pub fn ambiguous_without_candidates(message: impl Into<String>) -> DefinitionLoo
 /// without-candidates cases, so this generic constructor never answers
 /// [`DefinitionLookupStatus::Ambiguous`]: an ambiguous answer that reaches a
 /// caller through an unrelated status helper is the #1811 shape defect.
-fn diagnostic_outcome(
+#[doc(hidden)]
+pub fn diagnostic_outcome(
     status: DefinitionLookupStatus,
     kind: impl Into<String>,
     message: impl Into<String>,
@@ -4009,8 +4231,10 @@ mod tests {
 
     use super::*;
 
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#4460: the closed-world guard downgraded structured generated-surface boundaries")]
     fn a_structured_generated_surface_is_an_explicit_closed_world_boundary() {
@@ -4022,6 +4246,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "#4460: an inactive cfg module route was downgraded to an actionable incomplete answer"

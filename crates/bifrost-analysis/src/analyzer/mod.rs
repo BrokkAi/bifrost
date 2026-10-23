@@ -7,53 +7,32 @@ pub mod loop_facts;
 #[doc(hidden)]
 pub mod source_admission;
 pub use assignment_facts::OverwrittenLocalCandidate;
-
 pub use assignment_facts::OverwrittenLocalCandidates;
-
 pub use assignment_facts::OverwrittenLocalSourceKind;
-
 pub use assignment_facts::PlainAssignmentCandidate;
-
 pub use assignment_facts::PlainAssignmentCandidates;
-
 pub use assignment_facts::PlainAssignmentVerdict;
-
 pub use assignment_facts::go_overwritten_local_candidates;
-
 pub use assignment_facts::java_overwritten_local_candidates;
-
 pub use assignment_facts::js_ts_overwritten_local_candidates;
-
 pub use assignment_facts::plain_assignment_candidates;
-
 pub use assignment_facts::python_overwritten_local_candidates;
-
 pub use assignment_facts::single_target_overwritten_local_candidates;
 
 pub use loop_facts::LoopCandidate;
-
 pub use loop_facts::LoopCandidates;
-
 pub use loop_facts::LoopCoordinates;
-
 pub use loop_facts::LoopKind;
-
 pub use loop_facts::LoopSite;
-
 pub use loop_facts::LoopSyntax;
-
 pub use loop_facts::NestedLoopFacts;
-
 pub use loop_facts::loop_candidates;
-
 pub use loop_facts::nested_loop_facts;
 
 pub(crate) use loop_facts::build_loop_candidates;
-
 pub(crate) use loop_facts::weight_loop_candidates;
 
 pub use source_admission::AdmissionDimension;
-
 pub use source_admission::SourceAdmissionRefusal;
 
 pub mod branch_boolean;
@@ -84,13 +63,9 @@ pub mod i_analyzer;
 #[doc(hidden)]
 pub mod index_warmer;
 pub mod invalidation;
-#[doc(hidden)]
-pub mod java;
+
 pub mod java_integral_parameter;
-#[doc(hidden)]
-pub mod jvm;
-#[doc(hidden)]
-pub mod kotlin;
+
 #[doc(hidden)]
 pub mod languages;
 pub mod lexical_definitions;
@@ -101,24 +76,18 @@ pub mod multi_analyzer;
 pub mod native_points;
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::NativeAssignmentValueProbe;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::NativeTypeProbe;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::probe_native_assignment_value;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::probe_native_definition;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::probe_native_definition_trace;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use native_points::probe_native_type;
 
 pub mod packs_document;
-
 pub mod read_ledger;
 pub mod read_verification;
 pub mod reference_candidates;
@@ -143,8 +112,6 @@ pub fn whole_workspace_descendants(
     operation(&scope).expect("a descendant index that cannot stop always completes")
 }
 
-#[doc(hidden)]
-pub mod scala;
 mod source_ingestion;
 pub mod store;
 #[doc(hidden)]
@@ -244,68 +211,41 @@ pub fn estimate_collection_bytes<T>(
 // Each keeps the visibility its `mod` declaration had, so the seam does not
 // quietly widen this crate's public surface.
 pub use brokk_bifrost_core::analyzer::canonical_hash;
-
 pub use brokk_bifrost_core::analyzer::identifier;
-
 pub use brokk_bifrost_core::analyzer::test_paths;
 
 use brokk_bifrost_core::analyzer::capabilities;
-
 use brokk_bifrost_core::analyzer::code_unit_index;
-
 use brokk_bifrost_core::analyzer::config;
-
 use brokk_bifrost_core::analyzer::model;
-
 use brokk_bifrost_core::analyzer::pool_memo;
-
 use brokk_bifrost_core::analyzer::project;
-
 use brokk_bifrost_core::analyzer::source_content;
 
 pub(crate) use brokk_bifrost_core::analyzer::dense_id;
-
 pub(crate) use brokk_bifrost_core::analyzer::fq_name;
-
-pub(crate) use brokk_bifrost_core::analyzer::type_relations;
 
 pub use code_unit_index::CodeUnitIndex;
 
 pub(crate) use definition_lookup::BoundedDefinitionLookup;
-
 pub(crate) use definition_lookup::DefinitionLanguageScope;
-
 pub(crate) use definition_lookup::RelationalBatchError;
-
 pub(crate) use definition_lookup::RelationalBatchOutcome;
-
 pub(crate) use definition_lookup::RelationalCallableFact;
-
 pub(crate) use definition_lookup::RelationalDefinitionFrontier;
-
 pub(crate) use definition_lookup::RelationalDefinitionLookup;
-
 pub(crate) use definition_lookup::RelationalDefinitionQuery;
-
 pub(crate) use definition_lookup::RelationalDefinitionQuestion;
-
 pub(crate) use definition_lookup::RelationalDefinitionRequest;
-
 pub(crate) use definition_lookup::RelationalDefinitionResult;
-
 pub(crate) use definition_lookup::RelationalDefinitionValue;
-
 pub(crate) use definition_lookup::RelationalFrontierOutcome;
-
 pub(crate) use definition_lookup::sort_units;
 
 pub use analyzer_definition_lookup::AnalyzerDefinitionLookup;
-
 pub use analyzer_definition_lookup::DefinitionLookupMemo;
 
 pub(crate) use analyzer_definition_lookup::ForwardQueryProvider;
-
-pub(crate) use analyzer_definition_lookup::impl_forward_query_provider;
 
 #[doc = " The damaged-tree namespace index, for the root suites' index-level"]
 #[doc = " regressions over corpus-derived C++ fixtures that stay private."]
@@ -316,105 +256,53 @@ pub use brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceScopeIndex;
 pub use brokk_bifrost_csharp::syntax::csharp_transparent_expression_parent;
 
 pub use capabilities::AdditionalFileDependencies;
-
 pub use capabilities::CapabilityProvider;
-
 pub use capabilities::DescendantIndexScope;
-
 pub use capabilities::DescendantIndexVariant;
-
 pub use capabilities::FileDependencyFacts;
-
 pub use capabilities::ImportAnalysisProvider;
-
 pub use capabilities::ImportGraphBindingSurface;
-
 pub use capabilities::ImportGraphInputDigests;
-
 pub use capabilities::ImportLookupDependency;
-
 pub use capabilities::ImportReachability;
-
 pub use capabilities::ImportResolutionDependencies;
-
 pub use capabilities::ImportedFileEdgeFacts;
-
 pub use capabilities::TestDetectionProvider;
-
 pub use capabilities::TypeAliasProvider;
-
 pub use capabilities::TypeHierarchyProvider;
-
-pub(crate) use capabilities::DirectDescendantIndex;
-
-pub(crate) use capabilities::build_reverse_file_index;
-
-pub(crate) use capabilities::descendants_from_variant_index;
-
-pub(crate) use capabilities::memoized_reverse_import_index;
 
 pub(crate) use capabilities::resolve_imported_files_from_infos;
 
 pub use config::AnalyzerConfig;
-
 pub use config::CSharpAnalyzerConfig;
-
 pub use config::DispatchHierarchyExpansion;
-
 pub use config::GoAnalyzerConfig;
-
 pub use config::GoDependencyDiscoveryConfig;
-
 pub use config::GoDependencyDiscoveryMode;
-
 pub use config::JsTsAnalyzerConfig;
-
 pub use config::JsTsDependencyDiscoveryConfig;
-
 pub use config::JvmAnalyzerConfig;
-
 pub use config::JvmDependencyDiscoveryConfig;
-
 pub use config::JvmDependencyDiscoveryMode;
-
 pub use config::JvmExternalArtifact;
-
 pub use config::JvmExternalArtifactOrigin;
-
 pub use config::JvmExternalDependencies;
-
 pub use config::JvmMavenCoordinate;
-
 pub use config::JvmSourceToolchainBinding;
-
 pub use config::JvmSourceToolchainSelectionOpen;
-
 pub use config::JvmStandardLibraryDiscoveryConfig;
-
 pub use config::PhpAnalyzerConfig;
-
 pub use config::PhpDependencyApiEvidence;
-
 pub use config::PythonAnalyzerConfig;
-
 pub use config::PythonEnvironmentConfig;
-
 pub use config::PythonEnvironmentLimits;
-
 pub use config::RubyAnalyzerConfig;
-
 pub use config::RubyDependencyApiEvidence;
-
 pub use config::RubyGemApiArtifact;
-
 pub use config::RustAnalyzerConfig;
-
 pub use config::RustDependencyApiEvidence;
-
 pub use config::RustPackageApiArtifact;
-
 pub use config::RustSelectedTarget;
-
 pub use config::ensure_global_rayon_pool;
 
 pub use fq_name::FqName;
@@ -432,26 +320,17 @@ pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 pub use git2::Oid;
 
 pub use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligation;
-
 pub use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligationBasis;
-
 pub use brokk_bifrost_core::analyzer::structural::native_obligation::NativeResultObligationKind;
 
 pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUse;
-
 pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseFact;
-
 pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseIndex;
-
 pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseOpenReason;
-
 pub use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseSite;
-
 pub use brokk_bifrost_core::analyzer::structural::result_use::IntentionalDiscardKind;
 
 pub use brokk_bifrost_csharp::structural::CSharpCallResultUseIndex;
-
-pub use brokk_bifrost_csharp::structural::csharp_call_result_use;
 
 pub use brokk_bifrost_python::declarations::python_function_has_decorator;
 
@@ -460,226 +339,85 @@ pub use i_analyzer::AnalyzerStreamingFileScope;
 pub(crate) use i_analyzer::replay_query_reads;
 
 pub use i_analyzer::AnalyzerBuildTierAccess;
-
 pub use i_analyzer::AnalyzerQueryContext;
-
 pub use i_analyzer::AnalyzerSnapshotCaches;
-
 pub use i_analyzer::IAnalyzer;
-
 pub use i_analyzer::PersistedImportAdjacency;
-
 pub use i_analyzer::PersistedImportDependencies;
-
 pub use i_analyzer::PersistedImportDirection;
-
 pub use i_analyzer::PersistedImportEdge;
-
 pub use i_analyzer::PersistedImportGraphRefresh;
-
 pub use i_analyzer::QueryBatch;
-
 pub use i_analyzer::QueryReadIncomplete;
-
 pub use i_analyzer::SearchSymbolCandidates;
-
 pub use i_analyzer::SearchSymbolPatternBatch;
-
 pub use i_analyzer::WorkspaceFileIndex;
-
 pub use i_analyzer::WorkspaceFileIndexCell;
-
 pub use i_analyzer::capture_query_reads;
 
 pub use i_analyzer::AnalyzerQueryScope;
-
 pub use i_analyzer::InformationTier;
-
 pub use i_analyzer::QueryScope;
-
 pub use i_analyzer::QueryToken;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use i_analyzer::AnalyzerTestHooks;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use i_analyzer::NoOpAnalyzerTestHooks;
 
 pub use index_warmer::IndexWarmer;
 
-#[cfg(any(test, feature = "test-support"))]
-pub use java::native_call_relations::JavaNativeCallRelations;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::native_call_relations::java_native_incoming_calls;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::native_rename::JavaNativeRenameProvider;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::native_rename::java_native_rename;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::native_usages::JavaNativeUsageStrategy;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::selected_reverse::JavaNativeSelectedInverseProvider;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::selected_reverse::JavaNativeSelectedReferenceIndex;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::selected_reverse::JavaSelectedReverseOutcome;
-
-#[cfg(any(test, feature = "test-support"))]
-pub use java::selected_reverse::java_selected_inverse_for;
-
-pub use java::JavaAnalyzer;
-
-pub use java::JavaAnnotationTypeResolution;
-
-pub use java::JavaAnnotationTypeStatus;
-
-pub use java::JavaCallResultUse;
-
-pub use java::JavaCallResultUseIndex;
-
-pub use java::JavaCallResultUseOpen;
-
-pub use java::JavaCallResultUseRelationIndex;
-
-pub use java::JavaLocalAssignmentConversionProver;
-
-pub use java::JavaLocalAssignmentEvidence;
-
-pub use java::java_call_result_use_site;
-
-pub use java::java_plain_string_literal;
-
-pub use java::resolve_java_annotation_type;
-
-pub use jvm::external::JdkVersion;
-
-pub use jvm::external::JvmDependencyPackAdapter;
-
-pub use jvm::external::resolve_jvm_semantic_pack_dependencies;
-
-pub use jvm::java_artifact::JavaJarPackProducer;
-
-pub use jvm::jdk_artifact::JdkSourceArchiveLayout;
-
-pub use jvm::jdk_artifact::JdkSourceArchivePackProducer;
-
-pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
-
-pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
-
-pub use kotlin::KotlinAnalyzer;
-
-pub use kotlin::kotlin_declared_scalar_types;
-
 pub use model::CallableArity;
-
 pub use model::CallableFacts;
-
 pub use model::CallableOverrideModifier;
-
 pub use model::CloneSmell;
-
 pub use model::CloneSmellWeights;
-
 pub use model::CodeBaseMetrics;
-
 pub use model::CodeUnit;
-
 pub use model::CodeUnitType;
-
 pub use model::CommentDensityStats;
-
 pub use model::DeclarationId;
-
 pub use model::DeclarationInfo;
-
 pub use model::DeclarationKind;
-
 pub use model::DispatchExtensibility;
-
 pub use model::ExceptionHandlingAnalysis;
-
 pub use model::ExceptionHandlingSmell;
-
 pub use model::ExceptionSmellWeights;
-
 pub use model::ImportInfo;
-
 pub use model::JVM_SEMANTIC_PACK_LANGUAGES;
-
 pub use model::Language;
-
 pub use model::LanguageDialect;
-
 pub use model::MaintainabilitySizeSmell;
-
 pub use model::MaintainabilitySizeSmellWeights;
-
 pub use model::PackageAnchor;
-
 pub use model::ParameterMetadata;
-
 pub use model::ParseCompleteness;
-
 pub use model::ParseError;
-
 pub use model::ParseErrorKind;
-
 pub use model::ProjectFile;
-
 pub use model::Range;
-
 pub use model::RubyMethodDispatchMode;
-
 pub use model::ScalaExportInfo;
-
 pub use model::ScalaExportSelector;
-
 pub use model::SearchSymbolCandidate;
-
 pub use model::SemanticAbsenceProof;
-
 pub use model::SemanticDiagnostic;
-
 pub use model::SemanticDiagnosticDomain;
-
 pub use model::SemanticDiagnosticIncompleteReason;
-
 pub use model::SemanticDiagnosticOutcome;
-
 pub use model::SemanticDiagnosticReport;
-
 pub use model::SemanticDiagnosticReportStatus;
-
 pub use model::SignatureMetadata;
-
 pub use model::StructuredImportPath;
-
 pub use model::StructuredImportPathKind;
-
 pub use model::StructuredImportScope;
-
 pub use model::StructuredTypeIdentity;
-
 pub use model::StructuredTypeName;
-
 pub use model::SummaryFileProjection;
-
 pub use model::TestAssertionAnalysis;
-
 pub use model::TestAssertionSmell;
-
 pub use model::TestAssertionWeights;
-
 pub use model::metrics_from_declarations;
-
 pub use model::semantic_pack_realm;
 
 /// Select the earliest range by source line, then by byte offset.
@@ -690,154 +428,85 @@ pub fn primary_range(ranges: &[Range]) -> Option<Range> {
         .copied()
 }
 
-pub(crate) use model::CallableLinkage;
-
-pub(crate) use model::CppFieldLinkage;
-
 pub(crate) use model::CppTemplateMetadata;
-
-pub(crate) use multi_analyzer::forward_query_provider;
 
 pub use multi_analyzer::resolve_analyzer;
 
 pub use multi_analyzer::AnalyzerDelegate;
-
 pub use multi_analyzer::LanguageAnalyzer;
-
 pub use multi_analyzer::MultiAnalyzer;
-
 pub use multi_analyzer::is_language_configuration_input;
 
-pub(crate) use pool_memo::KeyedPoolSafeMemo;
-
-pub(crate) use pool_memo::PoolSafeMemo;
-
 pub(crate) use pool_memo::install_on_dedicated_build_pool;
-
 pub(crate) use pool_memo::spawn_on_dedicated_build_pool;
 
 pub use project::BIFROST_IGNORE_FILE_NAME;
-
 pub use project::DEFAULT_MAX_OVERLAY_BYTES;
-
 pub use project::FileSetProject;
-
 pub use project::FilesystemProject;
-
 pub use project::MultiRootProject;
-
 pub use project::OverlayProject;
-
 pub use project::OverlayRevision;
-
 pub use project::Project;
-
 pub use project::ProjectCoverage;
-
 pub use project::ProjectSourceOrigin;
-
 pub use project::ProjectSourceSnapshot;
-
 pub use project::SubsetCoverage;
-
 pub use project::TestProject;
-
 pub use project::WorkspaceFileListingCache;
-
 pub use project::collect_workspace_files;
 
 pub use read_ledger::IndexFamily;
-
 pub use read_ledger::LookupKind;
-
 pub use read_ledger::LookupQuestion;
-
 pub use read_ledger::ReadKey;
-
 pub use read_ledger::ReadLedger;
-
 pub use read_ledger::ReadSetDigest;
-
 pub use read_ledger::absent_summary_digest;
 
 pub use read_verification::ChangedFacts;
-
 pub use read_verification::ChangedRead;
-
 pub use read_verification::HeadInputs;
-
 pub use read_verification::LookupMemo;
-
 pub use read_verification::LookupReplayLimits;
-
 pub use read_verification::NoSummaryAnswers;
-
 pub use read_verification::ProcedureDispatchReadCallError;
-
 pub use read_verification::ReadVerdict;
-
 pub use read_verification::SummaryAnswers;
-
 pub use read_verification::WorkspaceFactIndex;
-
 pub use read_verification::analysis_epoch_digest;
-
 pub use read_verification::procedure_dispatch_read_call;
-
 pub use read_verification::replay_lookup;
-
 pub use read_verification::verify_procedure_dispatch_read;
-
 pub use read_verification::verify_read_set;
-
 pub use read_verification::verify_read_set_for_artifact;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use resolution::reset_reverse_fact_evaluation_count_for_test;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use resolution::reverse_fact_evaluation_count_for_test;
-
-pub use scala::ScalaAnalyzer;
-
-pub use scala::scala_declared_scalar_types;
 
 pub use source_content::SourceContent;
 
 pub use source_ingestion::IngestedSource;
-
 pub use source_ingestion::SourceIngestionError;
-
 pub use source_ingestion::SourceIngestionKind;
-
 pub use source_ingestion::ingest_source_bytes;
 
 pub(crate) use tree_sitter_analyzer::AnalyzerStoreContext;
-
 pub(crate) use tree_sitter_analyzer::BuildAbort;
 
-pub(crate) use tree_sitter_analyzer::BulkFileStateSource;
-
 pub(crate) use tree_sitter_analyzer::RevisionBlobIdentities;
-
 pub(crate) use tree_sitter_analyzer::ephemeral_store_context;
-
 pub(crate) use tree_sitter_analyzer::persistent_store_context;
-
 pub(crate) use tree_sitter_analyzer::persistent_store_context_without_automatic_gc;
-
 pub(crate) use tree_sitter_analyzer::revision_image_store_context;
-
 pub(crate) use tree_sitter_analyzer::scoped_store_context;
 
 pub use tree_sitter_analyzer::BuildProgress;
-
 pub use tree_sitter_analyzer::BuildProgressEvent;
-
 pub use tree_sitter_analyzer::BuildProgressPhase;
-
 pub use tree_sitter_analyzer::LanguageAdapter;
-
 pub use tree_sitter_analyzer::TreeSitterAnalyzer;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -849,21 +518,13 @@ pub use usages::workspace_graph::UsageEcosystem;
 pub(crate) use workspace::WorkspaceProjectionLease;
 
 pub use workspace::DependencyPackActivationOutcome;
-
 pub use workspace::DependencyPackEcosystem;
-
 pub use workspace::DependencyPackEcosystemOutcome;
-
 pub use workspace::DependencyPackWorkspaceContext;
-
 pub use workspace::EmptyAnalyzer;
-
 pub use workspace::InstalledDependencyPackActivationOutcome;
-
 pub use workspace::PythonSemanticModelActivationOutcome;
-
 pub use workspace::PythonSemanticModelWorkspaceContext;
-
 pub use workspace::WorkspaceAnalyzer;
 
 pub use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;
@@ -937,3 +598,9 @@ pub use brokk_bifrost_core::analyzer::definition_lookup;
 
 pub mod semantic;
 pub mod semantic_model;
+
+pub(crate) mod selected_services;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod store_support;

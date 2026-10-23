@@ -5,7 +5,7 @@ use crate::searchtools::*;
 // evidence has no equivalent in another supported language. Bounded selector projections
 // use the generic language capability, which keeps the framework out of C++ analyzer internals.
 
-use brokk_bifrost_analysis::analyzer::languages::language_support;
+use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 
 use brokk_bifrost_analysis::analyzer::symbol_lookup::FuzzyResolveBudget;
 
@@ -1656,7 +1656,7 @@ pub(crate) fn split_kind_qualified_lookup(lookup: &str) -> (Option<CodeUnitType>
 /// persisted projection when it provides one, otherwise the analyzer's full
 /// read (which may hydrate the owning `FileState`).
 pub(crate) fn selector_signatures(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
-    language_support(language_for_target(unit))
+    language_support_for_hook(language_for_target(unit), "signatures_limited")
         .and_then(|support| support.signatures_limited(analyzer, unit, usize::MAX))
         .filter(|signatures| signatures.complete)
         .map_or_else(|| analyzer.signatures(unit), |signatures| signatures.rows)
@@ -1672,8 +1672,11 @@ struct CppSelectorFacts {
 
 impl CppSelectorFacts {
     fn load(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Self {
-        let support =
-            language_support(Language::Cpp).expect("C++ language support must be registered");
+        let support = language_support_for_hook(
+            Language::Cpp,
+            "signature_metadata_limited/declaration_ranges_limited",
+        )
+        .expect("C++ language support must be registered");
         let mut facts = Self::default();
         for unit in units
             .iter()
@@ -2352,11 +2355,11 @@ mod tests {
 
     use brokk_bifrost_go_analysis::analyzer::go::GoAnalyzer;
 
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use brokk_bifrost_js_ts_analysis::analyzer::javascript::JavascriptAnalyzer;
 
-    use brokk_bifrost_analysis::analyzer::kotlin::KotlinAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::kotlin::KotlinAnalyzer;
 
     use brokk_bifrost_php_analysis::analyzer::php::PhpAnalyzer;
 
@@ -2366,7 +2369,7 @@ mod tests {
 
     use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
 
-    use brokk_bifrost_analysis::analyzer::scala::ScalaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::scala::ScalaAnalyzer;
 
     use brokk_bifrost_js_ts_analysis::analyzer::typescript::TypescriptAnalyzer;
 

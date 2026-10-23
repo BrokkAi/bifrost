@@ -46,6 +46,7 @@
 //! [`ReadSetDigest`]. That equality is the property the whole plan rests on: it
 //! is what lets a unit published from the exported base match a unit the head
 //! would have computed.
+pub use brokk_bifrost_store::analyzer::read_ledger::{ReadSetDigest, read_set_digest};
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,12 +57,10 @@ use crate::analyzer::{CodeUnit, Language, ProjectFile, SignatureMetadata};
 use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
 
+/// Domain for the digest of a whole read set.
+pub use crate::analyzer::semantic::read_ledger::IndexFamily;
 #[allow(unused_imports)]
 pub(crate) use crate::analyzer::semantic::read_ledger::READ_KEY_DOMAIN;
-/// Domain for the digest of a whole read set.
-const READ_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:set:v1";
-
-pub use crate::analyzer::semantic::read_ledger::IndexFamily;
 
 pub use crate::analyzer::semantic::read_ledger::LookupKind;
 
@@ -207,30 +206,6 @@ pub fn file_set_digest<'a>(files: impl IntoIterator<Item = &'a ProjectFile>) -> 
     StableDigest::from_array(hasher.finish())
 }
 
-/// The digest of one complete read set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReadSetDigest(StableDigest);
-
-impl ReadSetDigest {
-    pub const fn from_digest(digest: StableDigest) -> Self {
-        Self(digest)
-    }
-
-    pub const fn digest(self) -> StableDigest {
-        self.0
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        self.0.as_bytes()
-    }
-}
-
-impl std::fmt::Display for ReadSetDigest {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 /// The set of inputs one request read, plus the crossings it could not name.
 ///
 /// Shared behind an `Arc` and written from every thread the analyzer spends the
@@ -306,28 +281,6 @@ impl ReadLedger {
     pub fn digest(&self) -> ReadSetDigest {
         read_set_digest(&self.keys())
     }
-}
-
-/// The digest of one read set held as a slice rather than as a live ledger.
-///
-/// A verifier holds a published unit's keys, not the ledger that recorded
-/// them, and still has to name the unit by what it read; a persisted row does
-/// the same. Sorting here rather than trusting the caller's order is what
-/// makes the two digests equal.
-pub fn read_set_digest(keys: &[ReadKey]) -> ReadSetDigest {
-    let mut sorted = keys.to_vec();
-    sorted.sort();
-    sorted.dedup();
-    let mut hasher = CanonicalHasher::new(READ_SET_DOMAIN);
-    hasher.value(
-        &u64::try_from(sorted.len())
-            .expect("usize fits u64 on supported targets")
-            .to_be_bytes(),
-    );
-    for key in &sorted {
-        key.push_canonical(&mut hasher);
-    }
-    ReadSetDigest::from_digest(StableDigest::from_array(hasher.finish()))
 }
 
 #[cfg(test)]

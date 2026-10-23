@@ -22,6 +22,7 @@ pub(crate) enum QueryFeature {
     BooleanLiteralValue,
     /// AST-backed modifier state of callable facts.
     AsyncCallableValue,
+    UnsafeContext,
     /// Decoded value of a normalized string literal.
     StringLiteralValue,
     /// Exact canonical decimal value and bit masks for integer literals.
@@ -121,6 +122,11 @@ impl QueryFeatures {
         );
         let features = features.chain(
             query
+                .constrains_unsafe_context()
+                .then_some(QueryFeature::UnsafeContext),
+        );
+        let features = features.chain(
+            query
                 .constrains_duplicate_dictionary_key()
                 .then_some(QueryFeature::DuplicateDictionaryKey),
         );
@@ -162,6 +168,7 @@ impl QueryFeatures {
                 QueryFeature::Role(role) => unsupported.roles.push(role),
                 QueryFeature::BooleanLiteralValue => unsupported.boolean_literal_value = true,
                 QueryFeature::AsyncCallableValue => unsupported.async_callable_value = true,
+                QueryFeature::UnsafeContext => unsupported.unsafe_context = true,
                 QueryFeature::StringLiteralValue => unsupported.string_literal_value = true,
                 QueryFeature::IntegerLiteralValue => unsupported.integer_literal_value = true,
                 QueryFeature::DuplicateDictionaryKey => unsupported.duplicate_dictionary_key = true,
@@ -186,6 +193,7 @@ pub(crate) struct UnsupportedQueryFeatures {
     roles: Vec<Role>,
     boolean_literal_value: bool,
     async_callable_value: bool,
+    unsafe_context: bool,
     string_literal_value: bool,
     integer_literal_value: bool,
     duplicate_dictionary_key: bool,
@@ -217,6 +225,12 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::BooleanLiteralValue,
+            });
+        }
+        if self.unsafe_context {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::UnsafeContext,
             });
         }
         if self.async_callable_value {
@@ -318,6 +332,10 @@ impl QueryCapabilityDiagnostic {
                 "structural adapter for {} does not support exact boolean-literal values",
                 self.language.config_label()
             ),
+            UnsupportedFeatureGroup::UnsafeContext => format!(
+                "structural adapter for {} does not support unsafe-context on calls",
+                self.language.config_label()
+            ),
             UnsupportedFeatureGroup::AsyncCallableValue => format!(
                 "structural adapter for {} does not support AST-backed callable asyncness",
                 self.language.config_label()
@@ -378,6 +396,7 @@ enum UnsupportedFeatureGroup {
     Roles(Vec<Role>),
     BooleanLiteralValue,
     AsyncCallableValue,
+    UnsafeContext,
     StringLiteralValue,
     IntegerLiteralValue,
     DuplicateDictionaryKey,

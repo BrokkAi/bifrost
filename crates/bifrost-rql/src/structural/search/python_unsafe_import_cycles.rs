@@ -932,6 +932,7 @@ fn rule_fact(
 
 fn python_rule_incomplete_diagnostic(message: &str) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
         impact: CodeQueryDiagnosticImpact::Incomplete,

@@ -24,15 +24,15 @@ pub use brokk_bifrost_analysis::{
     CodeUnitType, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
     DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
     DispatchHierarchyExpansion, EmptyAnalyzer, FileSetProject, FilesystemProject, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JvmAnalyzerConfig,
+    ImportAnalysisProvider, ImportInfo, ImportReachability, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
-    JvmExternalDependencies, JvmMavenCoordinate, KotlinAnalyzer, Language, MultiAnalyzer,
-    MultiRootProject, NavigationOperation, OverlayProject, ParseCompleteness, ParseError,
-    ParseErrorKind, PhpAnalyzerConfig, PhpDependencyApiEvidence, Project, ProjectFile, Range,
-    RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact, ScalaAnalyzer,
-    SourceContent, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, WorkspaceAnalyzer,
-    collect_workspace_files, ensure_global_rayon_pool,
+    JvmExternalDependencies, JvmMavenCoordinate, Language, MultiAnalyzer, MultiRootProject,
+    NavigationOperation, OverlayProject, ParseCompleteness, ParseError, ParseErrorKind,
+    PhpAnalyzerConfig, PhpDependencyApiEvidence, Project, ProjectFile, Range, RubyAnalyzerConfig,
+    RubyDependencyApiEvidence, RubyGemApiArtifact, SourceContent, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TestProject, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider, WorkspaceAnalyzer, collect_workspace_files,
+    ensure_global_rayon_pool,
 };
 pub use brokk_bifrost_analysis::{
     cache_db, cache_gc, cancellation, compact_graph, git_file, gitblob, hash, navigation,
@@ -40,6 +40,7 @@ pub use brokk_bifrost_analysis::{
     sqlite_template, text_utils, util, workspace_document,
 };
 pub use brokk_bifrost_flow as flow;
+pub use brokk_bifrost_jvm_analysis::analyzer::{JavaAnalyzer, KotlinAnalyzer, ScalaAnalyzer};
 pub use brokk_bifrost_mcp::{
     mcp_cli, mcp_common, mcp_core, mcp_diff, mcp_extended, mcp_registry, mcp_slopcop, mcp_text,
     rmcp_host, scoped_project, searchtools_service, tool_arguments,
@@ -62,8 +63,8 @@ pub use brokk_bifrost_rust_analysis::{
 pub use brokk_bifrost_semantic_packs as semantic_packs;
 pub use brokk_bifrost_tools::{RenderedSummary, SummaryInput, summarize_inputs};
 pub use brokk_bifrost_tools::{
-    code_quality, cyclomatic_complexity_diff, diff_analysis, file_tools, model_context, relevance,
-    searchtools, searchtools_render, summary, symbol_rename,
+    code_quality, cyclomatic_complexity_diff, diff_analysis, file_tools, function_sources,
+    model_context, relevance, searchtools, searchtools_render, summary, symbol_rename,
 };
 
 use std::sync::OnceLock;
@@ -191,6 +192,23 @@ pub mod analyzer {
     pub use brokk_bifrost_js_ts_analysis::analyzer::js_ts::*;
     pub use brokk_bifrost_js_ts_analysis::analyzer::{javascript, js_ts, typescript};
     pub use brokk_bifrost_js_ts_analysis::{JavascriptAnalyzer, TypescriptAnalyzer};
+    pub use brokk_bifrost_jvm_analysis::analyzer::{
+        JavaAnalyzer, JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, JavaCallResultUse,
+        JavaCallResultUseIndex, JavaCallResultUseOpen, JavaCallResultUseRelationIndex,
+        JavaJarPackProducer, JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence,
+        JdkSourceArchiveLayout, JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,
+        KotlinAnalyzer, KotlinSourceJarPackProducer, ScalaAnalyzer, ScalaSourceJarPackProducer,
+        java_call_result_use_site, java_plain_string_literal, kotlin_declared_scalar_types,
+        resolve_java_annotation_type, resolve_jvm_semantic_pack_dependencies,
+        scala_declared_scalar_types,
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    pub use brokk_bifrost_jvm_analysis::analyzer::{
+        JavaNativeCallRelations, JavaNativeRenameProvider, JavaNativeSelectedInverseProvider,
+        JavaNativeSelectedReferenceIndex, JavaNativeUsageStrategy, JavaSelectedReverseOutcome,
+        java_native_incoming_calls, java_native_rename, java_selected_inverse_for,
+    };
+    pub use brokk_bifrost_jvm_analysis::analyzer::{java, jvm, kotlin, scala};
     pub use brokk_bifrost_rust_analysis::analyzer::rust;
     pub use brokk_bifrost_rust_analysis::analyzer::{
         RustAnalyzer, RustCallResultUseIndex, RustDependencyPackAdapter, RustNativeObligationProof,
@@ -210,8 +228,21 @@ pub mod analyzer {
     };
 }
 pub mod usages {
+    pub mod get_definition {
+        pub use brokk_bifrost_analysis::usages::get_definition::*;
+        pub use brokk_bifrost_jvm_analysis::analyzer::usages::get_definition::{
+            java, kotlin, scala,
+        };
+    }
+    pub mod get_type {
+        pub use brokk_bifrost_analysis::usages::get_type::*;
+        pub use brokk_bifrost_jvm_analysis::analyzer::usages::get_type::{java, scala};
+    }
     pub use brokk_bifrost_analysis::usages::*;
     pub use brokk_bifrost_js_ts_analysis::JsTsExportUsageGraphStrategy;
+    pub use brokk_bifrost_jvm_analysis::{
+        JavaUsageGraphStrategy, KotlinUsageGraphStrategy, ScalaUsageGraphStrategy,
+    };
     pub use brokk_bifrost_rust_analysis::RustNativeUsageStrategy;
 }
 

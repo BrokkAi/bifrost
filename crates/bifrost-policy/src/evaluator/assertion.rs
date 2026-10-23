@@ -1214,7 +1214,11 @@ fn finish_assertion_run(
     totals: AssertionRunTotals,
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
-    let adapted = adapt_query_diagnostics(&totals.query_diagnostics, budget.max_diagnostics());
+    let adapted = adapt_query_diagnostics(
+        &totals.query_diagnostics,
+        budget.max_diagnostics(),
+        budget.max_related_locations_per_finding(),
+    );
     let mut diagnostics = adapted.diagnostics;
     let mut diagnostics_truncated = adapted.truncated;
     // A per-file assert decides each file from that file alone, so a finding
@@ -2563,7 +2567,11 @@ fn relational_run(
     let work = relational_work_report(total_work, evaluation.work, 0, 0);
 
     let capability = assertion_capabilities(&query_diagnostics);
-    let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
+    let adapted = adapt_query_diagnostics(
+        &query_diagnostics,
+        budget.max_diagnostics(),
+        budget.max_related_locations_per_finding(),
+    );
     let scope = if adapted.truncated || adapted.adaptation_failed {
         InconclusiveScope::Run
     } else {

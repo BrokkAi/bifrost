@@ -56,7 +56,11 @@ impl CppAnalyzer {
         keep_going: &dyn Fn() -> bool,
     ) -> Option<Arc<Vec<CodeUnit>>> {
         if let Some(cached) = self.visible_type_units_by_file.get(file) {
-            return Some(cached);
+            cached.replay(self);
+            return cached
+                .incompleteness
+                .is_empty()
+                .then(|| Arc::clone(&cached.value));
         }
         #[cfg(any(test, feature = "test-support"))]
         self.record_visible_type_units_build_for_test();
@@ -71,7 +75,7 @@ impl CppAnalyzer {
             return None;
         }
         self.visible_type_units_by_file
-            .insert(file.clone(), Arc::clone(&built));
+            .insert(file.clone(), CachedFileRead::complete(Arc::clone(&built)));
         Some(built)
     }
 
@@ -84,15 +88,21 @@ impl CppAnalyzer {
         keep_going: &dyn Fn() -> bool,
     ) -> Option<Vec<CodeUnit>> {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return Some((*cached).clone());
+            cached.replay(self);
+            return cached
+                .incompleteness
+                .is_empty()
+                .then(|| (*cached.value).clone());
         }
         let scope = AnalyzerQueryScope::new(self);
         let resolved = cpp_resolve_direct_ancestors(self, scope.token(), code_unit, keep_going)?;
         if scope.read_completion().is_err() {
             return None;
         }
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(resolved.clone()));
+        self.direct_ancestors.insert(
+            code_unit.clone(),
+            CachedFileRead::complete(Arc::new(resolved.clone())),
+        );
         Some(resolved)
     }
 }
@@ -108,7 +118,7 @@ impl TypeHierarchyProvider for CppAnalyzer {
                         "an unstopped ancestor walk must report an incomplete dependency"
                     );
                     // cached_complete_read propagates the recorded reason and
-                    // refuses to publish this compatibility value.
+                    // retains its incompleteness with this compatibility value.
                     Vec::new()
                 },
             )

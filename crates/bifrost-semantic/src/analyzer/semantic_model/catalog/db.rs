@@ -12,7 +12,7 @@ use crate::analyzer::semantic_model::catalog::CatalogOpenMode;
 use brokk_bifrost_core::sqlite_template;
 
 pub(in crate::analyzer::semantic_model::catalog) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 21;
+pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 22;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
 const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
 const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
@@ -25,6 +25,7 @@ const SEMANTIC_MODEL_SCHEMA_V14_CATALOG_VERSION: i64 = 18;
 const SEMANTIC_MODEL_SCHEMA_V15_CATALOG_VERSION: i64 = 19;
 const SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION: i64 = 20;
 const SEMANTIC_MODEL_SCHEMA_V17_CATALOG_VERSION: i64 = 21;
+const SEMANTIC_MODEL_SCHEMA_V18_CATALOG_VERSION: i64 = 22;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -73,6 +74,9 @@ const SEMANTIC_MODEL_SCHEMA_V16_SQL: &str =
 const SEMANTIC_MODEL_SCHEMA_V17_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0021-semantic-model-schema-v17.sql");
 
+const SEMANTIC_MODEL_SCHEMA_V18_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0022-semantic-model-schema-v18.sql");
+
 /// This build's empty-catalog template. The migrations are the schema inputs:
 /// on an empty catalog their Rust steps have no rows to change, so the SQL
 /// alone decides the bytes.
@@ -102,6 +106,7 @@ static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| 
             SEMANTIC_MODEL_SCHEMA_V15_SQL.as_bytes(),
             SEMANTIC_MODEL_SCHEMA_V16_SQL.as_bytes(),
             SEMANTIC_MODEL_SCHEMA_V17_SQL.as_bytes(),
+            SEMANTIC_MODEL_SCHEMA_V18_SQL.as_bytes(),
         ],
     )
 });
@@ -123,7 +128,7 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
         }
     };
     if mode == CatalogOpenMode::ReadWrite {
-        // A new catalog runs twenty-one migrations. Copy a template instead; see
+        // A new catalog runs twenty-two migrations. Copy a template instead; see
         // `sqlite_template`. The caller holds the catalog's initialization
         // lock, so no other opener is creating this file.
         let _scope =
@@ -302,7 +307,8 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
     migrate_semantic_model_schema_v14(connection)?;
     migrate_semantic_model_schema_v15(connection)?;
     migrate_semantic_model_schema_v16(connection)?;
-    migrate_semantic_model_schema_v17(connection)
+    migrate_semantic_model_schema_v17(connection)?;
+    migrate_semantic_model_schema_v18(connection)
 }
 
 fn migrate_legacy_catalog_versions(connection: &mut Connection) -> Result<(), CatalogError> {
@@ -1506,10 +1512,33 @@ fn migrate_semantic_model_schema_v16_transaction(
 }
 
 fn migrate_semantic_model_schema_v17(connection: &mut Connection) -> Result<(), CatalogError> {
+    migrate_manifest_schema(
+        connection,
+        SEMANTIC_MODEL_SCHEMA_V17_CATALOG_VERSION,
+        SEMANTIC_MODEL_SCHEMA_V17_SQL,
+    )
+}
+
+fn migrate_semantic_model_schema_v18(connection: &mut Connection) -> Result<(), CatalogError> {
+    migrate_manifest_schema(
+        connection,
+        SEMANTIC_MODEL_SCHEMA_V18_CATALOG_VERSION,
+        SEMANTIC_MODEL_SCHEMA_V18_SQL,
+    )
+}
+
+fn migrate_manifest_schema(
+    connection: &mut Connection,
+    target_version: i64,
+    sql: &str,
+) -> Result<(), CatalogError> {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| {
-            CatalogError::sqlite("read catalog schema version before migration 21", error)
+            CatalogError::sqlite(
+                "read catalog schema version before manifest-schema migration",
+                error,
+            )
         })?;
     if version > CURRENT_CATALOG_VERSION {
         return Err(CatalogError::CatalogTooNew {
@@ -1517,46 +1546,57 @@ fn migrate_semantic_model_schema_v17(connection: &mut Connection) -> Result<(), 
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    if version >= SEMANTIC_MODEL_SCHEMA_V17_CATALOG_VERSION {
+    if version >= target_version {
         return Ok(());
     }
-    if version != SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION {
+    if version != (target_version - 1) {
         return Err(CatalogError::Integrity(format!(
-            "catalog schema reached unexpected version {version} before migration 21"
+            "catalog schema reached unexpected version {version} before manifest-schema migration {target_version}"
         )));
     }
 
     connection
         .pragma_update(None, "foreign_keys", false)
         .map_err(|error| {
-            CatalogError::sqlite("disable catalog foreign keys for migration 21", error)
+            CatalogError::sqlite(
+                "disable catalog foreign keys for manifest-schema migration",
+                error,
+            )
         })?;
-    let migration_result = migrate_semantic_model_schema_v17_transaction(connection);
+    let migration_result = migrate_manifest_schema_transaction(connection, target_version, sql);
     let foreign_keys_result = connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(|error| {
-            CatalogError::sqlite("restore catalog foreign keys after migration 21", error)
+            CatalogError::sqlite(
+                "restore catalog foreign keys after manifest-schema migration",
+                error,
+            )
         });
     match (migration_result, foreign_keys_result) {
         (Err(migration_error), Ok(())) => Err(migration_error),
         (Err(migration_error), Err(foreign_keys_error)) => Err(CatalogError::Integrity(format!(
-            "catalog migration 21 failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
+            "catalog manifest-schema migration {target_version} failed: {migration_error}; restoring foreign-key enforcement failed: {foreign_keys_error}"
         ))),
         (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
 
-fn migrate_semantic_model_schema_v17_transaction(
+fn migrate_manifest_schema_transaction(
     connection: &mut Connection,
+    target_version: i64,
+    sql: &str,
 ) -> Result<(), CatalogError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| CatalogError::sqlite("begin catalog migration 21", error))?;
+        .map_err(|error| CatalogError::sqlite("begin catalog manifest-schema migration", error))?;
     let locked_version: i64 = transaction
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| {
-            CatalogError::sqlite("recheck catalog schema before migration 21", error)
+            CatalogError::sqlite(
+                "recheck catalog schema before manifest-schema migration",
+                error,
+            )
         })?;
     if locked_version > CURRENT_CATALOG_VERSION {
         return Err(CatalogError::CatalogTooNew {
@@ -1564,27 +1604,25 @@ fn migrate_semantic_model_schema_v17_transaction(
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    if locked_version >= SEMANTIC_MODEL_SCHEMA_V17_CATALOG_VERSION {
+    if locked_version >= target_version {
         return transaction.commit().map_err(|error| {
-            CatalogError::sqlite("commit concurrent catalog migration 21", error)
+            CatalogError::sqlite("commit concurrent catalog manifest-schema migration", error)
         });
     }
-    if locked_version != SEMANTIC_MODEL_SCHEMA_V16_CATALOG_VERSION {
+    if locked_version != (target_version - 1) {
         return Err(CatalogError::Integrity(format!(
-            "catalog schema changed to unexpected version {locked_version} before migration 21"
+            "catalog schema changed to unexpected version {locked_version} before manifest-schema migration {target_version}"
         )));
     }
 
     transaction
-        .execute_batch(SEMANTIC_MODEL_SCHEMA_V17_SQL)
-        .map_err(|error| {
-            CatalogError::sqlite("apply semantic-model-schema-v17 catalog migration", error)
-        })?;
+        .execute_batch(sql)
+        .map_err(|error| CatalogError::sqlite("apply manifest-schema catalog migration", error))?;
     let foreign_key_violations = {
         let mut statement = transaction
             .prepare("PRAGMA foreign_key_check")
             .map_err(|error| {
-                CatalogError::sqlite("prepare migration 21 foreign-key check", error)
+                CatalogError::sqlite("prepare manifest-schema migration foreign-key check", error)
             })?;
         let rows = statement
             .query_map([], |row| {
@@ -1595,30 +1633,31 @@ fn migrate_semantic_model_schema_v17_transaction(
                     row.get::<_, i64>(3)?,
                 ))
             })
-            .map_err(|error| CatalogError::sqlite("run migration 21 foreign-key check", error))?;
+            .map_err(|error| {
+                CatalogError::sqlite("run manifest-schema migration foreign-key check", error)
+            })?;
         let mut violations = Vec::new();
         for row in rows {
             violations.push(row.map_err(|error| {
-                CatalogError::sqlite("read migration 21 foreign-key violation", error)
+                CatalogError::sqlite(
+                    "read manifest-schema migration foreign-key violation",
+                    error,
+                )
             })?);
         }
         violations
     };
     if !foreign_key_violations.is_empty() {
         return Err(CatalogError::Integrity(format!(
-            "catalog migration 21 found foreign-key violations: {foreign_key_violations:?}"
+            "catalog manifest-schema migration {target_version} found foreign-key violations: {foreign_key_violations:?}"
         )));
     }
     transaction
-        .pragma_update(
-            None,
-            "user_version",
-            SEMANTIC_MODEL_SCHEMA_V17_CATALOG_VERSION,
-        )
-        .map_err(|error| CatalogError::sqlite("publish catalog schema version 21", error))?;
+        .pragma_update(None, "user_version", target_version)
+        .map_err(|error| CatalogError::sqlite("publish manifest-schema catalog version", error))?;
     transaction
         .commit()
-        .map_err(|error| CatalogError::sqlite("commit catalog migration 21", error))
+        .map_err(|error| CatalogError::sqlite("commit catalog manifest-schema migration", error))
 }
 
 #[cfg(test)]
@@ -2306,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_13_through_21_preserve_catalog_rows_and_defer_old_shards_to_demand() {
+    fn migrations_13_through_22_preserve_catalog_rows_and_defer_old_shards_to_demand() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_schema_10(&mut connection);
         insert_legacy_pack(&connection);
@@ -2393,6 +2432,7 @@ mod tests {
         migrate_semantic_model_schema_v15(&mut connection).unwrap();
         migrate_semantic_model_schema_v16(&mut connection).unwrap();
         migrate_semantic_model_schema_v17(&mut connection).unwrap();
+        migrate_semantic_model_schema_v18(&mut connection).unwrap();
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -2521,6 +2561,14 @@ mod tests {
                 params!["17".repeat(32), "6".repeat(64)],
             )
             .expect("schema 17 is admitted after migration 21");
+        connection.execute(
+            "INSERT INTO catalog_packs(manifest_digest, semantic_digest, manifest_bytes, schema_version,
+              pack_id, pack_version, producer_name, producer_version, language, ecosystem,
+              bifrost_compatibility, provenance_json, license, completeness, state, installed_at, verified_at)
+             VALUES(?1, ?2, X'01', 18, 'schema-eighteen', '1.0.0', 'producer', '1.0.0',
+              'rust', 'cargo', NULL, X'7B7D', 'Apache-2.0', 'partial', 'verified', 1, 1)",
+            params!["18".repeat(32), "7".repeat(64)],
+        ).expect("schema 18 is admitted after migration 22");
         assert!(connection.execute(
             "UPDATE catalog_packs SET bifrost_compatibility = '*' WHERE schema_version = 17", []
         ).is_err(), "schema 17 retains native compatibility semantics");

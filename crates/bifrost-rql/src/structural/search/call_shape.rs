@@ -124,6 +124,7 @@ pub(super) fn call_shape_expansions_for_input(
         && reported_suppressed_shapes.insert(outcome.site_ast_id.clone())
     {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallShapeCoverageIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,

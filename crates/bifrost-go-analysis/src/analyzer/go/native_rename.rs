@@ -104,6 +104,29 @@ fn native_go_rename(
     if cancellation.is_cancelled() {
         return Err(failure("cancelled", "native Go rename was cancelled"));
     }
+    let snapshots = go.inner.selected_workspace_snapshots();
+    let (Some(snapshot), Some(profile)) = (
+        snapshots.get("go"),
+        go.context_profile_for_file(&brokk_bifrost_core::path_utils::rel_path_string(
+            target.source(),
+        )),
+    ) else {
+        return Err(failure(
+            "stale_context",
+            "selected Go package/import context is unavailable",
+        ));
+    };
+    let context = go
+        .inner
+        .analyzer_store()
+        .selected_go_context(snapshot, &profile)
+        .map_err(|error| failure("incomplete_analysis", error.to_string()))?
+        .ok_or_else(|| {
+            failure(
+                "stale_context",
+                "selected Go package/import context is unavailable",
+            )
+        })?;
     let generation = project.analysis_generation();
     let (original, conflict) =
         match go_selected_inverse_for_rename_original(go, target, new_name, cancellation) {
@@ -254,7 +277,22 @@ fn native_go_rename(
             "native Go rename was cancelled or selected generation changed",
         ));
     }
-    Ok(result)
+    use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextHeadStatus;
+    match go
+        .inner
+        .analyzer_store()
+        .go_context_head_status(&context, cancellation)
+        .map_err(|error| failure("incomplete_analysis", error.to_string()))?
+    {
+        GoContextHeadStatus::Current => Ok(result),
+        GoContextHeadStatus::Withdrawn => Err(failure(
+            "stale_context",
+            "selected Go package/import publication was withdrawn",
+        )),
+        GoContextHeadStatus::Cancelled => {
+            Err(failure("cancelled", "native Go rename was cancelled"))
+        }
+    }
 }
 
 fn build_rename_files(

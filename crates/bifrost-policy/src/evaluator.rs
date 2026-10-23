@@ -2769,6 +2769,7 @@ fn executable_match_query(
             | QueryValueKind::Occurrence
             | QueryValueKind::PythonRuleFact
             | QueryValueKind::PythonHierarchyFact
+            | QueryValueKind::RustMarkerImpl
             | QueryValueKind::RustPointerFinding
             // A binding and a resolution candidate are both exact facts about
             // one source position, so a match policy listing suspicious
@@ -2928,7 +2929,11 @@ fn adapt_match_execution(
         .iter()
         .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ResultLimitReached);
 
-    let adapted_diagnostics = adapt_query_diagnostics(query_diagnostics, budget.max_diagnostics());
+    let adapted_diagnostics = adapt_query_diagnostics(
+        query_diagnostics,
+        budget.max_diagnostics(),
+        budget.max_related_locations_per_finding(),
+    );
     let mut diagnostics = adapted_diagnostics.diagnostics;
     let mut diagnostics_truncated = adapted_diagnostics.truncated;
     if diagnostics_truncated {
@@ -3030,6 +3035,7 @@ struct AdaptedQueryDiagnostics {
 fn adapt_query_diagnostics(
     query_diagnostics: &[CodeQueryDiagnostic],
     max_diagnostics: usize,
+    max_related: usize,
 ) -> AdaptedQueryDiagnostics {
     let mut diagnostics = Vec::new();
     let mut truncated = false;
@@ -3050,7 +3056,8 @@ fn adapt_query_diagnostics(
             truncated = true;
             break;
         }
-        match adapt_query_diagnostic(diagnostic) {
+        truncated |= diagnostic.related.len() > max_related;
+        match adapt_query_diagnostic(diagnostic, max_related) {
             Ok(diagnostic) => diagnostics.push(diagnostic),
             Err(_) => {
                 // Analyzer prose is not trusted to satisfy policy-report bounds. Keep
@@ -3178,8 +3185,12 @@ fn adapt_match_candidate(
         Some(CodeQueryStableOwnerCandidate::Derived {
             derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
             ..
-        }) if evidence.domain == DetailedCodeQueryDomain::RustPointerFinding => {
-            // A pointer finding is anchored at its exact source row. Its
+        }) if matches!(
+            evidence.domain,
+            DetailedCodeQueryDomain::RustMarkerImpl | DetailedCodeQueryDomain::RustPointerFinding
+        ) =>
+        {
+            // These analysis facts are anchored at their exact source row. Their
             // semantic wire id is not a declaration owner; the source slice
             // hash and row ordinal provide the stable finding key.
             OwnerCandidate::Absent
@@ -3644,6 +3655,40 @@ fn terminal_presentation(
             )
         }
         UnitRowItemTerminal::SourcePosition
+            if *actual_domain == DetailedCodeQueryDomain::RustMarkerImpl =>
+        {
+            let fact_label = |name| match item.field(name) {
+                Ok(Some(
+                    CodeQueryRowScalarRef::ConstrainedEnum(value)
+                    | CodeQueryRowScalarRef::String(value),
+                )) => Some(value),
+                _ => None,
+            };
+            let proven = fact_label("completeness") == Some("complete");
+            let complete = fact_label("completeness") == Some("complete");
+            let certainty = if proven && complete {
+                Vec::new()
+            } else {
+                vec![
+                    CertaintyReason::analyzer_ambiguity("rust_marker_impl_incomplete")
+                        .map_err(|_| ())?,
+                ]
+            };
+            (
+                certainty,
+                if proven && complete {
+                    ProofState::Proven
+                } else {
+                    ProofState::Unproven
+                },
+                if proven && complete {
+                    ProofReason::DirectStructuralMatch
+                } else {
+                    ProofReason::PartialWitness
+                },
+            )
+        }
+        UnitRowItemTerminal::SourcePosition
             if *actual_domain == DetailedCodeQueryDomain::RustPointerFinding =>
         {
             let fact_label = |name| match item.field(name) {
@@ -4008,6 +4053,19 @@ fn adapt_terminal_result(
                 kind: relation.clone(),
                 location: location.clone(),
                 identity: None,
+            },
+            false,
+        )),
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::RustMarkerImpl,
+            DetailedCodeQueryKey::RustMarkerImpl { .. },
+            UnitRowIdentities::Primary(identity),
+        ) => Ok((
+            PolicyQueryResultRef::StructuralMatch {
+                kind: unit_row_label(item, "trait")?.to_owned(),
+                location: location.clone(),
+                identity: validated_provenance_identity(identity.as_ref()),
             },
             false,
         )),
@@ -4625,6 +4683,25 @@ fn adapt_provenance_ref(
                     display_range.ok_or(())?,
                 )?,
                 identity: None,
+            }
+        }
+        (
+            UnitRowItemRefValue::StructuralMatch {
+                kind,
+                node_range: Some(range),
+            },
+            DetailedCodeQueryDomain::RustMarkerImpl,
+            DetailedCodeQueryKey::RustMarkerImpl { .. },
+            UnitRowIdentities::Primary(identity),
+        ) if value_kind.as_ref() == "rust_marker_impl" && Some(range) == display_range => {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: kind.to_string(),
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                identity: validated_provenance_identity(identity.as_ref()),
             }
         }
         (
@@ -5293,6 +5370,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         // the structural source envelope; selector adaptation retains the
         // typed proof and completeness columns.
         DetailedCodeQueryDomain::PythonRuleFact => Some(MatchResultDomain::StructuralMatch),
+        DetailedCodeQueryDomain::RustMarkerImpl => Some(MatchResultDomain::StructuralMatch),
         DetailedCodeQueryDomain::RustPointerFinding => Some(MatchResultDomain::StructuralMatch),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
         DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
@@ -5449,6 +5527,9 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         DetailedCodeQueryKey::PythonRuleFact { id, relation } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, relation.as_bytes());
+        }
+        DetailedCodeQueryKey::RustMarkerImpl { id } => {
+            update_hash(&mut hasher, id.as_bytes());
         }
         DetailedCodeQueryKey::RustPointerFinding { id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -6096,6 +6177,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
 
 fn adapt_query_diagnostic(
     diagnostic: &CodeQueryDiagnostic,
+    max_related: usize,
 ) -> Result<PolicyDiagnostic, ReportValueError> {
     let (severity, impact) = match diagnostic.impact {
         CodeQueryDiagnosticImpact::Advisory => (
@@ -6125,6 +6207,25 @@ fn adapt_query_diagnostic(
                 .map_err(|_| ReportValueError::ResultLocationMustHaveSpan)
         })
         .transpose()?;
+    let related = diagnostic
+        .related
+        .iter()
+        .take(max_related)
+        .map(|related| {
+            let source = &related.source;
+            let path = WorkspaceRelativePath::new(&source.path)
+                .map_err(|_| ReportValueError::InvalidWorkspacePath)?;
+            let location =
+                policy_span_location(path, &(source.start_byte..source.end_byte), source.range)
+                    .map_err(|_| ReportValueError::ResultLocationMustHaveSpan)?;
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::Evidence,
+                location,
+                Vec::new(),
+            )?
+            .with_label(related.label.clone())
+        })
+        .collect::<Result<Vec<_>, ReportValueError>>()?;
     PolicyDiagnostic::try_new(
         PolicyDiagnosticCode::CodeQuery {
             code: diagnostic.code,
@@ -6133,7 +6234,7 @@ fn adapt_query_diagnostic(
         impact,
         diagnostic.message.clone(),
         primary,
-        Vec::new(),
+        related,
     )
 }
 

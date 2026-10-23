@@ -657,6 +657,7 @@ fn go_native_point_binds_standard_package_and_external_member_identity() {
     let workspace = fixture.workspace_analyzer(config.clone());
     let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
     let activation = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: Vec::new(),
         controls: Vec::new(),
@@ -1088,6 +1089,7 @@ func useUnknown[T interface{ Release() error }](receiver T) {
     let workspace = fixture.workspace_analyzer(config.clone());
     let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
     let activation = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: Vec::new(),
         controls: Vec::new(),
@@ -2078,7 +2080,7 @@ func use(s Service) { _ = s.ID }
         .get("go")
         .cloned()
         .expect("selected Go snapshot");
-    let profile = analyzer.native_context_profile().expect("Go profile");
+    let profile = analyzer.context_profile_for_test().expect("Go profile");
     let context = analyzer
         .inner
         .analyzer_store()
@@ -2215,6 +2217,7 @@ func run(opts *Options) { c, err := opts.Client(); _, _ = c, err }
     let workspace = fixture.workspace_analyzer(config.clone());
     let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
     let activation = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: Vec::new(),
         controls: Vec::new(),
@@ -3506,4 +3509,363 @@ fn go_native_point_resolves_anonymous_table_rows_and_local_type_owners() {
     assert_eq!(owner.status, DefinitionLookupStatus::Resolved, "{owner:#?}");
     assert_eq!(owner.definitions.len(), 1, "{owner:#?}");
     assert_eq!(owner.definitions[0].identifier(), "localOptions");
+}
+
+#[test]
+#[hardwon(
+    "#6524: interface method names hid signature types; parenthesized conversions lost their type"
+)]
+fn go_native_interface_method_names_do_not_hide_signature_types() {
+    let source = r#"package consumer
+import vocabulary "example.test/native/provider"
+type Result struct{}
+type I interface {
+    Result(Result) Result
+    Item(vocabulary.Item) vocabulary.Item
+}
+type S struct { Result Result }
+"#;
+    let (fixture, analyzer) = fixture(source);
+    for (needle, reference, expected_file, expected_name) in [
+        ("Result) Result", "Result", CALLER, "Result"),
+        ("Result\n", "Result", CALLER, "Result"),
+        ("Item) vocabulary", "Item", PROVIDER, "Item"),
+        ("Item\n", "Item", PROVIDER, "Item"),
+        ("Result }", "Result", CALLER, "Result"),
+    ] {
+        let start = source.find(needle).unwrap();
+        let outcome = resolve_at(&analyzer, &fixture, CALLER, source, start, reference);
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{needle}: {outcome:?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1, "{needle}: {outcome:?}");
+        assert_eq!(
+            outcome.definitions[0].source(),
+            &fixture.file(expected_file)
+        );
+        assert_eq!(outcome.definitions[0].terminal_name(), expected_name);
+        if expected_name == "Result" {
+            assert!(outcome.definitions[0].is_class(), "{needle}: {outcome:?}");
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "#6524: interface method names hid signature types; parenthesized conversions lost their type"
+)]
+fn go_native_parenthesized_conversions_preserve_type_targets() {
+    let source = r#"package consumer
+import vocabulary "example.test/native/provider"
+type Result struct{}
+func identity(value Result) Result { return value }
+func use(value Result, imported vocabulary.Item) {
+    localPointer := (*Result)(nil)
+    importedPointer := (*vocabulary.Item)(nil)
+    localValue := (Result)(value)
+    importedValue := (vocabulary.Item)(imported)
+    functionValue := (identity)(value)
+    _, _, _, _, _ = localPointer, importedPointer, localValue, importedValue, functionValue
+}
+"#;
+    let (fixture, analyzer) = fixture(source);
+    for (needle, reference, expected_file, expected_name) in [
+        ("Result)(nil)", "Result", CALLER, "Result"),
+        ("Item)(nil)", "Item", PROVIDER, "Item"),
+        ("Result)(value)", "Result", CALLER, "Result"),
+        ("Item)(imported)", "Item", PROVIDER, "Item"),
+        ("identity)(value)", "identity", CALLER, "identity"),
+    ] {
+        let start = source.find(needle).unwrap();
+        let outcome = resolve_at(&analyzer, &fixture, CALLER, source, start, reference);
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{needle}: {outcome:?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1, "{needle}: {outcome:?}");
+        assert_eq!(
+            outcome.definitions[0].source(),
+            &fixture.file(expected_file)
+        );
+        assert_eq!(outcome.definitions[0].terminal_name(), expected_name);
+        if expected_name == "Result" {
+            assert!(outcome.definitions[0].is_class(), "{needle}: {outcome:?}");
+        }
+    }
+    for (name, pointer, imported) in [
+        ("localPointer", true, false),
+        ("importedPointer", true, true),
+        ("localValue", false, false),
+        ("importedValue", false, true),
+        ("functionValue", false, false),
+    ] {
+        let file = fixture.file(CALLER);
+        let site = site_for(source, name);
+        let result = resolve_go_type_bounded(
+            BoundedReceiverQuery {
+                analyzer: &analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &site,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: None,
+            },
+            || {},
+        );
+        let BoundedResolution::Complete { value, .. } = result else {
+            panic!("{name}: {result:?}");
+        };
+        assert_eq!(value.types.len(), 1, "{name}: {value:?}");
+        let expected_file = fixture.file(if imported { PROVIDER } else { CALLER });
+        assert_eq!(value.types[0].definitions.len(), 1, "{name}: {value:?}");
+        let target = &value.types[0].definitions[0];
+        assert_eq!(target.source(), &expected_file, "{name}: {value:?}");
+        assert_eq!(
+            target.terminal_name(),
+            if imported { "Item" } else { "Result" }
+        );
+        assert_eq!(
+            value.types[0].fqn,
+            format!("{}{}", if pointer { "*" } else { "" }, target.fq_name()),
+            "{name}: {value:?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon("#6482: superseding a bound interval must not certify an empty native answer")]
+fn go_native_point_reports_superseded_interval_context() {
+    let source = r#"package consumer; import renamed "example.test/native/provider"; var Value renamed.Item"#;
+    let (fixture, analyzer) = fixture(source);
+    let file = fixture.file(CALLER);
+    let site = site(source);
+    let query = BoundedReceiverQuery {
+        analyzer: &analyzer,
+        file: &file,
+        source,
+        tree: None,
+        site: &site,
+        budget: ReceiverAnalysisBudget::default(),
+        cancellation: None,
+    };
+    let before = complete(resolve_go_definition_bounded(query, || {}));
+    assert_eq!(
+        before.status,
+        DefinitionLookupStatus::Resolved,
+        "{before:?}"
+    );
+    let cancellation = CancellationToken::new();
+    let GoNativePointRequestOpen::Ready(mut empty_request) =
+        GoNativePointRequest::open_for_file(&analyzer, query.file, None, &cancellation).unwrap()
+    else {
+        panic!("the zero-row request must bind the current context before supersession");
+    };
+    let snapshot = analyzer.selected_snapshot_for_test().unwrap();
+    let profile = analyzer.context_profile_for_test().unwrap();
+    let outcome = complete(resolve_go_definition_bounded(query, || {
+        let store = analyzer.inner.analyzer_store();
+        let context = store
+            .selected_go_context(&snapshot, &profile)
+            .unwrap()
+            .unwrap();
+        store.conn.execute(move |conn| {
+            assert_eq!(conn.execute("UPDATE go_context_publications SET valid_until=?2 WHERE context_id=?1 AND valid_until IS NULL", rusqlite::params![context.context_id, snapshot.revision]).unwrap(), 1);
+        });
+        assert!(
+            analyzer
+                .inner
+                .analyzer_store()
+                .selected_go_context(&snapshot, &profile)
+                .unwrap()
+                .is_none()
+        );
+    }));
+    let empty = empty_request
+        .operation
+        .finish_native(
+            Vec::<()>::new(),
+            &brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion::Complete,
+            &cancellation,
+        )
+        .unwrap();
+    assert!(matches!(empty, SelectedResolutionOperationOutcome::Stale(
+        brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionStale::NativeContextPublication { .. }
+    )), "a superseded context cannot publish an empty native result");
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Unavailable,
+        "{outcome:?}"
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "native_stale"
+                && diagnostic.message.contains("NativeContextPublication")),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+#[hardwon(
+    "#6524: build-excluded methods entered deferred lookup and made an interface binding incomplete"
+)]
+#[hardwon("#6524: a build-excluded method kept promoted-field lookup incomplete")]
+fn go_native_point_excludes_nonparticipating_deferred_methods() {
+    if !go_toolchain_available() {
+        return;
+    }
+    let interface_source = r#"package consumer
+import "sync"
+var _ sync.Mutex
+func shutdown(inner pluginClient) { inner.Shutdown() }
+"#;
+    let interface_declaration = "package consumer; type pluginClient interface { Shutdown() }";
+    let interface_target = "example.test/native/consumer.pluginClient.Shutdown";
+    for (source, declarations, implementation, member, expected) in [
+        (
+            interface_source,
+            interface_declaration,
+            "//go:build bifrost_c2_excluded\n\npackage consumer\ntype dynamicLibraryClient struct{}\nfunc (*dynamicLibraryClient) Shutdown() {}\n",
+            "Shutdown",
+            interface_target,
+        ),
+        (
+            interface_source,
+            interface_declaration,
+            "//go:build cgo\n\npackage consumer\nimport \"C\"\ntype dynamicLibraryClient struct{}\nfunc (*dynamicLibraryClient) Shutdown() {}\n",
+            "Shutdown",
+            interface_target,
+        ),
+        (
+            interface_source,
+            interface_declaration,
+            "package consumer\ntype dynamicLibraryClient struct{}\nfunc (*dynamicLibraryClient) Shutdown() {}\n",
+            "Shutdown",
+            interface_target,
+        ),
+        (
+            "package consumer; func use(s Service) { _ = s.ID }",
+            "package consumer; type C struct { ID string }; type B struct { C }; type A struct { ID string }; type Service struct { A; B }",
+            "//go:build bifrost_c2_excluded\n\npackage consumer\nfunc (Service) ID() {}\n",
+            "ID",
+            "example.test/native/consumer.A.ID",
+        ),
+    ] {
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+            .file("consumer/abi.go", declarations)
+            .file(CALLER, source)
+            .file("consumer/loader.go", implementation)
+            .file("nested/go.mod", "module example.test/other\n\ngo 1.22\n")
+            .file("nested/abi.go", "package other; type Other struct{}")
+            .file(
+                "nested/loader.go",
+                "//go:build bifrost_c2_excluded\n\npackage other\nfunc (Other) Shutdown() {}\n",
+            )
+            .build();
+        let config = AnalyzerConfig {
+            go: GoAnalyzerConfig {
+                dependency_discovery: GoDependencyDiscoveryConfig {
+                    mode: GoDependencyDiscoveryMode::FullProduction,
+                    ..GoDependencyDiscoveryConfig::default()
+                },
+            },
+            ..AnalyzerConfig::default()
+        };
+        let workspace = fixture.workspace_analyzer(config.clone());
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let activation = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cancellation = CancellationToken::default();
+        let discovery = workspace.activate_dependency_packs(
+            &config,
+            &[DependencyPackEcosystem::Go],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits: DependencyPackLimits::default(),
+                cancellation: &cancellation,
+            },
+        );
+        assert_go_discovery_completed(&discovery);
+
+        let analyzer = workspace.analyzer();
+        {
+            use brokk_bifrost_analysis::analyzer::resolution::{
+                SelectedTypedFactSource, SemanticId,
+            };
+            let GoNativePointRequestOpen::Ready(request) = GoNativePointRequest::open_for_file(
+                resolve_analyzer::<GoAnalyzer>(analyzer).unwrap(),
+                &fixture.file(CALLER),
+                None,
+                &cancellation,
+            )
+            .unwrap() else {
+                panic!("caller context must be ready");
+            };
+            let mount = request
+                .operation
+                .mount_table()
+                .mount_for_path("go", "nested/loader.go")
+                .unwrap()
+                .unwrap();
+            let connection = request.operation.ready().inventory.connection();
+            let key: u32 = connection.query_row(
+                "SELECT s.semantic_key FROM main.resolution_semantic_sites s JOIN main.source_native_declaration_bridges b ON b.blob_id=s.blob_id AND b.source_site=s.source_site JOIN main.source_go_callables c ON c.blob_id=b.blob_id AND c.declaration_id=b.declaration_id JOIN temp.selected_resolution_mounts m ON m.blob_id=s.blob_id WHERE m.mount_ordinal=?1 AND s.semantic_role='definition' AND c.is_method=1 AND c.name='Shutdown'",
+                [mount.ordinal().get()], |row| row.get(0),
+            ).unwrap();
+            let definition = SemanticId::local(mount.ordinal().get(), key);
+            assert_eq!(
+                request
+                    .operation
+                    .ready()
+                    .typed_source()
+                    .deferred_member_participation(&[definition], &cancellation)
+                    .unwrap(),
+                Some(vec![false]),
+                "an excluded method in another domain must not participate"
+            );
+            assert_eq!(
+                request.operation.bound_go_context_publications().len(),
+                2,
+                "the candidate domain must be bound for finish rechecks"
+            );
+        }
+        let file = fixture.file(CALLER);
+        let point = site_for(source, member);
+        let outcome = complete(resolve_go_definition_bounded(
+            BoundedReceiverQuery {
+                analyzer,
+                file: &file,
+                source,
+                tree: None,
+                site: &point,
+                budget: ReceiverAnalysisBudget::default(),
+                cancellation: Some(&cancellation),
+            },
+            || {},
+        ));
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "{expected}: {outcome:?}"
+        );
+        assert_eq!(outcome.definitions.len(), 1, "{outcome:?}");
+        assert_eq!(
+            outcome.definitions[0].fq_name().to_string(),
+            expected,
+            "{outcome:?}"
+        );
+    }
 }

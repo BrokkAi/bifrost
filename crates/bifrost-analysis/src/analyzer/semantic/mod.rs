@@ -73,7 +73,7 @@ macro_rules! impl_program_semantics_provider {
             ) -> Option<$crate::analyzer::semantic::StorageLanguageKey> {
                 Some(
                     $crate::analyzer::semantic::StorageLanguageKey::from_adapter(
-                        $crate::analyzer::tree_sitter_analyzer::LanguageAdapter::storage_language_key_for_file(
+                        $crate::analyzer::store::StoreLanguageAdapter::storage_language_key_for_file(
                             self.inner.adapter(),
                             file,
                         ),
@@ -147,7 +147,7 @@ macro_rules! impl_program_semantics_provider {
             ) -> Option<$crate::analyzer::semantic::StorageLanguageKey> {
                 Some(
                     $crate::analyzer::semantic::StorageLanguageKey::from_adapter(
-                        $crate::analyzer::tree_sitter_analyzer::LanguageAdapter::storage_language_key_for_file(
+                        $crate::analyzer::store::StoreLanguageAdapter::storage_language_key_for_file(
                             self.inner.adapter(),
                             file,
                         ),
@@ -215,8 +215,7 @@ pub mod value_type_barriers;
 pub mod workspace_oracle;
 pub use crate::cancellation::CancellationToken;
 pub use icfg::*;
-pub(crate) use inventory::*;
-pub(crate) use lowering::*;
+
 pub use oracle::*;
 pub use service::semantic_artifact_retained_bytes;
 #[cfg(any(test, feature = "test-support"))]
@@ -231,6 +230,7 @@ pub use type_flow::{
     NormalReturnTypeConstraint, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason,
     source_site_kind_tag, type_flow_adapter, validate_prepared_syntax_for_procedure,
 };
+
 pub use value_type_barriers::*;
 pub use workspace_oracle::*;
 pub mod local_value_origins;

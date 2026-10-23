@@ -4,7 +4,7 @@ pub(crate) mod go_publication_tests {
 
     use brokk_bifrost_core::analyzer::model::Language;
 
-    use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
     use brokk_bifrost_analysis::analyzer::store::test_support::parse_state;
 

@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize};
 /// Version fourteen carries directional variadic kinds on structured procedure
 /// formals. Version fifteen carries typed module values and callable parameter
 /// roles. Version sixteen carries exact runtime return-class sets. Version seventeen
-/// carries ordered exhaustive Python runtime direct-base claims.
+/// carries ordered exhaustive Python runtime direct-base claims. Version eighteen
+/// carries Rust generic defaults, implemented traits and receiver forms.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 17;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 18;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -38,7 +39,7 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 17;
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] =
-    &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+    &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
 /// Native callable-values facts first appeared in schema ten.
@@ -53,6 +54,8 @@ pub const TYPED_VALUES_AND_PARAMETER_ROLES_MIN_SCHEMA_VERSION: u32 = 15;
 pub const EXACT_RETURN_CLASSES_MIN_SCHEMA_VERSION: u32 = 16;
 /// Exhaustive ordered Python runtime bases first appeared in schema seventeen.
 pub const RUNTIME_BASES_MIN_SCHEMA_VERSION: u32 = 17;
+/// Structured Rust declaration contracts first appeared in schema eighteen.
+pub const RUST_DECLARATION_CONTRACT_MIN_SCHEMA_VERSION: u32 = 18;
 /// Structured channel-close effects and returned-callable bindings first
 /// appeared in schema eleven.
 pub const CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION: u32 = 11;
@@ -2691,6 +2694,14 @@ pub struct TypeFact {
     pub type_parameters: Vec<String>,
     #[serde(default)]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
+    /// Empty means unreviewed; otherwise parallel to type_parameters (lifetimes excluded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_parameter_defaults: Vec<Option<GenericParameterDefault>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implemented_traits: Vec<ImplementedTraitFact>,
+    /// Generic impl rules owned by the implemented trait, never concrete projections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generic_trait_impls: Vec<GenericTraitImplFact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlying_type: Option<StructuredTypeExpression>,
     /// Type-wide value-transfer semantics. This is deliberately optional:
@@ -2719,6 +2730,73 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// Rustdoc const defaults are compiler-rendered scalar expressions, not parsed source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GenericParameterDefault {
+    Type { r#type: TypeRef },
+    Const { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssociatedTypeBinding {
+    pub name: String,
+    pub r#type: TypeRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementedTraitFact {
+    pub trait_type: TypeRef,
+    #[serde(default)]
+    pub associated_types: Vec<AssociatedTypeBinding>,
+}
+
+/// The constructor shapes used by Rust's forwarding impls, with reference mutability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RustSelfPattern {
+    Parameter {
+        name: String,
+    },
+    Reference {
+        mutable: bool,
+        inner: Box<RustSelfPattern>,
+    },
+    Constructor {
+        owner: TypeRef,
+        arguments: Vec<RustSelfPattern>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenericTraitBound {
+    /// A parameter or an associated projection such as P::Target for Pin<P>.
+    pub subject: TypeRef,
+    pub bound: ImplementedTraitFact,
+    pub maybe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenericTraitImplFact {
+    pub type_parameters: Vec<String>,
+    pub self_pattern: RustSelfPattern,
+    pub bounds: Vec<GenericTraitBound>,
+    pub implementation: ImplementedTraitFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RustSelfForm {
+    Value,
+    Shared,
+    Mutable,
+    Other { pattern: RustSelfPattern },
 }
 
 /// Structured JVM inventory coverage. Missing coverage is deliberately open.
@@ -2834,6 +2912,10 @@ pub enum NonOverridableEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemberFact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implemented_trait: Option<TypeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_form: Option<RustSelfForm>,
     pub id: String,
     pub owner: String,
     pub name: String,
@@ -3344,6 +3426,15 @@ impl ParameterPassingMode {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeRef {
+    /// Rust associated-type projection, retained without claiming a solved type.
+    Projection {
+        owner: Box<TypeRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trait_type: Option<Box<TypeRef>>,
+        name: String,
+        #[serde(default)]
+        arguments: Vec<TypeRef>,
+    },
     /// The type is not known. This is neither a concrete type nor a claim that
     /// every type is allowed. Callable ports remain present independently.
     Unknown,
@@ -3431,7 +3522,7 @@ impl TypeRef {
         let mut pending = vec![self];
         while let Some(reference) = pending.pop() {
             match reference {
-                Self::Unknown => return true,
+                Self::Unknown | Self::Projection { .. } => return true,
                 Self::Named { arguments, .. } | Self::Declared { arguments, .. } => {
                     pending.extend(arguments);
                 }

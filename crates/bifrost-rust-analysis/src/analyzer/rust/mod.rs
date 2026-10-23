@@ -1,3 +1,4 @@
+use brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport;
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
 use brokk_bifrost_analysis::{
@@ -73,6 +74,77 @@ pub(crate) fn rust_call_reference_candidate(node: tree_sitter::Node<'_>) -> bool
         }
     }
     false
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSupport {
+    fn module_definition_provider(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::store::language_support::ModuleDefinitionProvider>
+    {
+        Some(|source, definitions, cancellation| {
+            source.rust_module_definitions(definitions, cancellation)
+        })
+    }
+
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("Cargo.toml" | "Cargo.lock")
+        ) || (path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == ".cargo")
+            && matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("config" | "config.toml")
+            ))
+    }
+    fn selected_macro_source_rows(
+        &self,
+    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroSourceRows>
+{
+        Some(&source_storage::RustMacroSourceRows)
+    }
+    fn intrinsic_sequence_type(
+        &self,
+        element: brokk_bifrost_analysis::analyzer::resolution::universe::UniverseEntry,
+        constructor: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind,
+        length: Option<&str>,
+    ) -> Option<(
+        brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind,
+        String,
+    )> {
+        use brokk_bifrost_analysis::analyzer::resolution::universe::UniverseIdentityKind;
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            IntrinsicTypeKind, ResolutionTypeConstructorKind,
+        };
+        if element.language != Language::Rust
+            || element.identity_kind != UniverseIdentityKind::Type(IntrinsicTypeKind::Primitive)
+        {
+            return None;
+        }
+        let name = element.identity_spelling;
+        match (constructor, length) {
+            (ResolutionTypeConstructorKind::Slice, None) => {
+                Some((IntrinsicTypeKind::Slice, format!("[{name}]")))
+            }
+            (ResolutionTypeConstructorKind::Array, Some(length)) => {
+                Some((IntrinsicTypeKind::Array, format!("[{name}; {length}]")))
+            }
+            _ => None,
+        }
+    }
+    fn selected_dependency_file_evidence(
+        &self,
+        root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        rust_file_dependency_evidence(root, selected, limits, None)
+    }
 }
 
 #[cfg(test)]
@@ -266,7 +338,7 @@ use brokk_bifrost_rust::crate_naming;
 
 pub(crate) use brokk_bifrost_rust::declarations::rust_type_identifiers;
 pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
-pub use brokk_bifrost_rust::graph_support::rust_reference_namespace;
+pub use brokk_bifrost_rust::graph_support::{rust_path_segments, rust_reference_namespace};
 pub(crate) use brokk_bifrost_rust::imports::rust_import_binding_name;
 use brokk_bifrost_rust::test_detection::detect_rust_test_assertion_smells;
 
@@ -1739,6 +1811,10 @@ impl CodeUnitIndex for RustAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
+    }
+
+    delegate_inner_methods! {
         fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
@@ -2503,18 +2579,6 @@ fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_by
 }
 
 impl LanguageSupport for RustSupport {
-    fn selected_dependency_file_evidence(
-        &self,
-        root: &std::path::Path,
-        selected: &[(
-            ProjectFile,
-            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
-        )],
-        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
-    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
-        rust_file_dependency_evidence(root, selected, limits, None)
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     fn probe_assignment_value(
         &self,
@@ -2710,50 +2774,6 @@ impl LanguageSupport for RustSupport {
         )
     }
 
-    fn intrinsic_sequence_type(
-        &self,
-        element: brokk_bifrost_analysis::analyzer::resolution::universe::UniverseEntry,
-        constructor: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeConstructorKind,
-        length: Option<&str>,
-    ) -> Option<(
-        brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind,
-        String,
-    )> {
-        use brokk_bifrost_analysis::analyzer::resolution::universe::UniverseIdentityKind;
-        use brokk_bifrost_core::analyzer::resolution_facts::{
-            IntrinsicTypeKind, ResolutionTypeConstructorKind,
-        };
-        if element.language != Language::Rust
-            || element.identity_kind != UniverseIdentityKind::Type(IntrinsicTypeKind::Primitive)
-        {
-            return None;
-        }
-        let name = element.identity_spelling;
-        match (constructor, length) {
-            (ResolutionTypeConstructorKind::Slice, None) => {
-                Some((IntrinsicTypeKind::Slice, format!("[{name}]")))
-            }
-            (ResolutionTypeConstructorKind::Array, Some(length)) => {
-                Some((IntrinsicTypeKind::Array, format!("[{name}; {length}]")))
-            }
-            _ => None,
-        }
-    }
-
-    fn is_configuration_input_path(&self, path: &Path) -> bool {
-        matches!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some("Cargo.toml" | "Cargo.lock")
-        ) || (path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|n| n == ".cargo")
-            && matches!(
-                path.file_name().and_then(|n| n.to_str()),
-                Some("config" | "config.toml")
-            ))
-    }
-
     fn caller_sites_compiled(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
@@ -2879,13 +2899,6 @@ impl LanguageSupport for RustSupport {
     ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::usages::call_conversion::CallArgumentConversionProver>
 {
         Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
-    }
-
-    fn selected_macro_source_rows(
-        &self,
-    ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroSourceRows>
-{
-        Some(&source_storage::RustMacroSourceRows)
     }
 
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {

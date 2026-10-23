@@ -38,6 +38,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     DeclaredVisibility, MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason,
     MethodFamilyRelation,
 };
+
 pub use brokk_bifrost_jvm::realm::{JvmExternalMemberIdentity, JvmReceiverSemantics};
 
 use crate::analyzer::common::language_for_file;
@@ -325,7 +326,8 @@ impl ExternalMemberFamilyAnswer {
         Self::stopped(ExternalMemberFamilyStatus::Incomplete(reason), visited)
     }
 
-    pub(crate) fn stopped(status: ExternalMemberFamilyStatus, visited: usize) -> Self {
+    #[doc(hidden)]
+    pub fn stopped(status: ExternalMemberFamilyStatus, visited: usize) -> Self {
         debug_assert!(status != ExternalMemberFamilyStatus::Complete);
         Self {
             status,
@@ -783,7 +785,8 @@ pub struct MemberFacts {
 }
 
 impl MemberFacts {
-    pub(crate) fn read(analyzer: &dyn IAnalyzer, member: &CodeUnit) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn read(analyzer: &dyn IAnalyzer, member: &CodeUnit) -> Option<Self> {
         let alternatives = analyzer.signature_metadata(member);
         let metadata = alternatives.first()?;
         let visibility = metadata.callable_declared_visibility()?;
@@ -845,7 +848,8 @@ impl MemberFacts {
         self.is_static
     }
 
-    pub(crate) fn arity(&self) -> Option<brokk_bifrost_core::analyzer::model::CallableArity> {
+    #[doc(hidden)]
+    pub fn arity(&self) -> Option<brokk_bifrost_core::analyzer::model::CallableArity> {
         self.arity
     }
 
@@ -1214,40 +1218,8 @@ fn owner_is_interface(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnitIndex, JavaAnalyzer};
-    use crate::inline_project::InlineTestProject;
 
-    #[test]
-    fn java_member_family_conflicting_visibility_alternatives_are_incomplete() {
-        for members in [
-            "public void run() {} private void run() {}",
-            "private void run() {} public void run() {}",
-        ] {
-            let fixture = InlineTestProject::with_language(Language::Java)
-                .file("Contract.java", "interface Contract { void run(); }")
-                .file(
-                    "Worker.java",
-                    format!("class Worker implements Contract {{ {members} }}"),
-                )
-                .build();
-            let analyzer = JavaAnalyzer::new(fixture.project_dyn());
-            let member = analyzer
-                .declarations(&fixture.file("Worker.java"))
-                .into_iter()
-                .find(|unit| unit.is_function() && unit.identifier() == "run")
-                .expect("written run method");
-            assert_eq!(analyzer.signature_metadata(&member).len(), 2);
-            let answer = java_member_family(&analyzer, &analyzer, &member, None);
-            assert_eq!(
-                answer.outcome,
-                MemberFamilyOutcome::Incomplete,
-                "{answer:?}"
-            );
-            assert_eq!(answer.reason, Some(MemberFamilyReason::ModifiersUnrecorded));
-            assert!(answer.edges.is_empty(), "{answer:?}");
-        }
-    }
-
+    #[cfg(test)]
     #[test]
     fn nominal_rules_and_the_support_table_agree() {
         let rules: [&dyn NominalFamilyRules; 3] =

@@ -147,6 +147,7 @@ fn report_unsupported(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
         impact: CodeQueryDiagnosticImpact::Incomplete,

@@ -1139,6 +1139,12 @@ impl ScalarStateDerivation {
             escaped_address_bindings,
             address_escape_bindings_by_point,
             shared_captures: shared_capture_bindings(procedure),
+            method_receivers_may_be_autoborrowed_mutably: matches!(
+                semantics.locator().language(),
+                brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                    crate::analyzer::Language::Rust
+                )
+            ),
             typing,
         };
         let mut states = vec![None::<Box<[ScalarFact]>>; point_count];
@@ -1441,7 +1447,7 @@ fn closed_scalar_cells(
             };
             if semantics.gaps().iter().any(|gap| {
                 if !gap.impacts.contains(SemanticGapImpact::HeapWrite)
-                    || gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+                    || crate::flow_state::gap_has_exit_only_control(gap)
                 {
                     return false;
                 }
@@ -1571,6 +1577,9 @@ struct ScalarTransferContext<'procedure, 'calls, 'typing> {
     escaped_address_bindings: HashSet<ValueId>,
     address_escape_bindings_by_point: HashMap<ProgramPointId, HashSet<ValueId>>,
     shared_captures: HashSet<ValueId>,
+    // Language fact: Rust method adjustment can implicitly borrow a receiver
+    // mutably. Java, JS/TS and Python cannot; others stay false until checked.
+    method_receivers_may_be_autoborrowed_mutably: bool,
     typing: &'typing ScalarTyping,
 }
 
@@ -1777,12 +1786,31 @@ fn transfer_point(
             }
             SemanticEffect::Invoke { call_site } => {
                 release_external_writers(state);
-                if modeled_address_calls.contains(&call_site) {
-                    continue;
-                }
                 let call = semantics
                     .call_site(call_site)
                     .expect("validated scalar call effect resolves");
+                // #6409: autoref can write a Rust local without a recorded
+                // assignment, including an untyped literal-initialized local.
+                // A receiver place-read temporary retains its unique binding
+                // origin; Address receivers use the same origin as arguments.
+                // This point transfer conservatively havocs the receiver on
+                // the normal continuation too; exact model edge writes may
+                // subsequently restore an outcome-specific fact.
+                if context.method_receivers_may_be_autoborrowed_mutably
+                    && let Some(receiver) = call.receiver
+                    && let Some(binding) = binding_origins.unique_binding_origin(receiver)
+                    && semantics.value(binding).is_some_and(|value| {
+                        matches!(
+                            value.kind,
+                            SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
+                        )
+                    })
+                {
+                    state[binding.index()] = ScalarFact::Unknown;
+                }
+                if modeled_address_calls.contains(&call_site) {
+                    continue;
+                }
                 for argument in &call.arguments {
                     if semantics
                         .value(argument.value)
@@ -1802,12 +1830,16 @@ fn transfer_point(
                 {
                     state[value.index()] = ScalarFact::Unknown;
                 }
-                // A suspension that is not lowered as a scaffold still lets
-                // other code run before this point continues.
+                // #6409: hidden calls release the same retained writers as Invoke.
+                // This suffices only when address-taking for everything the
+                // hidden call receives is recorded. Macros do not meet that
+                // premise; their NormalControlFlow/NonLocalControl gaps must
+                // continue to veto scalar proofs. Suspensions also run code.
                 if gap.subject == SemanticGapSubject::Point
                     && matches!(
                         gap.capability,
-                        SemanticCapability::GeneratorSuspension
+                        SemanticCapability::Calls
+                            | SemanticCapability::GeneratorSuspension
                             | SemanticCapability::AsyncSuspendResume
                     )
                 {
@@ -2578,6 +2610,75 @@ mod tests {
         assert!(derivation.is_reachable(guard.point));
         assert!(derivation.edge_is_feasible(guard.true_edge.expect("true arm")));
         assert!(derivation.edge_is_feasible(guard.false_edge.expect("false arm")));
+    }
+
+    #[test]
+    #[hardwon("#6409: aggregate-held mutable borrows must escape before an implicit Drop call")]
+    fn destructor_borrow_is_an_escaped_scalar_writer() {
+        for construction in ["Guard { value: &mut x }", "make(&mut x)"] {
+            let source = format!(
+                r#"
+struct Guard<'a> {{ value: &'a mut u8 }}
+impl Drop for Guard<'_> {{ fn drop(&mut self) {{ *self.value = 1; }} }}
+fn make(value: &mut u8) -> Guard<'_> {{ Guard {{ value }} }}
+fn run() -> bool {{
+    let mut x = 0u8;
+    {{ let _guard = {construction}; }}
+    if x == 0 {{ true }} else {{ false }}
+}}
+"#
+            );
+            let fixture = Fixture::source(Language::Rust, "main.rs", &source, "run");
+            let semantics = fixture.procedure.semantics();
+            let guard = semantics
+                .guard_facts()
+                .first()
+                .expect("the post-Drop scalar guard ran");
+            let operand = guard_operand(guard).expect("scalar guard operand");
+            let origins = BindingOriginIndex::new(&fixture.procedure);
+            let binding = origins.unique_binding_origin(operand).unwrap_or(operand);
+            let taken = address_taken_bindings(&origins);
+            let (escaped, _) = address_escape_bindings(&fixture.procedure, &[], &taken);
+            assert!(
+                escaped.contains(&binding),
+                "borrow must escape into the guard: {semantics:#?}"
+            );
+            assert!(
+                semantics
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.capability == SemanticCapability::Calls
+                        && gap.subject == SemanticGapSubject::Point),
+                "implicit release point must exist"
+            );
+            // #6409: these real producer facts retain their cross-consumer
+            // meaning. Relevance must not rely on narrowed impact rows.
+            let cleanup = semantics
+                .gaps()
+                .iter()
+                .find(|gap| {
+                    gap.capability == SemanticCapability::CleanupControlFlow
+                        && gap.subject == SemanticGapSubject::Point
+                })
+                .expect("cleanup fact");
+            assert!(
+                cleanup.impacts.contains(SemanticGapImpact::ValueFlow)
+                    && cleanup.impacts.contains(SemanticGapImpact::ReturnTransfer)
+            );
+            assert!(
+                semantics.gaps().iter().any(|gap| gap.capability
+                    == SemanticCapability::ResourceManagement
+                    && gap.subject == SemanticGapSubject::Point
+                    && gap.point == cleanup.point
+                    && gap.impacts.contains(SemanticGapImpact::CallEvaluation)),
+                "the resource fact at cleanup must retain CallEvaluation"
+            );
+            let scalar = ScalarStateDerivation::derive(&fixture.procedure);
+            assert_eq!(
+                scalar.guard_operand_fact(&fixture.procedure, guard),
+                Some(ScalarFact::Unknown)
+            );
+        }
     }
 
     #[test]

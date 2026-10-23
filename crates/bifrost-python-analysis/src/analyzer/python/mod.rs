@@ -848,6 +848,10 @@ impl CodeUnitIndex for PythonAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
+    }
+
+    delegate_inner_methods! {
         fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
@@ -1963,13 +1967,6 @@ impl LanguageSupport for PythonSupport {
         Some(external::python_qualified_base_name(target, &module).into_owned())
     }
 
-    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
-        matches!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("pyproject.toml" | "setup.py" | "__init__.py")
-        )
-    }
-
     fn signature_metadata_limited(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2110,6 +2107,7 @@ impl LanguageSupport for PythonSupport {
         crate::analyzer::usages::get_definition::python::release_definition_file(context, file);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn definition_tree(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
@@ -2117,6 +2115,7 @@ impl LanguageSupport for PythonSupport {
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         language: brokk_bifrost_core::analyzer::model::Language,
         source: &str,
+        _primary_tree: Option<&tree_sitter::Tree>,
     ) -> Option<tree_sitter::Tree> {
         crate::analyzer::usages::get_definition::python::definition_tree(
             analyzer, token, file, language, source,
@@ -2713,3 +2712,149 @@ use brokk_bifrost_analysis::{
 
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSupport {
+    fn include_native_metadata_paths(
+        &self,
+        project: &dyn brokk_bifrost_analysis::analyzer::Project,
+        files: &std::collections::BTreeSet<ProjectFile>,
+        inputs: &mut std::collections::BTreeSet<ProjectFile>,
+    ) -> std::io::Result<()> {
+        use brokk_bifrost_analysis::analyzer::store::workspace_inputs::metadata_ancestor_directories;
+        for directory in metadata_ancestor_directories(files.iter().filter(|file| {
+            file.rel_path()
+                .extension()
+                .is_some_and(|extension| extension == "py")
+        })) {
+            for name in ["pyproject.toml", "setup.py", "__init__.py"] {
+                let path = std::path::Path::new(name);
+                if self.is_configuration_input_path(path)
+                    && let Some(file) = project.file_by_rel_path(&directory.join(path))
+                {
+                    inputs.insert(file);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn qualified_member_registrations(
+        &self,
+    ) -> &'static [brokk_bifrost_analysis::analyzer::resolution::fact_source::QualifiedMemberRegistration]{
+        use brokk_bifrost_analysis::analyzer::resolution::fact_source::QualifiedMemberRegistration;
+        static REGISTRATION: [QualifiedMemberRegistration; 1] = [QualifiedMemberRegistration {
+            language: Language::Python,
+            hierarchy_identity: 0x5059_0001,
+            member_access: true,
+        }];
+        &REGISTRATION
+    }
+
+    fn publish_native_source_rows(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        blob: i64,
+        facts: &brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
+        cancellation: &brokk_bifrost_analysis::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        use brokk_bifrost_analysis::analyzer::store::{python_binding_rows, python_member_rows};
+        python_binding_rows::publish(tx, blob, facts, cancellation)?;
+        python_member_rows::publish(tx, blob, facts, cancellation)
+    }
+
+    fn has_conditional_type_seeds(&self) -> bool {
+        true
+    }
+
+    fn selected_conditional_type_seed(
+        &self,
+        selection: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        slot: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        cancellation: &brokk_bifrost_analysis::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Option<brokk_bifrost_analysis::analyzer::resolution::ConditionalTypeSeed>,
+    > {
+        brokk_bifrost_analysis::analyzer::store::python_member_rows::receiver_seed(
+            selection,
+            slot,
+            cancellation,
+        )
+    }
+
+    fn selected_implicit_base_inputs(
+        &self,
+        selection: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        environment: i64,
+        declared_version: Option<(u16, u16)>,
+        owner: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        cancellation: &brokk_bifrost_analysis::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Option<brokk_bifrost_analysis::analyzer::resolution::ImplicitBaseInputs>,
+    > {
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            ClassCreationKind, ImplicitBaseAuthority, ImplicitBaseInputs, ImplicitRootObject,
+            ResolutionCompletion, SemanticId, SharedNameInterner, universe,
+        };
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+        use brokk_bifrost_python::intrinsics::{PythonVersion, implicit_base};
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let version = declared_version.map(|(major, minor)| PythonVersion::new(major, minor));
+        let root = implicit_base(version).map(|builtin| {
+            let entry = universe::lookup(
+                Language::Python,
+                ResolutionNamespace::TypeOrValue,
+                builtin.name,
+            )
+            .expect("implicit root belongs to the Python universe");
+            SemanticId::shared_name(
+                selection
+                    .shared_names()
+                    .intern(universe::identity_digest(entry)),
+            )
+        });
+        if root == Some(owner) {
+            return Ok(Some(ImplicitBaseInputs {
+                written_inventory_complete: true,
+                written_base_count: 0,
+                creation: ClassCreationKind::Ordinary,
+                root_object: None,
+                authority: ImplicitBaseAuthority::Intrinsic { descriptor: owner },
+                completion: ResolutionCompletion::Complete,
+            }));
+        }
+        let Some(mut inputs) =
+            brokk_bifrost_analysis::analyzer::store::python_member_rows::implicit_inputs(
+                selection,
+                environment,
+                owner,
+                cancellation,
+            )?
+        else {
+            return Ok(None);
+        };
+        if inputs.creation == ClassCreationKind::Ordinary
+            && inputs.written_inventory_complete
+            && inputs.written_base_count == 0
+            && let Some(root) = root
+        {
+            // Python's no-written-base rule uses the intrinsic object, even
+            // when lexical lookup of the spelling object would be shadowed.
+            inputs.root_object = Some(ImplicitRootObject {
+                identity: root,
+                authority: ImplicitBaseAuthority::Intrinsic { descriptor: root },
+                occurrence: owner,
+            });
+            inputs.completion = ResolutionCompletion::Complete;
+        }
+        Ok(Some(inputs))
+    }
+
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("pyproject.toml" | "setup.py" | "__init__.py")
+        )
+    }
+}

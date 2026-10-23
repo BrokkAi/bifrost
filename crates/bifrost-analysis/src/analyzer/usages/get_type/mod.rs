@@ -1,45 +1,20 @@
 use super::read_source;
-
 use crate::analyzer::common::language_for_file;
-
-use crate::analyzer::languages::BoundedReceiverQuery;
-use crate::analyzer::languages::language_support;
-
-use crate::analyzer::usages::get_definition::BoundedResolution;
-use crate::analyzer::usages::get_definition::parse_tree_for_language;
-
-use crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
-use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
-use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::usages::reference_site::SourceLocationRequest;
-use crate::analyzer::usages::reference_site::resolve_reference_site;
-
+use crate::analyzer::languages::{BoundedReceiverQuery, language_support_for_hook};
+use crate::analyzer::usages::get_definition::{BoundedResolution, parse_tree_for_language};
+use crate::analyzer::usages::receiver_analysis::{
+    INTERACTIVE_TYPE_LOOKUP_BUDGET, ReceiverAnalysisBudget, ReceiverBudgetLimit,
+};
+use crate::analyzer::usages::reference_site::{
+    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-
-use crate::analyzer::AnalyzerDefinitionLookup;
-use crate::analyzer::CodeUnit;
-use crate::analyzer::IAnalyzer;
-use crate::analyzer::Language;
-use crate::analyzer::ProjectFile;
-
-use crate::hash::HashMap;
-use crate::hash::HashSet;
-
+use crate::analyzer::{AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
-
 use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
-
 use std::sync::Arc;
-
 use tree_sitter::Tree;
-
-pub(crate) mod java;
-
-mod scala;
-
-pub(crate) use scala::resolve_scala_type_bounded;
 
 #[derive(Debug, Clone)]
 pub struct TypeLookupRequest {
@@ -451,7 +426,7 @@ fn bounded_type_resolution(
     site: &ResolvedReferenceSite,
     budget: ReceiverAnalysisBudget,
 ) -> Option<BoundedResolution<TypeLookupOutcome>> {
-    language_support(language)?.bounded_type_resolution(
+    language_support_for_hook(language, "parse_tree_for_type_lookup")?.bounded_type_resolution(
         support,
         language,
         BoundedReceiverQuery {
@@ -492,7 +467,7 @@ pub fn parse_tree_for_type_lookup(
     language: Language,
     source: &str,
 ) -> Option<Tree> {
-    match language_support(language) {
+    match language_support_for_hook(language, "parse_tree_for_type_lookup") {
         Some(support) => support.parse_tree_for_type_lookup(file, language, source),
         None => parse_tree_for_language(file, language, source),
     }
@@ -563,7 +538,8 @@ pub fn no_type(kind: impl Into<String>, message: impl Into<String>) -> TypeLooku
     diagnostic_outcome(TypeLookupStatus::NoType, kind, message)
 }
 
-fn diagnostic_outcome(
+#[doc(hidden)]
+pub fn diagnostic_outcome(
     status: TypeLookupStatus,
     kind: impl Into<String>,
     message: impl Into<String>,

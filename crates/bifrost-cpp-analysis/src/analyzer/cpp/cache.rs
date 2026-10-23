@@ -434,3 +434,31 @@ fn weight_object_macro_replacement(
         .fold(0usize, |acc, name| acc.saturating_add(name.len()));
     fields.saturating_add(nested)
 }
+
+/// Preserve the existing byte budget while accounting for cached failure evidence.
+pub(super) fn build_file_read_cache<K, T>(
+    budget_bytes: u64,
+    weigher: impl Fn(&K, &Arc<T>) -> u32 + Send + Sync + 'static,
+) -> Cache<K, Arc<CachedFileRead<T>>>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    build_weighted_cache(budget_bytes, move |key, cached: &Arc<CachedFileRead<T>>| {
+        let evidence_bytes = cached.incompleteness.iter().fold(
+            std::mem::size_of::<CachedFileRead<T>>() as u64,
+            |bytes, reason| {
+                use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+                let QueryReadIncomplete::StructureUnavailable(file) = reason else {
+                    unreachable!("transient read failures must not enter file caches");
+                };
+                bytes.saturating_add(
+                    (std::mem::size_of::<QueryReadIncomplete>()
+                        + file.rel_path().as_os_str().len()
+                        + file.root().as_os_str().len()) as u64,
+                )
+            },
+        );
+        (u64::from(weigher(key, &cached.value)) + evidence_bytes).min(u64::from(u32::MAX)) as u32
+    })
+}

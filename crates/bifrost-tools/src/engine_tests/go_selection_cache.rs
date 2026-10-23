@@ -3,9 +3,10 @@ mod tests {
 
     use go_selection_fixture as SelectionFixture;
     mod go_selection_fixture {
+        use crate::selection_fixture_support::write_fixture_blob;
         use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
         use brokk_bifrost_analysis::analyzer::store::{AnalyzerStore, GenerationId};
-use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::{SelectionFixture, parsed_fixture_state, write_fixture_blob};
+use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::{SelectionFixture, parsed_fixture_state};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
         pub(super) fn with_store(

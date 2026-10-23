@@ -364,6 +364,7 @@ test("publisher dependency order and protected identities remain explicit", () =
     assert.equal(analysisDependencies.has(dependency), true, `analysis crate must wait for ${dependency}`);
   }
   const implementations = [
+    { name: "jvm-analysis", consumers: ["tools", "semantic-packs", "rql"] },
     { name: "rust-analysis", consumers: ["tools", "rql", "semantic-packs", "policy"] },
     { name: "go-analysis", consumers: ["tools", "rql", "semantic-packs"] },
     { name: "csharp-analysis", consumers: ["tools", "semantic-packs", "rql"] },
@@ -406,7 +407,7 @@ test("publisher dependency order and protected identities remain explicit", () =
   );
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis, publish-crate-jvm-analysis\]$/mu,
   );
   assert.match(cratePublisher, /^      id-token:\s*write$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);

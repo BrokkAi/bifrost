@@ -307,6 +307,13 @@ fn run_portable_runtime_command(args: &[String]) -> Option<Result<CliRunResult, 
                 Ok(CliRunResult::Exit(2))
             }
         },
+        Some("pack-admission") => match run_pack_admission(&args[1..]) {
+            Ok(result) => Ok(result),
+            Err(message) => {
+                eprintln!("{}", escape_terminal_text(&message));
+                Ok(CliRunResult::Exit(2))
+            }
+        },
         _ => return None,
     };
     Some(result)
@@ -542,6 +549,47 @@ fn run_prepare_open_packs(args: &[String]) -> Result<CliRunResult, String> {
         println!("Open-pack acquisition failed: {failure_class}");
         Ok(CliRunResult::Exit(1))
     }
+}
+
+/// Print the outcome of selecting a request's releases without acquiring them:
+/// exit 0 when the engine admits one, 1 with the typed failure otherwise.
+fn run_pack_admission(args: &[String]) -> Result<CliRunResult, String> {
+    let usage = "usage: bifrost pack-admission --cache-dir DIR --request-path FILE";
+    let [cache_flag, cache_dir, request_flag, request_path] = args else {
+        return Err(usage.to_owned());
+    };
+    if cache_flag != "--cache-dir"
+        || request_flag != "--request-path"
+        || cache_dir.is_empty()
+        || request_path.is_empty()
+    {
+        return Err(usage.to_owned());
+    }
+    let request_bytes = fs::read(request_path)
+        .map_err(|error| format!("cannot read request file `{request_path}`: {error}"))?;
+    let profile = brokk_bifrost::open_pack_engine_profile();
+    let request = brokk_bifrost_semantic_packs::download::parse_pack_request(&request_bytes);
+    let result = match &request {
+        Ok(request) => brokk_bifrost_semantic_packs::download::admit_pack_request_at(
+            &profile,
+            request,
+            Path::new(cache_dir),
+        ),
+        Err(error) => Err(error.clone()),
+    };
+    let mut outcome = brokk_bifrost_semantic_packs::download::admission_outcome(
+        &profile,
+        request.as_ref().ok(),
+        result,
+    );
+    outcome["engine"]["executable_sha256"] = json!(executable_sha256()?);
+    let admitted = outcome["status"] == "admitted";
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&outcome)
+            .map_err(|error| format!("cannot encode pack admission outcome: {error}"))?
+    );
+    Ok(CliRunResult::Exit(if admitted { 0 } else { 1 }))
 }
 
 fn executable_sha256() -> Result<String, String> {

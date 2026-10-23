@@ -7,6 +7,8 @@ mod rust_departing_tests_tests {
 
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
 
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
+
     use std::sync::Arc;
 
     use brokk_bifrost_core::cancellation::CancellationToken;
@@ -115,7 +117,7 @@ mod rust_departing_tests_tests {
 
     use brokk_bifrost_core::test_support::write_file;
 
-    use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
     use brokk_bifrost_rust_analysis::analyzer::rust::adapter::RustAdapter;
     #[test]

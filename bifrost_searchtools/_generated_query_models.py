@@ -803,8 +803,12 @@ class CodeQueryCallResultObligation:
 class CodeQueryCallShape:
     argument_count: int
     call_kind: str
+    callee_bounds: list[str]
     callee_name: str | None
+    callee_provenance: str
     callee_range: CodeQueryRange | None
+    callee_supplier: str | None
+    callee_type_shape: str
     coverage: str
     group_count: int
     id: str
@@ -1199,7 +1203,7 @@ class CodeQueryCppExpression:
 @dataclass(frozen=True)
 class CodeQueryCrossDomain:
     binding: str | None
-    code: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | None
+    code: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None
     code_id: str | None
     code_path: str | None
     configuration: CodeQueryConfigurationFact2 | None
@@ -1394,6 +1398,7 @@ class CodeQueryDiagnostic:
     impact: CodeQueryDiagnosticImpact
     language: str
     message: str
+    related: list[CodeQueryRelatedSource]
     source: CodeQuerySourceSpan | None
     withheld_rows_path: str | None
 
@@ -2610,7 +2615,7 @@ class CodeQueryProgramPointRef:
 @dataclass(frozen=True)
 class CodeQueryProvenance:
     branch: list[int]
-    seed: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85
+    seed: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86
     steps: list[CodeQueryProvenanceStep]
 
     @classmethod
@@ -2621,8 +2626,8 @@ class CodeQueryProvenance:
 @dataclass(frozen=True)
 class CodeQueryProvenanceStep:
     op: str
-    result: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85
-    via: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | None
+    result: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86
+    via: CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryProvenanceStep:
@@ -3067,6 +3072,16 @@ class CodeQueryReferenceSite:
 
 
 @dataclass(frozen=True)
+class CodeQueryRelatedSource:
+    label: str
+    source: CodeQuerySourceSpan
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryRelatedSource:
+        return _decode_code_query_related_source(data, 'CodeQueryRelatedSource')
+
+
+@dataclass(frozen=True)
 class CodeQueryResolutionCandidate:
     applicability: str | None
     ast_id: str
@@ -3100,7 +3115,7 @@ class CodeQueryResolutionCandidate:
 @dataclass(frozen=True)
 class CodeQueryResult:
     diagnostics: list[CodeQueryDiagnostic]
-    results: list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain]
+    results: list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain]
     session_subset: SubsetCoverage | None
     truncated: bool
 
@@ -4173,9 +4188,8 @@ class CodeQueryResultRefVariant72:
 class CodeQueryResultRefVariant73:
     id: str
     path: str
-    predicate: str
-    procedure_id: str
     range: CodeQueryRange
+    relation: str
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant73:
@@ -4184,10 +4198,10 @@ class CodeQueryResultRefVariant73:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant74:
-    domain: str
     id: str
-    outcome: str
     path: str
+    predicate: str
+    procedure_id: str
     range: CodeQueryRange
 
     @classmethod
@@ -4197,9 +4211,11 @@ class CodeQueryResultRefVariant74:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant75:
+    domain: str
     id: str
-    name: str
+    outcome: str
     path: str
+    range: CodeQueryRange
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant75:
@@ -4219,11 +4235,9 @@ class CodeQueryResultRefVariant76:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant77:
-    from_name: str
     id: str
+    name: str
     path: str
-    scope: str
-    to_name: str
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant77:
@@ -4232,11 +4246,11 @@ class CodeQueryResultRefVariant77:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant78:
-    ast_id: str
+    from_name: str
     id: str
     path: str
-    range: CodeQueryRange
-    segment_count: int
+    scope: str
+    to_name: str
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant78:
@@ -4245,12 +4259,11 @@ class CodeQueryResultRefVariant78:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant79:
-    ast_id: str | None
+    ast_id: str
     id: str
-    ordinal: int
     path: str
     range: CodeQueryRange
-    text: str
+    segment_count: int
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant79:
@@ -4274,9 +4287,10 @@ class CodeQueryResultRefVariant8:
 class CodeQueryResultRefVariant80:
     ast_id: str | None
     id: str
-    kind: str
+    ordinal: int
     path: str
     range: CodeQueryRange
+    text: str
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant80:
@@ -4285,9 +4299,9 @@ class CodeQueryResultRefVariant80:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant81:
-    exported_name: str
-    form: str
+    ast_id: str | None
     id: str
+    kind: str
     path: str
     range: CodeQueryRange
 
@@ -4298,10 +4312,11 @@ class CodeQueryResultRefVariant81:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant82:
-    fq_name: str
+    exported_name: str
+    form: str
     id: str
-    origin: str
     path: str
+    range: CodeQueryRange
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant82:
@@ -4310,7 +4325,9 @@ class CodeQueryResultRefVariant82:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant83:
+    fq_name: str
     id: str
+    origin: str
     path: str
 
     @classmethod
@@ -4320,10 +4337,8 @@ class CodeQueryResultRefVariant83:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant84:
-    fact_id: str
     id: str
     path: str
-    range: CodeQueryRange
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant84:
@@ -4332,6 +4347,18 @@ class CodeQueryResultRefVariant84:
 
 @dataclass(frozen=True)
 class CodeQueryResultRefVariant85:
+    fact_id: str
+    id: str
+    path: str
+    range: CodeQueryRange
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryResultRefVariant85:
+        return _decode_code_query_result_ref_variant85(data, 'CodeQueryResultRefVariant85')
+
+
+@dataclass(frozen=True)
+class CodeQueryResultRefVariant86:
     domain: str
     id: str
     operator: str
@@ -4339,8 +4366,8 @@ class CodeQueryResultRefVariant85:
     range: CodeQueryRange | None
 
     @classmethod
-    def from_dict(cls, data: Any) -> CodeQueryResultRefVariant85:
-        return _decode_code_query_result_ref_variant85(data, 'CodeQueryResultRefVariant85')
+    def from_dict(cls, data: Any) -> CodeQueryResultRefVariant86:
+        return _decode_code_query_result_ref_variant86(data, 'CodeQueryResultRefVariant86')
 
 
 @dataclass(frozen=True)
@@ -4438,6 +4465,48 @@ class CodeQueryRewriteStep:
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryRewriteStep:
         return _decode_code_query_rewrite_step(data, 'CodeQueryRewriteStep')
+
+
+@dataclass(frozen=True)
+class CodeQueryRustMarkerImpl:
+    bounds: list[str]
+    bounds_proof: str
+    completeness: str
+    declaration_parameter_ordinal: int | None
+    has_send_bound: bool
+    has_sync_bound: bool
+    id: str
+    impl_coverage: str
+    impl_range: CodeQueryRange
+    language: str
+    mapping_proof: str
+    parameter: str | None
+    path: str
+    range: CodeQueryRange
+    self_proof: str
+    shared_access: str
+    shared_ref_only: bool
+    stored: bool
+    trait: str
+    trait_proof: str
+    uses: list[CodeQueryRustMarkerUse]
+    uses_proof: str
+    provenance: list[CodeQueryProvenance]
+    provenance_truncated: bool
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryRustMarkerImpl:
+        return _decode_code_query_rust_marker_impl(data, 'CodeQueryRustMarkerImpl')
+
+
+@dataclass(frozen=True)
+class CodeQueryRustMarkerUse:
+    field: str
+    wrappers: list[str]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryRustMarkerUse:
+        return _decode_code_query_rust_marker_use(data, 'CodeQueryRustMarkerUse')
 
 
 @dataclass(frozen=True)
@@ -5015,7 +5084,7 @@ class Parameter:
     optional: bool
     passing_mode: ParameterPassingMode
     role: ParameterRole | None
-    type: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    type: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
     variadic: bool
 
     @classmethod
@@ -5046,7 +5115,7 @@ class PythonModeledClassIdentity:
 class PythonRuntimeBaseClaim:
     bases: list[PythonModeledClassIdentity | None]
     class_: PythonModeledClassIdentity | None
-    declared_bases: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
+    declared_bases: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]
     declared_class: PythonModeledClassIdentity
     provenance: SemanticModelProvenance
 
@@ -5057,6 +5126,7 @@ class PythonRuntimeBaseClaim:
 
 @dataclass(frozen=True)
 class SemanticModelActivationProvenance:
+    approximate: bool
     matched_evidence: SemanticModelMatchedEvidence
     reason: str
     source_id: str
@@ -5126,13 +5196,20 @@ class SubsetCoverage:
 
 @dataclass(frozen=True)
 class TypeRefVariant1:
-    pass
+    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]
+    name: str
+    owner: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
+    trait_type: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15 | None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> TypeRefVariant1:
+        return _decode_type_ref_variant1(data, 'TypeRefVariant1')
 
 
 @dataclass(frozen=True)
 class TypeRefVariant10:
-    key: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
-    value: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
+    length: str
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant10:
@@ -5141,8 +5218,8 @@ class TypeRefVariant10:
 
 @dataclass(frozen=True)
 class TypeRefVariant11:
-    direction: ChannelDirection
-    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    key: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
+    value: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant11:
@@ -5151,8 +5228,8 @@ class TypeRefVariant11:
 
 @dataclass(frozen=True)
 class TypeRefVariant12:
-    bound: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None
-    variance: WildcardVariance
+    direction: ChannelDirection
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant12:
@@ -5161,7 +5238,8 @@ class TypeRefVariant12:
 
 @dataclass(frozen=True)
 class TypeRefVariant13:
-    elements: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
+    bound: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15 | None
+    variance: WildcardVariance
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant13:
@@ -5170,8 +5248,7 @@ class TypeRefVariant13:
 
 @dataclass(frozen=True)
 class TypeRefVariant14:
-    parameters: list[Parameter]
-    result: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None
+    elements: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant14:
@@ -5179,20 +5256,24 @@ class TypeRefVariant14:
 
 
 @dataclass(frozen=True)
-class TypeRefVariant2:
-    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
-    name: str
-    nullable: bool
+class TypeRefVariant15:
+    parameters: list[Parameter]
+    result: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15 | None
 
     @classmethod
-    def from_dict(cls, data: Any) -> TypeRefVariant2:
-        return _decode_type_ref_variant2(data, 'TypeRefVariant2')
+    def from_dict(cls, data: Any) -> TypeRefVariant15:
+        return _decode_type_ref_variant15(data, 'TypeRefVariant15')
+
+
+@dataclass(frozen=True)
+class TypeRefVariant2:
+    pass
 
 
 @dataclass(frozen=True)
 class TypeRefVariant3:
-    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]
-    id: str
+    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]
+    name: str
     nullable: bool
 
     @classmethod
@@ -5202,7 +5283,9 @@ class TypeRefVariant3:
 
 @dataclass(frozen=True)
 class TypeRefVariant4:
-    name: str
+    arguments: list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]
+    id: str
+    nullable: bool
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant4:
@@ -5211,7 +5294,7 @@ class TypeRefVariant4:
 
 @dataclass(frozen=True)
 class TypeRefVariant5:
-    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    name: str
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant5:
@@ -5220,8 +5303,7 @@ class TypeRefVariant5:
 
 @dataclass(frozen=True)
 class TypeRefVariant6:
-    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
-    reference_kind: TypeRefReferenceKind
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant6:
@@ -5230,7 +5312,8 @@ class TypeRefVariant6:
 
 @dataclass(frozen=True)
 class TypeRefVariant7:
-    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
+    reference_kind: TypeRefReferenceKind
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant7:
@@ -5239,7 +5322,7 @@ class TypeRefVariant7:
 
 @dataclass(frozen=True)
 class TypeRefVariant8:
-    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant8:
@@ -5248,8 +5331,7 @@ class TypeRefVariant8:
 
 @dataclass(frozen=True)
 class TypeRefVariant9:
-    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14
-    length: str
+    element: TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15
 
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant9:
@@ -5834,16 +5916,16 @@ def _decode_code_query_build_target(value: Any, prefix: str = 'CodeQueryBuildTar
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     build_file_value = _decode_string(value['build_file'], f"{prefix}.build_file")
     if 'build_project_id' in value:
-        build_project_id_value = _decode_defs_code_query_result_item_union_82_properties_build_project_id(value['build_project_id'], f"{prefix}.build_project_id")
+        build_project_id_value = _decode_defs_code_query_result_item_union_83_properties_build_project_id(value['build_project_id'], f"{prefix}.build_project_id")
     else:
         build_project_id_value = None
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     name_value = _decode_string(value['name'], f"{prefix}.name")
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_82_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_83_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_82_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_83_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -7077,8 +7159,12 @@ def _decode_code_query_call_shape(value: Any, prefix: str = 'CodeQueryCallShape'
     expected = {
         'argument_count',
         'call_kind',
+        'callee_bounds',
         'callee_name',
+        'callee_provenance',
         'callee_range',
+        'callee_supplier',
+        'callee_type_shape',
         'coverage',
         'group_count',
         'id',
@@ -7098,6 +7184,10 @@ def _decode_code_query_call_shape(value: Any, prefix: str = 'CodeQueryCallShape'
     required = {
         'argument_count',
         'call_kind',
+        'callee_bounds',
+        'callee_provenance',
+        'callee_supplier',
+        'callee_type_shape',
         'coverage',
         'group_count',
         'id',
@@ -7112,14 +7202,18 @@ def _decode_code_query_call_shape(value: Any, prefix: str = 'CodeQueryCallShape'
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     argument_count_value = _decode_defs_code_query_result_item_union_27_properties_argument_count(value['argument_count'], f"{prefix}.argument_count")
     call_kind_value = _decode_string(value['call_kind'], f"{prefix}.call_kind")
+    callee_bounds_value = _decode_defs_code_query_result_item_union_27_properties_callee_bounds(value['callee_bounds'], f"{prefix}.callee_bounds")
     if 'callee_name' in value:
         callee_name_value = _decode_defs_code_query_result_item_union_27_properties_callee_name(value['callee_name'], f"{prefix}.callee_name")
     else:
         callee_name_value = None
+    callee_provenance_value = _decode_string(value['callee_provenance'], f"{prefix}.callee_provenance")
     if 'callee_range' in value:
         callee_range_value = _decode_defs_code_query_result_item_union_27_properties_callee_range(value['callee_range'], f"{prefix}.callee_range")
     else:
         callee_range_value = None
+    callee_supplier_value = _decode_defs_code_query_result_item_union_27_properties_callee_supplier(value['callee_supplier'], f"{prefix}.callee_supplier")
+    callee_type_shape_value = _decode_string(value['callee_type_shape'], f"{prefix}.callee_type_shape")
     coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
     group_count_value = _decode_defs_code_query_result_item_union_27_properties_group_count(value['group_count'], f"{prefix}.group_count")
     id_value = _decode_string(value['id'], f"{prefix}.id")
@@ -7143,8 +7237,12 @@ def _decode_code_query_call_shape(value: Any, prefix: str = 'CodeQueryCallShape'
     return CodeQueryCallShape(
         argument_count=argument_count_value,
         call_kind=call_kind_value,
+        callee_bounds=callee_bounds_value,
         callee_name=callee_name_value,
+        callee_provenance=callee_provenance_value,
         callee_range=callee_range_value,
+        callee_supplier=callee_supplier_value,
+        callee_type_shape=callee_type_shape_value,
         coverage=coverage_value,
         group_count=group_count_value,
         id=id_value,
@@ -8608,77 +8706,77 @@ def _decode_code_query_cross_domain(value: Any, prefix: str = 'CodeQueryCrossDom
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'binding' in value:
-        binding_value = _decode_defs_code_query_result_item_union_84_properties_binding(value['binding'], f"{prefix}.binding")
+        binding_value = _decode_defs_code_query_result_item_union_85_properties_binding(value['binding'], f"{prefix}.binding")
     else:
         binding_value = None
     if 'code' in value:
-        code_value = _decode_defs_code_query_result_item_union_84_properties_code(value['code'], f"{prefix}.code")
+        code_value = _decode_defs_code_query_result_item_union_85_properties_code(value['code'], f"{prefix}.code")
     else:
         code_value = None
     if 'code_id' in value:
-        code_id_value = _decode_defs_code_query_result_item_union_84_properties_code_id(value['code_id'], f"{prefix}.code_id")
+        code_id_value = _decode_defs_code_query_result_item_union_85_properties_code_id(value['code_id'], f"{prefix}.code_id")
     else:
         code_id_value = None
     if 'code_path' in value:
-        code_path_value = _decode_defs_code_query_result_item_union_84_properties_code_path(value['code_path'], f"{prefix}.code_path")
+        code_path_value = _decode_defs_code_query_result_item_union_85_properties_code_path(value['code_path'], f"{prefix}.code_path")
     else:
         code_path_value = None
     if 'configuration' in value:
-        configuration_value = _decode_defs_code_query_result_item_union_84_properties_configuration(value['configuration'], f"{prefix}.configuration")
+        configuration_value = _decode_defs_code_query_result_item_union_85_properties_configuration(value['configuration'], f"{prefix}.configuration")
     else:
         configuration_value = None
     if 'configuration_contributors' in value:
-        configuration_contributors_value = _decode_defs_code_query_result_item_union_84_properties_configuration_contributors(value['configuration_contributors'], f"{prefix}.configuration_contributors")
+        configuration_contributors_value = _decode_defs_code_query_result_item_union_85_properties_configuration_contributors(value['configuration_contributors'], f"{prefix}.configuration_contributors")
     else:
-        configuration_contributors_value = _decode_defs_code_query_result_item_union_84_properties_configuration_contributors([], f"{prefix}.configuration_contributors")
+        configuration_contributors_value = _decode_defs_code_query_result_item_union_85_properties_configuration_contributors([], f"{prefix}.configuration_contributors")
     if 'configuration_id' in value:
-        configuration_id_value = _decode_defs_code_query_result_item_union_84_properties_configuration_id(value['configuration_id'], f"{prefix}.configuration_id")
+        configuration_id_value = _decode_defs_code_query_result_item_union_85_properties_configuration_id(value['configuration_id'], f"{prefix}.configuration_id")
     else:
         configuration_id_value = None
     if 'configuration_path' in value:
-        configuration_path_value = _decode_defs_code_query_result_item_union_84_properties_configuration_path(value['configuration_path'], f"{prefix}.configuration_path")
+        configuration_path_value = _decode_defs_code_query_result_item_union_85_properties_configuration_path(value['configuration_path'], f"{prefix}.configuration_path")
     else:
         configuration_path_value = None
     if 'dependency_id' in value:
-        dependency_id_value = _decode_defs_code_query_result_item_union_84_properties_dependency_id(value['dependency_id'], f"{prefix}.dependency_id")
+        dependency_id_value = _decode_defs_code_query_result_item_union_85_properties_dependency_id(value['dependency_id'], f"{prefix}.dependency_id")
     else:
         dependency_id_value = None
     domain_value = _decode_string(value['domain'], f"{prefix}.domain")
     if 'effective_configuration' in value:
-        effective_configuration_value = _decode_defs_code_query_result_item_union_84_properties_effective_configuration(value['effective_configuration'], f"{prefix}.effective_configuration")
+        effective_configuration_value = _decode_defs_code_query_result_item_union_85_properties_effective_configuration(value['effective_configuration'], f"{prefix}.effective_configuration")
     else:
         effective_configuration_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     if 'key' in value:
-        key_value = _decode_defs_code_query_result_item_union_84_properties_key(value['key'], f"{prefix}.key")
+        key_value = _decode_defs_code_query_result_item_union_85_properties_key(value['key'], f"{prefix}.key")
     else:
         key_value = None
     if 'mapping_id' in value:
-        mapping_id_value = _decode_defs_code_query_result_item_union_84_properties_mapping_id(value['mapping_id'], f"{prefix}.mapping_id")
+        mapping_id_value = _decode_defs_code_query_result_item_union_85_properties_mapping_id(value['mapping_id'], f"{prefix}.mapping_id")
     else:
         mapping_id_value = None
     if 'mitigated' in value:
-        mitigated_value = _decode_defs_code_query_result_item_union_84_properties_mitigated(value['mitigated'], f"{prefix}.mitigated")
+        mitigated_value = _decode_defs_code_query_result_item_union_85_properties_mitigated(value['mitigated'], f"{prefix}.mitigated")
     else:
         mitigated_value = None
     operator_value = _decode_string(value['operator'], f"{prefix}.operator")
     if 'owner' in value:
-        owner_value = _decode_defs_code_query_result_item_union_84_properties_owner(value['owner'], f"{prefix}.owner")
+        owner_value = _decode_defs_code_query_result_item_union_85_properties_owner(value['owner'], f"{prefix}.owner")
     else:
         owner_value = None
     path_value = _decode_string(value['path'], f"{prefix}.path")
     if 'range' in value:
-        range_value = _decode_defs_code_query_result_item_union_84_properties_range(value['range'], f"{prefix}.range")
+        range_value = _decode_defs_code_query_result_item_union_85_properties_range(value['range'], f"{prefix}.range")
     else:
         range_value = None
     if 'relation' in value:
-        relation_value = _decode_defs_code_query_result_item_union_84_properties_relation(value['relation'], f"{prefix}.relation")
+        relation_value = _decode_defs_code_query_result_item_union_85_properties_relation(value['relation'], f"{prefix}.relation")
     else:
         relation_value = None
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_84_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_85_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_84_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_85_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -9347,6 +9445,7 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
         'impact',
         'language',
         'message',
+        'related',
         'source',
         'withheld_rows_path',
     }
@@ -9375,6 +9474,10 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
     impact_value = _decode_defs_code_query_diagnostic_impact(value['impact'], f"{prefix}.impact")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     message_value = _decode_string(value['message'], f"{prefix}.message")
+    if 'related' in value:
+        related_value = _decode_defs_code_query_diagnostic_properties_related(value['related'], f"{prefix}.related")
+    else:
+        related_value = _decode_defs_code_query_diagnostic_properties_related([], f"{prefix}.related")
     if 'source' in value:
         source_value = _decode_defs_code_query_diagnostic_properties_source(value['source'], f"{prefix}.source")
     else:
@@ -9390,6 +9493,7 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
         impact=impact_value,
         language=language_value,
         message=message_value,
+        related=related_value,
         source=source_value,
         withheld_rows_path=withheld_rows_path_value,
     )
@@ -11378,54 +11482,54 @@ def _decode_code_query_guard(value: Any, prefix: str = 'CodeQueryGuard') -> Code
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'classes_value' in value:
-        classes_value_value = _decode_defs_code_query_result_item_union_77_properties_classes_value(value['classes_value'], f"{prefix}.classes_value")
+        classes_value_value = _decode_defs_code_query_result_item_union_78_properties_classes_value(value['classes_value'], f"{prefix}.classes_value")
     else:
         classes_value_value = None
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
     if 'constant' in value:
-        constant_value = _decode_defs_code_query_result_item_union_77_properties_constant(value['constant'], f"{prefix}.constant")
+        constant_value = _decode_defs_code_query_result_item_union_78_properties_constant(value['constant'], f"{prefix}.constant")
     else:
         constant_value = None
     if 'constant_value' in value:
-        constant_value_value = _decode_defs_code_query_result_item_union_77_properties_constant_value(value['constant_value'], f"{prefix}.constant_value")
+        constant_value_value = _decode_defs_code_query_result_item_union_78_properties_constant_value(value['constant_value'], f"{prefix}.constant_value")
     else:
         constant_value_value = None
     if 'equality_negated' in value:
-        equality_negated_value = _decode_defs_code_query_result_item_union_77_properties_equality_negated(value['equality_negated'], f"{prefix}.equality_negated")
+        equality_negated_value = _decode_defs_code_query_result_item_union_78_properties_equality_negated(value['equality_negated'], f"{prefix}.equality_negated")
     else:
         equality_negated_value = None
     if 'false_edge_id' in value:
-        false_edge_id_value = _decode_defs_code_query_result_item_union_77_properties_false_edge_id(value['false_edge_id'], f"{prefix}.false_edge_id")
+        false_edge_id_value = _decode_defs_code_query_result_item_union_78_properties_false_edge_id(value['false_edge_id'], f"{prefix}.false_edge_id")
     else:
         false_edge_id_value = None
     if 'false_target_id' in value:
-        false_target_id_value = _decode_defs_code_query_result_item_union_77_properties_false_target_id(value['false_target_id'], f"{prefix}.false_target_id")
+        false_target_id_value = _decode_defs_code_query_result_item_union_78_properties_false_target_id(value['false_target_id'], f"{prefix}.false_target_id")
     else:
         false_target_id_value = None
     if 'guarded_value' in value:
-        guarded_value_value = _decode_defs_code_query_result_item_union_77_properties_guarded_value(value['guarded_value'], f"{prefix}.guarded_value")
+        guarded_value_value = _decode_defs_code_query_result_item_union_78_properties_guarded_value(value['guarded_value'], f"{prefix}.guarded_value")
     else:
         guarded_value_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     if 'integer_relation' in value:
-        integer_relation_value = _decode_defs_code_query_result_item_union_77_properties_integer_relation(value['integer_relation'], f"{prefix}.integer_relation")
+        integer_relation_value = _decode_defs_code_query_result_item_union_78_properties_integer_relation(value['integer_relation'], f"{prefix}.integer_relation")
     else:
         integer_relation_value = None
     language_value = _decode_string(value['language'], f"{prefix}.language")
     if 'member_value' in value:
-        member_value_value = _decode_defs_code_query_result_item_union_77_properties_member_value(value['member_value'], f"{prefix}.member_value")
+        member_value_value = _decode_defs_code_query_result_item_union_78_properties_member_value(value['member_value'], f"{prefix}.member_value")
     else:
         member_value_value = None
     if 'null_on_true' in value:
-        null_on_true_value = _decode_defs_code_query_result_item_union_77_properties_null_on_true(value['null_on_true'], f"{prefix}.null_on_true")
+        null_on_true_value = _decode_defs_code_query_result_item_union_78_properties_null_on_true(value['null_on_true'], f"{prefix}.null_on_true")
     else:
         null_on_true_value = None
     if 'null_target_id' in value:
-        null_target_id_value = _decode_defs_code_query_result_item_union_77_properties_null_target_id(value['null_target_id'], f"{prefix}.null_target_id")
+        null_target_id_value = _decode_defs_code_query_result_item_union_78_properties_null_target_id(value['null_target_id'], f"{prefix}.null_target_id")
     else:
         null_target_id_value = None
     if 'opaque_digest' in value:
-        opaque_digest_value = _decode_defs_code_query_result_item_union_77_properties_opaque_digest(value['opaque_digest'], f"{prefix}.opaque_digest")
+        opaque_digest_value = _decode_defs_code_query_result_item_union_78_properties_opaque_digest(value['opaque_digest'], f"{prefix}.opaque_digest")
     else:
         opaque_digest_value = None
     path_value = _decode_string(value['path'], f"{prefix}.path")
@@ -11435,21 +11539,21 @@ def _decode_code_query_guard(value: Any, prefix: str = 'CodeQueryGuard') -> Code
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
     if 'subject_value' in value:
-        subject_value_value = _decode_defs_code_query_result_item_union_77_properties_subject_value(value['subject_value'], f"{prefix}.subject_value")
+        subject_value_value = _decode_defs_code_query_result_item_union_78_properties_subject_value(value['subject_value'], f"{prefix}.subject_value")
     else:
         subject_value_value = None
     if 'true_edge_id' in value:
-        true_edge_id_value = _decode_defs_code_query_result_item_union_77_properties_true_edge_id(value['true_edge_id'], f"{prefix}.true_edge_id")
+        true_edge_id_value = _decode_defs_code_query_result_item_union_78_properties_true_edge_id(value['true_edge_id'], f"{prefix}.true_edge_id")
     else:
         true_edge_id_value = None
     if 'true_target_id' in value:
-        true_target_id_value = _decode_defs_code_query_result_item_union_77_properties_true_target_id(value['true_target_id'], f"{prefix}.true_target_id")
+        true_target_id_value = _decode_defs_code_query_result_item_union_78_properties_true_target_id(value['true_target_id'], f"{prefix}.true_target_id")
     else:
         true_target_id_value = None
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_77_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_78_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_77_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_78_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -13011,38 +13115,38 @@ def _decode_code_query_path_segment(value: Any, prefix: str = 'CodeQueryPathSegm
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'ast_id' in value:
-        ast_id_value = _decode_defs_code_query_result_item_union_80_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
+        ast_id_value = _decode_defs_code_query_result_item_union_81_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
     else:
         ast_id_value = None
-    end_byte_value = _decode_defs_code_query_result_item_union_80_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
+    end_byte_value = _decode_defs_code_query_result_item_union_81_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
     if 'generic_arity' in value:
-        generic_arity_value = _decode_defs_code_query_result_item_union_80_properties_generic_arity(value['generic_arity'], f"{prefix}.generic_arity")
+        generic_arity_value = _decode_defs_code_query_result_item_union_81_properties_generic_arity(value['generic_arity'], f"{prefix}.generic_arity")
     else:
         generic_arity_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     if 'namespace' in value:
-        namespace_value = _decode_defs_code_query_result_item_union_80_properties_namespace(value['namespace'], f"{prefix}.namespace")
+        namespace_value = _decode_defs_code_query_result_item_union_81_properties_namespace(value['namespace'], f"{prefix}.namespace")
     else:
         namespace_value = None
-    ordinal_value = _decode_defs_code_query_result_item_union_80_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
+    ordinal_value = _decode_defs_code_query_result_item_union_81_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     path_ast_id_value = _decode_string(value['path_ast_id'], f"{prefix}.path_ast_id")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
     if 'resolution_status' in value:
-        resolution_status_value = _decode_defs_code_query_result_item_union_80_properties_resolution_status(value['resolution_status'], f"{prefix}.resolution_status")
+        resolution_status_value = _decode_defs_code_query_result_item_union_81_properties_resolution_status(value['resolution_status'], f"{prefix}.resolution_status")
     else:
         resolution_status_value = None
-    start_byte_value = _decode_defs_code_query_result_item_union_80_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
+    start_byte_value = _decode_defs_code_query_result_item_union_81_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
     if 'target_count' in value:
-        target_count_value = _decode_defs_code_query_result_item_union_80_properties_target_count(value['target_count'], f"{prefix}.target_count")
+        target_count_value = _decode_defs_code_query_result_item_union_81_properties_target_count(value['target_count'], f"{prefix}.target_count")
     else:
         target_count_value = None
     text_value = _decode_string(value['text'], f"{prefix}.text")
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_80_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_81_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_80_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_81_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -14735,17 +14839,17 @@ def _decode_code_query_qualified_path(value: Any, prefix: str = 'CodeQueryQualif
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     ast_id_value = _decode_string(value['ast_id'], f"{prefix}.ast_id")
-    end_byte_value = _decode_defs_code_query_result_item_union_79_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
+    end_byte_value = _decode_defs_code_query_result_item_union_80_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    segment_count_value = _decode_defs_code_query_result_item_union_79_properties_segment_count(value['segment_count'], f"{prefix}.segment_count")
-    start_byte_value = _decode_defs_code_query_result_item_union_79_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
+    segment_count_value = _decode_defs_code_query_result_item_union_80_properties_segment_count(value['segment_count'], f"{prefix}.segment_count")
+    start_byte_value = _decode_defs_code_query_result_item_union_80_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_79_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_80_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_79_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_80_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -15407,6 +15511,31 @@ def _decode_code_query_reference_site(value: Any, prefix: str = 'CodeQueryRefere
         usage_kind=usage_kind_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
+    )
+
+def _decode_code_query_related_source(value: Any, prefix: str = 'CodeQueryRelatedSource') -> CodeQueryRelatedSource:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'label',
+        'source',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'label',
+        'source',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    label_value = _decode_string(value['label'], f"{prefix}.label")
+    source_value = _decode_code_query_source_span(value['source'], f"{prefix}.source")
+    return CodeQueryRelatedSource(
+        label=label_value,
+        source=source_value,
     )
 
 def _decode_code_query_resolution_candidate(value: Any, prefix: str = 'CodeQueryResolutionCandidate') -> CodeQueryResolutionCandidate:
@@ -18885,6 +19014,39 @@ def _decode_code_query_result_ref_variant73(value: Any, prefix: str = 'CodeQuery
     expected = {
         'id',
         'path',
+        'range',
+        'relation',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'id',
+        'path',
+        'range',
+        'relation',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    relation_value = _decode_string(value['relation'], f"{prefix}.relation")
+    return CodeQueryResultRefVariant73(
+        id=id_value,
+        path=path_value,
+        range=range_value,
+        relation=relation_value,
+    )
+
+def _decode_code_query_result_ref_variant74(value: Any, prefix: str = 'CodeQueryResultRefVariant74') -> CodeQueryResultRefVariant74:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'id',
+        'path',
         'predicate',
         'procedure_id',
         'range',
@@ -18908,7 +19070,7 @@ def _decode_code_query_result_ref_variant73(value: Any, prefix: str = 'CodeQuery
     predicate_value = _decode_string(value['predicate'], f"{prefix}.predicate")
     procedure_id_value = _decode_string(value['procedure_id'], f"{prefix}.procedure_id")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant73(
+    return CodeQueryResultRefVariant74(
         id=id_value,
         path=path_value,
         predicate=predicate_value,
@@ -18916,7 +19078,7 @@ def _decode_code_query_result_ref_variant73(value: Any, prefix: str = 'CodeQuery
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant74(value: Any, prefix: str = 'CodeQueryResultRefVariant74') -> CodeQueryResultRefVariant74:
+def _decode_code_query_result_ref_variant75(value: Any, prefix: str = 'CodeQueryResultRefVariant75') -> CodeQueryResultRefVariant75:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -18945,41 +19107,12 @@ def _decode_code_query_result_ref_variant74(value: Any, prefix: str = 'CodeQuery
     outcome_value = _decode_string(value['outcome'], f"{prefix}.outcome")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant74(
+    return CodeQueryResultRefVariant75(
         domain=domain_value,
         id=id_value,
         outcome=outcome_value,
         path=path_value,
         range=range_value,
-    )
-
-def _decode_code_query_result_ref_variant75(value: Any, prefix: str = 'CodeQueryResultRefVariant75') -> CodeQueryResultRefVariant75:
-    if not isinstance(value, dict):
-        raise TypeDecoderError(f"{prefix}: expected object")
-    expected = {
-        'id',
-        'name',
-        'path',
-    }
-    actual = set(value)
-    unexpected = actual - expected
-    if unexpected:
-        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
-    required = {
-        'id',
-        'name',
-        'path',
-    }
-    missing = required - actual
-    if missing:
-        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    id_value = _decode_string(value['id'], f"{prefix}.id")
-    name_value = _decode_string(value['name'], f"{prefix}.name")
-    path_value = _decode_string(value['path'], f"{prefix}.path")
-    return CodeQueryResultRefVariant75(
-        id=id_value,
-        name=name_value,
-        path=path_value,
     )
 
 def _decode_code_query_result_ref_variant76(value: Any, prefix: str = 'CodeQueryResultRefVariant76') -> CodeQueryResultRefVariant76:
@@ -19015,6 +19148,35 @@ def _decode_code_query_result_ref_variant77(value: Any, prefix: str = 'CodeQuery
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'id',
+        'name',
+        'path',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'id',
+        'name',
+        'path',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    name_value = _decode_string(value['name'], f"{prefix}.name")
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    return CodeQueryResultRefVariant77(
+        id=id_value,
+        name=name_value,
+        path=path_value,
+    )
+
+def _decode_code_query_result_ref_variant78(value: Any, prefix: str = 'CodeQueryResultRefVariant78') -> CodeQueryResultRefVariant78:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
         'from_name',
         'id',
         'path',
@@ -19040,7 +19202,7 @@ def _decode_code_query_result_ref_variant77(value: Any, prefix: str = 'CodeQuery
     path_value = _decode_string(value['path'], f"{prefix}.path")
     scope_value = _decode_string(value['scope'], f"{prefix}.scope")
     to_name_value = _decode_string(value['to_name'], f"{prefix}.to_name")
-    return CodeQueryResultRefVariant77(
+    return CodeQueryResultRefVariant78(
         from_name=from_name_value,
         id=id_value,
         path=path_value,
@@ -19048,7 +19210,7 @@ def _decode_code_query_result_ref_variant77(value: Any, prefix: str = 'CodeQuery
         to_name=to_name_value,
     )
 
-def _decode_code_query_result_ref_variant78(value: Any, prefix: str = 'CodeQueryResultRefVariant78') -> CodeQueryResultRefVariant78:
+def _decode_code_query_result_ref_variant79(value: Any, prefix: str = 'CodeQueryResultRefVariant79') -> CodeQueryResultRefVariant79:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19076,56 +19238,13 @@ def _decode_code_query_result_ref_variant78(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    segment_count_value = _decode_defs_code_query_result_ref_union_77_properties_segment_count(value['segment_count'], f"{prefix}.segment_count")
-    return CodeQueryResultRefVariant78(
+    segment_count_value = _decode_defs_code_query_result_ref_union_78_properties_segment_count(value['segment_count'], f"{prefix}.segment_count")
+    return CodeQueryResultRefVariant79(
         ast_id=ast_id_value,
         id=id_value,
         path=path_value,
         range=range_value,
         segment_count=segment_count_value,
-    )
-
-def _decode_code_query_result_ref_variant79(value: Any, prefix: str = 'CodeQueryResultRefVariant79') -> CodeQueryResultRefVariant79:
-    if not isinstance(value, dict):
-        raise TypeDecoderError(f"{prefix}: expected object")
-    expected = {
-        'ast_id',
-        'id',
-        'ordinal',
-        'path',
-        'range',
-        'text',
-    }
-    actual = set(value)
-    unexpected = actual - expected
-    if unexpected:
-        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
-    required = {
-        'id',
-        'ordinal',
-        'path',
-        'range',
-        'text',
-    }
-    missing = required - actual
-    if missing:
-        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    if 'ast_id' in value:
-        ast_id_value = _decode_defs_code_query_result_ref_union_78_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
-    else:
-        ast_id_value = None
-    id_value = _decode_string(value['id'], f"{prefix}.id")
-    ordinal_value = _decode_defs_code_query_result_ref_union_78_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
-    path_value = _decode_string(value['path'], f"{prefix}.path")
-    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    text_value = _decode_string(value['text'], f"{prefix}.text")
-    return CodeQueryResultRefVariant79(
-        ast_id=ast_id_value,
-        id=id_value,
-        ordinal=ordinal_value,
-        path=path_value,
-        range=range_value,
-        text=text_value,
     )
 
 def _decode_code_query_result_ref_variant8(value: Any, prefix: str = 'CodeQueryResultRefVariant8') -> CodeQueryResultRefVariant8:
@@ -19173,6 +19292,49 @@ def _decode_code_query_result_ref_variant80(value: Any, prefix: str = 'CodeQuery
     expected = {
         'ast_id',
         'id',
+        'ordinal',
+        'path',
+        'range',
+        'text',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'id',
+        'ordinal',
+        'path',
+        'range',
+        'text',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'ast_id' in value:
+        ast_id_value = _decode_defs_code_query_result_ref_union_79_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
+    else:
+        ast_id_value = None
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    ordinal_value = _decode_defs_code_query_result_ref_union_79_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    text_value = _decode_string(value['text'], f"{prefix}.text")
+    return CodeQueryResultRefVariant80(
+        ast_id=ast_id_value,
+        id=id_value,
+        ordinal=ordinal_value,
+        path=path_value,
+        range=range_value,
+        text=text_value,
+    )
+
+def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQueryResultRefVariant81') -> CodeQueryResultRefVariant81:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'ast_id',
+        'id',
         'kind',
         'path',
         'range',
@@ -19191,14 +19353,14 @@ def _decode_code_query_result_ref_variant80(value: Any, prefix: str = 'CodeQuery
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'ast_id' in value:
-        ast_id_value = _decode_defs_code_query_result_ref_union_79_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
+        ast_id_value = _decode_defs_code_query_result_ref_union_80_properties_ast_id(value['ast_id'], f"{prefix}.ast_id")
     else:
         ast_id_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     kind_value = _decode_string(value['kind'], f"{prefix}.kind")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant80(
+    return CodeQueryResultRefVariant81(
         ast_id=ast_id_value,
         id=id_value,
         kind=kind_value,
@@ -19206,7 +19368,7 @@ def _decode_code_query_result_ref_variant80(value: Any, prefix: str = 'CodeQuery
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQueryResultRefVariant81') -> CodeQueryResultRefVariant81:
+def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQueryResultRefVariant82') -> CodeQueryResultRefVariant82:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19235,7 +19397,7 @@ def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant81(
+    return CodeQueryResultRefVariant82(
         exported_name=exported_name_value,
         form=form_value,
         id=id_value,
@@ -19243,7 +19405,7 @@ def _decode_code_query_result_ref_variant81(value: Any, prefix: str = 'CodeQuery
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQueryResultRefVariant82') -> CodeQueryResultRefVariant82:
+def _decode_code_query_result_ref_variant83(value: Any, prefix: str = 'CodeQueryResultRefVariant83') -> CodeQueryResultRefVariant83:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19269,14 +19431,14 @@ def _decode_code_query_result_ref_variant82(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     origin_value = _decode_string(value['origin'], f"{prefix}.origin")
     path_value = _decode_string(value['path'], f"{prefix}.path")
-    return CodeQueryResultRefVariant82(
+    return CodeQueryResultRefVariant83(
         fq_name=fq_name_value,
         id=id_value,
         origin=origin_value,
         path=path_value,
     )
 
-def _decode_code_query_result_ref_variant83(value: Any, prefix: str = 'CodeQueryResultRefVariant83') -> CodeQueryResultRefVariant83:
+def _decode_code_query_result_ref_variant84(value: Any, prefix: str = 'CodeQueryResultRefVariant84') -> CodeQueryResultRefVariant84:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19296,12 +19458,12 @@ def _decode_code_query_result_ref_variant83(value: Any, prefix: str = 'CodeQuery
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
-    return CodeQueryResultRefVariant83(
+    return CodeQueryResultRefVariant84(
         id=id_value,
         path=path_value,
     )
 
-def _decode_code_query_result_ref_variant84(value: Any, prefix: str = 'CodeQueryResultRefVariant84') -> CodeQueryResultRefVariant84:
+def _decode_code_query_result_ref_variant85(value: Any, prefix: str = 'CodeQueryResultRefVariant85') -> CodeQueryResultRefVariant85:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19327,14 +19489,14 @@ def _decode_code_query_result_ref_variant84(value: Any, prefix: str = 'CodeQuery
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    return CodeQueryResultRefVariant84(
+    return CodeQueryResultRefVariant85(
         fact_id=fact_id_value,
         id=id_value,
         path=path_value,
         range=range_value,
     )
 
-def _decode_code_query_result_ref_variant85(value: Any, prefix: str = 'CodeQueryResultRefVariant85') -> CodeQueryResultRefVariant85:
+def _decode_code_query_result_ref_variant86(value: Any, prefix: str = 'CodeQueryResultRefVariant86') -> CodeQueryResultRefVariant86:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -19362,10 +19524,10 @@ def _decode_code_query_result_ref_variant85(value: Any, prefix: str = 'CodeQuery
     operator_value = _decode_string(value['operator'], f"{prefix}.operator")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     if 'range' in value:
-        range_value = _decode_defs_code_query_result_ref_union_84_properties_range(value['range'], f"{prefix}.range")
+        range_value = _decode_defs_code_query_result_ref_union_85_properties_range(value['range'], f"{prefix}.range")
     else:
         range_value = None
-    return CodeQueryResultRefVariant85(
+    return CodeQueryResultRefVariant86(
         domain=domain_value,
         id=id_value,
         operator=operator_value,
@@ -19633,39 +19795,39 @@ def _decode_code_query_rewrite_path(value: Any, prefix: str = 'CodeQueryRewriteP
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
-    declared_bound_value = _decode_defs_code_query_result_item_union_78_properties_declared_bound(value['declared_bound'], f"{prefix}.declared_bound")
+    declared_bound_value = _decode_defs_code_query_result_item_union_79_properties_declared_bound(value['declared_bound'], f"{prefix}.declared_bound")
     domain_value = _decode_string(value['domain'], f"{prefix}.domain")
-    end_byte_value = _decode_defs_code_query_result_item_union_78_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
+    end_byte_value = _decode_defs_code_query_result_item_union_79_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
     if 'explored' in value:
-        explored_value = _decode_defs_code_query_result_item_union_78_properties_explored(value['explored'], f"{prefix}.explored")
+        explored_value = _decode_defs_code_query_result_item_union_79_properties_explored(value['explored'], f"{prefix}.explored")
     else:
         explored_value = None
     if 'fixed_point' in value:
-        fixed_point_value = _decode_defs_code_query_result_item_union_78_properties_fixed_point(value['fixed_point'], f"{prefix}.fixed_point")
+        fixed_point_value = _decode_defs_code_query_result_item_union_79_properties_fixed_point(value['fixed_point'], f"{prefix}.fixed_point")
     else:
         fixed_point_value = None
-    generation_value = _decode_defs_code_query_result_item_union_78_properties_generation(value['generation'], f"{prefix}.generation")
+    generation_value = _decode_defs_code_query_result_item_union_79_properties_generation(value['generation'], f"{prefix}.generation")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     origin_specifier_value = _decode_string(value['origin_specifier'], f"{prefix}.origin_specifier")
     outcome_value = _decode_string(value['outcome'], f"{prefix}.outcome")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    start_byte_value = _decode_defs_code_query_result_item_union_78_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
-    step_count_value = _decode_defs_code_query_result_item_union_78_properties_step_count(value['step_count'], f"{prefix}.step_count")
-    steps_value = _decode_defs_code_query_result_item_union_78_properties_steps(value['steps'], f"{prefix}.steps")
+    start_byte_value = _decode_defs_code_query_result_item_union_79_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
+    step_count_value = _decode_defs_code_query_result_item_union_79_properties_step_count(value['step_count'], f"{prefix}.step_count")
+    steps_value = _decode_defs_code_query_result_item_union_79_properties_steps(value['steps'], f"{prefix}.steps")
     if 'uncovered_domains' in value:
-        uncovered_domains_value = _decode_defs_code_query_result_item_union_78_properties_uncovered_domains(value['uncovered_domains'], f"{prefix}.uncovered_domains")
+        uncovered_domains_value = _decode_defs_code_query_result_item_union_79_properties_uncovered_domains(value['uncovered_domains'], f"{prefix}.uncovered_domains")
     else:
-        uncovered_domains_value = _decode_defs_code_query_result_item_union_78_properties_uncovered_domains([], f"{prefix}.uncovered_domains")
+        uncovered_domains_value = _decode_defs_code_query_result_item_union_79_properties_uncovered_domains([], f"{prefix}.uncovered_domains")
     if 'witness' in value:
-        witness_value = _decode_defs_code_query_result_item_union_78_properties_witness(value['witness'], f"{prefix}.witness")
+        witness_value = _decode_defs_code_query_result_item_union_79_properties_witness(value['witness'], f"{prefix}.witness")
     else:
-        witness_value = _decode_defs_code_query_result_item_union_78_properties_witness([], f"{prefix}.witness")
+        witness_value = _decode_defs_code_query_result_item_union_79_properties_witness([], f"{prefix}.witness")
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_78_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_79_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_78_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_79_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -19726,6 +19888,148 @@ def _decode_code_query_rewrite_step(value: Any, prefix: str = 'CodeQueryRewriteS
         state_key=state_key_value,
     )
 
+def _decode_code_query_rust_marker_impl(value: Any, prefix: str = 'CodeQueryRustMarkerImpl') -> CodeQueryRustMarkerImpl:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'bounds',
+        'bounds_proof',
+        'completeness',
+        'declaration_parameter_ordinal',
+        'has_send_bound',
+        'has_sync_bound',
+        'id',
+        'impl_coverage',
+        'impl_range',
+        'language',
+        'mapping_proof',
+        'parameter',
+        'path',
+        'range',
+        'self_proof',
+        'shared_access',
+        'shared_ref_only',
+        'stored',
+        'trait',
+        'trait_proof',
+        'uses',
+        'uses_proof',
+        'provenance',
+        'provenance_truncated',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'bounds',
+        'bounds_proof',
+        'completeness',
+        'declaration_parameter_ordinal',
+        'has_send_bound',
+        'has_sync_bound',
+        'id',
+        'impl_coverage',
+        'impl_range',
+        'language',
+        'mapping_proof',
+        'parameter',
+        'path',
+        'range',
+        'self_proof',
+        'shared_access',
+        'shared_ref_only',
+        'stored',
+        'trait',
+        'trait_proof',
+        'uses',
+        'uses_proof',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    bounds_value = _decode_defs_code_query_result_item_union_76_properties_bounds(value['bounds'], f"{prefix}.bounds")
+    bounds_proof_value = _decode_string(value['bounds_proof'], f"{prefix}.bounds_proof")
+    completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
+    declaration_parameter_ordinal_value = _decode_defs_code_query_result_item_union_76_properties_declaration_parameter_ordinal(value['declaration_parameter_ordinal'], f"{prefix}.declaration_parameter_ordinal")
+    has_send_bound_value = _decode_boolean(value['has_send_bound'], f"{prefix}.has_send_bound")
+    has_sync_bound_value = _decode_boolean(value['has_sync_bound'], f"{prefix}.has_sync_bound")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    impl_coverage_value = _decode_string(value['impl_coverage'], f"{prefix}.impl_coverage")
+    impl_range_value = _decode_code_query_range(value['impl_range'], f"{prefix}.impl_range")
+    language_value = _decode_string(value['language'], f"{prefix}.language")
+    mapping_proof_value = _decode_string(value['mapping_proof'], f"{prefix}.mapping_proof")
+    parameter_value = _decode_defs_code_query_result_item_union_76_properties_parameter(value['parameter'], f"{prefix}.parameter")
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    self_proof_value = _decode_string(value['self_proof'], f"{prefix}.self_proof")
+    shared_access_value = _decode_string(value['shared_access'], f"{prefix}.shared_access")
+    shared_ref_only_value = _decode_boolean(value['shared_ref_only'], f"{prefix}.shared_ref_only")
+    stored_value = _decode_boolean(value['stored'], f"{prefix}.stored")
+    trait_value = _decode_string(value['trait'], f"{prefix}.trait")
+    trait_proof_value = _decode_string(value['trait_proof'], f"{prefix}.trait_proof")
+    uses_value = _decode_defs_code_query_result_item_union_76_properties_uses(value['uses'], f"{prefix}.uses")
+    uses_proof_value = _decode_string(value['uses_proof'], f"{prefix}.uses_proof")
+    if 'provenance' in value:
+        provenance_value = _decode_defs_code_query_result_item_union_76_properties_provenance(value['provenance'], f"{prefix}.provenance")
+    else:
+        provenance_value = _decode_defs_code_query_result_item_union_76_properties_provenance([], f"{prefix}.provenance")
+    if 'provenance_truncated' in value:
+        provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
+    else:
+        provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
+    return CodeQueryRustMarkerImpl(
+        bounds=bounds_value,
+        bounds_proof=bounds_proof_value,
+        completeness=completeness_value,
+        declaration_parameter_ordinal=declaration_parameter_ordinal_value,
+        has_send_bound=has_send_bound_value,
+        has_sync_bound=has_sync_bound_value,
+        id=id_value,
+        impl_coverage=impl_coverage_value,
+        impl_range=impl_range_value,
+        language=language_value,
+        mapping_proof=mapping_proof_value,
+        parameter=parameter_value,
+        path=path_value,
+        range=range_value,
+        self_proof=self_proof_value,
+        shared_access=shared_access_value,
+        shared_ref_only=shared_ref_only_value,
+        stored=stored_value,
+        trait=trait_value,
+        trait_proof=trait_proof_value,
+        uses=uses_value,
+        uses_proof=uses_proof_value,
+        provenance=provenance_value,
+        provenance_truncated=provenance_truncated_value,
+    )
+
+def _decode_code_query_rust_marker_use(value: Any, prefix: str = 'CodeQueryRustMarkerUse') -> CodeQueryRustMarkerUse:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'field',
+        'wrappers',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'field',
+        'wrappers',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    field_value = _decode_string(value['field'], f"{prefix}.field")
+    wrappers_value = _decode_defs_code_query_rust_marker_use_properties_wrappers(value['wrappers'], f"{prefix}.wrappers")
+    return CodeQueryRustMarkerUse(
+        field=field_value,
+        wrappers=wrappers_value,
+    )
+
 def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQueryRustPointerFinding') -> CodeQueryRustPointerFinding:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
@@ -19775,22 +20079,22 @@ def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQuery
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     access_kind_value = _decode_string(value['access_kind'], f"{prefix}.access_kind")
     if 'access_width' in value:
-        access_width_value = _decode_defs_code_query_result_item_union_76_properties_access_width(value['access_width'], f"{prefix}.access_width")
+        access_width_value = _decode_defs_code_query_result_item_union_77_properties_access_width(value['access_width'], f"{prefix}.access_width")
     else:
         access_width_value = None
     bounds_value = _decode_string(value['bounds'], f"{prefix}.bounds")
     if 'byte_extent' in value:
-        byte_extent_value = _decode_defs_code_query_result_item_union_76_properties_byte_extent(value['byte_extent'], f"{prefix}.byte_extent")
+        byte_extent_value = _decode_defs_code_query_result_item_union_77_properties_byte_extent(value['byte_extent'], f"{prefix}.byte_extent")
     else:
         byte_extent_value = None
     if 'byte_offset' in value:
-        byte_offset_value = _decode_defs_code_query_result_item_union_76_properties_byte_offset(value['byte_offset'], f"{prefix}.byte_offset")
+        byte_offset_value = _decode_defs_code_query_result_item_union_77_properties_byte_offset(value['byte_offset'], f"{prefix}.byte_offset")
     else:
         byte_offset_value = None
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     if 'invalidation_cause' in value:
-        invalidation_cause_value = _decode_defs_code_query_result_item_union_76_properties_invalidation_cause(value['invalidation_cause'], f"{prefix}.invalidation_cause")
+        invalidation_cause_value = _decode_defs_code_query_result_item_union_77_properties_invalidation_cause(value['invalidation_cause'], f"{prefix}.invalidation_cause")
     else:
         invalidation_cause_value = None
     language_value = _decode_string(value['language'], f"{prefix}.language")
@@ -19801,15 +20105,15 @@ def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQuery
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
     if 'reason' in value:
-        reason_value = _decode_defs_code_query_result_item_union_76_properties_reason(value['reason'], f"{prefix}.reason")
+        reason_value = _decode_defs_code_query_result_item_union_77_properties_reason(value['reason'], f"{prefix}.reason")
     else:
         reason_value = None
     relation_value = _decode_string(value['relation'], f"{prefix}.relation")
     strength_value = _decode_string(value['strength'], f"{prefix}.strength")
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_76_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_77_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_76_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_77_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -19977,13 +20281,13 @@ def _decode_code_query_source_set(value: Any, prefix: str = 'CodeQuerySourceSet'
     id_value = _decode_string(value['id'], f"{prefix}.id")
     name_value = _decode_string(value['name'], f"{prefix}.name")
     if 'target_id' in value:
-        target_id_value = _decode_defs_code_query_result_item_union_81_properties_target_id(value['target_id'], f"{prefix}.target_id")
+        target_id_value = _decode_defs_code_query_result_item_union_82_properties_target_id(value['target_id'], f"{prefix}.target_id")
     else:
         target_id_value = None
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_81_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_82_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_81_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_82_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -20732,14 +21036,14 @@ def _decode_code_query_topology_edge(value: Any, prefix: str = 'CodeQueryTopolog
     id_value = _decode_string(value['id'], f"{prefix}.id")
     scope_value = _decode_string(value['scope'], f"{prefix}.scope")
     if 'to_id' in value:
-        to_id_value = _decode_defs_code_query_result_item_union_83_properties_to_id(value['to_id'], f"{prefix}.to_id")
+        to_id_value = _decode_defs_code_query_result_item_union_84_properties_to_id(value['to_id'], f"{prefix}.to_id")
     else:
         to_id_value = None
     to_name_value = _decode_string(value['to_name'], f"{prefix}.to_name")
     if 'provenance' in value:
-        provenance_value = _decode_defs_code_query_result_item_union_83_properties_provenance(value['provenance'], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_84_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
-        provenance_value = _decode_defs_code_query_result_item_union_83_properties_provenance([], f"{prefix}.provenance")
+        provenance_value = _decode_defs_code_query_result_item_union_84_properties_provenance([], f"{prefix}.provenance")
     if 'provenance_truncated' in value:
         provenance_truncated_value = _decode_boolean(value['provenance_truncated'], f"{prefix}.provenance_truncated")
     else:
@@ -21978,6 +22282,14 @@ def _decode_defs_code_query_diagnostic_properties_exhausted_roots(value: Any, pr
         for index, item in enumerate(value)
     ]
 
+def _decode_defs_code_query_diagnostic_properties_related(value: Any, prefix: str = "array") -> list[CodeQueryRelatedSource]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_related_source(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_code_query_diagnostic_properties_source(value: Any, prefix: str = "union") -> CodeQuerySourceSpan | None:
     errors = []
     try:
@@ -22936,7 +23248,7 @@ def _decode_defs_code_query_provenance_properties_steps(value: Any, prefix: str 
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_provenance_step_properties_via(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | None:
+def _decode_defs_code_query_provenance_step_properties_via(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None:
     errors = []
     try:
         return _decode_defs_code_query_result_ref(value, prefix)
@@ -23319,7 +23631,7 @@ class CodeQueryResultItem(metaclass=_TaggedUnionMeta):
             raise DecoderError(f"unknown discriminator {tag_value!r}")
         return decoder(data)
 
-def _decode_defs_code_query_result_item(value: Any, prefix: str = 'CodeQueryResultItem') -> CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain:
+def _decode_defs_code_query_result_item(value: Any, prefix: str = 'CodeQueryResultItem') -> CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain:
     return CodeQueryResultItem.from_dict(value)
 
 def _decode_defs_code_query_result_item_union_0_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
@@ -24612,6 +24924,14 @@ def _decode_defs_code_query_result_item_union_27_properties_argument_count(value
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
+def _decode_defs_code_query_result_item_union_27_properties_callee_bounds(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_code_query_result_item_union_27_properties_callee_name(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -24630,6 +24950,16 @@ def _decode_defs_code_query_result_item_union_27_properties_callee_range(value: 
         errors.append(str(error))
     try:
         return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_27_properties_callee_supplier(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
@@ -30436,37 +30766,31 @@ def _decode_defs_code_query_result_item_union_75_properties_variable_id(value: A
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_76_properties_access_width(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_76_properties_bounds(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_result_item_union_76_properties_declaration_parameter_ordinal(value: Any, prefix: str = "union") -> int | None:
     if value is None:
         return None
     errors = []
     try:
-        return _decode_string(value, prefix)
+        return _decode_defs_code_query_result_item_union_76_properties_declaration_parameter_ordinal_union_0(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_76_properties_byte_extent(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+def _decode_defs_code_query_result_item_union_76_properties_declaration_parameter_ordinal_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
 
-def _decode_defs_code_query_result_item_union_76_properties_byte_offset(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_76_properties_invalidation_cause(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_76_properties_parameter(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30484,75 +30808,21 @@ def _decode_defs_code_query_result_item_union_76_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_result_item_union_76_properties_reason(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
 def _decode_defs_code_query_result_item_union_76_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'rust_pointer_finding'"
-    if value != 'rust_pointer_finding':
+    expected_repr = "'rust_marker_impl'"
+    if value != 'rust_marker_impl':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_item_union_77_properties_classes_value(value: Any, prefix: str = "union") -> int | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_defs_code_query_result_item_union_77_properties_classes_value_union_0(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+def _decode_defs_code_query_result_item_union_76_properties_uses(value: Any, prefix: str = "array") -> list[CodeQueryRustMarkerUse]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_rust_marker_use(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
-def _decode_defs_code_query_result_item_union_77_properties_classes_value_union_0(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_77_properties_constant(value: Any, prefix: str = "union") -> bool | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_boolean(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_constant_value(value: Any, prefix: str = "union") -> int | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_defs_code_query_result_item_union_77_properties_constant_value_union_0(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_constant_value_union_0(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_77_properties_equality_negated(value: Any, prefix: str = "union") -> bool | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_boolean(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_false_edge_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_77_properties_access_width(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30562,7 +30832,7 @@ def _decode_defs_code_query_result_item_union_77_properties_false_edge_id(value:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_77_properties_false_target_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_77_properties_byte_extent(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30572,23 +30842,7 @@ def _decode_defs_code_query_result_item_union_77_properties_false_target_id(valu
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_77_properties_guarded_value(value: Any, prefix: str = "union") -> int | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_defs_code_query_result_item_union_77_properties_guarded_value_union_0(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_guarded_value_union_0(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_77_properties_integer_relation(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_77_properties_byte_offset(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30598,33 +30852,7 @@ def _decode_defs_code_query_result_item_union_77_properties_integer_relation(val
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_77_properties_member_value(value: Any, prefix: str = "union") -> int | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_defs_code_query_result_item_union_77_properties_member_value_union_0(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_member_value_union_0(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_77_properties_null_on_true(value: Any, prefix: str = "union") -> bool | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_boolean(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_null_target_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_77_properties_invalidation_cause(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30633,22 +30861,6 @@ def _decode_defs_code_query_result_item_union_77_properties_null_target_id(value
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_opaque_digest(value: Any, prefix: str = "union") -> int | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_defs_code_query_result_item_union_77_properties_opaque_digest_union_0(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_77_properties_opaque_digest_union_0(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
 
 def _decode_defs_code_query_result_item_union_77_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
     if not isinstance(value, list):
@@ -30658,29 +30870,75 @@ def _decode_defs_code_query_result_item_union_77_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
+def _decode_defs_code_query_result_item_union_77_properties_reason(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_77_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'guard'"
-    if value != 'guard':
+    expected_repr = "'rust_pointer_finding'"
+    if value != 'rust_pointer_finding':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_item_union_77_properties_subject_value(value: Any, prefix: str = "union") -> int | None:
+def _decode_defs_code_query_result_item_union_78_properties_classes_value(value: Any, prefix: str = "union") -> int | None:
     if value is None:
         return None
     errors = []
     try:
-        return _decode_defs_code_query_result_item_union_77_properties_subject_value_union_0(value, prefix)
+        return _decode_defs_code_query_result_item_union_78_properties_classes_value_union_0(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_77_properties_subject_value_union_0(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_78_properties_classes_value_union_0(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
-def _decode_defs_code_query_result_item_union_77_properties_true_edge_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_78_properties_constant(value: Any, prefix: str = "union") -> bool | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_boolean(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_constant_value(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_78_properties_constant_value_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_constant_value_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_78_properties_equality_negated(value: Any, prefix: str = "union") -> bool | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_boolean(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_false_edge_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30690,7 +30948,7 @@ def _decode_defs_code_query_result_item_union_77_properties_true_edge_id(value: 
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_77_properties_true_target_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_78_properties_false_target_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30700,35 +30958,23 @@ def _decode_defs_code_query_result_item_union_77_properties_true_target_id(value
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_78_properties_declared_bound(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_78_properties_end_byte(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_78_properties_explored(value: Any, prefix: str = "union") -> int | None:
+def _decode_defs_code_query_result_item_union_78_properties_guarded_value(value: Any, prefix: str = "union") -> int | None:
     if value is None:
         return None
     errors = []
     try:
-        return _decode_defs_code_query_result_item_union_78_properties_explored_union_0(value, prefix)
+        return _decode_defs_code_query_result_item_union_78_properties_guarded_value_union_0(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_78_properties_explored_union_0(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_78_properties_guarded_value_union_0(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
-def _decode_defs_code_query_result_item_union_78_properties_fixed_point(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_78_properties_integer_relation(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30738,7 +30984,53 @@ def _decode_defs_code_query_result_item_union_78_properties_fixed_point(value: A
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_78_properties_generation(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_78_properties_member_value(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_78_properties_member_value_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_member_value_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_78_properties_null_on_true(value: Any, prefix: str = "union") -> bool | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_boolean(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_null_target_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_opaque_digest(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_78_properties_opaque_digest_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_opaque_digest_union_0(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
@@ -30753,48 +31045,86 @@ def _decode_defs_code_query_result_item_union_78_properties_provenance(value: An
     ]
 
 def _decode_defs_code_query_result_item_union_78_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'rewrite_path'"
-    if value != 'rewrite_path':
+    expected_repr = "'guard'"
+    if value != 'guard':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_item_union_78_properties_start_byte(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_78_properties_subject_value(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_78_properties_subject_value_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_subject_value_union_0(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
-def _decode_defs_code_query_result_item_union_78_properties_step_count(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_78_properties_true_edge_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_78_properties_true_target_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_79_properties_declared_bound(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
-
-def _decode_defs_code_query_result_item_union_78_properties_steps(value: Any, prefix: str = "array") -> list[CodeQueryRewriteStep]:
-    if not isinstance(value, list):
-        raise TypeDecoderError(f"{prefix}: expected array")
-    return [
-        _decode_code_query_rewrite_step(item, f"{prefix}[{index}]")
-        for index, item in enumerate(value)
-    ]
-
-def _decode_defs_code_query_result_item_union_78_properties_uncovered_domains(value: Any, prefix: str = "array") -> list[str]:
-    if not isinstance(value, list):
-        raise TypeDecoderError(f"{prefix}: expected array")
-    return [
-        _decode_string(item, f"{prefix}[{index}]")
-        for index, item in enumerate(value)
-    ]
-
-def _decode_defs_code_query_result_item_union_78_properties_witness(value: Any, prefix: str = "array") -> list[str]:
-    if not isinstance(value, list):
-        raise TypeDecoderError(f"{prefix}: expected array")
-    return [
-        _decode_string(item, f"{prefix}[{index}]")
-        for index, item in enumerate(value)
-    ]
 
 def _decode_defs_code_query_result_item_union_79_properties_end_byte(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_79_properties_explored(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_79_properties_explored_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_79_properties_explored_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_79_properties_fixed_point(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_79_properties_generation(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
@@ -30809,15 +31139,9 @@ def _decode_defs_code_query_result_item_union_79_properties_provenance(value: An
     ]
 
 def _decode_defs_code_query_result_item_union_79_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'qualified_path'"
-    if value != 'qualified_path':
+    expected_repr = "'rewrite_path'"
+    if value != 'rewrite_path':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
-    return value
-
-def _decode_defs_code_query_result_item_union_79_properties_segment_count(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
 def _decode_defs_code_query_result_item_union_79_properties_start_byte(value: Any, prefix: str = 'int') -> int:
@@ -30825,6 +31149,36 @@ def _decode_defs_code_query_result_item_union_79_properties_start_byte(value: An
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
+
+def _decode_defs_code_query_result_item_union_79_properties_step_count(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_79_properties_steps(value: Any, prefix: str = "array") -> list[CodeQueryRewriteStep]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_rewrite_step(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_result_item_union_79_properties_uncovered_domains(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_result_item_union_79_properties_witness(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 def _decode_defs_code_query_result_item_union_7_properties_certainty(value: Any, prefix: str = "union") -> CodeQueryFlowCertainty | None:
     errors = []
@@ -30894,49 +31248,7 @@ def _decode_defs_code_query_result_item_union_7_properties_source(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_80_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
 def _decode_defs_code_query_result_item_union_80_properties_end_byte(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_80_properties_generic_arity(value: Any, prefix: str = "union") -> int | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_defs_code_query_result_item_union_80_properties_generic_arity_union_0(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_80_properties_generic_arity_union_0(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_item_union_80_properties_namespace(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_item_union_80_properties_ordinal(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
@@ -30950,7 +31262,25 @@ def _decode_defs_code_query_result_item_union_80_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_result_item_union_80_properties_resolution_status(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_80_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'qualified_path'"
+    if value != 'qualified_path':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_item_union_80_properties_segment_count(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_80_properties_start_byte(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_81_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -30960,29 +31290,39 @@ def _decode_defs_code_query_result_item_union_80_properties_resolution_status(va
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_80_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'path_segment'"
-    if value != 'path_segment':
-        raise DecoderError(f"{prefix}: expected {expected_repr}")
-    return value
-
-def _decode_defs_code_query_result_item_union_80_properties_start_byte(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_81_properties_end_byte(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
-def _decode_defs_code_query_result_item_union_80_properties_target_count(value: Any, prefix: str = "union") -> int | None:
+def _decode_defs_code_query_result_item_union_81_properties_generic_arity(value: Any, prefix: str = "union") -> int | None:
     if value is None:
         return None
     errors = []
     try:
-        return _decode_defs_code_query_result_item_union_80_properties_target_count_union_0(value, prefix)
+        return _decode_defs_code_query_result_item_union_81_properties_generic_arity_union_0(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_80_properties_target_count_union_0(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_item_union_81_properties_generic_arity_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_81_properties_namespace(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_81_properties_ordinal(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
@@ -30996,31 +31336,43 @@ def _decode_defs_code_query_result_item_union_81_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
+def _decode_defs_code_query_result_item_union_81_properties_resolution_status(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_81_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'source_set'"
-    if value != 'source_set':
+    expected_repr = "'path_segment'"
+    if value != 'path_segment':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_item_union_81_properties_target_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_81_properties_start_byte(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_81_properties_target_count(value: Any, prefix: str = "union") -> int | None:
     if value is None:
         return None
     errors = []
     try:
-        return _decode_string(value, prefix)
+        return _decode_defs_code_query_result_item_union_81_properties_target_count_union_0(value, prefix)
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_82_properties_build_project_id(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+def _decode_defs_code_query_result_item_union_81_properties_target_count_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
 
 def _decode_defs_code_query_result_item_union_82_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
     if not isinstance(value, list):
@@ -31031,10 +31383,30 @@ def _decode_defs_code_query_result_item_union_82_properties_provenance(value: An
     ]
 
 def _decode_defs_code_query_result_item_union_82_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'build_target'"
-    if value != 'build_target':
+    expected_repr = "'source_set'"
+    if value != 'source_set':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
+
+def _decode_defs_code_query_result_item_union_82_properties_target_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_83_properties_build_project_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_result_item_union_83_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
     if not isinstance(value, list):
@@ -31045,12 +31417,26 @@ def _decode_defs_code_query_result_item_union_83_properties_provenance(value: An
     ]
 
 def _decode_defs_code_query_result_item_union_83_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'build_target'"
+    if value != 'build_target':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_item_union_84_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_provenance(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_result_item_union_84_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'topology_edge'"
     if value != 'topology_edge':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_item_union_83_properties_to_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_84_properties_to_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31060,7 +31446,7 @@ def _decode_defs_code_query_result_item_union_83_properties_to_id(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_binding(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_binding(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31070,7 +31456,7 @@ def _decode_defs_code_query_result_item_union_84_properties_binding(value: Any, 
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_code(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | None:
+def _decode_defs_code_query_result_item_union_85_properties_code(value: Any, prefix: str = "union") -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86 | None:
     errors = []
     try:
         return _decode_defs_code_query_result_ref(value, prefix)
@@ -31082,7 +31468,7 @@ def _decode_defs_code_query_result_item_union_84_properties_code(value: Any, pre
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_code_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_code_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31092,7 +31478,7 @@ def _decode_defs_code_query_result_item_union_84_properties_code_id(value: Any, 
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_code_path(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_code_path(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31102,7 +31488,7 @@ def _decode_defs_code_query_result_item_union_84_properties_code_path(value: Any
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_configuration(value: Any, prefix: str = "union") -> CodeQueryConfigurationFact2 | None:
+def _decode_defs_code_query_result_item_union_85_properties_configuration(value: Any, prefix: str = "union") -> CodeQueryConfigurationFact2 | None:
     errors = []
     try:
         return _decode_code_query_configuration_fact2(value, prefix)
@@ -31114,7 +31500,7 @@ def _decode_defs_code_query_result_item_union_84_properties_configuration(value:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_configuration_contributors(value: Any, prefix: str = "array") -> list[CodeQueryConfigurationFact2]:
+def _decode_defs_code_query_result_item_union_85_properties_configuration_contributors(value: Any, prefix: str = "array") -> list[CodeQueryConfigurationFact2]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -31122,7 +31508,7 @@ def _decode_defs_code_query_result_item_union_84_properties_configuration_contri
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_result_item_union_84_properties_configuration_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_configuration_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31132,7 +31518,7 @@ def _decode_defs_code_query_result_item_union_84_properties_configuration_id(val
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_configuration_path(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_configuration_path(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31142,7 +31528,7 @@ def _decode_defs_code_query_result_item_union_84_properties_configuration_path(v
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_dependency_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_dependency_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31152,7 +31538,7 @@ def _decode_defs_code_query_result_item_union_84_properties_dependency_id(value:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_effective_configuration(value: Any, prefix: str = "union") -> ConfigurationResolutionResult | None:
+def _decode_defs_code_query_result_item_union_85_properties_effective_configuration(value: Any, prefix: str = "union") -> ConfigurationResolutionResult | None:
     errors = []
     try:
         return _decode_configuration_resolution_result(value, prefix)
@@ -31164,7 +31550,7 @@ def _decode_defs_code_query_result_item_union_84_properties_effective_configurat
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_key(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_key(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31174,7 +31560,7 @@ def _decode_defs_code_query_result_item_union_84_properties_key(value: Any, pref
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_mapping_id(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_mapping_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31184,7 +31570,7 @@ def _decode_defs_code_query_result_item_union_84_properties_mapping_id(value: An
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_mitigated(value: Any, prefix: str = "union") -> bool | None:
+def _decode_defs_code_query_result_item_union_85_properties_mitigated(value: Any, prefix: str = "union") -> bool | None:
     if value is None:
         return None
     errors = []
@@ -31194,7 +31580,7 @@ def _decode_defs_code_query_result_item_union_84_properties_mitigated(value: Any
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_owner(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_owner(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31204,7 +31590,7 @@ def _decode_defs_code_query_result_item_union_84_properties_owner(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
+def _decode_defs_code_query_result_item_union_85_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -31212,7 +31598,7 @@ def _decode_defs_code_query_result_item_union_84_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_result_item_union_84_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
+def _decode_defs_code_query_result_item_union_85_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
     errors = []
     try:
         return _decode_code_query_range(value, prefix)
@@ -31224,7 +31610,7 @@ def _decode_defs_code_query_result_item_union_84_properties_range(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_relation(value: Any, prefix: str = "union") -> str | None:
+def _decode_defs_code_query_result_item_union_85_properties_relation(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -31234,7 +31620,7 @@ def _decode_defs_code_query_result_item_union_84_properties_relation(value: Any,
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_item_union_84_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_item_union_85_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'cross_domain'"
     if value != 'cross_domain':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
@@ -31327,7 +31713,7 @@ class CodeQueryResultRef(metaclass=_TaggedUnionMeta):
             raise DecoderError(f"unknown discriminator {tag_value!r}")
         return decoder(data)
 
-def _decode_defs_code_query_result_ref(value: Any, prefix: str = 'CodeQueryResultRef') -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85:
+def _decode_defs_code_query_result_ref(value: Any, prefix: str = 'CodeQueryResultRef') -> CodeQueryResultRefVariant1 | CodeQueryResultRefVariant2 | CodeQueryResultRefVariant3 | CodeQueryResultRefVariant4 | CodeQueryResultRefVariant5 | CodeQueryResultRefVariant6 | CodeQueryResultRefVariant7 | CodeQueryResultRefVariant8 | CodeQueryResultRefVariant9 | CodeQueryResultRefVariant10 | CodeQueryResultRefVariant11 | CodeQueryResultRefVariant12 | CodeQueryResultRefVariant13 | CodeQueryResultRefVariant14 | CodeQueryResultRefVariant15 | CodeQueryResultRefVariant16 | CodeQueryResultRefVariant17 | CodeQueryResultRefVariant18 | CodeQueryResultRefVariant19 | CodeQueryResultRefVariant20 | CodeQueryResultRefVariant21 | CodeQueryResultRefVariant22 | CodeQueryResultRefVariant23 | CodeQueryResultRefVariant24 | CodeQueryResultRefVariant25 | CodeQueryResultRefVariant26 | CodeQueryResultRefVariant27 | CodeQueryResultRefVariant28 | CodeQueryResultRefVariant29 | CodeQueryResultRefVariant30 | CodeQueryResultRefVariant31 | CodeQueryResultRefVariant32 | CodeQueryResultRefVariant33 | CodeQueryResultRefVariant34 | CodeQueryResultRefVariant35 | CodeQueryResultRefVariant36 | CodeQueryResultRefVariant37 | CodeQueryResultRefVariant38 | CodeQueryResultRefVariant39 | CodeQueryResultRefVariant40 | CodeQueryResultRefVariant41 | CodeQueryResultRefVariant42 | CodeQueryResultRefVariant43 | CodeQueryResultRefVariant44 | CodeQueryResultRefVariant45 | CodeQueryResultRefVariant46 | CodeQueryResultRefVariant47 | CodeQueryResultRefVariant48 | CodeQueryResultRefVariant49 | CodeQueryResultRefVariant50 | CodeQueryResultRefVariant51 | CodeQueryResultRefVariant52 | CodeQueryResultRefVariant53 | CodeQueryResultRefVariant54 | CodeQueryResultRefVariant55 | CodeQueryResultRefVariant56 | CodeQueryResultRefVariant57 | CodeQueryResultRefVariant58 | CodeQueryResultRefVariant59 | CodeQueryResultRefVariant60 | CodeQueryResultRefVariant61 | CodeQueryResultRefVariant62 | CodeQueryResultRefVariant63 | CodeQueryResultRefVariant64 | CodeQueryResultRefVariant65 | CodeQueryResultRefVariant66 | CodeQueryResultRefVariant67 | CodeQueryResultRefVariant68 | CodeQueryResultRefVariant69 | CodeQueryResultRefVariant70 | CodeQueryResultRefVariant71 | CodeQueryResultRefVariant72 | CodeQueryResultRefVariant73 | CodeQueryResultRefVariant74 | CodeQueryResultRefVariant75 | CodeQueryResultRefVariant76 | CodeQueryResultRefVariant77 | CodeQueryResultRefVariant78 | CodeQueryResultRefVariant79 | CodeQueryResultRefVariant80 | CodeQueryResultRefVariant81 | CodeQueryResultRefVariant82 | CodeQueryResultRefVariant83 | CodeQueryResultRefVariant84 | CodeQueryResultRefVariant85 | CodeQueryResultRefVariant86:
     return CodeQueryResultRef.from_dict(value)
 
 def _decode_defs_code_query_result_ref_union_0_properties_end_line(value: Any, prefix: str = 'int') -> int:
@@ -32337,73 +32723,57 @@ def _decode_defs_code_query_result_ref_union_70_properties_result_type(value: An
     return value
 
 def _decode_defs_code_query_result_ref_union_71_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'rust_marker_impl'"
+    if value != 'rust_marker_impl':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_ref_union_72_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'rust_pointer_finding'"
     if value != 'rust_pointer_finding':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_72_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_73_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'guard'"
     if value != 'guard':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_73_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_74_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'rewrite_path'"
     if value != 'rewrite_path':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_74_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_75_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'source_set'"
     if value != 'source_set':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_75_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_76_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'build_target'"
     if value != 'build_target':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_76_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_77_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'topology_edge'"
     if value != 'topology_edge':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_77_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_78_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'qualified_path'"
     if value != 'qualified_path':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_77_properties_segment_count(value: Any, prefix: str = 'int') -> int:
+def _decode_defs_code_query_result_ref_union_78_properties_segment_count(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_ref_union_78_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
-def _decode_defs_code_query_result_ref_union_78_properties_ordinal(value: Any, prefix: str = 'int') -> int:
-    value = _decode_integer(value, prefix)
-    if value < 0:
-        raise DecoderError(f"{prefix}: value is below the minimum")
-    return value
-
-def _decode_defs_code_query_result_ref_union_78_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'path_segment'"
-    if value != 'path_segment':
-        raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
 def _decode_defs_code_query_result_ref_union_79_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
@@ -32416,9 +32786,15 @@ def _decode_defs_code_query_result_ref_union_79_properties_ast_id(value: Any, pr
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_ref_union_79_properties_ordinal(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
 def _decode_defs_code_query_result_ref_union_79_properties_result_type(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'generation_site'"
-    if value != 'generation_site':
+    expected_repr = "'path_segment'"
+    if value != 'path_segment':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
@@ -32440,31 +32816,47 @@ def _decode_defs_code_query_result_ref_union_7_properties_result_type(value: Any
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_code_query_result_ref_union_80_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_ref_union_80_properties_result_type(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'generation_site'"
+    if value != 'generation_site':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_result_ref_union_81_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'export'"
     if value != 'export':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_81_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_82_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'declaration_state'"
     if value != 'declaration_state':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_82_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_83_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'dependency_evidence'"
     if value != 'dependency_evidence':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_83_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_84_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'configuration_fact'"
     if value != 'configuration_fact':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_84_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
+def _decode_defs_code_query_result_ref_union_85_properties_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
     errors = []
     try:
         return _decode_code_query_range(value, prefix)
@@ -32476,7 +32868,7 @@ def _decode_defs_code_query_result_ref_union_84_properties_range(value: Any, pre
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_code_query_result_ref_union_84_properties_result_type(value: Any, prefix: str = "const") -> str:
+def _decode_defs_code_query_result_ref_union_85_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'cross_domain'"
     if value != 'cross_domain':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
@@ -32499,6 +32891,14 @@ def _decode_defs_code_query_result_subject_outcome(value: Any, prefix: str = 'Co
     if value not in ('proven', 'repeatable_origin', 'unsupported', 'ambiguous', 'uncertain_receiver', 'missing_origin', 'cancelled', 'budget_exhausted', 'incomplete'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return CodeQueryResultSubjectOutcome(value)
+
+def _decode_defs_code_query_rust_marker_use_properties_wrappers(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 def _decode_defs_code_query_semantic_completeness(value: Any, prefix: str = 'CodeQuerySemanticCompleteness') -> CodeQuerySemanticCompleteness:
     values_repr = "['complete', 'partial']"
@@ -32960,11 +33360,11 @@ def _decode_defs_python_runtime_base_claim_properties_class(value: Any, prefix: 
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_python_runtime_base_claim_properties_declared_bases(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+def _decode_defs_python_runtime_base_claim_properties_declared_bases(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
-        _decode_defs_type_ref_13(item, f"{prefix}[{index}]")
+        _decode_defs_type_ref_14(item, f"{prefix}[{index}]")
         for index, item in enumerate(value)
     ]
 
@@ -33091,7 +33491,7 @@ class TypeRef(metaclass=_TaggedUnionMeta):
             raise DecoderError(f"unknown discriminator {tag_value!r}")
         return decoder(data)
 
-def _decode_defs_type_ref_13(value: Any, prefix: str = 'TypeRef') -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14:
+def _decode_defs_type_ref_14(value: Any, prefix: str = 'TypeRef') -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15:
     return TypeRef.from_dict(value)
 
 def _decode_defs_type_ref_reference_kind(value: Any, prefix: str = 'TypeRefReferenceKind') -> TypeRefReferenceKind:
@@ -33100,19 +33500,45 @@ def _decode_defs_type_ref_reference_kind(value: Any, prefix: str = 'TypeRefRefer
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return TypeRefReferenceKind(value)
 
+def _decode_defs_type_ref_union_0_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_type_ref_13(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_type_ref_union_0_properties_kind(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'unknown'"
-    if value != 'unknown':
+    expected_repr = "'projection'"
+    if value != 'projection':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_type_ref_union_0_properties_trait_type(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15 | None:
+    errors = []
+    try:
+        return _decode_defs_type_ref_13(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_type_ref_union_10_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'map'"
+    if value != 'map':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_11_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'channel'"
     if value != 'channel':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_11_properties_bound(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None:
+def _decode_defs_type_ref_union_12_properties_bound(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15 | None:
     errors = []
     try:
         return _decode_defs_type_ref_3(value, prefix)
@@ -33124,13 +33550,13 @@ def _decode_defs_type_ref_union_11_properties_bound(value: Any, prefix: str = "u
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_type_ref_union_11_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_12_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'wildcard'"
     if value != 'wildcard':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_12_properties_elements(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+def _decode_defs_type_ref_union_13_properties_elements(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -33138,19 +33564,19 @@ def _decode_defs_type_ref_union_12_properties_elements(value: Any, prefix: str =
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_type_ref_union_12_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_13_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'tuple'"
     if value != 'tuple':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_13_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_14_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'function'"
     if value != 'function':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_13_properties_parameters(value: Any, prefix: str = "array") -> list[Parameter]:
+def _decode_defs_type_ref_union_14_properties_parameters(value: Any, prefix: str = "array") -> list[Parameter]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -33158,7 +33584,7 @@ def _decode_defs_type_ref_union_13_properties_parameters(value: Any, prefix: str
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_type_ref_union_13_properties_result(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | None:
+def _decode_defs_type_ref_union_14_properties_result(value: Any, prefix: str = "union") -> TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15 | None:
     errors = []
     try:
         return _decode_defs_type_ref(value, prefix)
@@ -33170,7 +33596,13 @@ def _decode_defs_type_ref_union_13_properties_result(value: Any, prefix: str = "
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
-def _decode_defs_type_ref_union_1_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+def _decode_defs_type_ref_union_1_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'unknown'"
+    if value != 'unknown':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_type_ref_union_2_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -33178,13 +33610,13 @@ def _decode_defs_type_ref_union_1_properties_arguments(value: Any, prefix: str =
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_type_ref_union_1_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_2_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'named'"
     if value != 'named':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_2_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14]:
+def _decode_defs_type_ref_union_3_properties_arguments(value: Any, prefix: str = "array") -> list[TypeRefVariant1 | TypeRefVariant2 | TypeRefVariant3 | TypeRefVariant4 | TypeRefVariant5 | TypeRefVariant6 | TypeRefVariant7 | TypeRefVariant8 | TypeRefVariant9 | TypeRefVariant10 | TypeRefVariant11 | TypeRefVariant12 | TypeRefVariant13 | TypeRefVariant14 | TypeRefVariant15]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -33192,51 +33624,45 @@ def _decode_defs_type_ref_union_2_properties_arguments(value: Any, prefix: str =
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_type_ref_union_2_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_3_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'declared'"
     if value != 'declared':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_3_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_4_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'type_parameter'"
     if value != 'type_parameter':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_4_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_5_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'array'"
     if value != 'array':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_5_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_6_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'by_ref'"
     if value != 'by_ref':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_6_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_7_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'pointer'"
     if value != 'pointer':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_7_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_8_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'slice'"
     if value != 'slice':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_type_ref_union_8_properties_kind(value: Any, prefix: str = "const") -> str:
+def _decode_defs_type_ref_union_9_properties_kind(value: Any, prefix: str = "const") -> str:
     expected_repr = "'fixed_array'"
     if value != 'fixed_array':
-        raise DecoderError(f"{prefix}: expected {expected_repr}")
-    return value
-
-def _decode_defs_type_ref_union_9_properties_kind(value: Any, prefix: str = "const") -> str:
-    expected_repr = "'map'"
-    if value != 'map':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
@@ -33283,7 +33709,7 @@ def _decode_parameter(value: Any, prefix: str = 'Parameter') -> Parameter:
         role_value = _decode_defs_parameter_properties_role(value['role'], f"{prefix}.role")
     else:
         role_value = None
-    type_value = _decode_defs_type_ref_13(value['type'], f"{prefix}.type")
+    type_value = _decode_defs_type_ref_14(value['type'], f"{prefix}.type")
     if 'variadic' in value:
         variadic_value = _decode_boolean(value['variadic'], f"{prefix}.variadic")
     else:
@@ -33305,7 +33731,7 @@ def _decode_properties_diagnostics(value: Any, prefix: str = "array") -> list[Co
         for index, item in enumerate(value)
     ]
 
-def _decode_properties_results(value: Any, prefix: str = "array") -> list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain]:
+def _decode_properties_results(value: Any, prefix: str = "array") -> list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryCrossDomain]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
     return [
@@ -33412,6 +33838,7 @@ def _decode_semantic_model_activation_provenance(value: Any, prefix: str = 'Sema
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'approximate',
         'matched_evidence',
         'reason',
         'source_id',
@@ -33432,12 +33859,17 @@ def _decode_semantic_model_activation_provenance(value: Any, prefix: str = 'Sema
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'approximate' in value:
+        approximate_value = _decode_boolean(value['approximate'], f"{prefix}.approximate")
+    else:
+        approximate_value = _decode_boolean(False, f"{prefix}.approximate")
     matched_evidence_value = _decode_semantic_model_matched_evidence(value['matched_evidence'], f"{prefix}.matched_evidence")
     reason_value = _decode_string(value['reason'], f"{prefix}.reason")
     source_id_value = _decode_string(value['source_id'], f"{prefix}.source_id")
     source_kind_value = _decode_string(value['source_kind'], f"{prefix}.source_kind")
     status_value = _decode_string(value['status'], f"{prefix}.status")
     return SemanticModelActivationProvenance(
+        approximate=approximate_value,
         matched_evidence=matched_evidence_value,
         reason=reason_value,
         source_id=source_id_value,
@@ -33628,19 +34060,66 @@ def _decode_subset_coverage(value: Any, prefix: str = 'SubsetCoverage') -> Subse
 def _decode_type_ref_variant1(value: Any, prefix: str = 'TypeRefVariant1') -> TypeRefVariant1:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
-    expected = set()
+    expected = {
+        'arguments',
+        'name',
+        'owner',
+        'trait_type',
+    }
     actual = set(value)
     unexpected = actual - expected
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
-    required = set()
+    required = {
+        'name',
+        'owner',
+    }
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'arguments' in value:
+        arguments_value = _decode_defs_type_ref_union_0_properties_arguments(value['arguments'], f"{prefix}.arguments")
+    else:
+        arguments_value = _decode_defs_type_ref_union_0_properties_arguments([], f"{prefix}.arguments")
+    name_value = _decode_string(value['name'], f"{prefix}.name")
+    owner_value = _decode_defs_type_ref_14(value['owner'], f"{prefix}.owner")
+    if 'trait_type' in value:
+        trait_type_value = _decode_defs_type_ref_union_0_properties_trait_type(value['trait_type'], f"{prefix}.trait_type")
+    else:
+        trait_type_value = None
     return TypeRefVariant1(
+        arguments=arguments_value,
+        name=name_value,
+        owner=owner_value,
+        trait_type=trait_type_value,
     )
 
 def _decode_type_ref_variant10(value: Any, prefix: str = 'TypeRefVariant10') -> TypeRefVariant10:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'element',
+        'length',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'element',
+        'length',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
+    length_value = _decode_string(value['length'], f"{prefix}.length")
+    return TypeRefVariant10(
+        element=element_value,
+        length=length_value,
+    )
+
+def _decode_type_ref_variant11(value: Any, prefix: str = 'TypeRefVariant11') -> TypeRefVariant11:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33658,14 +34137,14 @@ def _decode_type_ref_variant10(value: Any, prefix: str = 'TypeRefVariant10') -> 
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    key_value = _decode_defs_type_ref_13(value['key'], f"{prefix}.key")
-    value_value = _decode_defs_type_ref_13(value['value'], f"{prefix}.value")
-    return TypeRefVariant10(
+    key_value = _decode_defs_type_ref_14(value['key'], f"{prefix}.key")
+    value_value = _decode_defs_type_ref_14(value['value'], f"{prefix}.value")
+    return TypeRefVariant11(
         key=key_value,
         value=value_value,
     )
 
-def _decode_type_ref_variant11(value: Any, prefix: str = 'TypeRefVariant11') -> TypeRefVariant11:
+def _decode_type_ref_variant12(value: Any, prefix: str = 'TypeRefVariant12') -> TypeRefVariant12:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33684,13 +34163,13 @@ def _decode_type_ref_variant11(value: Any, prefix: str = 'TypeRefVariant11') -> 
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     direction_value = _decode_defs_channel_direction(value['direction'], f"{prefix}.direction")
-    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
-    return TypeRefVariant11(
+    element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
+    return TypeRefVariant12(
         direction=direction_value,
         element=element_value,
     )
 
-def _decode_type_ref_variant12(value: Any, prefix: str = 'TypeRefVariant12') -> TypeRefVariant12:
+def _decode_type_ref_variant13(value: Any, prefix: str = 'TypeRefVariant13') -> TypeRefVariant13:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33708,16 +34187,16 @@ def _decode_type_ref_variant12(value: Any, prefix: str = 'TypeRefVariant12') -> 
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     if 'bound' in value:
-        bound_value = _decode_defs_type_ref_union_11_properties_bound(value['bound'], f"{prefix}.bound")
+        bound_value = _decode_defs_type_ref_union_12_properties_bound(value['bound'], f"{prefix}.bound")
     else:
         bound_value = None
     variance_value = _decode_defs_wildcard_variance(value['variance'], f"{prefix}.variance")
-    return TypeRefVariant12(
+    return TypeRefVariant13(
         bound=bound_value,
         variance=variance_value,
     )
 
-def _decode_type_ref_variant13(value: Any, prefix: str = 'TypeRefVariant13') -> TypeRefVariant13:
+def _decode_type_ref_variant14(value: Any, prefix: str = 'TypeRefVariant14') -> TypeRefVariant14:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33733,12 +34212,12 @@ def _decode_type_ref_variant13(value: Any, prefix: str = 'TypeRefVariant13') -> 
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    elements_value = _decode_defs_type_ref_union_12_properties_elements(value['elements'], f"{prefix}.elements")
-    return TypeRefVariant13(
+    elements_value = _decode_defs_type_ref_union_13_properties_elements(value['elements'], f"{prefix}.elements")
+    return TypeRefVariant14(
         elements=elements_value,
     )
 
-def _decode_type_ref_variant14(value: Any, prefix: str = 'TypeRefVariant14') -> TypeRefVariant14:
+def _decode_type_ref_variant15(value: Any, prefix: str = 'TypeRefVariant15') -> TypeRefVariant15:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33755,12 +34234,12 @@ def _decode_type_ref_variant14(value: Any, prefix: str = 'TypeRefVariant14') -> 
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    parameters_value = _decode_defs_type_ref_union_13_properties_parameters(value['parameters'], f"{prefix}.parameters")
+    parameters_value = _decode_defs_type_ref_union_14_properties_parameters(value['parameters'], f"{prefix}.parameters")
     if 'result' in value:
-        result_value = _decode_defs_type_ref_union_13_properties_result(value['result'], f"{prefix}.result")
+        result_value = _decode_defs_type_ref_union_14_properties_result(value['result'], f"{prefix}.result")
     else:
         result_value = None
-    return TypeRefVariant14(
+    return TypeRefVariant15(
         parameters=parameters_value,
         result=result_value,
     )
@@ -33768,34 +34247,16 @@ def _decode_type_ref_variant14(value: Any, prefix: str = 'TypeRefVariant14') -> 
 def _decode_type_ref_variant2(value: Any, prefix: str = 'TypeRefVariant2') -> TypeRefVariant2:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
-    expected = {
-        'arguments',
-        'name',
-        'nullable',
-    }
+    expected = set()
     actual = set(value)
     unexpected = actual - expected
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
-    required = {
-        'name',
-    }
+    required = set()
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    if 'arguments' in value:
-        arguments_value = _decode_defs_type_ref_union_1_properties_arguments(value['arguments'], f"{prefix}.arguments")
-    else:
-        arguments_value = _decode_defs_type_ref_union_1_properties_arguments([], f"{prefix}.arguments")
-    name_value = _decode_string(value['name'], f"{prefix}.name")
-    if 'nullable' in value:
-        nullable_value = _decode_boolean(value['nullable'], f"{prefix}.nullable")
-    else:
-        nullable_value = _decode_boolean(False, f"{prefix}.nullable")
     return TypeRefVariant2(
-        arguments=arguments_value,
-        name=name_value,
-        nullable=nullable_value,
     )
 
 def _decode_type_ref_variant3(value: Any, prefix: str = 'TypeRefVariant3') -> TypeRefVariant3:
@@ -33803,7 +34264,7 @@ def _decode_type_ref_variant3(value: Any, prefix: str = 'TypeRefVariant3') -> Ty
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'arguments',
-        'id',
+        'name',
         'nullable',
     }
     actual = set(value)
@@ -33811,7 +34272,7 @@ def _decode_type_ref_variant3(value: Any, prefix: str = 'TypeRefVariant3') -> Ty
     if unexpected:
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
-        'id',
+        'name',
     }
     missing = required - actual
     if missing:
@@ -33820,18 +34281,51 @@ def _decode_type_ref_variant3(value: Any, prefix: str = 'TypeRefVariant3') -> Ty
         arguments_value = _decode_defs_type_ref_union_2_properties_arguments(value['arguments'], f"{prefix}.arguments")
     else:
         arguments_value = _decode_defs_type_ref_union_2_properties_arguments([], f"{prefix}.arguments")
-    id_value = _decode_string(value['id'], f"{prefix}.id")
+    name_value = _decode_string(value['name'], f"{prefix}.name")
     if 'nullable' in value:
         nullable_value = _decode_boolean(value['nullable'], f"{prefix}.nullable")
     else:
         nullable_value = _decode_boolean(False, f"{prefix}.nullable")
     return TypeRefVariant3(
         arguments=arguments_value,
-        id=id_value,
+        name=name_value,
         nullable=nullable_value,
     )
 
 def _decode_type_ref_variant4(value: Any, prefix: str = 'TypeRefVariant4') -> TypeRefVariant4:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'arguments',
+        'id',
+        'nullable',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'arguments' in value:
+        arguments_value = _decode_defs_type_ref_union_3_properties_arguments(value['arguments'], f"{prefix}.arguments")
+    else:
+        arguments_value = _decode_defs_type_ref_union_3_properties_arguments([], f"{prefix}.arguments")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    if 'nullable' in value:
+        nullable_value = _decode_boolean(value['nullable'], f"{prefix}.nullable")
+    else:
+        nullable_value = _decode_boolean(False, f"{prefix}.nullable")
+    return TypeRefVariant4(
+        arguments=arguments_value,
+        id=id_value,
+        nullable=nullable_value,
+    )
+
+def _decode_type_ref_variant5(value: Any, prefix: str = 'TypeRefVariant5') -> TypeRefVariant5:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33848,11 +34342,11 @@ def _decode_type_ref_variant4(value: Any, prefix: str = 'TypeRefVariant4') -> Ty
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     name_value = _decode_string(value['name'], f"{prefix}.name")
-    return TypeRefVariant4(
+    return TypeRefVariant5(
         name=name_value,
     )
 
-def _decode_type_ref_variant5(value: Any, prefix: str = 'TypeRefVariant5') -> TypeRefVariant5:
+def _decode_type_ref_variant6(value: Any, prefix: str = 'TypeRefVariant6') -> TypeRefVariant6:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33868,12 +34362,12 @@ def _decode_type_ref_variant5(value: Any, prefix: str = 'TypeRefVariant5') -> Ty
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
-    return TypeRefVariant5(
+    element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
+    return TypeRefVariant6(
         element=element_value,
     )
 
-def _decode_type_ref_variant6(value: Any, prefix: str = 'TypeRefVariant6') -> TypeRefVariant6:
+def _decode_type_ref_variant7(value: Any, prefix: str = 'TypeRefVariant7') -> TypeRefVariant7:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
@@ -33890,35 +34384,14 @@ def _decode_type_ref_variant6(value: Any, prefix: str = 'TypeRefVariant6') -> Ty
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
     if 'reference_kind' in value:
         reference_kind_value = _decode_defs_type_ref_reference_kind(value['reference_kind'], f"{prefix}.reference_kind")
     else:
         reference_kind_value = _decode_defs_type_ref_reference_kind('lvalue', f"{prefix}.reference_kind")
-    return TypeRefVariant6(
-        element=element_value,
-        reference_kind=reference_kind_value,
-    )
-
-def _decode_type_ref_variant7(value: Any, prefix: str = 'TypeRefVariant7') -> TypeRefVariant7:
-    if not isinstance(value, dict):
-        raise TypeDecoderError(f"{prefix}: expected object")
-    expected = {
-        'element',
-    }
-    actual = set(value)
-    unexpected = actual - expected
-    if unexpected:
-        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
-    required = {
-        'element',
-    }
-    missing = required - actual
-    if missing:
-        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
     return TypeRefVariant7(
         element=element_value,
+        reference_kind=reference_kind_value,
     )
 
 def _decode_type_ref_variant8(value: Any, prefix: str = 'TypeRefVariant8') -> TypeRefVariant8:
@@ -33937,7 +34410,7 @@ def _decode_type_ref_variant8(value: Any, prefix: str = 'TypeRefVariant8') -> Ty
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
+    element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
     return TypeRefVariant8(
         element=element_value,
     )
@@ -33947,7 +34420,6 @@ def _decode_type_ref_variant9(value: Any, prefix: str = 'TypeRefVariant9') -> Ty
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'element',
-        'length',
     }
     actual = set(value)
     unexpected = actual - expected
@@ -33955,16 +34427,13 @@ def _decode_type_ref_variant9(value: Any, prefix: str = 'TypeRefVariant9') -> Ty
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
         'element',
-        'length',
     }
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
-    element_value = _decode_defs_type_ref_13(value['element'], f"{prefix}.element")
-    length_value = _decode_string(value['length'], f"{prefix}.length")
+    element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
     return TypeRefVariant9(
         element=element_value,
-        length=length_value,
     )
 
 TAGGED_UNION_VARIANTS = {}
@@ -34253,6 +34722,7 @@ _code_query_result_item_decoders = {
     'statement_reachability': lambda data: _decode_tagged_variant(_decode_code_query_statement_reachability, data, 'result_type', 'CodeQueryStatementReachability'),
     'pending_cleanup_flow': lambda data: _decode_tagged_variant(_decode_code_query_pending_cleanup_flow, data, 'result_type', 'CodeQueryPendingCleanupFlow'),
     'python_rule_fact': lambda data: _decode_tagged_variant(_decode_code_query_python_rule_fact, data, 'result_type', 'CodeQueryPythonRuleFact'),
+    'rust_marker_impl': lambda data: _decode_tagged_variant(_decode_code_query_rust_marker_impl, data, 'result_type', 'CodeQueryRustMarkerImpl'),
     'rust_pointer_finding': lambda data: _decode_tagged_variant(_decode_code_query_rust_pointer_finding, data, 'result_type', 'CodeQueryRustPointerFinding'),
     'guard': lambda data: _decode_tagged_variant(_decode_code_query_guard, data, 'result_type', 'CodeQueryGuard'),
     'rewrite_path': lambda data: _decode_tagged_variant(_decode_code_query_rewrite_path, data, 'result_type', 'CodeQueryRewritePath'),
@@ -34263,7 +34733,7 @@ _code_query_result_item_decoders = {
     'topology_edge': lambda data: _decode_tagged_variant(_decode_code_query_topology_edge, data, 'result_type', 'CodeQueryTopologyEdge'),
     'cross_domain': lambda data: _decode_tagged_variant(_decode_code_query_cross_domain, data, 'result_type', 'CodeQueryCrossDomain'),
 }
-CodeQueryResultItem._variant_types = (CodeQueryStructuralMatch, CodeQueryDeclaration, CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryControlEdge, CodeQueryTypestateFinding, CodeQueryTypestateWitness, CodeQueryFlowEndpoint, CodeQueryFlowWitness, CodeQueryClassSetRow, CodeQueryAbsentMemberFinding, CodeQueryAbsentMemberWitness, CodeQueryTaintFinding, CodeQueryFile, CodeQueryDependencyEvidence, CodeQueryConfigurationFact, CodeQueryReferenceSite, CodeQueryCallSite, CodeQueryExpressionSite, CodeQueryJsxAttributeValue, CodeQueryReceiverAnalysis, CodeQueryMemberTargetAnalysis, CodeQueryReceiverOutcome, CodeQueryReceiverEvidence, CodeQueryPointsToCandidate, CodeQueryFieldWriteValue, CodeQueryKeyedReadValue, CodeQueryCallShape, CodeQueryCallResult, CodeQueryCallArgumentGroup, CodeQueryCallArgument2, CodeQueryCallBinding, CodeQueryCallEffect, CodeQueryCallResultContract, CodeQueryCallResultObligation, CodeQueryResultSubjectUse, CodeQueryResultContractUse, CodeQueryResultContractFailureUse, CodeQueryNilnessOperation, CodeQuerySwitchCoverage, CodeQueryAssignmentRelation, CodeQueryDetachedTaskTransfer, CodeQueryProcedureEffect, CodeQueryCallableSignature, CodeQueryLiteralOccurrence, CodeQueryCallableMetrics, CodeQuerySignatureParameter, CodeQueryDecoratedParameter, CodeQueryCallableApplicability, CodeQueryOverloadSelection, CodeQueryMemberSelection, CodeQueryDispatchOutcome, CodeQueryDispatchTarget, CodeQueryMemberFamily, CodeQueryMemberFamilyEdge, CodeQueryPythonHierarchyFact, CodeQueryOccurrence, CodeQueryLexicalScope, CodeQueryBinding, CodeQueryResolutionCandidate, CodeQueryCandidateHop, CodeQueryGenerationSite, CodeQueryExport, CodeQueryDeclarationState, CodeQueryReferenceEdge, CodeQueryStateEvent, CodeQueryBindingInitializerCall, CodeQueryFlowRelation, CodeQueryControlRelation, CodeQueryBranchRelation, CodeQueryLoopRelation, CodeQueryCppExpression, CodeQueryFailureHandlerState, CodeQueryStatementReachability, CodeQueryPendingCleanupFlow, CodeQueryPythonRuleFact, CodeQueryRustPointerFinding, CodeQueryGuard, CodeQueryRewritePath, CodeQueryQualifiedPath, CodeQueryPathSegment, CodeQuerySourceSet, CodeQueryBuildTarget, CodeQueryTopologyEdge, CodeQueryCrossDomain,)
+CodeQueryResultItem._variant_types = (CodeQueryStructuralMatch, CodeQueryDeclaration, CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryControlEdge, CodeQueryTypestateFinding, CodeQueryTypestateWitness, CodeQueryFlowEndpoint, CodeQueryFlowWitness, CodeQueryClassSetRow, CodeQueryAbsentMemberFinding, CodeQueryAbsentMemberWitness, CodeQueryTaintFinding, CodeQueryFile, CodeQueryDependencyEvidence, CodeQueryConfigurationFact, CodeQueryReferenceSite, CodeQueryCallSite, CodeQueryExpressionSite, CodeQueryJsxAttributeValue, CodeQueryReceiverAnalysis, CodeQueryMemberTargetAnalysis, CodeQueryReceiverOutcome, CodeQueryReceiverEvidence, CodeQueryPointsToCandidate, CodeQueryFieldWriteValue, CodeQueryKeyedReadValue, CodeQueryCallShape, CodeQueryCallResult, CodeQueryCallArgumentGroup, CodeQueryCallArgument2, CodeQueryCallBinding, CodeQueryCallEffect, CodeQueryCallResultContract, CodeQueryCallResultObligation, CodeQueryResultSubjectUse, CodeQueryResultContractUse, CodeQueryResultContractFailureUse, CodeQueryNilnessOperation, CodeQuerySwitchCoverage, CodeQueryAssignmentRelation, CodeQueryDetachedTaskTransfer, CodeQueryProcedureEffect, CodeQueryCallableSignature, CodeQueryLiteralOccurrence, CodeQueryCallableMetrics, CodeQuerySignatureParameter, CodeQueryDecoratedParameter, CodeQueryCallableApplicability, CodeQueryOverloadSelection, CodeQueryMemberSelection, CodeQueryDispatchOutcome, CodeQueryDispatchTarget, CodeQueryMemberFamily, CodeQueryMemberFamilyEdge, CodeQueryPythonHierarchyFact, CodeQueryOccurrence, CodeQueryLexicalScope, CodeQueryBinding, CodeQueryResolutionCandidate, CodeQueryCandidateHop, CodeQueryGenerationSite, CodeQueryExport, CodeQueryDeclarationState, CodeQueryReferenceEdge, CodeQueryStateEvent, CodeQueryBindingInitializerCall, CodeQueryFlowRelation, CodeQueryControlRelation, CodeQueryBranchRelation, CodeQueryLoopRelation, CodeQueryCppExpression, CodeQueryFailureHandlerState, CodeQueryStatementReachability, CodeQueryPendingCleanupFlow, CodeQueryPythonRuleFact, CodeQueryRustMarkerImpl, CodeQueryRustPointerFinding, CodeQueryGuard, CodeQueryRewritePath, CodeQueryQualifiedPath, CodeQueryPathSegment, CodeQuerySourceSet, CodeQueryBuildTarget, CodeQueryTopologyEdge, CodeQueryCrossDomain,)
 TAGGED_UNION_VARIANTS['CodeQueryResultItem'] = (
     'result_type',
     {
@@ -34343,6 +34813,7 @@ TAGGED_UNION_VARIANTS['CodeQueryResultItem'] = (
         'statement_reachability': CodeQueryStatementReachability,
         'pending_cleanup_flow': CodeQueryPendingCleanupFlow,
         'python_rule_fact': CodeQueryPythonRuleFact,
+        'rust_marker_impl': CodeQueryRustMarkerImpl,
         'rust_pointer_finding': CodeQueryRustPointerFinding,
         'guard': CodeQueryGuard,
         'rewrite_path': CodeQueryRewritePath,
@@ -34427,22 +34898,23 @@ _code_query_result_ref_decoders = {
     'statement_reachability': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant69, data, 'result_type', 'CodeQueryResultRefVariant69'),
     'pending_cleanup_flow': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant70, data, 'result_type', 'CodeQueryResultRefVariant70'),
     'python_rule_fact': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant71, data, 'result_type', 'CodeQueryResultRefVariant71'),
-    'rust_pointer_finding': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant72, data, 'result_type', 'CodeQueryResultRefVariant72'),
-    'guard': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant73, data, 'result_type', 'CodeQueryResultRefVariant73'),
-    'rewrite_path': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant74, data, 'result_type', 'CodeQueryResultRefVariant74'),
-    'source_set': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant75, data, 'result_type', 'CodeQueryResultRefVariant75'),
-    'build_target': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant76, data, 'result_type', 'CodeQueryResultRefVariant76'),
-    'topology_edge': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant77, data, 'result_type', 'CodeQueryResultRefVariant77'),
-    'qualified_path': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant78, data, 'result_type', 'CodeQueryResultRefVariant78'),
-    'path_segment': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant79, data, 'result_type', 'CodeQueryResultRefVariant79'),
-    'generation_site': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant80, data, 'result_type', 'CodeQueryResultRefVariant80'),
-    'export': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant81, data, 'result_type', 'CodeQueryResultRefVariant81'),
-    'declaration_state': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant82, data, 'result_type', 'CodeQueryResultRefVariant82'),
-    'dependency_evidence': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant83, data, 'result_type', 'CodeQueryResultRefVariant83'),
-    'configuration_fact': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant84, data, 'result_type', 'CodeQueryResultRefVariant84'),
-    'cross_domain': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant85, data, 'result_type', 'CodeQueryResultRefVariant85'),
+    'rust_marker_impl': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant72, data, 'result_type', 'CodeQueryResultRefVariant72'),
+    'rust_pointer_finding': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant73, data, 'result_type', 'CodeQueryResultRefVariant73'),
+    'guard': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant74, data, 'result_type', 'CodeQueryResultRefVariant74'),
+    'rewrite_path': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant75, data, 'result_type', 'CodeQueryResultRefVariant75'),
+    'source_set': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant76, data, 'result_type', 'CodeQueryResultRefVariant76'),
+    'build_target': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant77, data, 'result_type', 'CodeQueryResultRefVariant77'),
+    'topology_edge': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant78, data, 'result_type', 'CodeQueryResultRefVariant78'),
+    'qualified_path': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant79, data, 'result_type', 'CodeQueryResultRefVariant79'),
+    'path_segment': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant80, data, 'result_type', 'CodeQueryResultRefVariant80'),
+    'generation_site': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant81, data, 'result_type', 'CodeQueryResultRefVariant81'),
+    'export': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant82, data, 'result_type', 'CodeQueryResultRefVariant82'),
+    'declaration_state': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant83, data, 'result_type', 'CodeQueryResultRefVariant83'),
+    'dependency_evidence': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant84, data, 'result_type', 'CodeQueryResultRefVariant84'),
+    'configuration_fact': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant85, data, 'result_type', 'CodeQueryResultRefVariant85'),
+    'cross_domain': lambda data: _decode_tagged_variant(_decode_code_query_result_ref_variant86, data, 'result_type', 'CodeQueryResultRefVariant86'),
 }
-CodeQueryResultRef._variant_types = (CodeQueryResultRefVariant1, CodeQueryResultRefVariant2, CodeQueryResultRefVariant3, CodeQueryResultRefVariant4, CodeQueryResultRefVariant5, CodeQueryResultRefVariant6, CodeQueryResultRefVariant7, CodeQueryResultRefVariant8, CodeQueryResultRefVariant9, CodeQueryResultRefVariant10, CodeQueryResultRefVariant11, CodeQueryResultRefVariant12, CodeQueryResultRefVariant13, CodeQueryResultRefVariant14, CodeQueryResultRefVariant15, CodeQueryResultRefVariant16, CodeQueryResultRefVariant17, CodeQueryResultRefVariant18, CodeQueryResultRefVariant19, CodeQueryResultRefVariant20, CodeQueryResultRefVariant21, CodeQueryResultRefVariant22, CodeQueryResultRefVariant23, CodeQueryResultRefVariant24, CodeQueryResultRefVariant25, CodeQueryResultRefVariant26, CodeQueryResultRefVariant27, CodeQueryResultRefVariant28, CodeQueryResultRefVariant29, CodeQueryResultRefVariant30, CodeQueryResultRefVariant31, CodeQueryResultRefVariant32, CodeQueryResultRefVariant33, CodeQueryResultRefVariant34, CodeQueryResultRefVariant35, CodeQueryResultRefVariant36, CodeQueryResultRefVariant37, CodeQueryResultRefVariant38, CodeQueryResultRefVariant39, CodeQueryResultRefVariant40, CodeQueryResultRefVariant41, CodeQueryResultRefVariant42, CodeQueryResultRefVariant43, CodeQueryResultRefVariant44, CodeQueryResultRefVariant45, CodeQueryResultRefVariant46, CodeQueryResultRefVariant47, CodeQueryResultRefVariant48, CodeQueryResultRefVariant49, CodeQueryResultRefVariant50, CodeQueryResultRefVariant51, CodeQueryResultRefVariant52, CodeQueryResultRefVariant53, CodeQueryResultRefVariant54, CodeQueryResultRefVariant55, CodeQueryResultRefVariant56, CodeQueryResultRefVariant57, CodeQueryResultRefVariant58, CodeQueryResultRefVariant59, CodeQueryResultRefVariant60, CodeQueryResultRefVariant61, CodeQueryResultRefVariant62, CodeQueryResultRefVariant63, CodeQueryResultRefVariant64, CodeQueryResultRefVariant65, CodeQueryResultRefVariant66, CodeQueryResultRefVariant67, CodeQueryResultRefVariant68, CodeQueryResultRefVariant69, CodeQueryResultRefVariant70, CodeQueryResultRefVariant71, CodeQueryResultRefVariant72, CodeQueryResultRefVariant73, CodeQueryResultRefVariant74, CodeQueryResultRefVariant75, CodeQueryResultRefVariant76, CodeQueryResultRefVariant77, CodeQueryResultRefVariant78, CodeQueryResultRefVariant79, CodeQueryResultRefVariant80, CodeQueryResultRefVariant81, CodeQueryResultRefVariant82, CodeQueryResultRefVariant83, CodeQueryResultRefVariant84, CodeQueryResultRefVariant85,)
+CodeQueryResultRef._variant_types = (CodeQueryResultRefVariant1, CodeQueryResultRefVariant2, CodeQueryResultRefVariant3, CodeQueryResultRefVariant4, CodeQueryResultRefVariant5, CodeQueryResultRefVariant6, CodeQueryResultRefVariant7, CodeQueryResultRefVariant8, CodeQueryResultRefVariant9, CodeQueryResultRefVariant10, CodeQueryResultRefVariant11, CodeQueryResultRefVariant12, CodeQueryResultRefVariant13, CodeQueryResultRefVariant14, CodeQueryResultRefVariant15, CodeQueryResultRefVariant16, CodeQueryResultRefVariant17, CodeQueryResultRefVariant18, CodeQueryResultRefVariant19, CodeQueryResultRefVariant20, CodeQueryResultRefVariant21, CodeQueryResultRefVariant22, CodeQueryResultRefVariant23, CodeQueryResultRefVariant24, CodeQueryResultRefVariant25, CodeQueryResultRefVariant26, CodeQueryResultRefVariant27, CodeQueryResultRefVariant28, CodeQueryResultRefVariant29, CodeQueryResultRefVariant30, CodeQueryResultRefVariant31, CodeQueryResultRefVariant32, CodeQueryResultRefVariant33, CodeQueryResultRefVariant34, CodeQueryResultRefVariant35, CodeQueryResultRefVariant36, CodeQueryResultRefVariant37, CodeQueryResultRefVariant38, CodeQueryResultRefVariant39, CodeQueryResultRefVariant40, CodeQueryResultRefVariant41, CodeQueryResultRefVariant42, CodeQueryResultRefVariant43, CodeQueryResultRefVariant44, CodeQueryResultRefVariant45, CodeQueryResultRefVariant46, CodeQueryResultRefVariant47, CodeQueryResultRefVariant48, CodeQueryResultRefVariant49, CodeQueryResultRefVariant50, CodeQueryResultRefVariant51, CodeQueryResultRefVariant52, CodeQueryResultRefVariant53, CodeQueryResultRefVariant54, CodeQueryResultRefVariant55, CodeQueryResultRefVariant56, CodeQueryResultRefVariant57, CodeQueryResultRefVariant58, CodeQueryResultRefVariant59, CodeQueryResultRefVariant60, CodeQueryResultRefVariant61, CodeQueryResultRefVariant62, CodeQueryResultRefVariant63, CodeQueryResultRefVariant64, CodeQueryResultRefVariant65, CodeQueryResultRefVariant66, CodeQueryResultRefVariant67, CodeQueryResultRefVariant68, CodeQueryResultRefVariant69, CodeQueryResultRefVariant70, CodeQueryResultRefVariant71, CodeQueryResultRefVariant72, CodeQueryResultRefVariant73, CodeQueryResultRefVariant74, CodeQueryResultRefVariant75, CodeQueryResultRefVariant76, CodeQueryResultRefVariant77, CodeQueryResultRefVariant78, CodeQueryResultRefVariant79, CodeQueryResultRefVariant80, CodeQueryResultRefVariant81, CodeQueryResultRefVariant82, CodeQueryResultRefVariant83, CodeQueryResultRefVariant84, CodeQueryResultRefVariant85, CodeQueryResultRefVariant86,)
 TAGGED_UNION_VARIANTS['CodeQueryResultRef'] = (
     'result_type',
     {
@@ -34517,20 +34989,21 @@ TAGGED_UNION_VARIANTS['CodeQueryResultRef'] = (
         'statement_reachability': CodeQueryResultRefVariant69,
         'pending_cleanup_flow': CodeQueryResultRefVariant70,
         'python_rule_fact': CodeQueryResultRefVariant71,
-        'rust_pointer_finding': CodeQueryResultRefVariant72,
-        'guard': CodeQueryResultRefVariant73,
-        'rewrite_path': CodeQueryResultRefVariant74,
-        'source_set': CodeQueryResultRefVariant75,
-        'build_target': CodeQueryResultRefVariant76,
-        'topology_edge': CodeQueryResultRefVariant77,
-        'qualified_path': CodeQueryResultRefVariant78,
-        'path_segment': CodeQueryResultRefVariant79,
-        'generation_site': CodeQueryResultRefVariant80,
-        'export': CodeQueryResultRefVariant81,
-        'declaration_state': CodeQueryResultRefVariant82,
-        'dependency_evidence': CodeQueryResultRefVariant83,
-        'configuration_fact': CodeQueryResultRefVariant84,
-        'cross_domain': CodeQueryResultRefVariant85,
+        'rust_marker_impl': CodeQueryResultRefVariant72,
+        'rust_pointer_finding': CodeQueryResultRefVariant73,
+        'guard': CodeQueryResultRefVariant74,
+        'rewrite_path': CodeQueryResultRefVariant75,
+        'source_set': CodeQueryResultRefVariant76,
+        'build_target': CodeQueryResultRefVariant77,
+        'topology_edge': CodeQueryResultRefVariant78,
+        'qualified_path': CodeQueryResultRefVariant79,
+        'path_segment': CodeQueryResultRefVariant80,
+        'generation_site': CodeQueryResultRefVariant81,
+        'export': CodeQueryResultRefVariant82,
+        'declaration_state': CodeQueryResultRefVariant83,
+        'dependency_evidence': CodeQueryResultRefVariant84,
+        'configuration_fact': CodeQueryResultRefVariant85,
+        'cross_domain': CodeQueryResultRefVariant86,
     },
 )
 
@@ -34563,39 +35036,41 @@ TAGGED_UNION_VARIANTS['CodeQueryTypestateWitnessStepKind'] = (
 )
 
 _type_ref_decoders = {
-    'unknown': lambda data: _decode_tagged_variant(_decode_type_ref_variant1, data, 'kind', 'TypeRefVariant1'),
-    'named': lambda data: _decode_tagged_variant(_decode_type_ref_variant2, data, 'kind', 'TypeRefVariant2'),
-    'declared': lambda data: _decode_tagged_variant(_decode_type_ref_variant3, data, 'kind', 'TypeRefVariant3'),
-    'type_parameter': lambda data: _decode_tagged_variant(_decode_type_ref_variant4, data, 'kind', 'TypeRefVariant4'),
-    'array': lambda data: _decode_tagged_variant(_decode_type_ref_variant5, data, 'kind', 'TypeRefVariant5'),
-    'by_ref': lambda data: _decode_tagged_variant(_decode_type_ref_variant6, data, 'kind', 'TypeRefVariant6'),
-    'pointer': lambda data: _decode_tagged_variant(_decode_type_ref_variant7, data, 'kind', 'TypeRefVariant7'),
-    'slice': lambda data: _decode_tagged_variant(_decode_type_ref_variant8, data, 'kind', 'TypeRefVariant8'),
-    'fixed_array': lambda data: _decode_tagged_variant(_decode_type_ref_variant9, data, 'kind', 'TypeRefVariant9'),
-    'map': lambda data: _decode_tagged_variant(_decode_type_ref_variant10, data, 'kind', 'TypeRefVariant10'),
-    'channel': lambda data: _decode_tagged_variant(_decode_type_ref_variant11, data, 'kind', 'TypeRefVariant11'),
-    'wildcard': lambda data: _decode_tagged_variant(_decode_type_ref_variant12, data, 'kind', 'TypeRefVariant12'),
-    'tuple': lambda data: _decode_tagged_variant(_decode_type_ref_variant13, data, 'kind', 'TypeRefVariant13'),
-    'function': lambda data: _decode_tagged_variant(_decode_type_ref_variant14, data, 'kind', 'TypeRefVariant14'),
+    'projection': lambda data: _decode_tagged_variant(_decode_type_ref_variant1, data, 'kind', 'TypeRefVariant1'),
+    'unknown': lambda data: _decode_tagged_variant(_decode_type_ref_variant2, data, 'kind', 'TypeRefVariant2'),
+    'named': lambda data: _decode_tagged_variant(_decode_type_ref_variant3, data, 'kind', 'TypeRefVariant3'),
+    'declared': lambda data: _decode_tagged_variant(_decode_type_ref_variant4, data, 'kind', 'TypeRefVariant4'),
+    'type_parameter': lambda data: _decode_tagged_variant(_decode_type_ref_variant5, data, 'kind', 'TypeRefVariant5'),
+    'array': lambda data: _decode_tagged_variant(_decode_type_ref_variant6, data, 'kind', 'TypeRefVariant6'),
+    'by_ref': lambda data: _decode_tagged_variant(_decode_type_ref_variant7, data, 'kind', 'TypeRefVariant7'),
+    'pointer': lambda data: _decode_tagged_variant(_decode_type_ref_variant8, data, 'kind', 'TypeRefVariant8'),
+    'slice': lambda data: _decode_tagged_variant(_decode_type_ref_variant9, data, 'kind', 'TypeRefVariant9'),
+    'fixed_array': lambda data: _decode_tagged_variant(_decode_type_ref_variant10, data, 'kind', 'TypeRefVariant10'),
+    'map': lambda data: _decode_tagged_variant(_decode_type_ref_variant11, data, 'kind', 'TypeRefVariant11'),
+    'channel': lambda data: _decode_tagged_variant(_decode_type_ref_variant12, data, 'kind', 'TypeRefVariant12'),
+    'wildcard': lambda data: _decode_tagged_variant(_decode_type_ref_variant13, data, 'kind', 'TypeRefVariant13'),
+    'tuple': lambda data: _decode_tagged_variant(_decode_type_ref_variant14, data, 'kind', 'TypeRefVariant14'),
+    'function': lambda data: _decode_tagged_variant(_decode_type_ref_variant15, data, 'kind', 'TypeRefVariant15'),
 }
-TypeRef._variant_types = (TypeRefVariant1, TypeRefVariant2, TypeRefVariant3, TypeRefVariant4, TypeRefVariant5, TypeRefVariant6, TypeRefVariant7, TypeRefVariant8, TypeRefVariant9, TypeRefVariant10, TypeRefVariant11, TypeRefVariant12, TypeRefVariant13, TypeRefVariant14,)
+TypeRef._variant_types = (TypeRefVariant1, TypeRefVariant2, TypeRefVariant3, TypeRefVariant4, TypeRefVariant5, TypeRefVariant6, TypeRefVariant7, TypeRefVariant8, TypeRefVariant9, TypeRefVariant10, TypeRefVariant11, TypeRefVariant12, TypeRefVariant13, TypeRefVariant14, TypeRefVariant15,)
 TAGGED_UNION_VARIANTS['TypeRef'] = (
     'kind',
     {
-        'unknown': TypeRefVariant1,
-        'named': TypeRefVariant2,
-        'declared': TypeRefVariant3,
-        'type_parameter': TypeRefVariant4,
-        'array': TypeRefVariant5,
-        'by_ref': TypeRefVariant6,
-        'pointer': TypeRefVariant7,
-        'slice': TypeRefVariant8,
-        'fixed_array': TypeRefVariant9,
-        'map': TypeRefVariant10,
-        'channel': TypeRefVariant11,
-        'wildcard': TypeRefVariant12,
-        'tuple': TypeRefVariant13,
-        'function': TypeRefVariant14,
+        'projection': TypeRefVariant1,
+        'unknown': TypeRefVariant2,
+        'named': TypeRefVariant3,
+        'declared': TypeRefVariant4,
+        'type_parameter': TypeRefVariant5,
+        'array': TypeRefVariant6,
+        'by_ref': TypeRefVariant7,
+        'pointer': TypeRefVariant8,
+        'slice': TypeRefVariant9,
+        'fixed_array': TypeRefVariant10,
+        'map': TypeRefVariant11,
+        'channel': TypeRefVariant12,
+        'wildcard': TypeRefVariant13,
+        'tuple': TypeRefVariant14,
+        'function': TypeRefVariant15,
     },
 )
 
@@ -34676,6 +35151,7 @@ CODE_QUERY_RESULT_ITEM_TYPES = {
     'statement_reachability': CodeQueryStatementReachability,
     'pending_cleanup_flow': CodeQueryPendingCleanupFlow,
     'python_rule_fact': CodeQueryPythonRuleFact,
+    'rust_marker_impl': CodeQueryRustMarkerImpl,
     'rust_pointer_finding': CodeQueryRustPointerFinding,
     'guard': CodeQueryGuard,
     'rewrite_path': CodeQueryRewritePath,

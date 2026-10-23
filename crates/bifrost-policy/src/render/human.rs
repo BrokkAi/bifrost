@@ -511,6 +511,9 @@ fn write_concise_report<W: Write>(
                 )
                 .map_err(map_io_error)?;
                 write_location(output, related.location()).map_err(map_io_error)?;
+                if let Some(label) = related.label() {
+                    write!(output, " [{}]", escape_terminal_text(label)).map_err(map_io_error)?;
+                }
                 writeln!(output).map_err(map_io_error)?;
             }
         }
@@ -3384,6 +3387,9 @@ fn write_run_diagnostics<W: Write>(
             )
             .map_err(map_io_error)?;
             write_location(output, related.location()).map_err(map_io_error)?;
+            if let Some(label) = related.label() {
+                write!(output, " [{}]", escape_terminal_text(label)).map_err(map_io_error)?;
+            }
             write_evidence_refs_suffix(output, related.evidence_refs())?;
             writeln!(output).map_err(map_io_error)?;
         }
@@ -4283,6 +4289,7 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::PackActivationFailed => "pack-activation-failed",
         Code::WorkspaceModelLoadFailed => "workspace-model-load-failed",
         Code::WorkspaceModelInert => "workspace-model-inert",
+        Code::ApproximateStandardLibrary => "approximate-standard-library",
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",

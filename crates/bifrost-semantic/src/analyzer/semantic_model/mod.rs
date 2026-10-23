@@ -178,6 +178,8 @@ pub use crate::analyzer::semantic_model::compiler::compile_pack;
 
 pub use crate::analyzer::semantic_model::compiler::compile_source;
 
+pub use crate::analyzer::semantic_model::compiler::lowest_schema_version;
+
 pub use crate::analyzer::semantic_model::compiler::normalize_callable_values_payload;
 
 pub use crate::analyzer::semantic_model::deferred_runtime::*;

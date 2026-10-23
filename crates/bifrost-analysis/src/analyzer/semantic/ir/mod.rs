@@ -10,136 +10,205 @@
 
 pub use brokk_bifrost_semantic::analyzer::semantic::ir::*;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[cfg(test)]
     use crate::analyzer::semantic::ir::go_extraction_support_26::*;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::AllocationKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::AllocationSite;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ArgumentDomain;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::AsyncResumeKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallArgumentExpansion;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallContinuationKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallInvocationMode;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallableReferenceKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallableTarget;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallableTargetResolution;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallableValue;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallerReceiverBinding;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CaptureBinding;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CaptureMode;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CaptureSource;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ControlContinuation;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ControlEdge;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ControlEdgeKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::artifact::ControlFlowGraph;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::Evidence;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::EvidenceCompleteness;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ExecutionTiming;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::FormalMultiplicity;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::FormalParameterPassingMode;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::IndexedLocationIdentity;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::MemoryAccessKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::MemoryLocation;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::MemoryLocationKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::MemoryValueCopy;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::MoveInvalidation;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::artifact::ProcedureLocalLocatorError;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ProcedureSemanticsParts;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ProofStatus;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::artifact::SemanticArtifact;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticCallArgument;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticCallSite;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticEffect;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticEvent;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticGap;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticGapDischarge;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticGapImpact;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticGapImpacts;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticGapKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticGapSubject;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticIrError;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticIrErrorKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticValue;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SemanticValueKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SourceMapping;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::SourceMappingKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::TransferKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::TransferOperation;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ValueFlowKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ValueTransfer;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::ValueUseKind;
 
+    #[cfg(test)]
     use crate::test_support::source_anchor;
+
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
+    #[cfg(test)]
     use std::sync::Arc;
 
+    #[cfg(test)]
     use crate::analyzer::semantic::capabilities::{SemanticCapabilities, SemanticCapability};
 
+    #[cfg(test)]
     use crate::analyzer::semantic::ids::{
-        AllocationId, CallSiteId, CaptureId, ContentIdentity, ControlEdgeId, DeclarationLocator,
-        DeclarationSegment, DeclarationSegmentKind, EvidenceId, MemoryLocationId, ProcedureId,
-        ProgramPointId, SemanticArtifactKey, SemanticGapId, SemanticLocator, SemanticRole,
-        SourceMappingId, StructuralNodeIdentity, ValueId, WorkspaceRelativePath,
+        AllocationId, CallSiteId, CaptureId, ContentIdentity, MemoryLocationId, SemanticGapId,
+        StructuralNodeIdentity, WorkspaceRelativePath,
     };
+
+    #[cfg(test)]
+    use crate::analyzer::semantic::ids::{
+        ControlEdgeId, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, EvidenceId,
+        ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticLocator, SemanticRole,
+        SourceMappingId, ValueId,
+    };
+
+    #[cfg(test)]
     use crate::analyzer::semantic::provider::{SemanticBudget, SemanticWork};
 
+    #[cfg(test)]
     fn partial_index_capabilities() -> SemanticCapabilities {
         let mut builder = SemanticCapabilities::builder();
         for capability in [
@@ -158,6 +227,7 @@ pub mod tests {
         builder.partial(SemanticCapability::IndexMemory).build()
     }
 
+    #[cfg(test)]
     fn direct_child_locator(
         key: &SemanticArtifactKey,
         parent: &SemanticLocator,
@@ -181,6 +251,7 @@ pub mod tests {
         )
     }
 
+    #[cfg(test)]
     #[test]
     fn durable_control_edge_locator_releases_and_rematerializes_its_artifact() {
         let key = key();
@@ -242,6 +313,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn durable_control_edge_locator_rejects_shifted_or_changed_same_key_rows() {
         let key = key();
@@ -320,6 +392,7 @@ pub mod tests {
         ));
     }
 
+    #[cfg(test)]
     #[test]
     fn durable_control_edge_locator_rejects_same_key_capability_change() {
         let key = key();
@@ -354,6 +427,7 @@ pub mod tests {
         ));
     }
 
+    #[cfg(test)]
     #[test]
     fn cfg_freeze_assigns_canonical_edge_ids_and_bidirectional_rows() {
         let key = key();
@@ -427,6 +501,7 @@ pub mod tests {
         assert!(std::panic::catch_unwind(|| procedure.predecessor_edges(invalid).count()).is_err());
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_rich_edges_are_rejected_but_distinct_provenance_is_preserved() {
         let key = key();
@@ -474,6 +549,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn aggregate_initializer_validates_values_selector_scope_and_event_evidence() {
         let key = key();
@@ -581,6 +657,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2662: Go aggregate copies lost identity with the matching assignment")]
     fn aggregate_copy_requires_one_adjacent_matching_assignment() {
@@ -652,6 +729,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     /// One procedure whose entry point carries `assignment; transfer` over two
     /// values, with the flow event on its own evidence row so tests can vary the
     /// claimed certainty independently of the fixture's proven-complete row 0.
@@ -707,6 +785,7 @@ pub mod tests {
         parts
     }
 
+    #[cfg(test)]
     fn transfer_capabilities() -> SemanticCapabilities {
         capabilities(&[
             SemanticCapability::Assignments,
@@ -715,6 +794,7 @@ pub mod tests {
         ])
     }
 
+    #[cfg(test)]
     #[test]
     fn uncertain_transfer_facts_reject_proven_complete_evidence() {
         let key = key();
@@ -755,6 +835,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "#2816: semantic source mappings accepted structural identities from a different source revision"
@@ -772,6 +853,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::SourceScope);
     }
 
+    #[cfg(test)]
     #[test]
     fn capture_slot_requires_a_subject_specific_binding_gap() {
         let key = key();
@@ -831,6 +913,7 @@ pub mod tests {
         .expect("a slot-specific gap explicitly preserves the missing binding");
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2638: duplicate gaps for one scoped fact were rejected as a semantic failure")]
     fn one_point_publishes_one_gap_per_scoped_fact() {
@@ -910,6 +993,7 @@ pub mod tests {
         .expect("distinct capabilities at one point remain distinct scoped facts");
     }
 
+    #[cfg(test)]
     #[test]
     fn known_capture_mode_rejects_a_contradictory_unknown_gap() {
         let key = key();
@@ -1041,6 +1125,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
     }
 
+    #[cfg(test)]
     #[test]
     fn retained_control_topology_requires_unknown_point_scoped_normal_control() {
         let key = key();
@@ -1083,6 +1168,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn retained_control_topology_accepts_a_point_scoped_concurrent_spawn() {
         let key = key();
@@ -1133,6 +1219,7 @@ pub mod tests {
             .expect("the adapter may retain parent topology while spawned execution stays open");
     }
 
+    #[cfg(test)]
     #[test]
     fn canonical_index_identity_requires_its_exact_access_at_the_gap_point() {
         let key = key();
@@ -1233,6 +1320,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn callable_creation_preserves_target_uncertainty_without_a_locator() {
         let key = key();
@@ -1342,6 +1430,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn unmaterialized_creation_requires_an_unpublished_direct_lexical_child() {
         let key = key();
@@ -1455,6 +1544,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::CallableContract);
     }
 
+    #[cfg(test)]
     #[test]
     fn artifact_construction_charges_retained_work_atomically() {
         let key = key();
@@ -1474,6 +1564,7 @@ pub mod tests {
         assert_eq!(budget.used(), before);
     }
 
+    #[cfg(test)]
     #[test]
     fn callable_environment_allocation_is_at_creation_point() {
         let key = key();
@@ -1535,6 +1626,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::CallableContract);
     }
 
+    #[cfg(test)]
     #[test]
     fn exit_only_procedure_completion_requires_a_local_completion_gap() {
         let key = key();
@@ -1651,6 +1743,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#5522: invalid callee diagnostics omitted artifact and source context")]
     fn non_callable_callee_error_includes_available_source_context() {
@@ -1722,6 +1815,7 @@ pub mod tests {
         assert!(!detail.contains("StructuralNodeIdentity"));
     }
 
+    #[cfg(test)]
     #[test]
     fn valid_ordinary_different_task_call_has_matched_continuations() {
         let key = key();
@@ -2133,6 +2227,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn unsupported_call_arm_requires_a_gap_and_no_fabricated_edge() {
         let key = key();
@@ -2266,6 +2361,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn valid_async_suspend_has_matched_resume_arms() {
         let key = key();
@@ -2368,6 +2464,7 @@ pub mod tests {
         .expect("matched async resume arms are valid");
     }
 
+    #[cfg(test)]
     fn artifact_with_values(
         values: Vec<SemanticValue>,
     ) -> Result<SemanticArtifact, SemanticIrError> {
@@ -2381,6 +2478,7 @@ pub mod tests {
         )
     }
 
+    #[cfg(test)]
     fn parameter_value(id: u32, ordinal: u32, multiplicity: FormalMultiplicity) -> SemanticValue {
         SemanticValue {
             id: ValueId::new(id),
@@ -2395,6 +2493,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     fn default_argument_value(id: u32, ordinal: u32) -> SemanticValue {
         SemanticValue {
             id: ValueId::new(id),
@@ -2404,6 +2503,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn default_argument_values_require_one_existing_nonrest_formal() {
         let duplicate = artifact_with_values(vec![
@@ -2435,6 +2535,7 @@ pub mod tests {
         .expect("one saved default for an existing nonrest formal is valid");
     }
 
+    #[cfg(test)]
     fn raw_cfg_parts() -> (Vec<ControlEdge>, Vec<u32>, Vec<u32>, Vec<ControlEdgeId>) {
         let source = SourceMappingId::new(0);
         let evidence = EvidenceId::new(0);
@@ -2461,6 +2562,7 @@ pub mod tests {
         )
     }
 
+    #[cfg(test)]
     #[test]
     fn checked_cfg_parts_reject_corrupt_adjacency() {
         let procedure = ProcedureId::new(0);
@@ -2549,6 +2651,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
     }
 
+    #[cfg(test)]
     #[test]
     fn rejects_lexical_parent_cycle_iteratively() {
         let key = key();
@@ -2562,6 +2665,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::ParentCycle);
     }
 
+    #[cfg(test)]
     #[test]
     fn rejects_unsupported_gap_for_complete_capability() {
         let key = key();
@@ -2598,6 +2702,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::CapabilityContract);
     }
 
+    #[cfg(test)]
     #[test]
     fn canonical_index_identity_requires_a_constant_indexed_location() {
         let key = key();
@@ -2677,6 +2782,7 @@ pub mod tests {
         assert!(error.detail().contains("canonical index identity"));
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "6e0319679345: non-rejoining exceptional-exit discharge must require a local exceptional gap"
@@ -2731,6 +2837,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn modeled_heap_partitions_reject_unpartitioned_effects() {
         for (impacts, valid) in [
@@ -2806,6 +2913,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "#5237: exact field partitions require zero impacts and a retained concrete field access"
@@ -2915,6 +3023,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn mandatory_gap_impacts_are_enforced_while_specific_extras_are_allowed() {
         let key = key();
@@ -3015,6 +3124,7 @@ pub mod tests {
         .expect("adapter-specific impacts may extend the mandatory baseline");
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("5aba1d8d47f4: duplicate gap diagnostics must name both facts and the procedure")]
     fn duplicate_gap_diagnostic_names_both_facts_and_the_procedure() {
@@ -3082,6 +3192,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn budget_limited_same_artifact_target_remains_explicitly_unmaterialized() {
         let key = key();
@@ -3163,6 +3274,7 @@ pub mod tests {
         .expect("same-artifact locator is legal only as an incomplete target");
     }
 
+    #[cfg(test)]
     #[test]
     fn async_continuation_gap_requires_a_real_matching_suspend_arm() {
         let key = key();
@@ -3210,6 +3322,7 @@ pub mod tests {
         assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
     }
 
+    #[cfg(test)]
     fn add_matched_async_suspend(
         parts: &mut ProcedureSemanticsParts,
     ) -> (SourceMappingId, EvidenceId) {
@@ -3270,6 +3383,7 @@ pub mod tests {
         (source, evidence)
     }
 
+    #[cfg(test)]
     #[test]
     fn async_events_require_async_procedure_property() {
         let key = key();

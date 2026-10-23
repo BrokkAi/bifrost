@@ -1,12 +1,14 @@
 use crate::call_match::{CppArgType, normalize_cpp_type_name};
 use crate::compile_context::CppCompileContext;
+use crate::declarations::cpp_displaced_preprocessor_branch;
 #[cfg(test)]
 use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
     CppComparableNode, CppComparableParameter, CppComparableSlot, CppRecoveredExportClassIndex,
     cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_template_term,
-    enclosing_cpp_namespace_nodes, node_text, normalize_cpp_whitespace, recovered_class_body_at,
-    recovered_function_like_field_declarator, recovered_pyobject_head_field,
+    enclosing_cpp_namespace_nodes, macro_modifier_identifier, node_text, normalize_cpp_whitespace,
+    recovered_class_body_at, recovered_function_like_field_declarator,
+    recovered_pyobject_head_field,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -85,9 +87,39 @@ struct PreprocessorContextNodeKey {
 #[derive(Default)]
 pub(crate) struct PreprocessorContextCache {
     displaced_boundaries: HashMap<PreprocessorContextNodeKey, Option<usize>>,
+    displaced_branches: HashMap<PreprocessorContextNodeKey, Option<DisplacedBranchDirective>>,
+}
+
+/// The end byte of a [`cpp_displaced_preprocessor_branch`] directive and
+/// whether it is an `#else` (otherwise an `#elif` form).
+#[derive(Clone, Copy)]
+struct DisplacedBranchDirective {
+    end_byte: usize,
+    is_else: bool,
 }
 
 impl PreprocessorContextCache {
+    fn displaced_branch(&mut self, conditional: Node<'_>) -> Option<DisplacedBranchDirective> {
+        let key = PreprocessorContextNodeKey {
+            id: conditional.id(),
+            start_byte: conditional.start_byte(),
+            end_byte: conditional.end_byte(),
+        };
+        if let Some(directive) = self.displaced_branches.get(&key) {
+            return *directive;
+        }
+        let directive = cpp_displaced_preprocessor_branch(conditional).map(|directive| {
+            DisplacedBranchDirective {
+                end_byte: directive.end_byte(),
+                is_else: directive.kind() == "#else",
+            }
+        });
+        if self.displaced_branches.len() < PREPROCESSOR_CONTEXT_CACHE_CAP {
+            self.displaced_branches.insert(key, directive);
+        }
+        directive
+    }
+
     fn displaced_boundary_end(&mut self, conditional: Node<'_>) -> Option<usize> {
         let key = PreprocessorContextNodeKey {
             id: conditional.id(),
@@ -1620,10 +1652,46 @@ fn c_function_macro_argument<'tree>(
 /// produced by tree-sitter-cpp for C source. The grammar retains the macro
 /// invocation as the assignment's left operand and the declared name as one
 /// adjacent `ERROR(identifier)` node, so no macro text splitting is needed.
+/// The macro-declaration grammar reads the same line as a clean declaration
+/// whose type is a `macro_type_specifier`; the `g_autoptr` name gate is what
+/// keeps an arbitrary function-like type macro from becoming a binding.
 fn recognized_c_macro_declarator_binding<'tree>(
     statement: Node<'tree>,
     source: &str,
 ) -> Option<MacroLocalBinding<'tree>> {
+    if statement.kind() == "declaration" {
+        let specifier = statement
+            .child_by_field_name("type")
+            .filter(|type_node| type_node.kind() == "macro_type_specifier")?;
+        let macro_name = specifier
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "identifier")?;
+        if node_text(macro_name, source) != "g_autoptr" {
+            return None;
+        }
+        let type_node = specifier
+            .child_by_field_name("type")
+            .and_then(|descriptor| descriptor.child_by_field_name("type"))?;
+        let declarator = statement
+            .child_by_field_name("declarator")
+            .filter(|declarator| declarator.kind() == "init_declarator")?;
+        let name_node = declarator
+            .child_by_field_name("declarator")
+            .filter(|name| name.kind() == "identifier")?;
+        declarator.child_by_field_name("value")?;
+        let name = node_text(name_node, source).trim();
+        let type_name = node_text(type_node, source).trim();
+        if name.is_empty() || type_name.is_empty() {
+            return None;
+        }
+        return Some(MacroLocalBinding {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            type_node: Some(type_node),
+            pointer_depth: 1,
+            proven_unit: None,
+        });
+    }
     let assignment = match statement.kind() {
         "assignment_expression" => statement,
         "expression_statement" if statement.named_child_count() == 1 => statement.named_child(0)?,
@@ -3660,7 +3728,12 @@ impl<'a> VisibilityIndex<'a> {
         let mut seen = HashSet::default();
         let mut stack = vec![(root, root.is_error())];
         while let Some((node, inside_error)) = stack.pop() {
-            let inside_error = inside_error || node.is_error();
+            // A `macro_type_specifier` is the macro-declaration grammar's
+            // structured form of the same evidence an `ERROR` carried: it is
+            // admitted only where the parse would otherwise fail, so the type
+            // it wraps keeps its structured references.
+            let inside_error =
+                inside_error || node.is_error() || node.kind() == "macro_type_specifier";
             if node.kind() == "preproc_arg" {
                 // Tree-sitter keeps an object-like replacement opaque. The
                 // inverse extractor uses the same parsed replacement helper;
@@ -3986,14 +4059,16 @@ impl<'a> VisibilityIndex<'a> {
                         .map(|value| value != 0),
                     _ => unreachable!(),
                 };
-                if conditional
-                    .child_by_field_name("alternative")
-                    .is_some_and(|alternative| {
-                        alternative.start_byte() <= descendant.start_byte()
-                            && descendant.end_byte() <= alternative.end_byte()
-                    })
-                {
-                    value = value.map(|value| !value);
+                match preprocessor_branch_of_descendant(
+                    conditional,
+                    descendant,
+                    &mut PreprocessorContextCache::default(),
+                ) {
+                    PreprocessorBranch::Consequence => {}
+                    PreprocessorBranch::Structured(_) | PreprocessorBranch::DisplacedElse => {
+                        value = value.map(|value| !value);
+                    }
+                    PreprocessorBranch::Unreadable => value = None,
                 }
                 match value {
                     Some(true) => {}
@@ -11377,7 +11452,7 @@ pub(crate) fn callable_guard_completion_byte_with_cache(
             && preprocessor_conditional_contains_descendant_with_cache(conditional, node, cache)
         {
             let family = preprocessor_conditional_family_root(conditional);
-            if !preprocessor_conditional_family_has_terminal_else(family) {
+            if !preprocessor_conditional_family_has_terminal_else(family, cache) {
                 return None;
             }
             completion_byte = completion_byte.max(family.end_byte());
@@ -11495,7 +11570,7 @@ pub(crate) fn preprocessor_conditional_family_for_declaration_with_cache<'tree>(
             && preprocessor_conditional_contains_descendant_with_cache(current, node, cache)
         {
             let family = preprocessor_conditional_family_root(current);
-            if preprocessor_conditional_family_has_terminal_else(family) {
+            if preprocessor_conditional_family_has_terminal_else(family, cache) {
                 return Some(family);
             }
         }
@@ -11520,10 +11595,15 @@ fn preprocessor_conditional_family_root(mut conditional: Node<'_>) -> Node<'_> {
     conditional
 }
 
-fn preprocessor_conditional_family_has_terminal_else(mut conditional: Node<'_>) -> bool {
+fn preprocessor_conditional_family_has_terminal_else(
+    mut conditional: Node<'_>,
+    cache: &mut PreprocessorContextCache,
+) -> bool {
     loop {
         let Some(alternative) = conditional.child_by_field_name("alternative") else {
-            return false;
+            return cache
+                .displaced_branch(conditional)
+                .is_some_and(|directive| directive.is_else);
         };
         match alternative.kind() {
             "preproc_else" => return true,
@@ -11650,7 +11730,7 @@ fn preprocessor_guard_environment_by_family_with_cache(
             && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
             && preprocessor_conditional_contains_descendant_with_cache(conditional, node, cache)
         {
-            let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
+            let guard = preprocessor_guard_for_descendant(conditional, node, source, cache)?;
             match guard {
                 PreprocessorGuard::Constant(true) => {
                     ancestor = conditional.parent();
@@ -11664,6 +11744,7 @@ fn preprocessor_guard_environment_by_family_with_cache(
             }
             if !preprocessor_conditional_family_has_terminal_else(
                 preprocessor_conditional_family_root(conditional),
+                cache,
             ) {
                 partial.insert(guard.clone());
             }
@@ -11736,6 +11817,7 @@ fn callable_preprocessor_ancestor_guards_with_cache(
                 conditional,
                 node,
                 source,
+                cache,
             )?);
         }
         ancestor = conditional.parent();
@@ -11804,25 +11886,61 @@ pub(crate) fn preprocessor_guard_for_descendant(
     conditional: Node<'_>,
     descendant: Node<'_>,
     source: &str,
+    cache: &mut PreprocessorContextCache,
 ) -> Option<PreprocessorGuard> {
-    let mut guard = simple_preprocessor_guard(conditional, source)?;
-    if conditional
-        .child_by_field_name("alternative")
-        .is_some_and(|alternative| {
-            alternative.start_byte() <= descendant.start_byte()
-                && descendant.end_byte() <= alternative.end_byte()
-        })
-    {
-        let alternative = conditional.child_by_field_name("alternative")?;
+    let guard = simple_preprocessor_guard(conditional, source)?;
+    match preprocessor_branch_of_descendant(conditional, descendant, cache) {
+        PreprocessorBranch::Consequence => Some(guard),
         // Tree-sitter nests an `#elif` chain in each `alternative` field. A
         // descendant in any later branch must first exclude the parent branch,
         // then collect the nested `preproc_elif` guard from its own ancestor.
-        if !matches!(alternative.kind(), "preproc_else" | "preproc_elif") {
-            return None;
+        PreprocessorBranch::Structured(alternative)
+            if matches!(alternative.kind(), "preproc_else" | "preproc_elif") =>
+        {
+            Some(guard.negated())
         }
-        guard = guard.negated();
+        PreprocessorBranch::DisplacedElse => Some(guard.negated()),
+        PreprocessorBranch::Structured(_) | PreprocessorBranch::Unreadable => None,
     }
-    Some(guard)
+}
+
+/// The branch of `conditional` that holds `descendant`.
+enum PreprocessorBranch<'tree> {
+    Consequence,
+    /// Inside the structured `alternative` field.
+    Structured(Node<'tree>),
+    /// After an `#else` the parser displaced into an `ERROR` of the
+    /// consequence ([`cpp_displaced_preprocessor_branch`]).
+    DisplacedElse,
+    /// After a displaced `#elif`, whose condition has no structured node.
+    Unreadable,
+}
+
+fn preprocessor_branch_of_descendant<'tree>(
+    conditional: Node<'tree>,
+    descendant: Node<'_>,
+    cache: &mut PreprocessorContextCache,
+) -> PreprocessorBranch<'tree> {
+    if let Some(alternative) =
+        conditional
+            .child_by_field_name("alternative")
+            .filter(|alternative| {
+                alternative.start_byte() <= descendant.start_byte()
+                    && descendant.end_byte() <= alternative.end_byte()
+            })
+    {
+        return PreprocessorBranch::Structured(alternative);
+    }
+    match cache.displaced_branch(conditional) {
+        Some(directive) if directive.end_byte <= descendant.start_byte() => {
+            if directive.is_else {
+                PreprocessorBranch::DisplacedElse
+            } else {
+                PreprocessorBranch::Unreadable
+            }
+        }
+        _ => PreprocessorBranch::Consequence,
+    }
 }
 
 pub(crate) fn preprocessor_conditional_contains_descendant(
@@ -12316,10 +12434,13 @@ fn flattened_macro_function_namespace_components(
 /// `namespace x {` leaves tree-sitter with a `function_definition` whose type is
 /// the macro token, whose declarator is the namespace name behind an `ERROR`
 /// holding the `namespace` keyword, and whose body spans the whole namespace
-/// region. The matching `*_NAMESPACE_END` sibling is what separates the recovery
-/// artifact from a real function definition.
+/// region. The macro-declaration grammar keeps the same envelope clean: the
+/// token is a `macro_modifier` (itself admitted only where the parse would
+/// otherwise contain an error) and the keyword occupies the type field. The
+/// matching `*_NAMESPACE_END` sibling is what separates the recovery artifact
+/// from a real function definition.
 fn recovered_macro_namespace_name(function: Node<'_>, source: &str) -> Option<String> {
-    if function.kind() != "function_definition" || !function.has_error() {
+    if function.kind() != "function_definition" {
         return None;
     }
     let body = function
@@ -12449,19 +12570,34 @@ fn flattened_macro_error_namespace_components(
 fn flattened_macro_sentinel_name(node: Node<'_>, source: &str) -> Option<String> {
     // At translation-unit scope the trailing `X_NAMESPACE_END` token parses as
     // an `expression_statement` with a missing semicolon; inside a namespace
-    // body the same token stays a bare `type_identifier`.
+    // body the same token stays a bare `type_identifier`. Under the
+    // macro-declaration grammar the token is wrapped in a `macro_modifier`
+    // wherever it decorates a declaration head, and a stacked `END`/`BEGIN`
+    // pair heads the next region's bogus function with the trailing `END` as
+    // its first modifier child.
     let node = if node.kind() == "expression_statement" && node.named_child_count() == 1 {
         node.named_child(0)?
     } else {
         node
     };
-    let candidate = direct_cpp_identifier_name(node, source).or_else(|| {
+    let candidates = [
+        direct_cpp_identifier_name(node, source),
         node.child_by_field_name("type")
-            .and_then(|type_node| direct_cpp_identifier_name(type_node, source))
-    })?;
-    (cpp_export_macro_token(&candidate)
-        && (is_namespace_begin_sentinel(&candidate) || is_namespace_end_sentinel(&candidate)))
-    .then_some(candidate)
+            .and_then(|type_node| direct_cpp_identifier_name(type_node, source)),
+        macro_modifier_identifier(node)
+            .map(|identifier| normalize_cpp_whitespace(node_text(identifier, source))),
+        {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() != "comment")
+                .and_then(macro_modifier_identifier)
+                .map(|identifier| normalize_cpp_whitespace(node_text(identifier, source)))
+        },
+    ];
+    candidates.into_iter().flatten().find(|candidate| {
+        cpp_export_macro_token(candidate)
+            && (is_namespace_begin_sentinel(candidate) || is_namespace_end_sentinel(candidate))
+    })
 }
 
 /// Namespace-opening macros are spelled both ways in the wild:
@@ -12634,6 +12770,11 @@ pub fn argument_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<
     (0..node.child_count())
         .filter_map(move |index| node.child(index))
         .filter(|child| child.is_named() && !child.is_extra())
+        // The `^(` opening a Clang block literal argument survives the
+        // macro-declaration grammar's bogus function envelope as an ERROR in
+        // the parameter list. It only opens the block: the parameter
+        // declaration that follows it already stands for the block argument.
+        .filter(move |child| node.kind() != "parameter_list" || !block_literal_open_error(*child))
         .flat_map(move |child| {
             if let Some((raw, left, right)) = recovered_block_arguments
                 && child == raw
@@ -12644,6 +12785,18 @@ pub fn argument_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<
             }
         })
         .flatten()
+}
+
+/// The `^(` token pair that opens a Clang block literal argument, retained by
+/// the bogus function envelope's parameter list as an `ERROR`. The block's
+/// parameter declaration follows it and counts as the one logical argument.
+fn block_literal_open_error(node: Node<'_>) -> bool {
+    if node.kind() != "ERROR" || node.is_missing() {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let tokens = node.children(&mut cursor).collect::<Vec<_>>();
+    matches!(tokens.as_slice(), [caret, open] if caret.kind() == "^" && open.kind() == "(")
 }
 
 /// Recover the two ordinary C values that the C++ grammar folds into one
@@ -14696,8 +14849,17 @@ impl OrphanedNamespaceScopeIndex {
             }
             // Error-free subtrees are balanced. Keeping them intact also
             // leaves their valid nested namespaces to the ordinary ancestry
-            // walk in restore_enclosing_namespaces.
-            if child.has_error() {
+            // walk in restore_enclosing_namespaces. A clean
+            // namespace-sentinel wrapper (the macro-declaration grammar reads
+            // it as a function_definition whose type is the literal namespace
+            // keyword) is the one exception: its body is a statement-context
+            // compound whose members need the recovered scope.
+            let descend = child.has_error()
+                || (child.kind() == "function_definition"
+                    && child.child_by_field_name("body").is_some_and(|body| {
+                        namespace_body_name_components(child, body, source).is_some()
+                    }));
+            if descend {
                 let parsed_scope = current.parsed_scope.clone();
                 frames.push(frame(child, parsed_scope, source));
             }
@@ -15038,7 +15200,7 @@ fn recovered_namespace_open_components<'tree>(
 }
 
 /// The written head and name-token ranges of the namespace opened by `body`.
-/// Ordinary namespace bodies and one strict damaged literal head share the
+/// Ordinary namespace bodies and the two damaged literal heads share the
 /// existing brace-stack lifetime; a recovered compound body's end is NOT a
 /// namespace close proof (#5868).
 fn namespace_body_name_components<'tree>(
@@ -15053,67 +15215,139 @@ fn namespace_body_name_components<'tree>(
         ("namespace_definition", "declaration_list") => {
             (parent, parent.child_by_field_name("name")?)
         }
-        ("function_definition", "compound_statement") if parent.has_error() => {
-            // An opaque prefix can make the parser read the literal namespace
-            // keyword as a function declarator. Account for every direct token:
-            // no parameters, attributes, extra names or punctuation may compete.
-            let mut cursor = parent.walk();
-            let children = parent
-                .children(&mut cursor)
-                .filter(|child| child.kind() != "comment")
-                .collect::<Vec<_>>();
-            let [prefix, keyword, error, actual_body] = children.as_slice() else {
-                return None;
-            };
-            if *actual_body != body
-                || parent.child_by_field_name("type") != Some(*prefix)
-                || parent.child_by_field_name("declarator") != Some(*keyword)
-                || prefix.kind() != "type_identifier"
-                || prefix.is_missing()
-                || prefix.has_error()
-                || prefix.child_count() != 0
-                || keyword.kind() != "identifier"
-                || keyword.is_missing()
-                || keyword.has_error()
-                || keyword.child_count() != 0
-                || node_text(*keyword, source) != "namespace"
-                || error.kind() != "ERROR"
-                || error.is_missing()
-                || body.is_missing()
-            {
-                return None;
-            }
-            let mut cursor = error.walk();
-            let names = error
-                .children(&mut cursor)
-                .filter(|child| child.kind() != "comment")
-                .collect::<Vec<_>>();
-            let [name] = names.as_slice() else {
-                return None;
-            };
-            if !matches!(name.kind(), "identifier" | "namespace_identifier")
-                || name.is_missing()
-                || name.has_error()
-                || name.child_count() != 0
-            {
-                return None;
-            }
-            let open = body.child(0)?;
-            if open.kind() != "{"
-                || open.is_missing()
-                || open.has_error()
-                || open.start_byte() != body.start_byte()
-            {
-                return None;
-            }
-            // Keep the literal keyword's provenance, never the unrelated prefix
-            // or the prematurely closed function envelope (#3309, #4292).
-            (*keyword, *name)
+        ("function_definition", "compound_statement") => {
+            // The two wrapper shapes are mutually exclusive on child kinds: a
+            // recovered head has an ERROR where the clean macro-modifier head
+            // has the name. Recovery inside the body still flags has_error on
+            // the clean shape, so the shape checks, not has_error, must pick
+            // the reader.
+            recovered_literal_namespace_head(parent, body, source)
+                .or_else(|| macro_modifier_namespace_head(parent, body, source))?
         }
         _ => return None,
     };
     let components = cpp_name_component_ranges(name, source)?;
     (!components.is_empty()).then_some((written_at, components))
+}
+
+/// The written head and name of the literal namespace a damaged wrapper opens,
+/// when recovery read the `namespace` keyword as a function declarator.
+fn recovered_literal_namespace_head<'tree>(
+    parent: Node<'tree>,
+    body: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    // An opaque prefix can make the parser read the literal namespace
+    // keyword as a function declarator. Account for every direct token:
+    // no parameters, attributes, extra names or punctuation may compete.
+    let mut cursor = parent.walk();
+    let children = parent
+        .children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [prefix, keyword, error, actual_body] = children.as_slice() else {
+        return None;
+    };
+    if *actual_body != body
+        || parent.child_by_field_name("type") != Some(*prefix)
+        || parent.child_by_field_name("declarator") != Some(*keyword)
+        || prefix.kind() != "type_identifier"
+        || prefix.is_missing()
+        || prefix.has_error()
+        || prefix.child_count() != 0
+        || keyword.kind() != "identifier"
+        || keyword.is_missing()
+        || keyword.has_error()
+        || keyword.child_count() != 0
+        || node_text(*keyword, source) != "namespace"
+        || error.kind() != "ERROR"
+        || error.is_missing()
+        || body.is_missing()
+    {
+        return None;
+    }
+    let mut cursor = error.walk();
+    let names = error
+        .children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [name] = names.as_slice() else {
+        return None;
+    };
+    if !matches!(name.kind(), "identifier" | "namespace_identifier")
+        || name.is_missing()
+        || name.has_error()
+        || name.child_count() != 0
+    {
+        return None;
+    }
+    let open = body.child(0)?;
+    if open.kind() != "{"
+        || open.is_missing()
+        || open.has_error()
+        || open.start_byte() != body.start_byte()
+    {
+        return None;
+    }
+    // Keep the literal keyword's provenance, never the unrelated prefix
+    // or the prematurely closed function envelope (#3309, #4292).
+    Some((*keyword, *name))
+}
+
+/// The written head and name of the literal namespace a macro-modifier
+/// wrapper opens, when the macro-declaration grammar read the same construct
+/// without recovery.
+fn macro_modifier_namespace_head<'tree>(
+    parent: Node<'tree>,
+    body: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    // The macro-declaration grammar reads the same construct without
+    // recovery: the opaque prefix is a `macro_modifier`, the literal
+    // `namespace` keyword occupies the type field, and the namespace
+    // name is the declarator. The keyword cannot be a type, so its
+    // presence in the type field is the recovery evidence the older
+    // grammar's `ERROR` carried; account for every direct token the
+    // same way.
+    let mut cursor = parent.walk();
+    let children = parent
+        .children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [prefix, keyword, name, actual_body] = children.as_slice() else {
+        return None;
+    };
+    if *actual_body != body
+        || parent.child_by_field_name("type") != Some(*keyword)
+        || parent.child_by_field_name("declarator") != Some(*name)
+        || prefix.kind() != "macro_modifier"
+        || prefix.is_missing()
+        || prefix.has_error()
+        || macro_modifier_identifier(*prefix).is_none()
+        || keyword.kind() != "type_identifier"
+        || keyword.is_missing()
+        || keyword.has_error()
+        || keyword.child_count() != 0
+        || node_text(*keyword, source) != "namespace"
+        || !matches!(name.kind(), "identifier" | "namespace_identifier")
+        || name.is_missing()
+        || name.has_error()
+        || name.child_count() != 0
+        || body.is_missing()
+    {
+        return None;
+    }
+    let open = body.child(0)?;
+    if open.kind() != "{"
+        || open.is_missing()
+        || open.has_error()
+        || open.start_byte() != body.start_byte()
+    {
+        return None;
+    }
+    // Keep the literal keyword's provenance, never the unrelated prefix
+    // or the prematurely closed function envelope (#3309, #4292).
+    Some((*keyword, *name))
 }
 
 #[derive(Clone, Copy)]
@@ -15233,6 +15467,30 @@ pub fn recovered_macro_decorated_type_node(
                 && type_node.start_byte() != type_node.end_byte()
         })?;
     Some((type_node, context))
+}
+
+/// The macro-declaration grammar's clean reading of the head
+/// [`recovered_macro_decorated_type_node`] recovers: `API static inline T
+/// make()` parses as a leading `macro_modifier` and `T` as the declaration's
+/// `type`. Accepts the same type kinds and declaration containers as the
+/// recovered form, so a rule keyed on that macro-decorated head keeps its
+/// scope across both grammars.
+pub fn macro_modifier_decorated_type_node(node: Node<'_>) -> bool {
+    matches!(node.kind(), "type_identifier" | "template_type")
+        && node.parent().is_some_and(|declaration| {
+            matches!(
+                declaration.kind(),
+                "declaration"
+                    | "function_definition"
+                    | "parameter_declaration"
+                    | "optional_parameter_declaration"
+            ) && declaration.child_by_field_name("type") == Some(node)
+                && declaration.child_by_field_name("declarator").is_some()
+                && crate::declarations::cpp_declaration_type_follows_macro_modifier(
+                    declaration,
+                    node,
+                )
+        })
 }
 
 fn recovered_declarator_container(
@@ -15913,6 +16171,31 @@ fn recovered_c_function_call(
             .any(CodeUnit::is_function)
 }
 
+/// The bogus `function_definition` the macro-declaration grammar builds for a
+/// C call whose argument list a Clang block literal breaks: `f(first, ^(T b)
+/// { ... })` reads as a definition whose declarator ends at the block's `(`,
+/// with the block body as the function body. The older grammar kept the
+/// `call_expression` and left the damage inside its argument list. The
+/// declarator must carry the damage, and the envelope must sit in statement
+/// context: a clean type-less definition is a real one (a constructor).
+pub fn recovered_c_block_call_envelope(declarator: Node<'_>) -> Option<Node<'_>> {
+    if declarator.kind() != "function_declarator" || !declarator.has_error() {
+        return None;
+    }
+    let definition = declarator.parent().filter(|parent| {
+        parent.kind() == "function_definition"
+            && parent.child_by_field_name("declarator") == Some(declarator)
+    })?;
+    if definition.child_by_field_name("type").is_some()
+        || definition.named_child(0) != Some(declarator)
+        || definition.child_by_field_name("body").is_none()
+        || definition.parent()?.kind() != "compound_statement"
+    {
+        return None;
+    }
+    Some(definition)
+}
+
 /// Return whether a C identifier belongs to a call-shaped declarator that the
 /// C++ grammar put under an `ERROR` node.
 ///
@@ -15923,52 +16206,66 @@ fn recovered_c_function_call(
 /// at a real expression-bearing boundary; declarations therefore cannot pass
 /// this predicate merely because they have a parameter list.
 fn recovered_c_function_declarator_invocation(node: Node<'_>) -> bool {
-    let mut function_declarator = if node.parent().is_some_and(|parent| {
-        parent.kind() == "function_declarator"
-            && parent.child_by_field_name("declarator") == Some(node)
+    // The macro-declaration grammar keeps a function-like macro invocation at
+    // declaration scope as a `macro_type_specifier` (a function-like macro
+    // wrapping a type), admitted only where the parse would otherwise contain
+    // an error. Its name is the invocation.
+    let mut current = if node.parent().is_some_and(|parent| {
+        parent.kind() == "macro_type_specifier" && parent.child_by_field_name("name") == Some(node)
     }) {
-        node.parent().expect("checked function declarator parent")
+        node.parent().expect("checked macro_type_specifier parent")
     } else {
-        let Some(parameter) = node.parent().filter(|parent| {
-            parent.kind() == "parameter_declaration"
-                && parent.child_by_field_name("type") == Some(node)
+        let mut function_declarator = if node.parent().is_some_and(|parent| {
+            parent.kind() == "function_declarator"
+                && parent.child_by_field_name("declarator") == Some(node)
+        }) {
+            node.parent().expect("checked function declarator parent")
+        } else {
+            let Some(parameter) = node.parent().filter(|parent| {
+                parent.kind() == "parameter_declaration"
+                    && parent.child_by_field_name("type") == Some(node)
+            }) else {
+                return false;
+            };
+            if !parameter
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| declarator.kind() == "abstract_function_declarator")
+            {
+                return false;
+            }
+            let Some(parameters) = parameter
+                .parent()
+                .filter(|parent| parent.kind() == "parameter_list")
+            else {
+                return false;
+            };
+            let Some(function_declarator) = parameters
+                .parent()
+                .filter(|parent| parent.kind() == "function_declarator")
+            else {
+                return false;
+            };
+            function_declarator
+        };
+
+        // Recovery may absorb the next statement's parenthesized cast into a
+        // second function declarator. Follow only the original declarator chain.
+        while let Some(parent) = function_declarator.parent().filter(|parent| {
+            parent.kind() == "function_declarator"
+                && parent.child_by_field_name("declarator") == Some(function_declarator)
+        }) {
+            function_declarator = parent;
+        }
+        // The macro-declaration grammar can attach the malformed call's
+        // declarator directly to the bogus `function_definition` (a block
+        // literal argument reads as the body) without the older grammar's
+        // ERROR wrapper.
+        let Some(current) = function_declarator.parent().filter(|parent| {
+            parent.is_error() || recovered_c_block_call_envelope(function_declarator).is_some()
         }) else {
             return false;
         };
-        if !parameter
-            .child_by_field_name("declarator")
-            .is_some_and(|declarator| declarator.kind() == "abstract_function_declarator")
-        {
-            return false;
-        }
-        let Some(parameters) = parameter
-            .parent()
-            .filter(|parent| parent.kind() == "parameter_list")
-        else {
-            return false;
-        };
-        let Some(function_declarator) = parameters
-            .parent()
-            .filter(|parent| parent.kind() == "function_declarator")
-        else {
-            return false;
-        };
-        function_declarator
-    };
-
-    // Recovery may absorb the next statement's parenthesized cast into a
-    // second function declarator. Follow only the original declarator chain.
-    while let Some(parent) = function_declarator.parent().filter(|parent| {
-        parent.kind() == "function_declarator"
-            && parent.child_by_field_name("declarator") == Some(function_declarator)
-    }) {
-        function_declarator = parent;
-    }
-    let Some(mut current) = function_declarator
-        .parent()
-        .filter(|parent| parent.is_error())
-    else {
-        return false;
+        current
     };
     loop {
         let Some(parent) = current.parent() else {
@@ -16016,6 +16313,35 @@ fn recovered_c_function_declarator_invocation(node: Node<'_>) -> bool {
 /// the argument retained beneath the nested `ERROR` is a reference; sibling
 /// declarator identifiers remain binders/grammar artifacts.
 fn recovered_c_parenthesized_declarator_reference(node: Node<'_>) -> bool {
+    // The macro-declaration grammar keeps the same line as a `dependent_type`
+    // whose `macro_type_specifier` argument list retains the first argument
+    // beneath the nested `ERROR`; that argument's `type_descriptor` is the
+    // reference, and the specifier's own `type` field is the following
+    // sibling, never a reference.
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "type_descriptor")
+    {
+        let Some(type_descriptor) = node.parent() else {
+            return false;
+        };
+        let Some(error) = type_descriptor.parent().filter(|parent| parent.is_error()) else {
+            return false;
+        };
+        if error.named_child_count() != 1 || error.named_child(0) != Some(type_descriptor) {
+            return false;
+        }
+        let Some(dependent) = error
+            .parent()
+            .and_then(|parent| parent.parent())
+            .filter(|parent| parent.kind() == "dependent_type")
+        else {
+            return false;
+        };
+        return dependent
+            .child(0)
+            .is_some_and(|keyword| keyword.kind() == "typename");
+    }
     let Some(error) = node.parent().filter(|parent| parent.is_error()) else {
         return false;
     };
@@ -18823,15 +19149,18 @@ struct AfterAll {};
         let tree = parse_cpp(source);
         let target = named_node_at(&tree, source, "class Target");
 
+        // The macro-declaration grammar keeps the namespace head and its
+        // members inside a surviving `namespace_definition` even with the
+        // macro invocation shredding one declaration inside the body, so the
+        // scope authority answers from parsed ancestry; the recovered-region
+        // path this fixture exercised is no longer needed for it.
         assert!(
-            !has_ancestor_kind(target, "namespace_definition"),
-            "the fixture must reproduce the collapse: the class has no namespace ancestor"
+            tree.root_node().has_error(),
+            "the fixture must retain the macro invocation's parse damage"
         );
-        let head = target.parent().expect("the collapsed namespace envelope");
-        assert_eq!(
-            head.kind(),
-            "ERROR",
-            "the fixture must keep the namespace head in an ERROR node"
+        assert!(
+            has_ancestor_kind(target, "namespace_definition"),
+            "the namespace head survives: the class keeps its parsed namespace ancestor"
         );
 
         let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), source);
@@ -18875,13 +19204,16 @@ struct AfterAll {};
             .root_node()
             .named_descendant_for_byte_range(keyword_start, keyword_start + "namespace".len())
             .expect("literal keyword node");
-        assert_eq!(keyword.kind(), "identifier");
+        // The macro-declaration grammar reads the opaque prefix as a
+        // `macro_modifier` and the literal `namespace` keyword as the bogus
+        // function's type: a keyword cannot be a type, so the type field is
+        // the same recovery evidence the older grammar's `ERROR` carried.
+        assert_eq!(keyword.kind(), "type_identifier");
         assert_eq!(keyword.child_count(), 0);
         assert!(!keyword.is_missing() && !keyword.has_error());
         assert_eq!(node_text(keyword, source), "namespace");
         let wrapper = keyword.parent().expect("actual wrapper");
         assert_eq!(wrapper.kind(), "function_definition");
-        assert!(wrapper.has_error());
         let mut cursor = wrapper.walk();
         let children = wrapper
             .children(&mut cursor)
@@ -18893,30 +19225,17 @@ struct AfterAll {};
             "all named and unnamed children accounted: {children:?}"
         );
         let prefix = children[0];
-        assert_eq!(prefix.kind(), "type_identifier");
-        assert_eq!(prefix.child_count(), 0);
+        assert_eq!(prefix.kind(), "macro_modifier");
         assert!(!prefix.is_missing() && !prefix.has_error());
-        assert_eq!(wrapper.child_by_field_name("type"), Some(prefix));
+        assert_eq!(node_text(prefix, source), "OPAQUE_PREFIX");
         assert_eq!(children[1], keyword);
-        assert_eq!(wrapper.child_by_field_name("declarator"), Some(keyword));
-        let error = children[2];
-        assert_eq!(error.kind(), "ERROR");
-        assert!(!error.is_missing());
-        let mut cursor = error.walk();
-        let error_children = error
-            .children(&mut cursor)
-            .filter(|child| child.kind() != "comment")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            error_children.len(),
-            1,
-            "exact literal-name error envelope: {error_children:?}"
-        );
-        let name = error_children[0];
+        assert_eq!(wrapper.child_by_field_name("type"), Some(keyword));
+        let name = children[2];
         assert!(matches!(name.kind(), "identifier" | "namespace_identifier"));
         assert_eq!(name.child_count(), 0);
         assert!(!name.is_missing() && !name.has_error());
         assert_eq!(node_text(name, source), "recovered");
+        assert_eq!(wrapper.child_by_field_name("declarator"), Some(name));
         let body = wrapper.child_by_field_name("body").expect("actual body");
         assert_eq!(children[3], body);
         assert_eq!(body.kind(), "compound_statement");
@@ -18983,15 +19302,14 @@ struct AfterAll {};
 
         // The measured '=' case has no function/body envelope. A missing
         // body is likewise parser-absence coverage, not a passed helper guard.
+        // The macro-declaration grammar reads both as clean declarations whose
+        // specifier words are `macro_modifier`s, so the parser-absence premise
+        // is now their lack of a function/body envelope rather than an ERROR.
         for absent in [
             "OPAQUE_PREFIX namespace recovered = other { int member; }",
             "OPAQUE_PREFIX namespace recovered int member;",
         ] {
             let tree = parse_cpp(absent);
-            assert!(
-                tree.root_node().has_error(),
-                "expected malformed input: {absent}"
-            );
             let mut stack = vec![tree.root_node()];
             let mut helper_candidates = 0;
             while let Some(node) = stack.pop() {
@@ -19389,24 +19707,34 @@ consteval int leading_zeroes(uint64_t input_num, int last_bit = 0) {
         let split_declaration = "struct Node;\n\ntypedef\n  #ifdef FEATURE_X\n    struct Node *\n  #else\n    UInt32\n  #endif\n  NodeRef;\n\nstatic int target(void) { return 1; }\n#ifdef LATER\nint later;\n#endif\n";
         let tree = parse(split_declaration);
         let root = tree.root_node();
-        let conditional = root
+        // The macro-declaration grammar folds the whole split declaration
+        // into one damaged `type_definition` instead of keeping a
+        // `preproc_ifdef` with a displaced terminator: the boundary the
+        // recovery supplied is now the declaration node itself. What must not
+        // change is the outcome -- the function written after the split
+        // declaration is outside the damaged span and inherits no guard.
+        let split = root
             .named_children(&mut root.walk())
-            .find(|node| node.kind() == "preproc_ifdef" && node.start_position().row == 3)
-            .expect("split declaration conditional");
+            .find(|node| node.kind() == "type_definition")
+            .expect("the split declaration folds into one type definition");
+        assert_eq!(
+            split.end_position().row + 1,
+            9,
+            "the split declaration ends at its own declarator line"
+        );
         let target = split_declaration
             .find("static int target")
             .expect("target byte");
-        let boundary =
-            cpp_displaced_preprocessor_boundary(conditional).expect("split declaration boundary");
-        assert!(boundary.end_byte <= target, "{boundary:?}");
-        assert_eq!(boundary.end_line, 9, "{boundary:?}");
+        assert!(split.end_byte() <= target);
         let target_node = root
             .descendant_for_byte_range(target, target + "static".len())
             .expect("target node");
-        assert!(!preprocessor_conditional_contains_descendant(
-            conditional,
-            target_node
-        ));
+        assert!(
+            !std::iter::successors(Some(target_node), |node| node.parent())
+                .any(|ancestor| ancestor.kind() == "preproc_ifdef" && ancestor.has_error()),
+            "the declaration after the shredded split declaration must not \
+             inherit a damaged conditional ancestor"
+        );
     }
 
     #[test]
@@ -19431,6 +19759,166 @@ consteval int leading_zeroes(uint64_t input_num, int last_bit = 0) {
             ],
         )));
         assert_eq!(preprocessor_guard_environment(node, source), Some(expected));
+    }
+
+    #[test]
+    #[hardwon(
+        "#6325: grammar 0.24.4 displaced #else/#elif into a declaration ERROR and the branch boundary vanished"
+    )]
+    fn displaced_branch_directives_decide_guards_without_proving_unreadable_branches() {
+        let parse = |source: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("C++ grammar");
+            parser.parse(source, None).expect("fixture tree")
+        };
+        fn at<'tree>(root: Node<'tree>, source: &str, needle: &str, token: &str) -> Node<'tree> {
+            let start = source.find(needle).expect("needle") + needle.find(token).expect("token");
+            root.descendant_for_byte_range(start, start + token.len())
+                .expect("token node")
+        }
+        let guards = |node: Node<'_>, source: &str| preprocessor_guard_environment(node, source);
+        let set = |items: &[PreprocessorGuard]| items.iter().cloned().collect::<HashSet<_>>();
+
+        // `#ifdef`: the `#else` is an ERROR child of the declaration that spans
+        // both sentinels, and a `#define` after it stays a structured child of
+        // the same conditional.
+        let source = "namespace n {\n#ifdef A\nBEGIN_NS\nint x;\nEND_NS\n#else\nBEGIN_NS\nclass T {};\nEND_NS\n#define MODE 2\n#endif\n}\n";
+        let tree = parse(source);
+        let root = tree.root_node();
+        let x = at(root, source, "int x", "x");
+        let conditional = std::iter::successors(Some(x), |node| node.parent())
+            .find(|node| node.kind() == "preproc_ifdef")
+            .expect("ifdef");
+        assert!(conditional.child_by_field_name("alternative").is_none());
+        let directive = cpp_displaced_preprocessor_branch(conditional).expect("displaced #else");
+        assert_eq!(directive.kind(), "#else");
+        assert_eq!(directive.parent().map(|node| node.kind()), Some("ERROR"));
+        let defined = PreprocessorGuard::Defined("A".to_string());
+        assert_eq!(guards(x, source), Some(set(std::slice::from_ref(&defined))));
+        let class_name = at(root, source, "class T", "T");
+        assert_eq!(guards(class_name, source), Some(set(&[defined.negated()])));
+        let define = at(root, source, "#define MODE", "MODE")
+            .parent()
+            .filter(|node| node.kind() == "preproc_def")
+            .expect("macro event");
+        let mut cache = PreprocessorContextCache::default();
+        assert!(matches!(
+            preprocessor_branch_of_descendant(conditional, define, &mut cache),
+            PreprocessorBranch::DisplacedElse
+        ));
+        assert_eq!(
+            preprocessor_conditional_family_for_declaration_with_cache(class_name, &mut cache),
+            Some(conditional),
+            "a displaced #else completes the family"
+        );
+        assert_eq!(
+            callable_guard_completion_byte(class_name, source),
+            Some(conditional.end_byte())
+        );
+
+        // A displaced `#elif B` reads `B` as the declaration's type: its
+        // condition has no structured node, so nothing after it, including the
+        // later displaced `#else`, may be read as `!A`.
+        let source = "namespace n {\n#if A\nBEGIN_NS\nint x;\nEND_NS\n#elif B\nBEGIN_NS\nclass T {};\nEND_NS\n#else\nBEGIN_NS\nstruct T {};\nEND_NS\n#endif\n}\n";
+        let tree = parse(source);
+        let root = tree.root_node();
+        let x = at(root, source, "int x", "x");
+        let conditional = std::iter::successors(Some(x), |node| node.parent())
+            .find(|node| node.kind() == "preproc_if")
+            .expect("if");
+        assert!(conditional.child_by_field_name("alternative").is_none());
+        assert_eq!(
+            cpp_displaced_preprocessor_branch(conditional).map(|node| node.kind()),
+            Some("#elif")
+        );
+        let truthy = PreprocessorGuard::Boolean(BooleanGuardExpression::Truthy("A".to_string()));
+        assert_eq!(guards(x, source), Some(set(&[truthy])));
+        let mut cache = PreprocessorContextCache::default();
+        for needle in ["class T", "struct T"] {
+            let name = at(root, source, needle, "T");
+            assert_eq!(
+                guards(name, source),
+                None,
+                "{needle} after a displaced #elif"
+            );
+            assert!(matches!(
+                preprocessor_branch_of_descendant(conditional, name, &mut cache),
+                PreprocessorBranch::Unreadable
+            ));
+            assert_eq!(
+                preprocessor_conditional_family_for_declaration_with_cache(name, &mut cache),
+                None,
+                "{needle}: an unreadable #elif branch does not complete the family"
+            );
+            assert_eq!(callable_guard_completion_byte(name, source), None);
+        }
+
+        // A structured `#elif` whose own `#else` was displaced: the content
+        // after it excludes both readable conditions.
+        let source = "namespace n {\n#if defined(A)\nBEGIN_NS\nint x;\nEND_NS\n#elif defined(B)\nBEGIN_NS\nclass T {};\nEND_NS\n#else\nBEGIN_NS\nclass T {};\nEND_NS\n#endif\n}\n";
+        let tree = parse(source);
+        let root = tree.root_node();
+        let start = source.rfind("class T").expect("else class") + "class ".len();
+        let name = root
+            .descendant_for_byte_range(start, start + 1)
+            .expect("else class name");
+        let elif = std::iter::successors(Some(name), |node| node.parent())
+            .find(|node| node.kind() == "preproc_elif")
+            .expect("structured elif");
+        assert_eq!(
+            cpp_displaced_preprocessor_branch(elif).map(|node| node.kind()),
+            Some("#else")
+        );
+        assert_eq!(
+            guards(name, source),
+            Some(set(&[
+                PreprocessorGuard::Defined("A".to_string()).negated(),
+                PreprocessorGuard::Defined("B".to_string()).negated(),
+            ]))
+        );
+        let mut cache = PreprocessorContextCache::default();
+        assert!(
+            preprocessor_conditional_family_for_declaration_with_cache(name, &mut cache).is_some()
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#2184: grammar 0.24.4 reads a macro-decorated return type cleanly, so the recovered-only same-file alias gate stopped matching"
+    )]
+    fn macro_modifier_decorated_type_matches_the_recovered_gate_scope() {
+        let source = "API static inline T make(void);\nAPI T value;\nvoid take(API T p);\nstatic inline T plain(void);\nAPI ns::T qualified(void);\nAPI static inline T body(void) { return 0; }\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let root = tree.root_node();
+        let type_before = |declared: &str| {
+            let end = source.find(declared).expect("declared name");
+            let start = source[..end].rfind('T').expect("type token");
+            root.descendant_for_byte_range(start, start + 1)
+                .expect("type node")
+        };
+        for declared in ["make(", "value;", "p)", "body("] {
+            let node = type_before(declared);
+            assert_eq!(node.kind(), "type_identifier", "{declared}");
+            assert!(
+                macro_modifier_decorated_type_node(node),
+                "{declared}: {}",
+                node.parent().expect("declaration").to_sexp()
+            );
+        }
+        for declared in ["plain(", "qualified("] {
+            let node = type_before(declared);
+            assert!(
+                !macro_modifier_decorated_type_node(node),
+                "{declared} is outside the macro-decorated head scope: {}",
+                node.parent().expect("parent").to_sexp()
+            );
+        }
     }
 
     #[test]
@@ -19718,21 +20206,43 @@ int malformed_head = (wchar_t *template) {
                 .expect("call name node");
             loop {
                 if node.kind() == "call_expression" {
-                    break node;
+                    break Some(node);
                 }
-                node = node.parent().expect("call expression ancestor");
+                let Some(parent) = node.parent() else {
+                    break None;
+                };
+                node = parent;
             }
         };
         let c_file = ProjectFile::new(std::env::temp_dir(), "keyword-near-miss.c");
-        for marker in [
-            "helper(NULL, template); /* type */",
-            "helper(NULL, template); /* qualifier */",
-            "helper(NULL, template); /* annotation */",
-            "helper(NULL, template); /* default */",
-            "helper(NULL, template); /* nested */",
-            "helper(NULL, template); /* malformed */",
-        ] {
-            let keyword_call = call(marker);
+        let markers = [
+            ("helper(NULL, template); /* type */", true),
+            ("helper(NULL, template); /* qualifier */", false),
+            ("helper(NULL, template); /* annotation */", false),
+            ("helper(NULL, template); /* default */", false),
+            ("helper(NULL, template); /* nested */", false),
+            ("helper(NULL, template); /* malformed */", false),
+        ];
+        let mut exercised = 0;
+        for (marker, expect_call) in markers {
+            // The macro-declaration grammar admits the misplaced keyword's
+            // neighbors as `macro_modifier`s, which flattens these heads and
+            // their bodies: where no `call_expression` survives, the recovery
+            // has no invocation to fire on, which is itself the non-admission
+            // proof. Pin the split so the near-miss matrix cannot silently
+            // decay: only the `type` marker retains an invocation.
+            let Some(keyword_call) = call(marker) else {
+                assert!(
+                    !expect_call,
+                    "{marker} lost its call_expression; the near-miss matrix changed"
+                );
+                continue;
+            };
+            assert!(
+                expect_call,
+                "{marker} unexpectedly retains a call_expression; the near-miss matrix changed"
+            );
+            exercised += 1;
             let keyword_arguments = keyword_call
                 .child_by_field_name("arguments")
                 .expect("keyword argument list");
@@ -19747,6 +20257,10 @@ int malformed_head = (wchar_t *template) {
                 "keyword in {marker} must not prove a parameter binding"
             );
         }
+        assert!(
+            exercised > 0,
+            "at least one near-miss marker must exercise the count itself"
+        );
     }
 
     #[test]
@@ -19861,7 +20375,10 @@ int main(int argc, char **argv) {
         let typename = named_node_at(&tree, source, "typename = helper");
         let helper = named_node_at(&tree, source, "helper(ctx, ccinitial)");
 
-        assert_eq!(ctx.kind(), "identifier");
+        // The macro-declaration grammar retains the argument beneath the
+        // nested `ERROR` as a `type_descriptor`, so its type position is a
+        // `type_identifier`; the recovery contract below is unchanged.
+        assert_eq!(ctx.kind(), "type_identifier");
         assert!(recovered_c_parenthesized_declarator_reference(ctx));
         assert!(!recovered_c_parenthesized_declarator_reference(ccinitial));
         assert!(!recovered_c_parenthesized_declarator_reference(typename));

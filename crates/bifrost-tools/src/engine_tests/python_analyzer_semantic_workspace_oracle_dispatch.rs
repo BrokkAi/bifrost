@@ -199,6 +199,7 @@ mod python_extraction_tests {
             )
             .expect("register external summary fixture");
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("package version"),
             evidence: vec![SemanticModelActivationEvidence {

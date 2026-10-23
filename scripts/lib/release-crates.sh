@@ -29,6 +29,7 @@ RELEASE_CRATES=(
   brokk-bifrost-go-analysis
   brokk-bifrost-rust-analysis
   brokk-bifrost-csharp-analysis
+  brokk-bifrost-jvm-analysis
   brokk-bifrost-php-analysis
   brokk-bifrost-cpp-analysis
   brokk-bifrost-python-analysis

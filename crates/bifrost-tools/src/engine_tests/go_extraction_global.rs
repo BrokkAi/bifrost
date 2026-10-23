@@ -1406,6 +1406,19 @@ mod go_extraction_tests_global {
             let cancellation = CancellationToken::new();
             let operation = fixture.open_ready(&cancellation);
             let conn = operation.ready.inventory.connection();
+            brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(conn);
+            let snapshot = &fixture.snapshots["go"];
+            conn.execute("DELETE FROM temp.go_summary_snapshot", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO temp.go_summary_snapshot VALUES(?1,'go',?2,?3)",
+                rusqlite::params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ],
+            )
+            .unwrap();
             let registry = registry();
             let sql = &registry
                 .statements
@@ -1478,7 +1491,7 @@ mod go_extraction_tests_global {
 
         use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: site_for_identifier ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: site_for_identifier ;
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::package_context::SelectedPackageRows;
 

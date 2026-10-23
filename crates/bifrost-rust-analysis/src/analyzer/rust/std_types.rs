@@ -1819,7 +1819,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         mut ty: Node<'tree>,
     ) -> Option<(String, Vec<Node<'tree>>)> {
         let mut arguments = Vec::new();
-        loop {
+        let primitive_identity = loop {
             match ty.kind() {
                 "reference_type" => ty = ty.child_by_field_name("type")?,
                 "generic_type" => {
@@ -1829,38 +1829,54 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                         .collect();
                     ty = ty.child_by_field_name("type")?;
                 }
-                "type_identifier" | "scoped_type_identifier" => break,
+                "primitive_type" => {
+                    break Some(format!("std.primitive.{}", source.node_text(ty)?));
+                }
+                "array_type" => {
+                    arguments.push(ty.child_by_field_name("element")?);
+                    let primitive = if let Some(length) = ty.child_by_field_name("length") {
+                        arguments.push(length);
+                        "array"
+                    } else {
+                        "slice"
+                    };
+                    break Some(format!("std.primitive.{primitive}"));
+                }
+                "type_identifier" | "scoped_type_identifier" => break None,
                 _ => return None,
             }
-        }
-        let outcome = self.resolve(source, ty)?;
-        if !outcome.definitions.is_empty() || outcome.lexical_definition.is_some() {
-            return None;
-        }
-        let identity = if let Some(prelude) = prelude_item_of(&outcome, "type") {
-            rust_std_type_fact(&prelude)?.path.join(".")
+        };
+        let identity = if let Some(identity) = primitive_identity {
+            identity
         } else {
-            let subjects = outcome
-                .diagnostics
-                .iter()
-                .filter_map(|diagnostic| diagnostic.claim.as_ref())
-                .filter(|claim| claim.kind == UnindexedClaimKind::ExternalBoundary)
-                .flat_map(|claim| claim.subjects.iter())
-                .collect::<Vec<_>>();
-            match subjects.as_slice() {
-                [subject]
-                    if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary =>
-                {
-                    (*subject).clone()
-                }
-                [] if ty.kind() == "scoped_type_identifier" => {
-                    // A qualified type may have no terminal reference row. Prove
-                    // its root through the selected resolver instead; the model
-                    // below must still publish the complete nominal identity.
-                    let segments = rust_path_segments(ty)?;
-                    let root = *segments.first()?;
-                    let scope = AnalyzerQueryScope::new(self.analyzer);
-                    if !crate::analyzer::rust::external_calls::native_external_root_with_resolver(
+            let outcome = self.resolve(source, ty)?;
+            if !outcome.definitions.is_empty() || outcome.lexical_definition.is_some() {
+                return None;
+            }
+            if let Some(prelude) = prelude_item_of(&outcome, "type") {
+                rust_std_type_fact(&prelude)?.path.join(".")
+            } else {
+                let subjects = outcome
+                    .diagnostics
+                    .iter()
+                    .filter_map(|diagnostic| diagnostic.claim.as_ref())
+                    .filter(|claim| claim.kind == UnindexedClaimKind::ExternalBoundary)
+                    .flat_map(|claim| claim.subjects.iter())
+                    .collect::<Vec<_>>();
+                match subjects.as_slice() {
+                    [subject]
+                        if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary =>
+                    {
+                        (*subject).clone()
+                    }
+                    [] if ty.kind() == "scoped_type_identifier" => {
+                        // A qualified type may have no terminal reference row. Prove
+                        // its root through the selected resolver instead; the model
+                        // below must still publish the complete nominal identity.
+                        let segments = rust_path_segments(ty)?;
+                        let root = *segments.first()?;
+                        let scope = AnalyzerQueryScope::new(self.analyzer);
+                        if !crate::analyzer::rust::external_calls::native_external_root_with_resolver(
                         self.analyzer,
                         scope.token(),
                         &source.file,
@@ -1872,13 +1888,14 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     ) {
                         return None;
                     }
-                    segments
-                        .iter()
-                        .map(|segment| source.node_text(*segment))
-                        .collect::<Option<Vec<_>>>()?
-                        .join(".")
+                        segments
+                            .iter()
+                            .map(|segment| source.node_text(*segment))
+                            .collect::<Option<Vec<_>>>()?
+                            .join(".")
+                    }
+                    _ => return None,
                 }
-                _ => return None,
             }
         };
         let overlay = self.analyzer.semantic_model_overlay()?;
@@ -1899,10 +1916,16 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         let active = self.analyzer.active_semantic_models()?;
         let declarations = active.types_with_id(&symbol.id);
         if declarations.records.is_empty()
-            || declarations
-                .records
-                .iter()
-                .any(|declaration| declaration.record.type_parameters.len() != arguments.len())
+            || declarations.records.iter().any(|declaration| {
+                let record = declaration.record;
+                let written = arguments.len();
+                written > record.type_parameters.len()
+                    || (written < record.type_parameters.len()
+                        && (record.type_parameter_defaults.len() != record.type_parameters.len()
+                            || record.type_parameter_defaults[written..]
+                                .iter()
+                                .any(Option::is_none)))
+            })
         {
             incomplete_proof("external_receiver_generic_arity_mismatch");
             return None;
@@ -2986,6 +3009,83 @@ pub fn run() { let first = Item; let second = Item; }
     }
 
     #[test]
+    #[hardwon("#6542: std receivers rejected defaulted arguments and primitive type syntax")]
+    fn std_receiver_type_contract_accepts_defaults_and_structural_primitives() {
+        // Synthetic declarations exercise the schema/structured-resolver boundary;
+        // these are test-only shapes, not a product standard-library catalog.
+        let source = "fn probe(a: Vec<u8>, b: Vec<u8, u16>, c: Vec, d: Vec<u8, u16, u32>, e: &str, f: &[u8], g: u32, h: &[u8; 4], i: std::slice::Iter<'_, u8>) {}";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        let mut vector = rust_type("std.vec.Vec", "struct");
+        vector["type_parameters"] = serde_json::json!(["T", "A"]);
+        vector["type_parameter_defaults"] = serde_json::json!([
+            null, { "kind": "type", "type": { "kind": "named", "name": "u8" } }
+        ]);
+        let primitive = |name: &str, parameters: &[&str]| {
+            let mut fact = rust_type(&format!("core.primitive.{name}"), "struct");
+            fact["aliases"] = serde_json::json!([format!("std.primitive.{name}")]);
+            fact["type_parameters"] = serde_json::json!(parameters);
+            fact
+        };
+        let mut iterator = rust_type("std.slice.Iter", "struct");
+        iterator["type_parameters"] = serde_json::json!(["T"]);
+        let pack = serde_json::json!({
+            "schema_version": 18,
+            "pack_id": "fixture.rust-std-receiver-contract",
+            "version": "1.0.0",
+            "producer": { "name": "rust-type-proof-test", "version": "1.0.0" },
+            "language": "rust",
+            "ecosystem": "cargo",
+            "compatibility": { "toolchains": [] },
+            "provenance": { "source": "synthetic test-only receiver contract for #6542" },
+            "license": "NOASSERTION",
+            "completeness": "partial",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": "declarations.receiver-contract",
+                "activation": [{ "targets": [], "configurations": [] }],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": [
+                        rust_type("std", "module"), vector, iterator,
+                        primitive("str", &[]), primitive("slice", &["T"]),
+                        primitive("u32", &[]), primitive("array", &["T", "N"])
+                    ],
+                    "members": [], "relations": []
+                }
+            }]
+        });
+        activate_model_pack(&fixture, pack, "fixture.rust-std-receiver-contract", "std");
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let proof = RustTypeProof::new(analyzer).expect("Rust type proof");
+        let prepared = proof.source(&file).expect("prepared source");
+        let function = named_children(prepared.tree().root_node())[0];
+        let parameters = named_children(function.child_by_field_name("parameters").unwrap());
+        let owners = parameters
+            .into_iter()
+            .map(|parameter| {
+                proof
+                    .nominal_type_owner(&prepared, parameter.child_by_field_name("type").unwrap())
+                    .map(|(owner, _)| owner)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners,
+            [
+                Some("std.vec.Vec".into()),
+                Some("std.vec.Vec".into()),
+                None,
+                None,
+                Some("core.primitive.str".into()),
+                Some("core.primitive.slice".into()),
+                Some("core.primitive.u32".into()),
+                Some("core.primitive.array".into()),
+                Some("std.slice.Iter".into())
+            ]
+        );
+    }
+
+    #[test]
     fn modeled_path_constructor_proves_join_receiver_owner() {
         let source = "use std::path::Path;\n\nfn run(value: &str) {\n    Path::new(\"/srv\").join(value);\n}\n";
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
@@ -3272,6 +3372,7 @@ pub fn run() { let first = Item; let second = Item; }
             )
             .expect("register Rust model fixture");
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version parses"),
             evidence: vec![SemanticModelActivationEvidence {

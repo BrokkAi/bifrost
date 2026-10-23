@@ -21,7 +21,6 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventoryOutcome;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
 
     #[test]
@@ -143,7 +142,7 @@ mod tests {
                 call(0, &live).is_err(),
                 "exact repeat rejects altered producer closure rows"
             );
-            let foreign_fixture = SelectionFixture::new(1);
+            let foreign_fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
             let foreign_selection = foreign_fixture.open_ready(&[]);
             let foreign = foreign_selection
                 .persisted_mount_record(SelectedResolutionMountOrdinal::new(0))

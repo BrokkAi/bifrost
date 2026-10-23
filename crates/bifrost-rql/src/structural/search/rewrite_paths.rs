@@ -79,6 +79,7 @@ impl RewritePathTraversalCache {
             }
             let uncovered = uncovered_domains(completeness);
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,

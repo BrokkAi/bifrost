@@ -7,6 +7,12 @@
 //! `left`, ...) point at either another fact or, when the target expression is
 //! not itself normalized, at a raw source span.
 
+pub use crate::analyzer::store::structural_vocabulary::{
+    PersistedCallSite, PersistedOccurrenceRole, PersistedRecoveredRegion, PersistedSpan,
+    PersistedStructuralFacts, PersistedStructuralNode, PersistedStructuralRole,
+    STRUCTURAL_FACTS_VERSION,
+};
+
 pub use brokk_bifrost_core::analyzer::structural::facts::{
     AssignmentSequenceKind, AssignmentShape, IntegerLiteralValue, Span,
 };
@@ -23,6 +29,7 @@ use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallShapeCoverage, CallSiteFacts,
 };
+
 use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
 use std::fmt;
 
@@ -45,6 +52,8 @@ pub struct NormalizedNode {
     pub integer_literal_value: Option<IntegerLiteralValue>,
     pub duplicate_key: Option<bool>,
     pub is_async: Option<bool>,
+    /// Rust call-site unsafe context; absent on other kinds and languages.
+    pub unsafe_context: Option<bool>,
     pub string_value: Option<String>,
     pub construct: Option<String>,
     pub range: Range,
@@ -199,6 +208,7 @@ fn materialize_rows(
             integer_literal_value: node.integer_literal_value.clone(),
             duplicate_key: node.duplicate_key,
             is_async: node.is_async,
+            unsafe_context: node.unsafe_context,
             string_value: node.string_value.clone(),
             construct: node.construct.clone(),
             range: source_facts.occurrence(node.occurrence).range,
@@ -211,7 +221,7 @@ fn materialize_rows(
                     end_byte: range.end_byte,
                 }),
             subtree_end: node.subtree_end,
-            call_site: node.call_site,
+            call_site: node.call_site.clone(),
         })
         .collect::<Vec<_>>();
     let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), rows.role_count());
@@ -289,6 +299,7 @@ fn append_syntax_error_facts(
             integer_literal_value: None,
             duplicate_key: None,
             is_async: None,
+            unsafe_context: None,
             string_value: None,
             construct: None,
             range: region.range,
@@ -452,16 +463,18 @@ impl FileFacts {
                     integer_literal_value: node.integer_literal_value.clone(),
                     duplicate_key: node.duplicate_key,
                     is_async: node.is_async,
+                    unsafe_context: node.unsafe_context,
                     string_value: node.string_value.clone(),
                     construct: node.construct.clone(),
                     span: persist_span(node.span())?,
                     parent: node.parent,
                     name: node.name.map(persist_span).transpose()?,
                     subtree_end: node.subtree_end,
-                    call_site: node.call_site.map(|facts| PersistedCallSite {
+                    call_site: node.call_site.as_ref().map(|facts| PersistedCallSite {
                         call_kind: facts.call_kind.map(|kind| kind.code()),
                         coverage: facts.coverage.code(),
                         continues_callee_groups: facts.continues_callee_groups,
+                        callee_provenance: facts.callee_provenance.clone(),
                     }),
                 })
             })
@@ -529,7 +542,8 @@ impl FileFacts {
         })
     }
 
-    pub(crate) fn from_persisted_rows(
+    #[doc(hidden)]
+    pub fn from_persisted_rows(
         source: String,
         persisted: PersistedStructuralFacts,
     ) -> Result<Self, StructuralFactsPersistenceError> {
@@ -616,6 +630,7 @@ impl FileFacts {
                             },
                         )?,
                         continues_callee_groups: facts.continues_callee_groups,
+                        callee_provenance: facts.callee_provenance.clone(),
                     })
                 })
                 .transpose()?;
@@ -671,6 +686,7 @@ impl FileFacts {
                 integer_literal_value: node.integer_literal_value,
                 duplicate_key: node.duplicate_key,
                 is_async: node.is_async,
+                unsafe_context: node.unsafe_context,
                 string_value: node.string_value,
                 construct: node.construct,
                 call_site,
@@ -940,18 +956,13 @@ impl FileFacts {
     }
 }
 
-pub use crate::analyzer::store::structural_vocabulary::{
-    PersistedCallSite, PersistedOccurrenceRole, PersistedRecoveredRegion, PersistedSpan,
-    PersistedStructuralFacts, PersistedStructuralNode, PersistedStructuralRole,
-    STRUCTURAL_FACTS_VERSION,
-};
-
 #[cfg(test)]
 mod tests {
     use super::{
         AssignmentSequenceKind, AssignmentShape, FileFacts, IntegerLiteralValue, NormalizedNode,
         PersistedSpan, RoleTarget, Span,
     };
+
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{NormalizedKind, Role};
     use crate::analyzer::structural::occurrences::OccurrenceRole;
@@ -959,7 +970,9 @@ mod tests {
     use brokk_bifrost_core::analyzer::structural::callable::{
         CallKind, CallShapeCoverage, CallSiteFacts,
     };
+
     use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
     fn role_target(role: Role, start_byte: usize) -> RoleTarget {
@@ -989,6 +1002,7 @@ mod tests {
             integer_literal_value: None,
             duplicate_key: None,
             is_async: None,
+            unsafe_context: None,
             string_value: None,
             construct: None,
             range: Range {
@@ -1015,6 +1029,7 @@ mod tests {
                 integer_literal_value: None,
                 duplicate_key: None,
                 is_async: None,
+                unsafe_context: None,
                 string_value: None,
                 construct: Some("fixture_call".to_owned()),
                 range: Range {
@@ -1030,6 +1045,7 @@ mod tests {
                 }),
                 subtree_end: 2,
                 call_site: Some(CallSiteFacts {
+                    callee_provenance: None,
                     call_kind: Some(CallKind::Method),
                     coverage: CallShapeCoverage::Partial,
                     continues_callee_groups: true,
@@ -1043,6 +1059,7 @@ mod tests {
                 integer_literal_value: None,
                 duplicate_key: None,
                 is_async: None,
+                unsafe_context: None,
                 string_value: None,
                 construct: None,
                 range: Range {
@@ -1108,6 +1125,7 @@ mod tests {
         )
     }
 
+    #[cfg(test)]
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
         let original = relational_fixture();
@@ -1157,6 +1175,7 @@ mod tests {
         assert_eq!(decoded.line_of_byte(6), 2);
     }
 
+    #[cfg(test)]
     #[test]
     fn assignment_shape_survives_relational_hydration() {
         let fixture = relational_fixture();
@@ -1179,6 +1198,7 @@ mod tests {
         assert_eq!(hydrated.nodes()[0].assignment_shape, Some(expected));
     }
 
+    #[cfg(test)]
     #[test]
     fn integer_literal_value_survives_relational_hydration() {
         let fixture = relational_fixture();
@@ -1204,6 +1224,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn duplicate_key_fact_survives_relational_hydration() {
         let fixture = relational_fixture();
@@ -1218,6 +1239,7 @@ mod tests {
         assert_eq!(hydrated.nodes()[0].duplicate_key, Some(true));
     }
 
+    #[cfg(test)]
     #[test]
     fn relational_hydration_rejects_inconsistent_rows() {
         let fixture = relational_fixture();
@@ -1309,6 +1331,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[hardwon("#783: structural fact memory accounting ignored retained allocation capacity")]
     #[test]
     fn estimated_bytes_counts_retained_allocation_capacity() {

@@ -21,13 +21,13 @@ pub use runtime_values::{
 };
 #[doc(hidden)]
 pub mod value_flow;
-use crate::analyzer::languages::{SavedDefaultArgumentSafety, language_support};
+use crate::analyzer::languages::{SavedDefaultArgumentSafety, language_support_for_hook};
 use crate::analyzer::semantic::{DispatchHints, OracleLimits};
 use crate::analyzer::semantic::{FormalParameterPassingMode, ProcedureHandle};
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ResolvedActiveSemanticModels, SemanticModelOverlay,
 };
-use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
+use crate::analyzer::{DispatchHierarchyExpansion, WorkspaceAnalyzer};
 #[doc(hidden)]
 pub use dispatch::PreparedWorkspaceDispatchPool;
 pub use dispatch::procedures_for_definition_with_limits;
@@ -102,7 +102,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             .map(|site| site.file.language())
             .collect::<crate::hash::HashSet<_>>();
         for language in languages {
-            let Some(support) = language_support(language) else {
+            let Some(support) = language_support_for_hook(language, "caller_sites_compiled") else {
                 continue;
             };
             let answers = support
@@ -193,8 +193,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             hierarchy_expansion,
             active_semantic_model_snapshot,
             dispatch_hints: Arc::new(dispatch_hints),
-            python_saved_default_safety: language_support(Language::Python)
-                .and_then(|support| support.saved_default_argument_safety(workspace.analyzer())),
+            python_saved_default_safety: crate::analyzer::languages::registered_language_supports()
+                .find_map(|support| support.saved_default_argument_safety(workspace.analyzer())),
         }
     }
 

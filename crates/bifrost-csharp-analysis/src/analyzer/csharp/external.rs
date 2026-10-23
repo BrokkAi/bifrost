@@ -1,4 +1,5 @@
 use crate::analyzer::csharp::dependency_discovery::project_assets_files;
+mod targeting_packs;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -480,21 +481,21 @@ impl CSharpExternalDeclarationIndex {
                 None,
             )
         };
-        let mut paths: Vec<_> = discovery
+        let mut artifacts: Vec<_> = discovery
             .dependencies
             .iter()
             .flat_map(|dependency| dependency.artifacts.iter())
-            .map(|artifact| artifact.path().to_owned())
+            .map(|artifact| (artifact.path().to_owned(), artifact.module.clone()))
             .collect();
-        paths.sort();
-        paths.dedup();
+        artifacts.sort();
+        artifacts.dedup();
         let _timing =
             brokk_bifrost_core::profiling::scope("csharp_external_index.build_from_artifacts");
         let mut index = Self::default();
         index.complete &= discovery.complete;
         index.has_dependency_inputs = discovery.profile.metadata_inputs_considered > 0;
-        for path in paths {
-            index.index_assembly(&path);
+        for (path, declared_assembly) in artifacts {
+            index.index_assembly(&path, declared_assembly.as_deref());
         }
         index
             .production_diagnostics
@@ -589,41 +590,60 @@ impl CSharpExternalDeclarationIndex {
     pub fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
         &self.production_diagnostics
     }
-    fn index_assembly(&mut self, path: &Path) {
-        let production = CSharpAssemblyPackProducer.produce_exact_artifact(
-            &ArtifactProductionRequest {
-                path: path.to_path_buf(),
-                artifact_kind: ExternalArtifactKind::DotNetAssembly,
-                pack_id: "bifrost.external.csharp".to_owned(),
-                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
-                ecosystem: "nuget".to_owned(),
-                compatibility: Compatibility {
-                    bifrost: None,
-                    toolchains: Vec::new(),
-                },
-                activation: vec![ActivationSelector {
-                    package: None,
-                    module: None,
-                    toolchain: Some(NameSelector {
-                        name: "dotnet".to_owned(),
-                        version: None,
-                    }),
-                    targets: Vec::new(),
-                    configurations: Vec::new(),
-                    artifact_sha256: None,
-                }],
-                provenance: Provenance {
-                    source: "local dependency artifact".to_owned(),
-                    revision: None,
-                },
-                license: "NOASSERTION".to_owned(),
-                safety: Safety {
-                    generated_code_only: false,
-                    review_required: false,
-                },
+    fn index_assembly(&mut self, path: &Path, declared_assembly: Option<&str>) {
+        let request = ArtifactProductionRequest {
+            path: path.to_path_buf(),
+            artifact_kind: ExternalArtifactKind::DotNetAssembly,
+            pack_id: "bifrost.external.csharp".to_owned(),
+            pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+            ecosystem: "nuget".to_owned(),
+            compatibility: Compatibility {
+                bifrost: None,
+                toolchains: Vec::new(),
             },
-            &ArtifactProducerLimits::default(),
-        );
+            activation: vec![ActivationSelector {
+                package: None,
+                module: None,
+                toolchain: Some(NameSelector {
+                    name: "dotnet".to_owned(),
+                    version: None,
+                }),
+                targets: Vec::new(),
+                configurations: Vec::new(),
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source: "local dependency artifact".to_owned(),
+                revision: None,
+            },
+            license: "NOASSERTION".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+        };
+        let limits = ArtifactProducerLimits::default();
+        let production = match declared_assembly {
+            None => CSharpAssemblyPackProducer.produce_exact_artifact(&request, &limits),
+            Some(declared) => {
+                let read_limits = ArtifactProducerLimits {
+                    max_artifact_bytes: limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
+                    ..limits
+                };
+                let checked =
+                    read_exact_artifact_while(path, &read_limits, || false).and_then(|artifact| {
+                        match assembly_identity_mismatch(&artifact, declared) {
+                            Some(diagnostic) => Err(diagnostic),
+                            None => Ok(artifact),
+                        }
+                    });
+                match checked {
+                    Ok(artifact) => CSharpAssemblyPackProducer
+                        .produce_loaded_artifact(&request, &limits, None, &artifact),
+                    Err(diagnostic) => ArtifactProduction::failed(diagnostic, &limits),
+                }
+            }
+        };
         self.production_diagnostics
             .extend(production.diagnostics.iter().cloned());
         self.complete &= production.completeness == Completeness::Complete;
@@ -1272,7 +1292,8 @@ fn decoded_type_from_semantic(
         TypeRef::ByRef { element, .. } => Some(DecodedType::ByRef(Box::new(
             decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
         ))),
-        TypeRef::Unknown
+        TypeRef::Projection { .. }
+        | TypeRef::Unknown
         | TypeRef::Declared { .. }
         | TypeRef::Pointer { .. }
         | TypeRef::Slice { .. }
@@ -1314,9 +1335,12 @@ pub fn resolve_csharp_semantic_pack_dependencies(
             configuration: None,
             role: DotNetAssetRole::Explicit,
             project_reference: false,
+            assembly_name: None,
+            framework_reference: None,
         })
         .collect();
     let assets_files = project_assets_files(project.root());
+    let sdk_roots = targeting_packs::approved_sdk_roots(project.root());
     let metadata_inputs_considered = config
         .assembly_paths
         .len()
@@ -1326,7 +1350,7 @@ pub fn resolve_csharp_semantic_pack_dependencies(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return csharp_cancelled_discovery();
         }
-        let resolution = assemblies_from_assets(&assets);
+        let resolution = assemblies_from_assets(&assets, &sdk_roots);
         assemblies.extend(resolution.assemblies);
         diagnostic_messages.extend(resolution.diagnostics);
     }
@@ -1429,6 +1453,16 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
                 suppressed_diagnostics: SuppressedDiagnostics::default(),
             };
         };
+        if let Some(diagnostic) = artifact
+            .module()
+            .and_then(|declared| assembly_identity_mismatch(artifact.exact(), declared))
+        {
+            return DependencyPackProduction {
+                pack: None,
+                diagnostics: vec![diagnostic],
+                suppressed_diagnostics: SuppressedDiagnostics::default(),
+            };
+        }
         let mut request = csharp_dependency_production_request(dependency);
         request.path = artifact.path().to_owned();
         let mut production = CSharpAssemblyPackProducer.produce_loaded_artifact(
@@ -1645,6 +1679,9 @@ impl CSharpAssemblyPackProducer {
             }
             types.push(TypeFact {
                 jvm_inventory: None,
+                type_parameter_defaults: Vec::new(),
+                implemented_traits: Vec::new(),
+                generic_trait_impls: Vec::new(),
                 runtime_bases: None,
                 ambient_use: None,
                 id: type_id.clone(),
@@ -1745,6 +1782,8 @@ impl CSharpAssemblyPackProducer {
                     return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {
+                    implemented_trait: None,
+                    self_form: None,
                     non_overridable: None,
                     ambient_use: None,
                     value_type: None,
@@ -2051,15 +2090,22 @@ struct ResolvedCSharpAssembly {
     configuration: Option<String>,
     role: DotNetAssetRole,
     project_reference: bool,
+    /// The assembly name a targeting pack's file list declares for this
+    /// file. Production requires the metadata to carry the same name.
+    assembly_name: Option<String>,
+    /// The `FrameworkReference` whose targeting pack supplied this file.
+    framework_reference: Option<String>,
 }
 
 fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDependency {
-    let assembly_name = assembly
-        .path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let assembly_name = assembly.assembly_name.clone().unwrap_or_else(|| {
+        assembly
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
     let id = match (&assembly.package_name, &assembly.package_version) {
         (Some(name), Some(version)) => format!("{name}/{version}:{assembly_name}"),
         _ => format!("explicit:{assembly_name}"),
@@ -2089,6 +2135,7 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
         ("version", assembly.package_version.as_ref()),
         ("target", assembly.target.as_ref()),
         ("configuration", assembly.configuration.as_ref()),
+        ("framework_reference", assembly.framework_reference.as_ref()),
     ] {
         if let Some(value) = value {
             provenance.push(DependencyProvenance {
@@ -2113,9 +2160,24 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             assembly.role,
             DotNetAssetRole::Reference | DotNetAssetRole::Compile
         ) {
-        assembly_name
+        assembly_name.clone()
     } else {
         "local-dotnet-assembly".to_owned()
+    };
+    // A declared assembly name binds the artifact to it, so production
+    // rejects bytes whose metadata names another assembly.
+    let artifact = match assembly.assembly_name {
+        Some(declared) => ResolvedDependencyArtifact::module_file(
+            artifact_role,
+            ExternalArtifactKind::DotNetAssembly,
+            declared,
+            assembly.path,
+        ),
+        None => ResolvedDependencyArtifact::file(
+            artifact_role,
+            ExternalArtifactKind::DotNetAssembly,
+            assembly.path,
+        ),
     };
     ResolvedDependency {
         id,
@@ -2133,11 +2195,7 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             artifact_sha256: None,
         },
         provenance,
-        artifacts: vec![ResolvedDependencyArtifact::file(
-            artifact_role,
-            ExternalArtifactKind::DotNetAssembly,
-            assembly.path,
-        )],
+        artifacts: vec![artifact],
         scope: DependencyScope::Unknown,
         declared_by: None,
     }
@@ -2204,7 +2262,7 @@ struct CSharpAssetsResolution {
     diagnostics: Vec<String>,
 }
 
-fn assemblies_from_assets(path: &Path) -> CSharpAssetsResolution {
+fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsResolution {
     let Ok(meta) = fs::metadata(path) else {
         return CSharpAssetsResolution {
             diagnostics: vec![format!("could not inspect {}", path.display())],
@@ -2305,6 +2363,8 @@ fn assemblies_from_assets(path: &Path) -> CSharpAssetsResolution {
                                 configuration: None,
                                 role,
                                 project_reference: false,
+                                assembly_name: None,
+                                framework_reference: None,
                             });
                         }
                     }
@@ -2344,6 +2404,8 @@ fn assemblies_from_assets(path: &Path) -> CSharpAssetsResolution {
                                     configuration,
                                     role: DotNetAssetRole::ProjectOutput,
                                     project_reference: true,
+                                    assembly_name: None,
+                                    framework_reference: None,
                                 }),
                             );
                         }
@@ -2360,6 +2422,10 @@ fn assemblies_from_assets(path: &Path) -> CSharpAssetsResolution {
             }
         }
     }
+    let framework_references =
+        targeting_packs::framework_reference_assemblies(path, &root, &folders, sdk_roots);
+    out.extend(framework_references.assemblies);
+    diagnostics.extend(framework_references.diagnostics);
     out.sort_by(|left, right| {
         (
             &left.target,
@@ -2529,6 +2595,45 @@ struct EventRow {
     flags: u16,
     name: String,
     event_type: u32,
+}
+
+/// A diagnostic when `artifact`'s Assembly metadata row does not name
+/// `declared`, the identity discovery bound the file to.
+fn assembly_identity_mismatch(
+    artifact: &ExactArtifact,
+    declared: &str,
+) -> Option<ProducerDiagnostic> {
+    let name = assembly_definition_name(artifact.bytes());
+    (name.as_deref() != Some(declared)).then(|| ProducerDiagnostic {
+        severity: ProducerDiagnosticSeverity::Error,
+        source_entry: None,
+        code: "csharp.assembly_identity".to_owned(),
+        location: Some(artifact.path().to_string_lossy().into_owned()),
+        declaration: None,
+        message: format!(
+            "assembly metadata names {name:?}, but discovery selected this file as {declared:?}"
+        ),
+    })
+}
+
+/// The name in the single Assembly (0x20) metadata row.
+fn assembly_definition_name(bytes: &[u8]) -> Option<String> {
+    let pe = PE::parse(bytes).ok()?;
+    let streams = Streams::parse(metadata_bytes(&pe, bytes)?)?;
+    let layout = TableLayout::parse(streams.tables?)?;
+    if layout.rows(32) != 1 {
+        return None;
+    }
+    let row = layout.row(32, 1)?;
+    // HashAlgId, four version parts and Flags precede the PublicKey blob.
+    let mut p = 16 + if layout.heap & 4 != 0 { 4 } else { 2 };
+    str_index(
+        row,
+        &mut p,
+        layout.heap,
+        streams.strings?,
+        &mut MetadataDecodeBudget::default(),
+    )
 }
 
 fn parse_assembly_bounded(

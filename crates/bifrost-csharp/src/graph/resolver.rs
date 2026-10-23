@@ -12,6 +12,7 @@ use crate::syntax::{
     csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target, map_csharp_type_arguments,
 };
+use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, ClassLikeKind, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
@@ -237,7 +238,13 @@ pub fn seed_visible_bindings_at(
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    seed_visible_bindings_inner(scope, target, csharp, token, file, source, bindings);
+    let class_ranges = csharp.class_range_index(file);
+    let context = CSharpTypeReferenceContext {
+        file,
+        source,
+        class_ranges: &class_ranges,
+    };
+    seed_visible_bindings_inner(scope, target, csharp, token, &context, bindings);
 }
 
 pub fn seed_bindings_before(
@@ -249,11 +256,17 @@ pub fn seed_bindings_before(
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
+    let class_ranges = csharp.class_range_index(file);
+    let context = CSharpTypeReferenceContext {
+        file,
+        source,
+        class_ranges: &class_ranges,
+    };
     walk_named_nodes_before(node, cutoff_start, |current| {
         match current.kind() {
-            "parameter" => seed_parameter(current, csharp, token, file, source, bindings),
+            "parameter" => seed_parameter(current, csharp, &context, bindings),
             "variable_declaration" => {
-                seed_variable_declaration(current, csharp, token, file, source, bindings)
+                seed_variable_declaration(current, csharp, token, &context, bindings)
             }
             _ => {}
         }
@@ -266,7 +279,7 @@ pub fn seed_bindings_before_in_session(
     node: Node<'_>,
     cutoff_start: usize,
     csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
@@ -278,14 +291,14 @@ pub fn seed_bindings_before_in_session(
         }
         match current.kind() {
             "parameter" => {
-                seed_parameter_in_session(current, csharp, token, file, source, bindings, session);
+                seed_parameter_in_session(current, csharp, file, source, bindings, session);
                 if !session.observe_cancellation() {
                     return NamedNodeWalk::Stop;
                 }
             }
             "variable_declaration" => {
                 seed_variable_declaration_in_session(
-                    current, csharp, token, file, source, bindings, session,
+                    current, csharp, file, source, bindings, session,
                 );
                 if !session.observe_cancellation() {
                     return NamedNodeWalk::Stop;
@@ -348,13 +361,18 @@ const SCOPE_NODES: &[&str] = &[
     "catch_clause",
 ];
 
+struct CSharpTypeReferenceContext<'a> {
+    file: &'a ProjectFile,
+    source: &'a str,
+    class_ranges: &'a ClassRangeIndex,
+}
+
 fn seed_visible_bindings_inner(
     node: Node<'_>,
     target: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     if node.start_byte() >= target.start_byte() {
@@ -370,9 +388,9 @@ fn seed_visible_bindings_inner(
     }
 
     match node.kind() {
-        "parameter" => seed_usage_parameter(node, csharp, token, file, source, bindings),
+        "parameter" => seed_usage_parameter(node, csharp, token, context, bindings),
         "variable_declaration" => {
-            seed_usage_variable_declaration(node, csharp, token, file, source, bindings)
+            seed_usage_variable_declaration(node, csharp, token, context, bindings)
         }
         _ => {}
     }
@@ -385,7 +403,7 @@ fn seed_visible_bindings_inner(
         if SCOPE_NODES.contains(&child.kind()) && !node_covers(child, target) {
             continue;
         }
-        seed_visible_bindings_inner(child, target, csharp, token, file, source, bindings);
+        seed_visible_bindings_inner(child, target, csharp, token, context, bindings);
     }
 }
 
@@ -393,14 +411,13 @@ fn seed_usage_parameter(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some((name_node, type_node)) = csharp_parameter_name_and_type(node) else {
         return;
     };
-    seed_usage_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
+    seed_usage_symbol_for_type(name_node, type_node, csharp, token, context, bindings);
 }
 
 pub(super) fn for_local_variable_declarators<'tree>(
@@ -425,21 +442,18 @@ pub(super) fn for_local_variable_declarators<'tree>(
 fn seed_parameter(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
     let Some((name_node, type_node)) = csharp_parameter_name_and_type(node) else {
         return;
     };
-    seed_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
+    seed_symbol_for_type(name_node, type_node, csharp, context, bindings);
 }
 
 fn seed_parameter_in_session(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
@@ -449,7 +463,7 @@ fn seed_parameter_in_session(
         return;
     };
     seed_symbol_for_type_in_session(
-        name_node, type_node, csharp, token, file, source, bindings, session,
+        name_node, type_node, csharp, file, source, bindings, session,
     );
 }
 
@@ -457,33 +471,35 @@ fn seed_usage_variable_declaration(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    for_local_variable_declarators(node, source, |type_node, type_text, child| {
+    for_local_variable_declarators(node, context.source, |type_node, type_text, child| {
         let Some(name_node) = child.child_by_field_name("name") else {
             return;
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
-                && let Some(target) = resolve_usage_type_fq_name(
+                && let Some(target) = resolve_type_fq_name_at(
                     csharp,
                     token,
-                    file,
-                    &reference_type_text(initializer_type, source),
+                    context.file,
+                    context.class_ranges,
+                    &reference_type_text(initializer_type, context.source),
+                    initializer_type,
+                    context.source,
                 )
             {
-                bindings.seed_symbol(node_text(name_node, source), target);
+                bindings.seed_symbol(node_text(name_node, context.source), target);
             } else if let Some(target) =
-                var_initializer_member_type(child, csharp, token, file, source, bindings, true)
+                var_initializer_member_type(child, csharp, token, context, bindings, true)
             {
-                bindings.seed_symbol(node_text(name_node, source), target);
+                bindings.seed_symbol(node_text(name_node, context.source), target);
             } else {
-                bindings.declare_shadow(node_text(name_node, source));
+                bindings.declare_shadow(node_text(name_node, context.source));
             }
         } else {
-            seed_usage_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
+            seed_usage_symbol_for_type(name_node, type_node, csharp, token, context, bindings);
         }
     });
 }
@@ -492,39 +508,38 @@ fn seed_variable_declaration(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
-    for_local_variable_declarators(node, source, |type_node, type_text, child| {
+    for_local_variable_declarators(node, context.source, |type_node, type_text, child| {
         let Some(name_node) = child.child_by_field_name("name") else {
             return;
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
-                && let Some(target) = resolve_type_fq_name(
+                && let Some(target) = resolve_declared_type_fq_name_at(
                     csharp,
-                    token,
-                    file,
-                    &reference_type_text(initializer_type, source),
+                    &reference_type_text(initializer_type, context.source),
+                    initializer_type,
+                    context,
                 )
             {
                 bindings.seed_symbol(
-                    node_text(name_node, source),
+                    node_text(name_node, context.source),
                     CSharpDeclaredType::resolved(target),
                 );
             } else if let Some(target) =
-                var_initializer_member_type(child, csharp, token, file, source, bindings, false)
+                var_initializer_member_type(child, csharp, token, context, bindings, false)
             {
                 bindings.seed_symbol(
-                    node_text(name_node, source),
+                    node_text(name_node, context.source),
                     CSharpDeclaredType::resolved(target),
                 );
             } else {
-                bindings.declare_shadow(node_text(name_node, source));
+                bindings.declare_shadow(node_text(name_node, context.source));
             }
         } else {
-            seed_symbol_for_type(name_node, type_node, csharp, token, file, source, bindings);
+            seed_symbol_for_type(name_node, type_node, csharp, context, bindings);
         }
     });
 }
@@ -532,7 +547,6 @@ fn seed_variable_declaration(
 fn seed_variable_declaration_in_session(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
@@ -556,11 +570,12 @@ fn seed_variable_declaration_in_session(
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child) {
-                if let Some(target) = resolve_type_fq_name_in_session(
+                if let Some(target) = resolve_declared_type_fq_name_at_in_session(
                     csharp,
-                    token,
-                    file,
                     &reference_type_text(initializer_type, source),
+                    initializer_type,
+                    file,
+                    source,
                     session,
                 ) {
                     bindings.seed_symbol(
@@ -578,7 +593,7 @@ fn seed_variable_declaration_in_session(
             }
         } else {
             seed_symbol_for_type_in_session(
-                name_node, type_node, csharp, token, file, source, bindings, session,
+                name_node, type_node, csharp, file, source, bindings, session,
             );
         }
     }
@@ -593,13 +608,12 @@ fn var_initializer_member_type<T: DeclaredTypeName>(
     declarator: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
     let initializer = variable_declarator_initializer(declarator)?;
-    expression_type_fq_name_inner(initializer, csharp, token, file, source, bindings, usage)
+    expression_type_fq_name_inner(initializer, csharp, token, context, bindings, usage)
 }
 
 use crate::syntax::variable_declarator_initializer;
@@ -612,23 +626,34 @@ fn expression_type_fq_name<T: DeclaredTypeName>(
     source: &str,
     bindings: &LocalInferenceEngine<T>,
 ) -> Option<String> {
-    expression_type_fq_name_inner(expression, csharp, token, file, source, bindings, true)
+    let class_ranges = csharp.class_range_index(file);
+    let context = CSharpTypeReferenceContext {
+        file,
+        source,
+        class_ranges: &class_ranges,
+    };
+    expression_type_fq_name_inner(expression, csharp, token, &context, bindings, true)
 }
 
 fn expression_type_fq_name_inner<T: DeclaredTypeName>(
     expression: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
     match expression.kind() {
         "identifier" => {
-            let name = node_text(expression, source);
+            let name = node_text(expression, context.source);
             unique_precise_binding(bindings, name).or_else(|| {
-                let owner = enclosing_declared_type(expression, csharp, token, file, source)?;
+                let owner = enclosing_declared_type(
+                    expression,
+                    csharp,
+                    token,
+                    context.file,
+                    context.source,
+                )?;
                 member_declared_type_fq_name_for_scope(csharp, token, &owner, name, usage)
             })
         }
@@ -644,23 +669,23 @@ fn expression_type_fq_name_inner<T: DeclaredTypeName>(
                 }
             };
             let name = csharp_member_name(name_node)?;
-            let owners = receiver_type_units(receiver, csharp, token, file, source, bindings);
+            let owners = receiver_type_units(receiver, csharp, token, context, bindings);
             owners.into_iter().find_map(|owner| {
                 member_declared_type_fq_name_for_scope(
                     csharp,
                     token,
                     &owner,
-                    node_text(name.identifier, source),
+                    node_text(name.identifier, context.source),
                     usage,
                 )
             })
         }
         "invocation_expression" => invocation_expression_return_type_fq_name(
-            expression, csharp, token, file, source, bindings, usage,
+            expression, csharp, token, context, bindings, usage,
         ),
         "parenthesized_expression" | "checked_expression" => {
             expression.named_child(0).and_then(|inner| {
-                expression_type_fq_name_inner(inner, csharp, token, file, source, bindings, usage)
+                expression_type_fq_name_inner(inner, csharp, token, context, bindings, usage)
             })
         }
         "cast_expression" | "as_expression" => expression
@@ -670,13 +695,20 @@ fn expression_type_fq_name_inner<T: DeclaredTypeName>(
                 "right"
             })
             .and_then(|type_node| {
-                resolve_type_fq_name_for_scope(
-                    csharp,
-                    token,
-                    file,
-                    &reference_type_text(type_node, source),
-                    usage,
-                )
+                let reference = reference_type_text(type_node, context.source);
+                if usage {
+                    resolve_type_fq_name_at(
+                        csharp,
+                        token,
+                        context.file,
+                        context.class_ranges,
+                        &reference,
+                        type_node,
+                        context.source,
+                    )
+                } else {
+                    resolve_declared_type_fq_name_at(csharp, &reference, type_node, context)
+                }
             }),
         _ => None,
     }
@@ -686,11 +718,12 @@ fn invocation_expression_return_type_fq_name<T: DeclaredTypeName>(
     invocation: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
+    let file = context.file;
+    let source = context.source;
     let function = invocation.child_by_field_name("function")?;
     let arity = argument_count(invocation, source);
     match function.kind() {
@@ -737,7 +770,7 @@ fn invocation_expression_return_type_fq_name<T: DeclaredTypeName>(
             };
             let name = csharp_member_name(name_node)?;
             let type_arguments = resolved_type_arguments(name, csharp, token, file, source, usage);
-            let owners = receiver_type_units(receiver, csharp, token, file, source, bindings);
+            let owners = receiver_type_units(receiver, csharp, token, context, bindings);
             owners.into_iter().find_map(|owner| {
                 method_return_type_fq_name_for_arity_inner(
                     csharp,
@@ -760,24 +793,33 @@ fn receiver_type_units<T: DeclaredTypeName>(
     receiver: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &LocalInferenceEngine<T>,
 ) -> Vec<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
-            let name = node_text(receiver, source);
+            let name = node_text(receiver, context.source);
             if let Some(target) = unique_precise_binding(bindings, name) {
                 return usage_type_declarations_for_fq_name(csharp, token, &target);
             }
             if bindings.is_shadowed(name) {
                 Vec::new()
             } else {
-                enclosing_declared_type(receiver, csharp, token, file, source)
+                enclosing_declared_type(receiver, csharp, token, context.file, context.source)
                     .and_then(|owner| {
                         usage_member_declared_type_fq_name(csharp, token, &owner, name)
                     })
-                    .or_else(|| resolve_usage_type_fq_name(csharp, token, file, name))
+                    .or_else(|| {
+                        resolve_type_fq_name_at(
+                            csharp,
+                            token,
+                            context.file,
+                            context.class_ranges,
+                            name,
+                            receiver,
+                            context.source,
+                        )
+                    })
                     .into_iter()
                     .flat_map(|fq_name| {
                         usage_type_declarations_for_fq_name(csharp, token, &fq_name)
@@ -785,7 +827,7 @@ fn receiver_type_units<T: DeclaredTypeName>(
                     .collect()
             }
         }
-        "this" => enclosing_declared_type(receiver, csharp, token, file, source)
+        "this" => enclosing_declared_type(receiver, csharp, token, context.file, context.source)
             .into_iter()
             .collect(),
         _ => Vec::new(),
@@ -2241,14 +2283,21 @@ fn seed_usage_symbol_for_type(
     type_node: Node<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let reference = reference_type_text(type_node, source);
-    match resolve_usage_type_fq_name(csharp, token, file, &reference) {
-        Some(target) => bindings.seed_symbol(node_text(name_node, source), target),
-        None => bindings.declare_shadow(node_text(name_node, source)),
+    let reference = reference_type_text(type_node, context.source);
+    match resolve_type_fq_name_at(
+        csharp,
+        token,
+        context.file,
+        context.class_ranges,
+        &reference,
+        type_node,
+        context.source,
+    ) {
+        Some(target) => bindings.seed_symbol(node_text(name_node, context.source), target),
+        None => bindings.declare_shadow(node_text(name_node, context.source)),
     }
 }
 
@@ -2256,43 +2305,34 @@ fn seed_symbol_for_type(
     name_node: Node<'_>,
     type_node: Node<'_>,
     csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
-    let reference = reference_type_text(type_node, source);
-    if let Some(target) = resolve_type_fq_name(csharp, token, file, &reference) {
+    let reference = reference_type_text(type_node, context.source);
+    if let Some(target) = resolve_declared_type_fq_name_at(csharp, &reference, type_node, context) {
         bindings.seed_symbol(
-            node_text(name_node, source),
+            node_text(name_node, context.source),
             CSharpDeclaredType::resolved(target),
         );
         return;
     }
-    let normalized = normalize_type_text(&reference);
     let identity = csharp_arity_preserving_full_name(&reference);
-    let raw_type = csharp
-        .using_aliases_of(file)
-        .get(&normalized)
-        .cloned()
-        .unwrap_or(identity);
-    seed_unresolved_symbol(name_node, source, raw_type, bindings);
+    seed_unresolved_symbol(name_node, context.source, identity, bindings);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn seed_symbol_for_type_in_session(
     name_node: Node<'_>,
     type_node: Node<'_>,
     csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
     let reference = reference_type_text(type_node, source);
-    if let Some(target) = resolve_type_fq_name_in_session(csharp, token, file, &reference, session)
-    {
+    if let Some(target) = resolve_declared_type_fq_name_at_in_session(
+        csharp, &reference, type_node, file, source, session,
+    ) {
         bindings.seed_symbol(
             node_text(name_node, source),
             CSharpDeclaredType::resolved(target),
@@ -2302,13 +2342,8 @@ fn seed_symbol_for_type_in_session(
     if !session.observe_cancellation() {
         return;
     }
-    let normalized = normalize_type_text(&reference);
     let identity = csharp_arity_preserving_full_name(&reference);
-    let raw_type = using_aliases_for_file_in_session(csharp, file, session)
-        .get(&normalized)
-        .cloned()
-        .unwrap_or(identity);
-    seed_unresolved_symbol(name_node, source, raw_type, bindings);
+    seed_unresolved_symbol(name_node, source, identity, bindings);
 }
 
 fn seed_unresolved_symbol(
@@ -2380,17 +2415,39 @@ pub(super) fn resolve_type_fq_name_at(
     node: Node<'_>,
     source: &str,
 ) -> Option<String> {
-    let normalized = normalize_and_expand_type_reference(csharp, file, reference);
+    let normalized = normalize_type_text(reference);
     if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
         return None;
     }
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
-    resolve_in_enclosing_type_scopes(csharp, token, class_ranges, &normalized, node.start_byte())
-        .map(|unit| unit.fq_name())
-        .or_else(|| resolve_usage_visible_type_fq_name(csharp, token, file, &normalized))
-        .or_else(|| class_unit_for_fq_name(csharp, token, &normalized).map(|unit| unit.fq_name()))
+
+    if let Some(unit) = resolve_in_enclosing_nested_type_scopes(
+        csharp,
+        token,
+        class_ranges,
+        &normalized,
+        node.start_byte(),
+    ) {
+        return Some(unit.fq_name());
+    }
+
+    let context = graph_support::CSharpLookupContext::at(source, node, || true)?;
+    let mut type_candidates = |fqn: &str| {
+        Some(graph_support::usage_type_candidates_by_fqn(
+            csharp, token, fqn,
+        ))
+    };
+    let candidates = usage_visible_type_candidates_at_with_lookups(
+        csharp,
+        token,
+        file,
+        &context,
+        &normalized,
+        &mut type_candidates,
+    )?;
+    graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
 }
 
 /// Resolve a type name in a grammar-proven context that permits omitted
@@ -2406,7 +2463,7 @@ pub(super) fn resolve_arity_free_type_fq_name_at(
     node: Node<'_>,
     source: &str,
 ) -> Option<String> {
-    let normalized = normalize_and_expand_type_reference(csharp, file, reference);
+    let normalized = normalize_type_text(reference);
     if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
         return None;
     }
@@ -2428,25 +2485,219 @@ pub(super) fn resolve_arity_free_type_fq_name_at(
             )?;
             graph_support::unique_logical_type(candidates)
         });
-    nested
-        .map(|unit| unit.fq_name())
-        .or_else(|| {
-            graph_support::unique_logical_type(
-                graph_support::usage_arity_free_visible_type_candidates(
-                    csharp,
-                    token,
-                    file,
-                    &normalized,
-                ),
-            )
-            .map(|unit| unit.fq_name())
+    if let Some(unit) = nested {
+        return Some(unit.fq_name());
+    }
+
+    let context = graph_support::CSharpLookupContext::at(source, node, || true)?;
+    let mut type_candidates = |fqn: &str| {
+        Some(graph_support::usage_arity_free_type_candidates_by_fqn(
+            csharp, token, fqn,
+        ))
+    };
+    let candidates = usage_visible_type_candidates_at_with_lookups(
+        csharp,
+        token,
+        file,
+        &context,
+        &normalized,
+        &mut type_candidates,
+    )?;
+    graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
+}
+
+fn usage_visible_type_candidates_at_with_lookups<Candidates>(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    context: &graph_support::CSharpLookupContext,
+    name: &str,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<Vec<CodeUnit>>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+{
+    let mut global_alias_target =
+        |alias: &str| Some(csharp.global_using_aliases().get(alias).cloned());
+    let mut global_using_namespaces = || Some(csharp.sorted_global_using_namespaces());
+    let mut namespace_exists = |namespace: &str| {
+        Some(graph_support::usage_workspace_namespace_exists(
+            csharp, token, namespace,
+        ))
+    };
+    graph_support::visible_type_candidates_at_with_lookups(
+        name,
+        context,
+        &mut global_alias_target,
+        &mut global_using_namespaces,
+        &mut namespace_exists,
+        type_candidates_by_fqn,
+        &mut |candidate: &CodeUnit| csharp.compilation_visibility(file, candidate.source()),
+        &mut || true,
+    )
+    // An answer that depends on unproven compilation membership is not a
+    // resolved type; the receiver stays unresolved and its sites unproven.
+    .and_then(graph_support::VisibleTypes::proven)
+}
+
+fn declared_visible_type_candidates_at_with_lookups<Candidates>(
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    context: &graph_support::CSharpLookupContext,
+    name: &str,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<Vec<CodeUnit>>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+{
+    let mut global_alias_target =
+        |alias: &str| Some(csharp.global_using_aliases().get(alias).cloned());
+    let mut global_using_namespaces = || Some(csharp.sorted_global_using_namespaces());
+    let mut namespace_exists = |namespace: &str| Some(csharp.workspace_namespace_exists(namespace));
+    graph_support::visible_type_candidates_at_with_lookups(
+        name,
+        context,
+        &mut global_alias_target,
+        &mut global_using_namespaces,
+        &mut namespace_exists,
+        type_candidates_by_fqn,
+        &mut |candidate: &CodeUnit| csharp.compilation_visibility(file, candidate.source()),
+        &mut || true,
+    )
+    // An answer that depends on unproven compilation membership is not a
+    // resolved type; the receiver stays unresolved and its sites unproven.
+    .and_then(graph_support::VisibleTypes::proven)
+}
+
+fn visible_type_candidates_at_in_session<Candidates, NamespaceExists>(
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    context: &graph_support::CSharpLookupContext,
+    name: &str,
+    namespace_exists: &mut NamespaceExists,
+    type_candidates_by_fqn: &mut Candidates,
+    session: &ResolutionSession,
+) -> Option<Vec<CodeUnit>>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    NamespaceExists: FnMut(&str) -> Option<bool>,
+{
+    let mut global_alias_target = |alias: &str| {
+        let aliases = session.query_limited_rows(|limit| {
+            csharp.global_using_aliases_limited(limit, &mut || session.observe_cancellation())
+        });
+        session.observe_cancellation().then(|| {
+            aliases
+                .into_iter()
+                .find(|(candidate, _)| candidate == alias)
+                .map(|(_, target)| target)
         })
-        .or_else(|| {
-            graph_support::unique_logical_type(
-                graph_support::usage_arity_free_type_candidates_by_fqn(csharp, token, &normalized),
-            )
-            .map(|unit| unit.fq_name())
-        })
+    };
+    let mut global_using_namespaces = || {
+        let mut namespaces = session.query_limited_rows(|limit| {
+            csharp.global_using_namespaces_limited(limit, &mut || session.observe_cancellation())
+        });
+        namespaces.sort();
+        session.observe_cancellation().then_some(namespaces)
+    };
+    graph_support::visible_type_candidates_at_with_lookups(
+        name,
+        context,
+        &mut global_alias_target,
+        &mut global_using_namespaces,
+        namespace_exists,
+        type_candidates_by_fqn,
+        &mut |candidate: &CodeUnit| csharp.compilation_visibility(file, candidate.source()),
+        &mut || session.scope_step(),
+    )
+    // An answer that depends on unproven compilation membership is not a
+    // resolved type; the receiver stays unresolved and its sites unproven.
+    .and_then(graph_support::VisibleTypes::proven)
+}
+
+fn declared_visible_type_candidates_at_in_session(
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    context: &graph_support::CSharpLookupContext,
+    name: &str,
+    session: &ResolutionSession,
+) -> Option<Vec<CodeUnit>> {
+    let mut namespace_exists =
+        |namespace: &str| session.query(|| csharp.workspace_namespace_exists(namespace));
+    let mut type_candidates = |fqn: &str| {
+        let candidates = forward_type_declarations_for_fq_name_in_session(csharp, fqn, session);
+        session.observe_cancellation().then_some(candidates)
+    };
+    visible_type_candidates_at_in_session(
+        csharp,
+        file,
+        context,
+        name,
+        &mut namespace_exists,
+        &mut type_candidates,
+        session,
+    )
+}
+
+fn resolve_declared_type_fq_name_at(
+    csharp: &dyn CSharpSource,
+    reference: &str,
+    node: Node<'_>,
+    site: &CSharpTypeReferenceContext<'_>,
+) -> Option<String> {
+    let normalized = normalize_type_text(reference);
+    if normalized.is_empty() || type_parameter_shadows_reference(node, site.source, &normalized) {
+        return None;
+    }
+    if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
+        return Some(canonical.to_string());
+    }
+    if let Some(declaring_type) = site.class_ranges.enclosing(node.start_byte()) {
+        let nested = graph_support::enclosing_type_candidates_with_lookups(
+            declaring_type,
+            &normalized,
+            &mut |fqn| Some(forward_type_declarations_for_fq_name(csharp, fqn)),
+        )?;
+        if let Some(unit) = graph_support::unique_logical_type(nested) {
+            return Some(unit.fq_name());
+        }
+    }
+    let lookup_context = graph_support::CSharpLookupContext::at(site.source, node, || true)?;
+    let mut type_candidates = |fqn: &str| Some(forward_type_declarations_for_fq_name(csharp, fqn));
+    let candidates = declared_visible_type_candidates_at_with_lookups(
+        csharp,
+        site.file,
+        &lookup_context,
+        &normalized,
+        &mut type_candidates,
+    )?;
+    graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
+}
+
+fn resolve_declared_type_fq_name_at_in_session(
+    csharp: &dyn CSharpSource,
+    reference: &str,
+    node: Node<'_>,
+    file: &ProjectFile,
+    source: &str,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let normalized = normalize_type_text(reference);
+    if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
+        return None;
+    }
+    if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
+        return Some(canonical.to_string());
+    }
+    let context = graph_support::CSharpLookupContext::at(source, node, || session.scope_step())?;
+    let candidates = declared_visible_type_candidates_at_in_session(
+        csharp,
+        file,
+        &context,
+        &normalized,
+        session,
+    )?;
+    graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
 }
 
 pub fn resolve_type_fq_name(
@@ -2576,18 +2827,31 @@ pub(super) fn usage_attribute_type_candidates(
     source: &str,
 ) -> Vec<CodeUnit> {
     let names = csharp_attribute_type_names(name, source);
+    let Some(context) = graph_support::CSharpLookupContext::at(source, name, || true) else {
+        return Vec::new();
+    };
     let mut type_candidates = |spelling: &str| {
-        Some(
-            match resolve_in_enclosing_type_scopes(
-                csharp,
-                token,
-                class_ranges,
-                spelling,
-                name.start_byte(),
-            ) {
-                Some(unit) => vec![unit],
-                None => graph_support::usage_visible_type_candidates(csharp, token, file, spelling),
-            },
+        if let Some(unit) = resolve_in_enclosing_nested_type_scopes(
+            csharp,
+            token,
+            class_ranges,
+            spelling,
+            name.start_byte(),
+        ) {
+            return Some(vec![unit]);
+        }
+        let mut declaration_candidates = |fqn: &str| {
+            Some(graph_support::usage_type_candidates_by_fqn(
+                csharp, token, fqn,
+            ))
+        };
+        usage_visible_type_candidates_at_with_lookups(
+            csharp,
+            token,
+            file,
+            &context,
+            spelling,
+            &mut declaration_candidates,
         )
     };
     hierarchy::usage_unambiguous_attribute_type_candidates(
@@ -2598,7 +2862,7 @@ pub(super) fn usage_attribute_type_candidates(
     )
 }
 
-fn resolve_in_enclosing_type_scopes(
+fn resolve_in_enclosing_nested_type_scopes(
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
     class_ranges: &ClassRangeIndex,
@@ -2642,9 +2906,7 @@ fn resolve_in_enclosing_type_scopes(
             });
         }
 
-        let Some(parent) = csharp.parent_of(&scope) else {
-            return resolve_in_enclosing_namespace(csharp, token, scope.package_name(), name);
-        };
+        let parent = csharp.parent_of(&scope)?;
         scope = parent;
     }
 }
@@ -2662,8 +2924,11 @@ fn nested_class_children_named(
     }
     parts
         .into_iter()
-        .flat_map(|part| csharp.direct_children(&part))
-        .filter(|child| child.is_class() && child.identifier() == name)
+        .flat_map(|part| {
+            csharp.direct_children_where(&part, &|child| {
+                child.is_class() && child.identifier() == name
+            })
+        })
         .collect()
 }
 
@@ -2727,22 +2992,6 @@ fn resolve_nested_type_suffix(
             .flatten()?;
     }
     Some(owner)
-}
-
-fn resolve_in_enclosing_namespace(
-    csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    namespace: &str,
-    name: &str,
-) -> Option<CodeUnit> {
-    brokk_bifrost_core::analyzer::usages::common::namespace_prefixes(namespace).find_map(|scope| {
-        let candidate_fqn = if scope.is_empty() {
-            name.to_string()
-        } else {
-            format!("{scope}.{name}")
-        };
-        class_unit_for_fq_name(csharp, token, &candidate_fqn)
-    })
 }
 
 pub fn type_parameter_shadows_reference(node: Node<'_>, source: &str, reference: &str) -> bool {
@@ -4095,7 +4344,10 @@ pub fn compatible_receiver_type_names(
                     }
                     stack.extend(direct);
                 }
-            } else if let Some(provider) = graph.hierarchy {
+            } else if graph.hierarchy.is_some() {
+                // Through the reference's own source: a membership view
+                // derives each base contribution by its part's membership.
+                let provider: &dyn TypeHierarchyProvider = csharp;
                 let mut stack = provider.get_direct_ancestors(&owner);
                 let mut seen = HashSet::default();
                 while let Some(ancestor) = stack.pop() {
@@ -4202,7 +4454,13 @@ pub(super) fn receiver_targets_owner(
     source: &str,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
-    receiver_type_fq_names(receiver_node, graph, csharp, token, file, source, bindings)
+    let class_ranges = csharp.class_range_index(file);
+    let context = CSharpTypeReferenceContext {
+        file,
+        source,
+        class_ranges: &class_ranges,
+    };
+    receiver_type_fq_names(receiver_node, graph, csharp, token, &context, bindings)
 }
 
 fn receiver_type_fq_names(
@@ -4210,13 +4468,12 @@ fn receiver_type_fq_names(
     graph: &CSharpGraphSource<'_>,
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
+    context: &CSharpTypeReferenceContext<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
     match receiver_node.kind() {
         "identifier" => {
-            let receiver = node_text(receiver_node, source);
+            let receiver = node_text(receiver_node, context.source);
             match bindings.resolve_symbol(receiver) {
                 SymbolResolution::Precise(targets) => SymbolResolution::Precise(targets),
                 SymbolResolution::Unknown if !bindings.is_shadowed(receiver) => {
@@ -4226,39 +4483,50 @@ fn receiver_type_fq_names(
                         graph,
                         csharp,
                         token,
-                        file,
-                        source,
+                        context.file,
+                        context.source,
                     )
                 }
                 resolution => resolution,
             }
         }
-        "member_access_expression" | "conditional_access_expression" => {
-            expression_type_fq_name(receiver_node, csharp, token, file, source, bindings)
-                .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
-                .unwrap_or(SymbolResolution::Unknown)
-        }
-        "invocation_expression" => {
-            expression_type_fq_name(receiver_node, csharp, token, file, source, bindings)
-                .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
-                .unwrap_or(SymbolResolution::Unknown)
-        }
+        "member_access_expression" | "conditional_access_expression" => expression_type_fq_name(
+            receiver_node,
+            csharp,
+            token,
+            context.file,
+            context.source,
+            bindings,
+        )
+        .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+        .unwrap_or(SymbolResolution::Unknown),
+        "invocation_expression" => expression_type_fq_name(
+            receiver_node,
+            csharp,
+            token,
+            context.file,
+            context.source,
+            bindings,
+        )
+        .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+        .unwrap_or(SymbolResolution::Unknown),
         "object_creation_expression" => object_created_type(receiver_node)
             .and_then(|type_node| {
-                resolve_usage_type_fq_name(
+                resolve_type_fq_name_at(
                     csharp,
                     token,
-                    file,
-                    &reference_type_text(type_node, source),
+                    context.file,
+                    context.class_ranges,
+                    &reference_type_text(type_node, context.source),
+                    type_node,
+                    context.source,
                 )
             })
             .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
             .unwrap_or(SymbolResolution::Unknown),
         "parenthesized_expression" | "checked_expression" => receiver_node
             .named_child(0)
-            .map(|inner| {
-                receiver_type_fq_names(inner, graph, csharp, token, file, source, bindings)
-            })
+            .map(|inner| receiver_type_fq_names(inner, graph, csharp, token, context, bindings))
             .unwrap_or(SymbolResolution::Unknown),
         "cast_expression" | "as_expression" => receiver_node
             .child_by_field_name(if receiver_node.kind() == "cast_expression" {
@@ -4267,22 +4535,29 @@ fn receiver_type_fq_names(
                 "right"
             })
             .and_then(|type_node| {
-                resolve_usage_type_fq_name(
+                resolve_type_fq_name_at(
                     csharp,
                     token,
-                    file,
-                    &reference_type_text(type_node, source),
+                    context.file,
+                    context.class_ranges,
+                    &reference_type_text(type_node, context.source),
+                    type_node,
+                    context.source,
                 )
             })
             .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
             .unwrap_or(SymbolResolution::Unknown),
-        "this" => enclosing_declared_type(receiver_node, csharp, token, file, source)
-            .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
-            .unwrap_or(SymbolResolution::Unknown),
-        "base" => enclosing_declared_type(receiver_node, csharp, token, file, source)
-            .and_then(|owner| usage_direct_base(graph, csharp, token, &owner))
-            .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
-            .unwrap_or(SymbolResolution::Unknown),
+        "this" => {
+            enclosing_declared_type(receiver_node, csharp, token, context.file, context.source)
+                .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
+                .unwrap_or(SymbolResolution::Unknown)
+        }
+        "base" => {
+            enclosing_declared_type(receiver_node, csharp, token, context.file, context.source)
+                .and_then(|owner| usage_direct_base(graph, csharp, token, &owner))
+                .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
+                .unwrap_or(SymbolResolution::Unknown)
+        }
         _ => SymbolResolution::Unknown,
     }
 }
@@ -4637,7 +4912,11 @@ pub fn nearest_member_candidates_for_owner_inner(
             return members;
         }
         if !usage && session.is_none() && hierarchy.is_none() {
-            hierarchy = graph.hierarchy;
+            // Through the reference's own source, as in
+            // compatible_receiver_type_names.
+            hierarchy = graph
+                .hierarchy
+                .map(|_| csharp as &dyn TypeHierarchyProvider);
         }
         let mut next_level = Vec::new();
         if usage {

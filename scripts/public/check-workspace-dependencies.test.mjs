@@ -6,6 +6,7 @@ import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
 // Each extracted implementation adds one descriptor; its fixture package,
 // required edges, consumers and layer checks follow from this entry.
 const languageImplementations = [
+  { name: "brokk-bifrost-jvm-analysis", knowledge: "brokk-bifrost-jvm", extra: ["brokk-bifrost-semantic"], consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"] },
   { name: "brokk-bifrost-rust-analysis", knowledge: "brokk-bifrost-rust", extra: ["brokk-bifrost-semantic"], consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs", "brokk-bifrost-policy"] },
   { name: "brokk-bifrost-go-analysis", knowledge: "brokk-bifrost-go", extra: ["brokk-bifrost-semantic"], consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql", "brokk-bifrost-semantic-packs"] },
   { name: "brokk-bifrost-cpp-analysis", knowledge: "brokk-bifrost-cpp", consumers: ["brokk-bifrost-tools", "brokk-bifrost-rql"] },

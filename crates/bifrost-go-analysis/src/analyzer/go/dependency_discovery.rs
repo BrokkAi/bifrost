@@ -186,6 +186,28 @@ fn discover_with_runner(
     cancellation: Option<&CancellationToken>,
     runner: &dyn GoCommandRunner,
 ) -> GoDiscoveryOutcome {
+    discover_domain_with_runner(
+        config,
+        project,
+        limits,
+        cancellation,
+        runner,
+        &Default::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn discover_domain_with_runner(
+    config: &GoAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    runner: &dyn GoCommandRunner,
+    domain: &brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
+    environment: Option<GoEnvironment>,
+) -> GoDiscoveryOutcome {
+    let root = project.root().join(&domain.directory);
     let discovery = &config.dependency_discovery;
     if discovery.mode == GoDependencyDiscoveryMode::Disabled {
         return DependencyDiscoveryOutcome::complete(Vec::new()).into();
@@ -200,7 +222,13 @@ fn discover_with_runner(
         .go_executable
         .as_deref()
         .unwrap_or_else(|| Path::new("go"));
-    let base_env = hardened_environment(discovery);
+    let mut base_env = hardened_environment(discovery);
+    let gowork = if domain.gowork_path.is_empty() {
+        OsString::from("off")
+    } else {
+        project.root().join(&domain.gowork_path).into_os_string()
+    };
+    set_env(&mut base_env, "GOWORK", &gowork);
     let env_invocation = GoInvocation {
         args: [
             "env",
@@ -220,27 +248,29 @@ fn discover_with_runner(
         stdout_limit: MAX_GO_ENV_STDOUT_BYTES,
         description: "Go environment discovery",
     };
-    let env_bytes = match runner.run(
-        executable,
-        project.root(),
-        discovery,
-        &env_invocation,
-        cancellation,
-    ) {
-        Ok(bytes) => bytes,
-        Err(error) => return failed_outcome("go.env_failed", error, cancellation, limits).into(),
-    };
-    let environment: GoEnvironment = match serde_json::from_slice(&env_bytes) {
-        Ok(environment) => environment,
-        Err(error) => {
-            return failed_outcome(
-                "go.env_invalid_json",
-                format!("Go environment discovery returned invalid JSON: {error}"),
-                cancellation,
-                limits,
-            )
-            .into();
-        }
+    let environment = if let Some(environment) = environment {
+        environment
+    } else {
+        let env_bytes =
+            match runner.run(executable, &root, discovery, &env_invocation, cancellation) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return failed_outcome("go.env_failed", error, cancellation, limits).into();
+                }
+            };
+        let environment: GoEnvironment = match serde_json::from_slice(&env_bytes) {
+            Ok(environment) => environment,
+            Err(error) => {
+                return failed_outcome(
+                    "go.env_invalid_json",
+                    format!("Go environment discovery returned invalid JSON: {error}"),
+                    cancellation,
+                    limits,
+                )
+                .into();
+            }
+        };
+        environment
     };
     let goos = discovery.goos.as_deref().unwrap_or(&environment.goos);
     let goarch = discovery.goarch.as_deref().unwrap_or(&environment.goarch);
@@ -253,7 +283,7 @@ fn discover_with_runner(
         )
         .into();
     }
-    let vendor = project.root().join("vendor").join("modules.txt").is_file();
+    let vendor = root.join("vendor").join("modules.txt").is_file();
     let mut list_args = vec![
         OsString::from("list"),
         OsString::from("-deps"),
@@ -272,72 +302,79 @@ fn discover_with_runner(
             discovery.build_tags.join(",")
         )));
     }
-    list_args.extend(discovery.workspace_patterns.iter().map(OsString::from));
+    if domain.gowork_path.is_empty() {
+        list_args.extend(discovery.workspace_patterns.iter().map(OsString::from));
+    } else {
+        list_args.extend(
+            domain
+                .modules
+                .iter()
+                .map(|(_, module)| OsString::from(format!("{module}/..."))),
+        );
+    }
     let list_invocation = GoInvocation {
         args: list_args,
         env: target_environment(discovery, &environment, goos, goarch),
         stdout_limit: MAX_GO_LIST_STDOUT_BYTES,
         description: "Go package discovery",
     };
-    let package_bytes = match runner.run(
-        executable,
-        project.root(),
-        discovery,
-        &list_invocation,
-        cancellation,
-    ) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let semantic_packs =
-                failed_outcome("go.list_failed", error.clone(), cancellation, limits);
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return semantic_packs.into();
-            }
-            // An unsuccessful root invocation has no per-file selection
-            // authority. Retain its structured failure alongside inventory
-            // placements instead of erasing them with an empty tool profile.
-            let packages = discovery
-                .workspace_patterns
-                .iter()
-                .map(|pattern| GoPackage {
-                    import_path: pattern.clone(),
-                    name: String::new(),
-                    dir: project.root().to_path_buf(),
-                    standard: false,
-                    incomplete: true,
-                    error: Some(GoPackageError {
-                        err: error.clone(),
-                        import_stack: Vec::new(),
-                        pos: String::new(),
+    let package_bytes =
+        match runner.run(executable, &root, discovery, &list_invocation, cancellation) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let semantic_packs =
+                    failed_outcome("go.list_failed", error.clone(), cancellation, limits);
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return semantic_packs.into();
+                }
+                // An unsuccessful root invocation has no per-file selection
+                // authority. Retain its structured failure alongside inventory
+                // placements instead of erasing them with an empty tool profile.
+                let packages = discovery
+                    .workspace_patterns
+                    .iter()
+                    .map(|pattern| GoPackage {
+                        import_path: pattern.clone(),
+                        name: String::new(),
+                        dir: root.clone(),
+                        standard: false,
+                        incomplete: true,
+                        error: Some(GoPackageError {
+                            err: error.clone(),
+                            import_stack: Vec::new(),
+                            pos: String::new(),
+                        }),
+                        module: None,
+                        go_files: Vec::new(),
+                        cgo_files: Vec::new(),
+                        ignored_go_files: Vec::new(),
+                        imports: Vec::new(),
+                        import_map: BTreeMap::new(),
+                        for_test: String::new(),
+                        test_go_files: Vec::new(),
+                        x_test_go_files: Vec::new(),
+                        test_imports: Vec::new(),
+                        x_test_imports: Vec::new(),
+                        deps_errors: Vec::new(),
+                    })
+                    .collect();
+                return GoDiscoveryOutcome {
+                    canonical: Some(GoPackageDiscovery {
+                        domain: domain.clone(),
+                        input_digest: None,
+                        failure: None,
+                        packages,
+                        environment: environment.clone(),
+                        goos: goos.to_owned(),
+                        goarch: goarch.to_owned(),
+                        build_tags: discovery.build_tags.clone(),
+                        workspace_patterns: discovery.workspace_patterns.clone(),
+                        vendor,
                     }),
-                    module: None,
-                    go_files: Vec::new(),
-                    cgo_files: Vec::new(),
-                    ignored_go_files: Vec::new(),
-                    imports: Vec::new(),
-                    import_map: BTreeMap::new(),
-                    for_test: String::new(),
-                    test_go_files: Vec::new(),
-                    x_test_go_files: Vec::new(),
-                    test_imports: Vec::new(),
-                    x_test_imports: Vec::new(),
-                    deps_errors: Vec::new(),
-                })
-                .collect();
-            return GoDiscoveryOutcome {
-                canonical: Some(GoPackageDiscovery {
-                    packages,
-                    environment: environment.clone(),
-                    goos: goos.to_owned(),
-                    goarch: goarch.to_owned(),
-                    build_tags: discovery.build_tags.clone(),
-                    workspace_patterns: discovery.workspace_patterns.clone(),
-                    vendor,
-                }),
-                semantic_packs,
-            };
-        }
-    };
+                    semantic_packs,
+                };
+            }
+        };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_outcome().into();
     }
@@ -348,6 +385,9 @@ fn discover_with_runner(
         }
     };
     let canonical = GoPackageDiscovery {
+        domain: domain.clone(),
+        input_digest: None,
+        failure: None,
         packages: packages.clone(),
         environment: environment.clone(),
         goos: goos.to_owned(),
@@ -360,6 +400,9 @@ fn discover_with_runner(
         canonical: Some(canonical),
         semantic_packs,
     };
+    if !domain.directory.is_empty() {
+        return finish(DependencyDiscoveryOutcome::complete(Vec::new()));
+    }
     if discovery.mode == GoDependencyDiscoveryMode::CuratedPackEvidence {
         return finish(build_curated_pack_evidence_outcome(
             packages,
@@ -384,23 +427,18 @@ fn discover_with_runner(
         let mut cgo_invocation = list_invocation;
         set_env(&mut cgo_invocation.env, "CGO_ENABLED", OsStr::new("1"));
         cgo_invocation.description = "Go cgo surface discovery";
-        let cgo_bytes = match runner.run(
-            executable,
-            project.root(),
-            discovery,
-            &cgo_invocation,
-            cancellation,
-        ) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return finish(failed_outcome(
-                    "go.cgo_probe_failed",
-                    error,
-                    cancellation,
-                    limits,
-                ));
-            }
-        };
+        let cgo_bytes =
+            match runner.run(executable, &root, discovery, &cgo_invocation, cancellation) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return finish(failed_outcome(
+                        "go.cgo_probe_failed",
+                        error,
+                        cancellation,
+                        limits,
+                    ));
+                }
+            };
         let cgo_packages = match parse_package_stream(&cgo_bytes) {
             Ok(packages) => packages,
             Err(error) => {
@@ -426,7 +464,7 @@ fn discover_with_runner(
     finish(build_outcome(
         packages,
         &environment,
-        project.root(),
+        &root,
         goos,
         goarch,
         discovery,
@@ -543,6 +581,7 @@ fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, 
         os_env("GOPROXY", "off"),
         os_env("GOSUMDB", "off"),
         os_env("GOENV", "off"),
+        os_env("GOWORK", "off"),
         os_env("GOFLAGS", "-buildvcs=false"),
         os_env("CGO_ENABLED", "0"),
     ]);
@@ -607,6 +646,7 @@ fn target_environment(
     let mut env = hardened_environment(config);
     set_env(&mut env, "GOOS", OsStr::new(goos));
     set_env(&mut env, "GOARCH", OsStr::new(goarch));
+    set_env(&mut env, "GOWORK", OsStr::new(&environment.gowork));
     set_env(&mut env, "GOROOT", environment.goroot.as_os_str());
     set_env(&mut env, "GOPATH", environment.gopath.as_os_str());
     set_env(&mut env, "GOMODCACHE", environment.gomodcache.as_os_str());
@@ -1270,6 +1310,71 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
     DependencyDiscoveryOutcome::cancelled_with_message("Go dependency discovery was cancelled")
 }
 
+/// Environment observation precedes the reconciliation-only rerun decision.
+pub(crate) fn domain_environment(
+    config: &GoAnalyzerConfig,
+    project: &dyn Project,
+    domain: &brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
+    cancellation: &CancellationToken,
+) -> Result<GoEnvironment, String> {
+    let config = &config.dependency_discovery;
+    let mut env = hardened_environment(config);
+    let gowork = if domain.gowork_path.is_empty() {
+        OsString::from("off")
+    } else {
+        project.root().join(&domain.gowork_path).into_os_string()
+    };
+    set_env(&mut env, "GOWORK", &gowork);
+    let bytes = SystemGoCommandRunner.run(
+        config
+            .go_executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new("go")),
+        &project.root().join(&domain.directory),
+        config,
+        &GoInvocation {
+            args: [
+                "env",
+                "-json",
+                "GOROOT",
+                "GOPATH",
+                "GOMODCACHE",
+                "GOVERSION",
+                "GOWORK",
+                "GOOS",
+                "GOARCH",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+            env,
+            stdout_limit: MAX_GO_ENV_STDOUT_BYTES,
+            description: "Go domain environment discovery",
+        },
+        Some(cancellation),
+    )?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid Go environment: {error}"))
+}
+
+pub(crate) fn discover_domain(
+    config: &GoAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: &CancellationToken,
+    domain: &brokk_bifrost_go::package_discovery::GoDiscoveryDomain,
+    environment: GoEnvironment,
+) -> GoDiscoveryOutcome {
+    discover_domain_with_runner(
+        config,
+        project,
+        limits,
+        Some(cancellation),
+        &SystemGoCommandRunner,
+        domain,
+        Some(environment),
+    )
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1295,6 +1400,7 @@ mod tests {
     struct FakeRunner {
         outputs: RefCell<VecDeque<Result<Vec<u8>, String>>>,
         invocations: RefCell<Vec<GoInvocation>>,
+        roots: RefCell<Vec<PathBuf>>,
     }
 
     impl FakeRunner {
@@ -1302,6 +1408,7 @@ mod tests {
             Self {
                 outputs: RefCell::new(outputs.into_iter().map(Ok).collect()),
                 invocations: RefCell::new(Vec::new()),
+                roots: RefCell::new(Vec::new()),
             }
         }
     }
@@ -1310,11 +1417,12 @@ mod tests {
         fn run(
             &self,
             _executable: &Path,
-            _root: &Path,
+            root: &Path,
             _config: &GoDependencyDiscoveryConfig,
             invocation: &GoInvocation,
             _cancellation: Option<&CancellationToken>,
         ) -> Result<Vec<u8>, String> {
+            self.roots.borrow_mut().push(root.to_path_buf());
             self.invocations.borrow_mut().push(invocation.clone());
             self.outputs.borrow_mut().pop_front().unwrap()
         }
@@ -1660,6 +1768,435 @@ mod tests {
         assert_eq!(go_version("devel go1.28-deadbeef"), None);
     }
 
+    #[test]
+    fn go_domains_use_structured_membership_and_isolated_invocations() {
+        use brokk_bifrost_go::package_discovery::go_discovery_domains;
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/root\n")
+            .file("go.work", "go 1.22\nuse ./shared\n")
+            .file("shared/go.mod", "module example.test/shared\n")
+            .file("nested/go.mod", "module example.test/nested\n")
+            .file("team/go.work", "go 1.22\nuse (\n./a\n./b\n)\n")
+            .file("team/a/go.mod", "module example.test/a\n")
+            .file("team/b/go.mod", "module example.test/b\n")
+            .file("vendor/ignored/go.mod", "module example.test/vendor\n")
+            .file("testdata/ignored/go.mod", "module example.test/testdata\n")
+            .file("_hidden/go.mod", "module example.test/hidden\n")
+            .file(".hidden/go.mod", "module example.test/dot\n")
+            .file("empty/go.mod", "")
+            .build();
+        let inputs = fixture
+            .project_dyn()
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .filter(|file| {
+                file.rel_path()
+                    .file_name()
+                    .is_some_and(|name| name == "go.mod" || name == "go.work")
+            })
+            .map(|file| {
+                (
+                    file.rel_path().to_path_buf(),
+                    fixture.project_dyn().read_source(&file).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let domains = go_discovery_domains(fixture.root(), &inputs).unwrap();
+        assert_eq!(
+            domains.len(),
+            4,
+            "root isolated, root workfile, nested, team workfile: {domains:?}"
+        );
+        let mut outcomes = Vec::new();
+        for domain in &domains {
+            let runner = FakeRunner::with_outputs([environment(fixture.root()), Vec::new()]);
+            if domain.directory == "nested" {
+                *runner.outputs.borrow_mut().back_mut().unwrap() = Err("offline domain".into());
+            }
+            let mut config = config();
+            config.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+            let outcome = discover_domain_with_runner(
+                &config,
+                fixture.project_dyn().as_ref(),
+                &DependencyPackLimits::default(),
+                None,
+                &runner,
+                domain,
+                None,
+            );
+            assert!(
+                runner
+                    .roots
+                    .borrow()
+                    .iter()
+                    .all(|root| root == &fixture.root().join(&domain.directory))
+            );
+            let expected = if domain.gowork_path.is_empty() {
+                OsString::from("off")
+            } else {
+                fixture.root().join(&domain.gowork_path).into_os_string()
+            };
+            assert!(
+                runner.invocations.borrow()[0]
+                    .env
+                    .iter()
+                    .any(|(key, value)| key == "GOWORK" && value == &expected)
+            );
+            if !domain.gowork_path.is_empty() {
+                for (_, module) in &domain.modules {
+                    assert!(
+                        runner.invocations.borrow()[1]
+                            .args
+                            .contains(&OsString::from(format!("{module}/...")))
+                    );
+                }
+            }
+            outcomes.push((domain.directory.clone(), outcome.semantic_packs.complete));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .any(|(directory, complete)| directory == "nested" && !*complete)
+        );
+        assert_eq!(
+            outcomes.iter().filter(|(_, complete)| *complete).count(),
+            3,
+            "a failed domain leaves sibling outcomes: {outcomes:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_go_domain_lifecycle_reuses_placement_and_retries_incomplete_domains() {
+        use crate::analyzer::go::dependency_packs::{
+            GoReconciliationTrigger, reconcile_selected_go_domains,
+        };
+        use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+        use brokk_bifrost_analysis::analyzer::workspace::{
+            DependencyPackEcosystem, WorkspaceAnalyzer,
+        };
+        use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::PermissionsExt;
+        let Some(go) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|path| path.join("go"))
+            .find(|path| path.is_file())
+        else {
+            return;
+        };
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/root\n\ngo 1.22\n")
+            .file(
+                "root.go",
+                "package root\nfunc Value() int {return 1}\nfunc caller(){_ = Value()}\n",
+            )
+            .file("nested/go.mod", "module example.test/nested\n\ngo 1.22\n")
+            .file(
+                "nested/nested.go",
+                "package nested\nfunc Value() int {return 1}\n",
+            )
+            .build();
+        let log = fixture.root().join("go-invocations");
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let wrapper = fixture.root().join("go-wrapper");
+        std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$1\" = list ]; then pwd >> {}; if [ -f \"$PWD/fail-list\" ]; then echo forced-offline >&2; exit 1; fi; fi\nexec {} \"$@\"\n",quote(&log),quote(&go))).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.go_executable = Some(wrapper);
+        config.go.dependency_discovery.timeout = Duration::from_secs(30);
+        let database = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_persistent(
+                &database.path().join("domains.db"),
+            )
+            .unwrap(),
+        );
+        let store_context =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_shared_store(
+                fixture.project_dyn().as_ref(),
+                store,
+                false,
+            );
+        let mut workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+            fixture.project_dyn(),
+            config.clone(),
+            store_context,
+        )
+        .unwrap();
+        let activate = |workspace: &WorkspaceAnalyzer| {
+            workspace.resolve_dependency_discovery(
+                DependencyPackEcosystem::Go,
+                &config,
+                &DependencyPackLimits::default(),
+                &CancellationToken::new(),
+            )
+        };
+        let clear = || std::fs::write(&log, "").unwrap();
+        let runs = || {
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(activate(&workspace).complete);
+        assert_eq!(runs().len(), 2, "each initial module invokes Go once");
+        let context = |workspace: &WorkspaceAnalyzer, directory: &str| {
+            let conn = workspace.store().unwrap().read_conn().unwrap();
+            conn.query_row("SELECT p.context_id,s.profile_digest,p.complete FROM go_context_selections s JOIN go_context_publications p USING(selection_id) WHERE s.domain_dir=?1 AND p.valid_until IS NULL AND s.profile_digest<>?2",
+                rusqlite::params![directory,brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile()],
+                |row|Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,bool>(2)?))).unwrap()
+        };
+        let root = context(&workspace, "");
+        let nested = context(&workspace, "nested");
+        assert_ne!(root.1, nested.1, "module domains have distinct profiles");
+        clear();
+        fixture
+            .file("nested/nested.go")
+            .write("package nested\nfunc Value() int {return 2}\n")
+            .unwrap();
+        workspace = workspace.update(&BTreeSet::from([fixture.file("nested/nested.go")]));
+        assert_eq!(
+            runs(),
+            vec![fixture.root().join("nested")],
+            "body edit reruns only its domain"
+        );
+        assert_eq!(
+            context(&workspace, "nested").0,
+            nested.0,
+            "body edit cuts off placement publication"
+        );
+        clear();
+        fixture
+            .file("nested/go.mod")
+            .write("module example.test/nested2\n\ngo 1.22\n")
+            .unwrap();
+        workspace = workspace.update(&BTreeSet::from([fixture.file("nested/go.mod")]));
+        assert_eq!(runs(), vec![fixture.root().join("nested")]);
+        assert_ne!(
+            context(&workspace, "nested").0,
+            nested.0,
+            "module identity change publishes placement"
+        );
+        clear();
+        let summary = |workspace: &WorkspaceAnalyzer| {
+            let conn = workspace.store().unwrap().read_conn().unwrap();
+            conn.query_row("SELECT versions.valid_from FROM resolution_unit_summary_versions versions JOIN resolution_unit_summaries summary USING(summary_id) WHERE versions.lang='go' AND versions.valid_until IS NULL AND versions.profile_digest=?1 LIMIT 1",[&root.1],|row|row.get::<_,i64>(0)).unwrap()
+        };
+        let previous = summary(&workspace);
+        let source =
+            "package root\nfunc Value() string {return \"new\"}\nfunc caller(){_ = Value()}\n";
+        fixture.file("root.go").write(source).unwrap();
+        workspace = workspace.update(&BTreeSet::from([fixture.file("root.go")]));
+        assert_eq!(
+            context(&workspace, "").0,
+            root.0,
+            "signature edit leaves placement unchanged"
+        );
+        assert!(
+            summary(&workspace) > previous,
+            "changed member blob rolls the summary version despite cutoff"
+        );
+        let analyzer =
+            resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer()).unwrap();
+        let value = analyzer
+            .declarations(&fixture.file("root.go"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "Value")
+            .unwrap();
+        assert!(
+            analyzer
+                .signature_metadata(&value)
+                .iter()
+                .any(|metadata| metadata.return_type_text() == Some("string")),
+            "{:?}",
+            analyzer.signature_metadata(&value)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut pending = vec![tree.root_node()];
+        let mut call = None;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "call_expression" {
+                call = node.child_by_field_name("function");
+                break;
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+        let call = call.unwrap();
+        let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+            path: "root.go".into(),
+            text: "Value".into(),
+            range: brokk_bifrost_core::analyzer::model::Range {
+                start_byte: call.start_byte(),
+                end_byte: call.end_byte(),
+                start_line: call.start_position().row,
+                end_line: call.end_position().row,
+            },
+            focus_start_byte: call.start_byte(),
+            focus_end_byte: call.end_byte(),
+        };
+        let file = fixture.file("root.go");
+        let answer = crate::analyzer::go::native_points::resolve_go_definition_bounded(
+            brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: Default::default(),
+                cancellation: None,
+            },
+            || {},
+        );
+        let brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete {
+            value: answer,
+            ..
+        } = answer
+        else {
+            panic!("definition request must complete");
+        };
+        assert_eq!(
+            answer.definitions.len(),
+            1,
+            "usage must see the new definition: {answer:?}"
+        );
+        assert!(
+            analyzer
+                .signature_metadata(&answer.definitions[0])
+                .iter()
+                .any(|metadata| metadata.return_type_text() == Some("string")),
+            "{:?}",
+            analyzer.signature_metadata(&answer.definitions[0])
+        );
+        // A request bound before a same-revision replacement must not publish
+        // its retained rows as a current or empty answer.
+        let mut replacement = discover_go_packages(
+            &config.go,
+            fixture.project_dyn().as_ref(),
+            &DependencyPackLimits::default(),
+            None,
+        )
+        .canonical
+        .unwrap();
+        replacement.packages[0].incomplete = true;
+        assert_eq!(
+            brokk_bifrost_analysis::analyzer::store::go_package_context::profile_digest(
+                &replacement
+            )
+            .as_slice(),
+            root.1,
+            "replacement must target the request's profile"
+        );
+        let store = workspace.store().unwrap();
+        let snapshot = analyzer.selected_snapshot_for_test().unwrap();
+        let cancellation = CancellationToken::new();
+        let brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome::Ready(observation) = store.observe_go_context_inputs(&snapshot, fixture.project_dyn().as_ref(), &cancellation).unwrap() else { panic!("selected inputs") };
+        let stale = crate::analyzer::go::native_points::resolve_go_definition_bounded(
+            brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: Default::default(),
+                cancellation: None,
+            },
+            || {
+                let brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome::Published(replaced) = store.publish_go_package_context(snapshot, fixture.root().to_path_buf(), None, &observation, &observation, replacement, &cancellation).unwrap() else {panic!("replacement must publish")};
+                assert_ne!(
+                    replaced.context_id, root.0,
+                    "replacement must supersede the request's context"
+                );
+            },
+        );
+        let brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete {
+            value: stale,
+            ..
+        } = stale
+        else {
+            panic!("stale request completes with an honest status")
+        };
+        assert_eq!(stale.status, brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Unavailable, "{stale:?}");
+        assert!(
+            stale
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "native_stale"),
+            "{stale:?}"
+        );
+        std::fs::write(fixture.root().join("nested/fail-list"), "").unwrap();
+        reconcile_selected_go_domains(
+            &workspace,
+            &config,
+            &DependencyPackLimits::default(),
+            &CancellationToken::new(),
+            GoReconciliationTrigger::ExplicitRefresh,
+        )
+        .unwrap();
+        assert!(
+            !context(&workspace, "nested").2,
+            "failed domain is published with source inventory"
+        );
+        std::fs::remove_file(fixture.root().join("nested/fail-list")).unwrap();
+        clear();
+        assert!(activate(&workspace).complete);
+        assert!(
+            context(&workspace, "nested").2,
+            "next activation retries incomplete output at the SAME revision"
+        );
+        assert_eq!(
+            runs().len(),
+            2,
+            "root activation plus incomplete sibling retry"
+        );
+        // A shared receiver request can bind files from several domains.
+        // Superseding any of them invalidates even a zero-row result.
+        {
+            use crate::analyzer::go::native_points::{
+                GoNativePointRequest, GoNativePointRequestOpen,
+            };
+            let analyzer =
+                resolve_analyzer::<crate::analyzer::go::GoAnalyzer>(workspace.analyzer()).unwrap();
+            let token = CancellationToken::new();
+            let GoNativePointRequestOpen::Ready(mut request) =
+                GoNativePointRequest::open(analyzer, None, &token).unwrap()
+            else {
+                panic!("shared point request opens");
+            };
+            let root_id = request.oracle_for_test("root.go").1;
+            let (operation, nested_id) = request.oracle_for_test("nested/nested.go");
+            assert_ne!(root_id, nested_id);
+            let snapshot = analyzer.selected_snapshot_for_test().unwrap();
+            workspace.store().unwrap().conn.execute(move |conn| {
+                assert_eq!(conn.execute("UPDATE go_context_publications SET valid_until=?2 WHERE context_id=?1 AND valid_until IS NULL", rusqlite::params![nested_id, snapshot.revision]).unwrap(), 1);
+            });
+            assert!(matches!(operation.finish_native(Vec::<()>::new(), &brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion::Complete, &token).unwrap(), brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome::Stale(_)), "all bound contexts must still certify the result");
+        }
+        std::fs::remove_file(fixture.file("go.mod").abs_path()).unwrap();
+        workspace = workspace.update(&BTreeSet::from([fixture.file("go.mod")]));
+        let no_root = activate(&workspace);
+        assert!(
+            !no_root.complete,
+            "nested-only workspace has no semantic root domain"
+        );
+        assert!(
+            no_root.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "go.list_failed" | "go.package_incomplete"
+            )),
+            "{no_root:?}"
+        );
+        assert!(
+            context(&workspace, "nested").2,
+            "nested source context still publishes without semantic root"
+        );
+    }
     #[test]
     fn installed_go_discovers_standard_library_offline() {
         if Command::new("go").arg("version").output().is_err() {

@@ -645,7 +645,7 @@ mod tests {
     fn classify_kotlin_value(source: &str) -> KotlinBooleanBranchClassification {
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+            .set_language(&brokk_bifrost_jvm::kotlin::language::LANGUAGE.into())
             .expect("Kotlin grammar");
         let tree = parser.parse(source, None).expect("parsed source");
         assert!(!tree.root_node().has_error(), "{source}");

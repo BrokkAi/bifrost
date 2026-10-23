@@ -2030,6 +2030,7 @@ pub(super) fn call_binding_expansions(
                 pack_id = provenance.as_ref().map(|value| value.pack_id.clone());
                 semantic_model_provenance = provenance;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2210,6 +2211,7 @@ pub(super) fn call_binding_expansions(
                 target_origin = incomplete_provenance.as_ref().map(|_| "semantic_model");
                 semantic_model_provenance = incomplete_provenance;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2259,6 +2261,7 @@ pub(super) fn call_binding_expansions(
                 target_origin = incomplete_provenance.as_ref().map(|_| "semantic_model");
                 semantic_model_provenance = incomplete_provenance;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2366,6 +2369,7 @@ pub(super) fn call_binding_expansions(
     let mut report = call_binding_report(&file, &shape.report, target);
     if let Some(original_gap) = native_resolution_gap.as_ref() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2380,6 +2384,7 @@ pub(super) fn call_binding_expansions(
     }
     if let Some(original_reasons) = incomplete_callee_diagnostics.as_ref() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2541,6 +2546,7 @@ pub(super) fn call_binding_expansions(
     };
     if has_semantic && !binding_is_complete {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -2558,6 +2564,7 @@ pub(super) fn call_binding_expansions(
         });
     } else if has_semantic && !selector.exact {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallBindingDispatchPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,

@@ -70,6 +70,7 @@ fn provenance_expansions_with_model_key(
     }
     let Some(workspace) = workspace else {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -83,6 +84,7 @@ fn provenance_expansions_with_model_key(
     };
     let Some(semantic) = semantic.as_mut() else {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -106,6 +108,7 @@ fn provenance_expansions_with_model_key(
         for rule in rules.iter().copied() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -157,6 +160,7 @@ fn report_incomplete(
     reason: Option<&'static str>,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
         impact: CodeQueryDiagnosticImpact::Incomplete,

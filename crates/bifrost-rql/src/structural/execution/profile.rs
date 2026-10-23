@@ -155,6 +155,7 @@ pub(crate) struct QueryAccessPathProfile {
     pub(crate) index_unavailable: u64,
     pub(crate) index_over_budget: u64,
     pub(crate) scan_fallbacks: u64,
+    pub(crate) index_build_in_flight_fallbacks: u64,
     pub(crate) index_build_files: u64,
     pub(crate) index_build_source_bytes: u64,
     pub(crate) index_build_fact_nodes: u64,
@@ -216,6 +217,9 @@ impl QueryAccessPathProfile {
             .index_over_budget
             .saturating_add(other.index_over_budget);
         self.scan_fallbacks = self.scan_fallbacks.saturating_add(other.scan_fallbacks);
+        self.index_build_in_flight_fallbacks = self
+            .index_build_in_flight_fallbacks
+            .saturating_add(other.index_build_in_flight_fallbacks);
         self.index_build_files = self
             .index_build_files
             .saturating_add(other.index_build_files);
@@ -285,6 +289,7 @@ pub(crate) enum QueryOperatorTermination {
     CancellationDuringWork,
     DependencyCancelled,
     DependencyPipelineHalted,
+    EmptyOperand,
     TerminalCap,
     ResultLimit,
     ExecutionBudget,
@@ -734,6 +739,8 @@ pub struct CodeQueryAccessPathProfile {
     pub index_unavailable: u64,
     pub index_over_budget: u64,
     pub scan_fallbacks: u64,
+    /// Lookups that fell back because an optional index build for the same content was already running.
+    pub index_build_in_flight_fallbacks: u64,
     pub index_build_files: u64,
     pub index_build_source_bytes: u64,
     pub index_build_fact_nodes: u64,
@@ -787,6 +794,7 @@ impl CodeQueryAccessPathProfile {
             index_unavailable: profile.index_unavailable,
             index_over_budget: profile.index_over_budget,
             scan_fallbacks: profile.scan_fallbacks,
+            index_build_in_flight_fallbacks: profile.index_build_in_flight_fallbacks,
             index_build_files: profile.index_build_files,
             index_build_source_bytes: profile.index_build_source_bytes,
             index_build_fact_nodes: profile.index_build_fact_nodes,
@@ -1198,6 +1206,7 @@ pub enum CodeQueryOperatorTermination {
     CancellationDuringWork,
     DependencyCancelled,
     DependencyPipelineHalted,
+    EmptyOperand,
     TerminalCap,
     ResultLimit,
     ExecutionBudget,
@@ -1215,6 +1224,7 @@ impl CodeQueryOperatorTermination {
             QueryOperatorTermination::CancellationDuringWork => Self::CancellationDuringWork,
             QueryOperatorTermination::DependencyCancelled => Self::DependencyCancelled,
             QueryOperatorTermination::DependencyPipelineHalted => Self::DependencyPipelineHalted,
+            QueryOperatorTermination::EmptyOperand => Self::EmptyOperand,
             QueryOperatorTermination::TerminalCap => Self::TerminalCap,
             QueryOperatorTermination::ResultLimit => Self::ResultLimit,
             QueryOperatorTermination::ExecutionBudget => Self::ExecutionBudget,
@@ -1273,6 +1283,14 @@ mod public_contract_tests {
         let union_node = physical.node(physical.root()).dependencies()[0];
         let union_operator = physical.node(union_node).operator();
         let mut profile = QueryExecutionProfile::new(&physical, 11, 7);
+        profile.access_path = QueryAccessPathProfile {
+            index_build_in_flight_fallbacks: 2,
+            ..QueryAccessPathProfile::default()
+        }
+        .saturating_add(QueryAccessPathProfile {
+            index_build_in_flight_fallbacks: 3,
+            ..QueryAccessPathProfile::default()
+        });
         profile.execution_ns = 22;
         profile.rendering_ns = 33;
         profile.total_elapsed_ns = 66;
@@ -1551,6 +1569,7 @@ mod public_contract_tests {
                 "index_unavailable": 0,
                 "index_over_budget": 0,
                 "scan_fallbacks": 0,
+                "index_build_in_flight_fallbacks": 5,
                 "index_build_files": 0,
                 "index_build_source_bytes": 0,
                 "index_build_fact_nodes": 0,

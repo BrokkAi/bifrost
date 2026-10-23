@@ -1046,6 +1046,7 @@ fn validate_wrapper(
         | RqlForm::CallResultContracts
         | RqlForm::CallResultObligations
         | RqlForm::ProcedureReturnProfile
+        | RqlForm::RustMarkerImplsOf
         | RqlForm::RustPointerFindings
         | RqlForm::PythonIteratorReturnProtocol
         | RqlForm::PythonBuiltinIdentity
@@ -1106,6 +1107,7 @@ fn validate_wrapper(
         | RqlForm::DuplicateKey
         | RqlForm::Index
         | RqlForm::Async
+        | RqlForm::UnsafeContext
         | RqlForm::Modifier
         | RqlForm::StringValueRegex
         | RqlForm::Not
@@ -3392,6 +3394,7 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::CommentBlockRegex => "comment_block_text.regex",
         RqlProperty::BooleanValue => "boolean_value",
         RqlProperty::Async => "async",
+        RqlProperty::UnsafeContext => "unsafe_context",
         RqlProperty::Modifier => "modifier",
         RqlProperty::DuplicateKey => "duplicate_key",
         RqlProperty::Parenthesized => "parenthesized",
@@ -3471,6 +3474,7 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
         | RqlProperty::AssignmentUnstarredCountMismatch
         | RqlProperty::Index
         | RqlProperty::Async
+        | RqlProperty::UnsafeContext
         | RqlProperty::NotKind
         | RqlProperty::Arity
         | RqlProperty::Visibility
@@ -3670,6 +3674,16 @@ fn reject_callable_signature_property(
     range: &Range<usize>,
     analysis: &mut Analysis,
 ) {
+    if property == RqlProperty::UnsafeContext {
+        if !kind.satisfies(NormalizedKind::Call) {
+            analysis.error(
+                range.clone(),
+                "invalid-query",
+                "unsafe-context is only supported on call patterns".to_string(),
+            );
+        }
+        return;
+    }
     if !matches!(
         property,
         RqlProperty::Async

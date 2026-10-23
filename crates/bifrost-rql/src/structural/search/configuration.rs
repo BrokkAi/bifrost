@@ -369,6 +369,7 @@ impl ConfigurationFactsTraversalCache {
             return;
         }
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -671,6 +672,7 @@ pub(super) fn execute_configuration_facts_seed(
         Ok(files) => files,
         Err(error) => {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -690,6 +692,7 @@ pub(super) fn execute_configuration_facts_seed(
     };
     if files.is_empty() && !seed.where_globs.is_empty() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -783,6 +786,7 @@ pub(super) fn execute_configuration_facts_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
                     impact: CodeQueryDiagnosticImpact::Incomplete,

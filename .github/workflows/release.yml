@@ -801,7 +801,7 @@ jobs:
 
   publish-crate-rql:
     name: publish RQL crate
-    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-cpp-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
+    needs: [publish-crate-jvm-analysis, release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-cpp-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -975,6 +975,26 @@ jobs:
       qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
     permissions: { contents: read, actions: read, id-token: write }
 
+  publish-crate-jvm-analysis:
+    name: publish JVM analysis crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-jvm-analysis
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
+
+
+
+
   publish-crate-rust-analysis:
     name: publish Rust analysis crate
     needs: [release-context, promote-qualification, publish-crate-analysis]
@@ -993,7 +1013,7 @@ jobs:
 
   publish-crate-tools:
     name: publish tools crate
-    needs: [release-context, promote-qualification, publish-crate-ruby-analysis, publish-crate-cpp-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
+    needs: [publish-crate-jvm-analysis, release-context, promote-qualification, publish-crate-ruby-analysis, publish-crate-cpp-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1057,7 +1077,7 @@ jobs:
 
   publish-crate-semantic-packs:
     name: publish semantic packs crate
-    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis]
+    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-tools, publish-crate-ruby-analysis, publish-crate-csharp-analysis, publish-crate-php-analysis, publish-crate-python-analysis, publish-crate-js-ts-analysis, publish-crate-go-analysis, publish-crate-rust-analysis, publish-crate-jvm-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1089,7 +1109,7 @@ jobs:
 
   publish-crate-facade:
     name: publish facade crate
-    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis]
+    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-tools, publish-crate-rust-analysis, publish-crate-jvm-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

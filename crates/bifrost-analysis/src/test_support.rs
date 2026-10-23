@@ -2,8 +2,9 @@
 //! materializes a `TempDir` workspace, builds a `WorkspaceAnalyzer` over
 //! it, and exposes both for assertions. Test-only.
 
-#[cfg(test)]
-pub(crate) use brokk_bifrost_core::test_support::write_file;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use brokk_bifrost_core::test_support::write_file;
 
 /// Engine fixture shared with surface regression tests in the tools crate.
 pub const RUST_CFG_DECORATED_MACROS_SOURCE: &str =
@@ -128,7 +129,8 @@ pub mod shared_git;
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "../../../test-support/zip.rs"]
-pub(crate) mod zip_helpers;
+#[doc(hidden)]
+pub mod zip_helpers;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::semantic::SemanticArtifact;
@@ -280,6 +282,7 @@ pub fn activate_rust_declaration_pack(
         )
         .expect("register the Rust declaration fixture");
     let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
         evidence: vec![SemanticModelActivationEvidence {
             language: "rust".to_owned(),
@@ -872,6 +875,7 @@ pub fn go_semantic_model_activation_request(
     use semver::Version;
 
     SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
         evidence: vec![SemanticModelActivationEvidence {
             language: "go".to_owned(),
@@ -943,14 +947,6 @@ pub fn external_route_candidates(
             )
         })
         .collect()
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn java_analyzer(root: &Path) -> crate::analyzer::JavaAnalyzer {
-    use crate::analyzer::JavaAnalyzer;
-
-    JavaAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Java))
 }
 
 #[cfg(any(test, feature = "test-support"))]

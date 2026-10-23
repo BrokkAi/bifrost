@@ -19,7 +19,8 @@ pub enum JavaIntegralDomain {
 }
 
 impl JavaIntegralDomain {
-    pub(crate) fn from_type(type_node: Node<'_>) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn from_type(type_node: Node<'_>) -> Option<Self> {
         if type_node.kind() != "integral_type" || type_node.has_error() {
             return None;
         }
@@ -33,10 +34,11 @@ impl JavaIntegralDomain {
         }
     }
 
+    #[doc(hidden)]
     /// Java's unsuffixed decimal literal after unary sign has `int` value.
     /// Assignment to a narrower primitive is legal only when its compile-time
     /// value fits; assignment to `long` widens without changing the value.
-    pub(crate) fn accepts_decimal_int_literal(self, value: i64) -> bool {
+    pub fn accepts_decimal_int_literal(self, value: i64) -> bool {
         if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) {
             return false;
         }
@@ -52,7 +54,8 @@ impl JavaIntegralDomain {
 }
 
 /// Parse one unsuffixed decimal-literal token before Java's `int` range check.
-pub(crate) fn decimal_integer_value(source: &str, node: Node<'_>) -> Option<i64> {
+#[doc(hidden)]
+pub fn decimal_integer_value(source: &str, node: Node<'_>) -> Option<i64> {
     crate::analyzer::common::integer_literal_value_with_kind(
         source,
         node,
@@ -106,7 +109,8 @@ pub enum JavaScalarType {
 }
 
 impl JavaScalarType {
-    pub(crate) fn from_type(type_node: Node<'_>) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn from_type(type_node: Node<'_>) -> Option<Self> {
         if type_node.kind() == "boolean_type" && !type_node.has_error() {
             return Some(Self::Boolean);
         }
@@ -120,6 +124,7 @@ impl JavaScalarType {
         JavaIntegralDomain::from_type(type_node).map(Self::Integral)
     }
 
+    #[doc(hidden)]
     /// The primitive type a wrapper type name unboxes to (JLS 5.1.8).
     ///
     /// The name is read from its `type_identifier` node, so a user class that
@@ -129,7 +134,7 @@ impl JavaScalarType {
     /// primitive or on one of the wrapper classes, so in compilable code the
     /// name denotes the wrapper there. A typed store of a fact the type
     /// cannot hold makes the binding unknown.
-    pub(crate) fn from_wrapper_type(type_node: Node<'_>, source: &str) -> Option<Self> {
+    pub fn from_wrapper_type(type_node: Node<'_>, source: &str) -> Option<Self> {
         if type_node.kind() != "type_identifier" || type_node.has_error() {
             return None;
         }

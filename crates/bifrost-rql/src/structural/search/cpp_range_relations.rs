@@ -32,6 +32,7 @@ fn report_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
         impact: CodeQueryDiagnosticImpact::Incomplete,

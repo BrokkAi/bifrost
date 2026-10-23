@@ -1264,13 +1264,51 @@ where
         let path = attribute
             .named_child(0)
             .and_then(|attribute| attribute.named_child(0));
-        if !path.is_some_and(|path| {
-            matches!(
-                crate::declarations::rust_node_text(path, source),
-                "cfg" | "inline" | "doc"
-            )
-        }) {
+        let Some(path) = path.filter(|path| path.kind() == "identifier") else {
             return Ok(false);
+        };
+        match crate::declarations::rust_node_text(path, source) {
+            "cfg" | "inline" | "doc" | "allow" | "warn" | "deny" | "forbid" | "expect"
+            | "must_use" | "cold" | "track_caller" | "deprecated" | "repr" | "non_exhaustive" => {}
+            "test" => {
+                // Unlike inert attributes, the built-in test macro can be
+                // shadowed. Reuse the macro producer's structured import
+                // binding projection, including aliases and grouped imports.
+                let mut parent = node.parent();
+                while let Some(scope) = parent {
+                    charge(1)?;
+                    let mut cursor = scope.walk();
+                    for raw in scope.named_children(&mut cursor) {
+                        charge(1)?;
+                        let item = unwrap_attributes(raw);
+                        if item.kind() == "macro_definition"
+                            && item.child_by_field_name("name").is_some_and(|name| {
+                                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                    crate::declarations::rust_node_text(name, source),
+                                ) == "test"
+                            })
+                        {
+                            return Ok(false);
+                        }
+                        if item.kind() == "use_declaration" {
+                            for import in crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+                                item, source, &mut *charge,
+                            )? {
+                                charge(1)?;
+                                if !import.import.module_self
+                                    && import.import.binding_name().named().is_some_and(|name| {
+                                        brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(name) == "test"
+                                    })
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                    parent = scope.parent();
+                }
+            }
+            _ => return Ok(false),
         }
     }
     Ok(true)
@@ -1661,6 +1699,124 @@ where
         })?;
     charge(0)?;
     Ok(matches!(selection, RustLexicalSelection::Complete))
+}
+
+/// Select the nearest value binding visible at a use. Like the scope index,
+/// lets activate after their declaration, parameters over the callable body,
+/// and pattern binders only over their arm/loop/condition body. The returned
+/// syntax owner preserves the declared type and initializer for consumers.
+pub(crate) fn rust_value_binding_at_bounded<'tree, E>(
+    site: Node<'tree>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<Option<Node<'tree>>, E> {
+    let name = crate::declarations::rust_node_text(site, source);
+    let byte = site.start_byte();
+    let mut current = site.parent();
+    while let Some(scope) = current {
+        charge(1)?;
+        match scope.kind() {
+            "block" => {
+                // Source order, nearest let first. A declaration's own
+                // initializer still sees the previous binding.
+                for index in (0..scope.named_child_count()).rev() {
+                    charge(1)?;
+                    let raw = scope.named_child(index).expect("indexed block child");
+                    let binding = unwrap_attributes(raw);
+                    if binding.kind() == "let_declaration"
+                        && binding.end_byte() <= byte
+                        && let Some(pattern) = binding.child_by_field_name("pattern")
+                        && rust_pattern_binds_name_bounded(pattern, name, source, charge)?
+                    {
+                        return Ok(Some(binding));
+                    }
+                }
+            }
+            "function_item" | "closure_expression" => {
+                if let Some(parameters) = scope.child_by_field_name("parameters") {
+                    let mut cursor = parameters.walk();
+                    for raw in parameters.named_children(&mut cursor) {
+                        charge(1)?;
+                        let parameter = unwrap_attributes(raw);
+                        let pattern = parameter
+                            .child_by_field_name("pattern")
+                            .unwrap_or(parameter);
+                        if (parameter.kind() == "self_parameter" && name == "self")
+                            || rust_pattern_binds_name_bounded(pattern, name, source, charge)?
+                        {
+                            return Ok(Some(parameter));
+                        }
+                    }
+                }
+                // Closures can capture an outer parameter or local; nested
+                // function items cannot capture their enclosing value scope.
+                if scope.kind() == "function_item" {
+                    return Ok(None);
+                }
+            }
+            "match_arm" | "for_expression" => {
+                if let Some(pattern) = scope.child_by_field_name("pattern") {
+                    let visible = if scope.kind() == "for_expression" {
+                        scope
+                            .child_by_field_name("body")
+                            .is_some_and(|body| contains_byte(body, byte))
+                    } else {
+                        pattern.end_byte() <= byte
+                    };
+                    if visible && rust_pattern_binds_name_bounded(pattern, name, source, charge)? {
+                        return Ok(Some(scope));
+                    }
+                }
+            }
+            "if_expression" | "while_expression" => {
+                if let Some(body) = scope
+                    .child_by_field_name("consequence")
+                    .or_else(|| scope.child_by_field_name("body"))
+                    && contains_byte(body, byte)
+                    && let Some(condition) = scope.child_by_field_name("condition")
+                {
+                    let mut stack = vec![condition];
+                    while let Some(node) = stack.pop() {
+                        charge(1)?;
+                        if node.kind() == "let_condition" {
+                            if let Some(pattern) = node.child_by_field_name("pattern")
+                                && rust_pattern_binds_name_bounded(pattern, name, source, charge)?
+                            {
+                                return Ok(Some(node));
+                            }
+                        } else if matches!(node.kind(), "let_chain" | "parenthesized_expression") {
+                            let mut cursor = node.walk();
+                            stack.extend(node.named_children(&mut cursor));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        current = scope.parent();
+    }
+    Ok(None)
+}
+
+fn rust_pattern_binds_name_bounded<E>(
+    pattern: Node<'_>,
+    name: &str,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        charge(1)?;
+        if matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+            && crate::declarations::rust_node_text(node, source) == name
+            && is_pattern_binding_identifier(node)
+        {
+            return Ok(true);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Ok(false)
 }
 
 /// Whether `node` is the identifier being introduced by a Rust binding pattern.

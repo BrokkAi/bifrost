@@ -53,6 +53,10 @@ pub(crate) struct RustItemSourceCollector {
     syntax_by_occurrence: HashMap<SourceOccurrenceId, usize>,
     macro_by_invocation: HashMap<SourceOccurrenceId, usize>,
     context_stack: Vec<SourceOccurrenceId>,
+    /// Parallel to `context_stack`: the `facts.contexts` index of each
+    /// enclosing context, so an attribute start can be attached without a
+    /// search.
+    context_fact_indices: Vec<usize>,
     /// One entry for every enter call, including anonymous syntax nodes. This
     /// keeps exit synchronized with the shared iterative tree walk.
     context_frames: Vec<Option<SourceOccurrenceId>>,
@@ -71,6 +75,22 @@ impl RustItemSourceCollector {
         types: &mut RustTypeSourceCollector,
     ) -> Option<RustItemMacroSourcePosition> {
         let parent = self.context_stack.last().copied();
+        if matches!(node.kind(), "attribute_item" | "inner_attribute_item")
+            && crate::resolution::rust_attribute_item_can_expand(node, source)
+        {
+            let fact_index = *self
+                .context_fact_indices
+                .last()
+                .expect("an expanding Rust attribute has an enclosing source context");
+            let starts = &mut self.facts.contexts[fact_index].expanding_attribute_starts;
+            assert!(
+                starts
+                    .last()
+                    .is_none_or(|previous| *previous < node.start_byte()),
+                "Rust source item walk visits context attributes in ascending source order"
+            );
+            starts.push(node.start_byte());
+        }
         let source_position = (node.kind() == "macro_invocation").then(|| {
             let invocation = sink.intern_node(node);
             let position = crate::declarations::rust_macro_invocation_source_position(node);
@@ -113,13 +133,16 @@ impl RustItemSourceCollector {
         if let Some((kind, owner)) = context_kind(node, sink) {
             let context = sink.intern_node(node);
             self.record_syntax(context, node.has_error());
+            let fact_index = self.facts.contexts.len();
             self.facts.contexts.push(RustSourceContextFact {
                 context,
                 parent,
                 owner,
                 kind,
+                expanding_attribute_starts: Vec::new(),
             });
             self.context_stack.push(context);
+            self.context_fact_indices.push(fact_index);
             entered_context = Some(context);
         }
 
@@ -147,6 +170,9 @@ impl RustItemSourceCollector {
                 Some(context),
                 "Rust source item contexts exit in source order"
             );
+            self.context_fact_indices
+                .pop()
+                .expect("Rust source item context facts unwind with their context");
         }
     }
 
@@ -174,7 +200,9 @@ impl RustItemSourceCollector {
 
     pub(crate) fn into_facts(self) -> RustItemSourceFacts {
         assert!(
-            self.context_frames.is_empty() && self.context_stack.is_empty(),
+            self.context_frames.is_empty()
+                && self.context_stack.is_empty()
+                && self.context_fact_indices.is_empty(),
             "Rust source item collector is fully unwound before publication"
         );
         self.facts

@@ -1114,6 +1114,8 @@ pub enum PolicyReportDiagnosticCode {
     /// A reviewed workspace model is registered but held back by its own
     /// review gate, so it contributes nothing to this run (#2493).
     WorkspaceModelInert,
+    /// A standard-library pack selected without an exact project toolchain.
+    ApproximateStandardLibrary,
     PolicyLoadFailed,
     PolicyParseFailed,
     PolicyValidationFailed,

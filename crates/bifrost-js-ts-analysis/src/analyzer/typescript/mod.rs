@@ -98,53 +98,8 @@ mod semantic;
 pub struct TypescriptAdapter;
 
 impl brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter for TypescriptAdapter {
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::js_ts::source_publication::SOURCE_STORAGE)
-    }
-
-    fn produces_canonical_source_facts(&self) -> bool {
-        true
-    }
-
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        true
-    }
-
-    fn js_ts_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::js_ts_facts::JS_TS_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::TypeScript
-    }
-
     fn query_directory(&self) -> &'static str {
         TYPESCRIPT_QUERY_DIRECTORY
-    }
-
-    /// The `.ts`/`.tsx` split applies only to files whose OWN language is
-    /// TypeScript. Every other file must answer its own language's key, as
-    /// the trait contract (`LanguageAdapter::storage_language_key_for_file`)
-    /// and the cpp override demand: the cross-adapter guards
-    /// (`storage_key_and_generation`, #1189/#1805) discriminate on that
-    /// answer. Returning "typescript:ts" for a foreign file (say a `.rb`
-    /// file) arms those guards with this adapter's own key, so a
-    /// request-scoped cross-language lookup that reaches this analyzer with
-    /// the foreign file parses and persists it as TypeScript, and the
-    /// phantom units flip same-name resolution session-wide (#2748).
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
-        let own_language = file_language(file);
-        if own_language != Language::TypeScript {
-            return own_language.config_label();
-        }
-        if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
-            "typescript:tsx"
-        } else {
-            "typescript:ts"
-        }
     }
 
     fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
@@ -164,47 +119,12 @@ impl brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter for
         "ts"
     }
 
-    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        brokk_bifrost_analysis::analyzer::common::should_persist_code_unit(code_unit)
-    }
-
     fn lookup_candidate_separators(&self) -> &'static [&'static str] {
         DOT_LOOKUP_CANDIDATE_SEPARATORS
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
         lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
-    }
-
-    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
-        crate::analyzer::js_ts::hydrate_contains_tests(stored, file)
-    }
-
-    fn synthesize_hydrated_units(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
-    ) {
-        synthesize_js_ts_hydrated_module_unit(file, source, state);
-    }
-
-    fn synthesize_summary_projection(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        has_structured_imports: bool,
-        projection: &mut brokk_bifrost_core::analyzer::model::SummaryFileProjection,
-    ) {
-        synthesize_js_ts_summary_module_unit(file, source, has_structured_imports, projection);
-    }
-
-    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
-        Some(module_code_unit(file))
-    }
-
-    fn has_path_synthetic_module_units(&self) -> bool {
-        true
     }
 
     fn path_synthetic_module_requires_imports(&self) -> bool {
@@ -242,6 +162,67 @@ impl brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter for
         &self,
     ) -> Option<&'static brokk_bifrost_core::analyzer::cognitive_complexity::Config> {
         Some(crate::analyzer::js_ts::cognitive_complexity_config())
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for TypescriptAdapter {
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::js_ts::source_publication::SOURCE_STORAGE)
+    }
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+    fn js_ts_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::js_ts_facts::JS_TS_SOURCE_FACTS_VERSION)
+    }
+    fn language(&self) -> Language {
+        Language::TypeScript
+    }
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
+        let own_language = file_language(file);
+        if own_language != Language::TypeScript {
+            return own_language.config_label();
+        }
+        if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
+            "typescript:tsx"
+        } else {
+            "typescript:ts"
+        }
+    }
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        brokk_bifrost_analysis::analyzer::common::should_persist_code_unit(code_unit)
+    }
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
+        crate::analyzer::js_ts::hydrate_contains_tests(stored, file)
+    }
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        synthesize_js_ts_hydrated_module_unit(file, source, state);
+    }
+    fn synthesize_summary_projection(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        has_structured_imports: bool,
+        projection: &mut brokk_bifrost_core::analyzer::model::SummaryFileProjection,
+    ) {
+        synthesize_js_ts_summary_module_unit(file, source, has_structured_imports, projection);
+    }
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        Some(module_code_unit(file))
+    }
+    fn has_path_synthetic_module_units(&self) -> bool {
+        true
     }
 }
 
@@ -618,6 +599,10 @@ impl CodeUnitIndex for TypescriptAnalyzer {
 
     delegate_inner_methods! {
         fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
+    }
+
+    delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
     delegate_inner_methods! {
@@ -1121,7 +1106,7 @@ mod tests {
 
     use crate::analyzer::typescript::*;
 
-    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
 
     #[test]
     fn hydration_uses_persisted_facts_and_path_conventions_only() {

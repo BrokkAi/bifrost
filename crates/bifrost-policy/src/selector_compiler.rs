@@ -2583,9 +2583,9 @@ impl<'a> PolicySelectorSession<'a> {
         // `selector_scans` metric reports the multiplier this compile actually
         // used, so the total cost stays auditable rather than implicit.
         //
-        // `max_pipeline_rows` bounds one query's materialized rows rather than
-        // workspace volume, so it was never a shared quantity either; it is
-        // per-query by construction.
+        // `max_pipeline_rows` follows workspace volume (#6420), but bounds
+        // one query's materialized rows. It is not shared across entries;
+        // retention remains per-query by construction.
         Ok(CodeQueryExecutionLimits {
             max_scanned_files: self.query_limits.max_scanned_files,
             max_scanned_source_bytes: self.query_limits.max_scanned_source_bytes,
@@ -3102,6 +3102,17 @@ pub(super) fn selected_site_quality(
                             .reason
                             .clone()
                             .unwrap_or_else(|| "Python rule fact evidence is incomplete".into())
+                            .into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::RustMarkerImpl { value } => (
+                proof_from_label(if value.completeness == "complete" { "proven" } else { "unproven" }),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        "Rust marker impl evidence is incomplete".to_owned()
                             .into(),
                     )
                 },
@@ -4366,6 +4377,7 @@ func inspect(item resource, callback callbacks, unknown unknownpkg.Resource) {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
                     .expect("crate version is semver"),

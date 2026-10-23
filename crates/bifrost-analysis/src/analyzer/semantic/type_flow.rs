@@ -10,7 +10,7 @@
 //! declares a member. JavaScript, Ruby, and PHP adapters are follow-on work;
 //! they supply seeds and member lookup only, never a solver.
 
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 use crate::analyzer::semantic::oracle::CandidateCoverage;
 use crate::analyzer::semantic::{
     AdapterSemanticsVersion, AllocationSite, ContentIdentity, GuardFact, MemoryLocation,
@@ -844,5 +844,6 @@ pub trait TypeFlowAdapter: Send + Sync {
 /// support reports none. This is the public enumeration point for engines in
 /// sibling crates; `LanguageSupport::type_flow_adapter` stays crate-internal.
 pub fn type_flow_adapter(language: Language) -> Option<&'static dyn TypeFlowAdapter> {
-    language_support(language).and_then(|support| support.type_flow_adapter())
+    language_support_for_hook(language, "type_flow_adapter")
+        .and_then(|support| support.type_flow_adapter())
 }

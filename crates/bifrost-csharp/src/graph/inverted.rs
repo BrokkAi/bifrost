@@ -22,6 +22,7 @@ use crate::graph::extractor::{
     is_declaration_name, is_unqualified_method_group_value, member_access_name,
     member_access_receiver,
 };
+use crate::graph::membership_scope::MembershipScopedSource;
 use crate::graph::resolver::{
     CSharpBuiltinValueArguments, UnqualifiedMethodGroupResolution, argument_count,
     class_unit_for_fq_name, collection_target_element_type_node, extension_visibility_site_key,
@@ -37,6 +38,7 @@ use crate::graph::resolver::{
     usage_visible_extension_method_candidates,
 };
 use crate::graph_support::CSharpSource;
+use crate::graph_support::{CSharpCompilationVisibility, identity_visibility};
 use crate::syntax::{
     CSharpMemberName, CSharpNamedArgumentLabel, csharp_attribute_type_names,
     csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
@@ -72,9 +74,14 @@ pub fn scan_file(
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
+    // Every lookup this file's scan makes is held to the file's compilation
+    // membership.
+    let membership = MembershipScopedSource::new(csharp.shared_source(), file);
     let mut ctx = CsScan {
         graph,
-        csharp,
+        csharp: &membership,
+        membership: &membership,
+        site_doubt: 0,
         file,
         source: input.source,
         class_ranges: ClassRangeIndex::build(graph.index, file),
@@ -82,6 +89,7 @@ pub fn scan_file(
         method_group_cache: HashMap::default(),
         member_cache: HashMap::default(),
         extension_cache: HashMap::default(),
+        callee_visibility: HashMap::default(),
         input,
         edges: PerFileEdges::default(),
     };
@@ -93,13 +101,21 @@ pub fn scan_file(
 struct CsScan<'a> {
     graph: &'a CSharpGraphSource<'a>,
     csharp: &'a dyn CSharpSource,
+    /// The same source as `csharp`, for its doubt count.
+    membership: &'a MembershipScopedSource,
+    /// Doubt admitted before the node now being recorded: an edge whose
+    /// derivation admitted more is not proven.
+    site_doubt: usize,
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
     using_aliases: Arc<HashMap<String, String>>,
-    method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
-    member_cache: HashMap<MemberCacheKey, Vec<String>>,
-    extension_cache: HashMap<ExtensionCacheKey, Vec<String>>,
+    method_group_cache: HashMap<(String, String), (UnqualifiedMethodGroupResolution, bool)>,
+    member_cache: HashMap<MemberCacheKey, (Vec<String>, bool)>,
+    extension_cache: HashMap<ExtensionCacheKey, (Vec<String>, bool)>,
+    /// Whether this file's compilation sees each callee identity, for this
+    /// file's scan only.
+    callee_visibility: HashMap<String, Option<CSharpCompilationVisibility>>,
     input: &'a FileEdgeScanInput<'a>,
     edges: PerFileEdges,
 }
@@ -197,8 +213,37 @@ impl CsScan<'_> {
         self.class_ranges.enclosing(byte)
     }
 
+    /// Record a proven edge only where this file's compilation sees a
+    /// declaration of `callee`: a member only an invisible copy declares is
+    /// no edge, and one only an unproven copy declares is unproven inbound.
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_reference(self.input, callee, node);
+        if self.membership.doubt() > self.site_doubt {
+            self.record_unproven_callee(callee, node);
+            return;
+        }
+        let visibility = match self.callee_visibility.get(&callee) {
+            Some(visibility) => *visibility,
+            None => {
+                let visibility = identity_visibility(
+                    self.membership.unscoped(),
+                    self.file,
+                    &callee,
+                    None,
+                    |_| true,
+                );
+                self.callee_visibility.insert(callee.clone(), visibility);
+                visibility
+            }
+        };
+        match visibility {
+            Some(CSharpCompilationVisibility::Visible) => {
+                self.edges.record_reference(self.input, callee, node);
+            }
+            Some(CSharpCompilationVisibility::NotVisible) => {}
+            Some(CSharpCompilationVisibility::Unresolved) | None => {
+                self.record_unproven_callee(callee, node);
+            }
+        }
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
@@ -232,6 +277,7 @@ impl CsScan<'_> {
             call_arity,
         );
         if !self.member_cache.contains_key(&key) {
+            let before = self.membership.doubt();
             let candidates = class_unit_for_fq_name(self.csharp, token, owner_fqn)
                 .map(|owner| {
                     call_arity.map_or_else(
@@ -262,9 +308,13 @@ impl CsScan<'_> {
                 .into_iter()
                 .map(|candidate| candidate.fq_name())
                 .collect();
-            self.member_cache.insert(key.clone(), candidates);
+            let doubted = self.membership.doubt() > before;
+            self.member_cache.insert(key.clone(), (candidates, doubted));
+        } else {
+            let doubted = self.member_cache[&key].1;
+            self.membership.replay(doubted);
         }
-        let candidates = self
+        let (candidates, _) = self
             .member_cache
             .get(&key)
             .expect("member cache entry was inserted");
@@ -300,7 +350,10 @@ impl CsScan<'_> {
                     scope_end,
                     CSharpBuiltinValueArguments::at_site(node, self.source),
                 );
-                if !self.extension_cache.contains_key(&extension_key) {
+                if let Some((_, doubted)) = self.extension_cache.get(&extension_key) {
+                    self.membership.replay(*doubted);
+                } else {
+                    let before = self.membership.doubt();
                     let receiver_types = [owner_fqn.to_string()];
                     let mut extensions = usage_visible_extension_method_candidates(
                         self.csharp,
@@ -318,12 +371,14 @@ impl CsScan<'_> {
                     .collect::<Vec<_>>();
                     extensions.sort();
                     extensions.dedup();
+                    let doubted = self.membership.doubt() > before;
                     self.extension_cache
-                        .insert(extension_key.clone(), extensions);
+                        .insert(extension_key.clone(), (extensions, doubted));
                 }
                 self.extension_cache
                     .get(&extension_key)
                     .expect("extension cache entry was inserted")
+                    .0
                     .clone()
             })
             .unwrap_or_default();
@@ -379,6 +434,7 @@ fn walk(
                 bindings.enter_scope();
             }
             seed_declaration(node, token, ctx, bindings);
+            ctx.site_doubt = ctx.membership.doubt();
             record_reference(node, token, ctx, bindings);
             if enters_scope {
                 TreeWalkAction::DescendWithExit
@@ -548,19 +604,24 @@ fn record_reference(
                         return;
                     }
                     let key = (owner_fqn.clone(), name.clone());
-                    let resolution = if let Some(cached) = ctx.method_group_cache.get(&key) {
-                        cached.clone()
-                    } else {
-                        let Some(owner) = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)
-                        else {
-                            return;
+                    let resolution =
+                        if let Some((cached, doubted)) = ctx.method_group_cache.get(&key) {
+                            ctx.membership.replay(*doubted);
+                            cached.clone()
+                        } else {
+                            let before = ctx.membership.doubt();
+                            let Some(owner) = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)
+                            else {
+                                return;
+                            };
+                            let resolution = resolve_unqualified_method_group_for_owner(
+                                ctx.graph, ctx.csharp, token, &owner, &name,
+                            );
+                            let doubted = ctx.membership.doubt() > before;
+                            ctx.method_group_cache
+                                .insert(key, (resolution.clone(), doubted));
+                            resolution
                         };
-                        let resolution = resolve_unqualified_method_group_for_owner(
-                            ctx.graph, ctx.csharp, token, &owner, &name,
-                        );
-                        ctx.method_group_cache.insert(key, resolution.clone());
-                        resolution
-                    };
                     if matches!(&resolution, UnqualifiedMethodGroupResolution::NoMember)
                         || unqualified_member_has_structured_shadow(node, ctx.source)
                     {
@@ -790,14 +851,18 @@ fn receiver_type_fqn(
         "identifier" => {
             let name = node_text(receiver, ctx.source);
             // A typed local or nearest inherited member wins over the type
-            // namespace. An ambiguous value binding must not fall through to
-            // a same-named visible static type.
+            // namespace. An ambiguous value binding, or a local of unknown
+            // type, must not fall through to a same-named visible static type.
             match unqualified_value_type_fqn(receiver, token, name, ctx, bindings) {
                 SymbolResolution::Precise(targets) if targets.len() == 1 => {
                     targets.into_iter().next()
                 }
-                SymbolResolution::Unknown => ctx.resolve_type_fqn_at(token, name, receiver),
-                SymbolResolution::Precise(_) | SymbolResolution::Ambiguous => None,
+                SymbolResolution::Unknown if !bindings.is_shadowed(name) => {
+                    ctx.resolve_type_fqn_at(token, name, receiver)
+                }
+                SymbolResolution::Precise(_)
+                | SymbolResolution::Ambiguous
+                | SymbolResolution::Unknown => None,
             }
         }
         "this" => ctx
@@ -849,16 +914,14 @@ fn seed_declaration(
             ) else {
                 return;
             };
-            seed_typed(
-                name,
+            let resolved = ctx.membership.measured(|| {
                 ctx.resolve_type_fqn_at(
                     token,
                     &reference_type_text(type_node, ctx.source),
                     type_node,
-                ),
-                ctx,
-                bindings,
-            );
+                )
+            });
+            seed_typed(name, resolved, ctx, bindings);
         }
         "variable_declaration" => seed_variable_declaration(node, token, ctx, bindings),
         _ => {}
@@ -876,26 +939,31 @@ fn seed_variable_declaration(
             return;
         };
         // `var x = new Foo()` infers from the initializer; other `var` is unknown.
-        let resolved = if type_text == "var" {
-            object_created_type(child)
-                .and_then(|type_node| {
-                    ctx.resolve_type_fqn_at(
-                        token,
-                        &reference_type_text(type_node, ctx.source),
-                        type_node,
-                    )
-                })
-                .or_else(|| var_initializer_type(child, token, ctx, bindings))
-        } else {
-            ctx.resolve_type_fqn_at(token, type_text, type_node)
-        };
+        let resolved = ctx.membership.measured(|| {
+            if type_text == "var" {
+                object_created_type(child)
+                    .and_then(|type_node| {
+                        ctx.resolve_type_fqn_at(
+                            token,
+                            &reference_type_text(type_node, ctx.source),
+                            type_node,
+                        )
+                    })
+                    .or_else(|| var_initializer_type(child, token, ctx, bindings))
+            } else {
+                ctx.resolve_type_fqn_at(token, type_text, type_node)
+            }
+        });
         seed_typed(name, resolved, ctx, bindings);
     });
 }
 
+/// Bind `name` to its `resolved` type and whether deriving it admitted
+/// membership doubt. A binding holds no provenance, so a doubted type only
+/// shadows the name: its uses then prove no edge.
 fn seed_typed(
     name: Node<'_>,
-    resolved: Option<String>,
+    (resolved, doubted): (Option<String>, bool),
     ctx: &CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
@@ -903,7 +971,7 @@ fn seed_typed(
     if binding_name.is_empty() {
         return;
     }
-    bindings.seed_or_shadow(binding_name.to_string(), resolved);
+    bindings.seed_or_shadow(binding_name.to_string(), resolved.filter(|_| !doubted));
 }
 
 /// The type node of a `new Foo()` initializer reachable from a declarator.

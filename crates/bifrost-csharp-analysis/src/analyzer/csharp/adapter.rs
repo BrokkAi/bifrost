@@ -38,18 +38,6 @@ use brokk_bifrost_csharp::syntax::strip_csharp_generic_arity;
 pub struct CSharpAdapter;
 
 impl LanguageAdapter for CSharpAdapter {
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        true
-    }
-
-    fn produces_canonical_source_facts(&self) -> bool {
-        true
-    }
-
-    fn language(&self) -> Language {
-        Language::CSharp
-    }
-
     /// Relative to `brokk-bifrost-csharp`'s crate root: the `.scm` assets moved
     /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
@@ -71,14 +59,6 @@ impl LanguageAdapter for CSharpAdapter {
         csharp_included_ranges(source)
     }
 
-    fn normalize_full_name(&self, fq_name: &str) -> String {
-        csharp_normalize_full_name(fq_name)
-    }
-
-    fn normalize_fq_name(&self, fq_name: &FqName) -> FqName {
-        brokk_bifrost_csharp::syntax::csharp_normalize_fq_name(fq_name)
-    }
-
     fn visibility_containers(&self, unit: &CodeUnit) -> Vec<FqName> {
         let Some(last) = unit.fq().last() else {
             return Vec::new();
@@ -89,14 +69,6 @@ impl LanguageAdapter for CSharpAdapter {
         } else {
             Vec::new()
         }
-    }
-
-    fn simple_type_name(&self, unit: &CodeUnit) -> String {
-        csharp_source_identifier(unit).to_string()
-    }
-
-    fn persist_content_stable_lookup_keys(&self) -> bool {
-        true
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
@@ -147,5 +119,29 @@ impl LanguageAdapter for CSharpAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&CSHARP_COGNITIVE_CONFIG)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for CSharpAdapter {
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+    fn language(&self) -> Language {
+        Language::CSharp
+    }
+    fn normalize_full_name(&self, fq_name: &str) -> String {
+        csharp_normalize_full_name(fq_name)
+    }
+    fn normalize_fq_name(&self, fq_name: &FqName) -> FqName {
+        brokk_bifrost_csharp::syntax::csharp_normalize_fq_name(fq_name)
+    }
+    fn simple_type_name(&self, unit: &CodeUnit) -> String {
+        csharp_source_identifier(unit).to_string()
+    }
+    fn persist_content_stable_lookup_keys(&self) -> bool {
+        true
     }
 }

@@ -9,6 +9,17 @@ use brokk_bifrost_core::analyzer::{Language, fq_name::joined_segments};
 #[path = "intrinsic_inventory_data.rs"]
 mod data;
 
+/// Exact generated data participates in JVM analyzer epochs, including all
+/// root, default-provider and closed-owner inventories. Regeneration invalidates
+/// persisted resolution inputs automatically.
+pub const INVENTORY_EPOCH_INPUT: &str = include_str!("intrinsic_inventory_data.rs");
+
+/// Whether this language can use an inventory as an absence-only provider.
+pub fn language_has_member_inventory(language: Language, owner: &str) -> bool {
+    language_root_member_inventory(language, owner).is_some()
+        || (language == Language::Kotlin && closed_owner_member_inventory(owner).is_some())
+}
+
 pub const KOTLIN_STDLIB_VERSION: &str = "2.1.20";
 pub const SCALA_LIBRARY_VERSION: &str = "2.13.16";
 pub const SCALA3_LIBRARY_VERSION: &str = "3.3.5";
@@ -20,6 +31,46 @@ pub const JAVA_LANG_VERSION: &str = "Temurin-21.0.12.1+1-LTS";
 pub struct IntrinsicMember {
     pub name: &'static str,
     pub visibility: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosedMemberKind {
+    Callable,
+    Value,
+    Type,
+}
+
+pub struct ClosedOwnerMember {
+    pub name: &'static str,
+    pub kind: ClosedMemberKind,
+    pub visibility: &'static str,
+}
+
+/// A flattened, complete name inventory: it already includes inherited and mapped names,
+/// so no hierarchy walk is needed. Name presence only; no signatures or declarations.
+pub fn closed_owner_member_inventory(owner: &str) -> Option<&'static [ClosedOwnerMember]> {
+    data::CLOSED_OWNER_MEMBERS
+        .iter()
+        .find_map(|(name, members)| (*name == owner).then_some(*members))
+}
+
+#[test]
+fn closed_owner_inventory_is_sorted_and_deduplicated() {
+    assert!(!data::CLOSED_OWNER_MEMBERS.is_empty());
+    assert!(
+        data::CLOSED_OWNER_MEMBERS
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0)
+    );
+    for (owner, members) in data::CLOSED_OWNER_MEMBERS {
+        assert!(!members.is_empty(), "{owner}");
+        assert!(
+            members.windows(2).all(|pair| {
+                (pair[0].name, pair[0].kind as u8) < (pair[1].name, pair[1].kind as u8)
+            }),
+            "{owner}"
+        );
+    }
 }
 
 /// The complete spelling inventory of one of this language's default providers.

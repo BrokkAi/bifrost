@@ -1,5 +1,6 @@
 use crate::graph::CSharpGraphSource;
 use crate::graph::hits::{push_hit, push_self_receiver_hit, push_unproven_hit};
+use crate::graph::membership_scope::MembershipScopedSource;
 use crate::graph::resolver::{
     CSharpBuiltinValueArguments, CSharpCallArgumentOwners, CSharpInitializerOwnerLookups,
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
@@ -106,8 +107,12 @@ pub fn scan_prepared_file(
         return;
     }
 
+    // Every lookup this file's scan makes is held to the file's compilation
+    // membership.
+    let membership = MembershipScopedSource::new(csharp.shared_source(), file);
     let mut ctx = ScanCtx::new(
-        csharp,
+        &membership,
+        &membership,
         graph,
         file,
         prepared,
@@ -132,11 +137,13 @@ pub fn scan_prepared_file_batch<'a>(
     prepared: &'a PreparedCSharpFile,
     scans: &'a mut [BatchScanState<'a>],
 ) {
+    let membership = MembershipScopedSource::new(csharp.shared_source(), file);
     let mut contexts: Vec<_> = scans
         .iter_mut()
         .map(|scan| {
             ScanCtx::new(
-                csharp,
+                &membership,
+                &membership,
                 graph,
                 file,
                 prepared,
@@ -151,8 +158,16 @@ pub fn scan_prepared_file_batch<'a>(
     scan_nodes(prepared.tree.root_node(), token, &mut contexts);
 }
 
+/// A receiver type, explicit generic arity and call arity.
+type NearestMemberTargetKey = (String, Option<usize>, Option<usize>);
+
 pub(super) struct ScanCtx<'a> {
     pub(super) csharp: &'a dyn CSharpSource,
+    /// The same source as `csharp`, for its doubt count.
+    pub(super) membership: &'a MembershipScopedSource,
+    /// Doubt admitted before the node now being scanned: a hit whose
+    /// derivation admitted more is not proven.
+    pub(super) site_doubt: usize,
     pub(super) graph: &'a CSharpGraphSource<'a>,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
@@ -163,17 +178,19 @@ pub(super) struct ScanCtx<'a> {
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
-    nearest_member_target_cache:
-        HashMap<(String, Option<usize>, Option<usize>), TargetMemberResolution>,
-    extension_target_cache: HashMap<ExtensionTargetCacheKey, TargetMemberResolution>,
+    nearest_member_target_cache: HashMap<NearestMemberTargetKey, (TargetMemberResolution, bool)>,
+    extension_target_cache: HashMap<ExtensionTargetCacheKey, (TargetMemberResolution, bool)>,
     pub(super) class_ranges: ClassRangeIndex,
     using_aliases: &'a HashMap<String, String>,
+    /// Whether this file's compilation sees the target's identity, read once.
+    pub(super) target_visibility: Option<Option<crate::graph_support::CSharpCompilationVisibility>>,
 }
 
 impl<'a> ScanCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         csharp: &'a dyn CSharpSource,
+        membership: &'a MembershipScopedSource,
         graph: &'a CSharpGraphSource<'a>,
         file: &'a ProjectFile,
         prepared: &'a PreparedCSharpFile,
@@ -185,6 +202,8 @@ impl<'a> ScanCtx<'a> {
     ) -> Self {
         Self {
             csharp,
+            membership,
+            site_doubt: 0,
             graph,
             file,
             source: &prepared.source,
@@ -197,6 +216,7 @@ impl<'a> ScanCtx<'a> {
             enclosing_cache: HashMap::default(),
             nearest_member_target_cache: HashMap::default(),
             extension_target_cache: HashMap::default(),
+            target_visibility: None,
             class_ranges: prepared.class_ranges.clone(),
             using_aliases: &prepared.using_aliases,
         }
@@ -260,6 +280,7 @@ fn scan_nodes<'tree>(root: Node<'tree>, token: QueryToken<'_>, contexts: &mut [S
             if *ctx.limit_exceeded {
                 continue;
             }
+            ctx.site_doubt = ctx.membership.doubt();
             match ctx.spec.kind {
                 TargetKind::Type => scan_type_reference(node, token, ctx),
                 TargetKind::Constructor => scan_constructor_reference(node, token, ctx),
@@ -836,9 +857,11 @@ fn extension_call_resolution(
         scope_end,
         CSharpBuiltinValueArguments::at_site(name, ctx.source),
     );
-    if let Some(resolution) = ctx.extension_target_cache.get(&cache_key) {
+    if let Some((resolution, doubted)) = ctx.extension_target_cache.get(&cache_key) {
+        ctx.membership.replay(*doubted);
         return *resolution;
     }
+    let before = ctx.membership.doubt();
     let ordinary_member_is_applicable = receiver_type_names.iter().any(|receiver_fqn| {
         class_unit_for_fq_name(ctx.csharp, token, receiver_fqn).is_some_and(|owner| {
             applicable_member_candidates_for_owner(
@@ -855,8 +878,9 @@ fn extension_call_resolution(
         })
     });
     if ordinary_member_is_applicable {
+        let doubted = ctx.membership.doubt() > before;
         ctx.extension_target_cache
-            .insert(cache_key, TargetMemberResolution::KnownOther);
+            .insert(cache_key, (TargetMemberResolution::KnownOther, doubted));
         return TargetMemberResolution::KnownOther;
     }
     let candidates = usage_visible_extension_method_candidates(
@@ -877,7 +901,9 @@ fn extension_call_resolution(
     } else {
         TargetMemberResolution::KnownOther
     };
-    ctx.extension_target_cache.insert(cache_key, resolution);
+    let doubted = ctx.membership.doubt() > before;
+    ctx.extension_target_cache
+        .insert(cache_key, (resolution, doubted));
     resolution
 }
 
@@ -1232,9 +1258,11 @@ fn receiver_fqn_target_member_resolution(
     ctx: &mut ScanCtx<'_>,
 ) -> TargetMemberResolution {
     let key = (receiver_fqn.to_string(), explicit_generic_arity, call_arity);
-    if let Some(resolution) = ctx.nearest_member_target_cache.get(&key) {
+    if let Some((resolution, doubted)) = ctx.nearest_member_target_cache.get(&key) {
+        ctx.membership.replay(*doubted);
         return *resolution;
     }
+    let before = ctx.membership.doubt();
     let resolution = class_unit_for_fq_name(ctx.csharp, token, receiver_fqn)
         .map(|receiver_owner| {
             call_arity.map_or_else(
@@ -1271,7 +1299,9 @@ fn receiver_fqn_target_member_resolution(
             }
         })
         .unwrap_or(TargetMemberResolution::NotFound);
-    ctx.nearest_member_target_cache.insert(key, resolution);
+    let doubted = ctx.membership.doubt() > before;
+    ctx.nearest_member_target_cache
+        .insert(key, (resolution, doubted));
     resolution
 }
 

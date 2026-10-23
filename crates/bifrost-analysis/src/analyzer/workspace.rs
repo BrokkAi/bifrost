@@ -17,6 +17,7 @@ use crate::analyzer::semantic_model::SemanticPackCatalog;
 use crate::analyzer::semantic_model::SubprocessPolicy;
 use crate::analyzer::semantic_model::acquire_active_semantic_models_with_runtime_artifacts;
 use crate::analyzer::semantic_model::prepare_installed_dependency_packs;
+use crate::analyzer::semantic_model::runtime::ApproximateSemanticModelExpectation;
 
 use crate::analyzer::store::StoreError;
 
@@ -628,9 +629,12 @@ impl DependencyPackEcosystem {
     /// construction and revision export one source of truth.
     #[doc(hidden)]
     pub fn is_file_dependency_input(self, path: &Path) -> bool {
-        crate::analyzer::languages::language_support(self.languages()[0])
-            .expect("dependency ecosystem primary language support")
-            .is_file_dependency_input(path)
+        crate::analyzer::languages::language_support_for_hook(
+            self.languages()[0],
+            "is_file_dependency_input",
+        )
+        .expect("dependency ecosystem primary language support")
+        .is_file_dependency_input(path)
     }
 
     /// The resolver that discovers this ecosystem's dependencies, paired with
@@ -641,10 +645,13 @@ impl DependencyPackEcosystem {
     /// resolver-to-adapter pairing inline, which is how the activation loop
     /// came to hold per-ecosystem limit adjustments as well.
     pub(crate) fn resolver(self) -> &'static dyn DependencyResolver {
-        crate::analyzer::languages::language_support(self.languages()[0])
-            .expect("dependency ecosystem primary language support")
-            .dependency_pack_resolver()
-            .expect("dependency ecosystem resolver")
+        crate::analyzer::languages::language_support_for_hook(
+            self.languages()[0],
+            "dependency_pack_resolver",
+        )
+        .expect("dependency ecosystem primary language support")
+        .dependency_pack_resolver()
+        .expect("dependency ecosystem resolver")
     }
 }
 
@@ -702,14 +709,16 @@ struct DependencyPackPublicationEvidence {
 /// Correlate a configured source toolchain with the exact pack produced from
 /// that home's artifacts. Discovery IDs are run-local join keys; only the
 /// prepared evidence's artifact digest authorizes later call applicability.
-pub(crate) fn prepared_jdk_artifacts_for_source_bindings(
+#[doc(hidden)]
+pub fn prepared_jdk_artifacts_for_source_bindings(
     config: &AnalyzerConfig,
     project_root: &Path,
     outcomes: &[DependencyPackEcosystemOutcome],
 ) -> Option<HashMap<PathBuf, SemanticModelActivationEvidence>> {
-    crate::analyzer::languages::language_support(Language::Java)
-        .expect("Java support")
-        .dependency_source_artifacts(config, project_root, outcomes)
+    Language::ANALYZABLE
+        .iter()
+        .filter_map(|&language| crate::analyzer::languages::language_support(language))
+        .find_map(|support| support.dependency_source_artifacts(config, project_root, outcomes))
 }
 
 /// The installed-pack stage's activation: the published interim outcome plus
@@ -757,9 +766,14 @@ fn python_runtime_publication(
     Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
     StoreError,
 > {
-    crate::analyzer::languages::language_support(Language::Python).map_or(Ok(None), |support| {
-        support.publish_dependency_runtime(workspace, config, activation, context)
-    })
+    for support in crate::analyzer::languages::registered_language_supports() {
+        if let Some(publication) =
+            support.publish_dependency_runtime(workspace, config, activation, context)?
+        {
+            return Ok(Some(publication));
+        }
+    }
+    Ok(None)
 }
 
 impl WorkspaceAnalyzer {
@@ -780,9 +794,12 @@ impl WorkspaceAnalyzer {
         limits: &DependencyPackLimits,
         cancellation: &crate::CancellationToken,
     ) -> DependencyDiscoveryOutcome {
-        crate::analyzer::languages::language_support(ecosystem.languages()[0])
-            .expect("dependency ecosystem primary language support")
-            .resolve_workspace_dependencies(self, config, limits, cancellation)
+        crate::analyzer::languages::language_support_for_hook(
+            ecosystem.languages()[0],
+            "resolve_workspace_dependencies",
+        )
+        .expect("dependency ecosystem primary language support")
+        .resolve_workspace_dependencies(self, config, limits, cancellation)
     }
 
     fn discover_dependency_pack_ecosystem(
@@ -853,6 +870,16 @@ impl WorkspaceAnalyzer {
         for ecosystem in ecosystems.iter().copied() {
             let (resolver, limits, discovery) =
                 self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+            activation.approximate_standard_libraries.extend(
+                discovery
+                    .standard_library_pack_expectations()
+                    .filter(|expectation| expectation.approximate)
+                    .map(|expectation| ApproximateSemanticModelExpectation {
+                        language: expectation.language.config_label().to_owned(),
+                        ecosystem: ecosystem.label().to_owned(),
+                        pack_id: expectation.pack_id.to_owned(),
+                    }),
+            );
             if discovery.cancelled {
                 cancelled = true;
                 outcomes.push(DependencyPackEcosystemOutcome {
@@ -969,6 +996,16 @@ impl WorkspaceAnalyzer {
         for ecosystem in ecosystems.iter().copied() {
             let (resolver, limits, discovery) =
                 self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+            activation.approximate_standard_libraries.extend(
+                discovery
+                    .standard_library_pack_expectations()
+                    .filter(|expectation| expectation.approximate)
+                    .map(|expectation| ApproximateSemanticModelExpectation {
+                        language: expectation.language.config_label().to_owned(),
+                        ecosystem: ecosystem.label().to_owned(),
+                        pack_id: expectation.pack_id.to_owned(),
+                    }),
+            );
             if discovery.cancelled {
                 cancelled = true;
                 outcomes.push(DependencyPackEcosystemOutcome {
@@ -1082,7 +1119,8 @@ impl WorkspaceAnalyzer {
         if cancelled
             || (!ecosystems_empty
                 && publication.dependencies.is_empty()
-                && activation.evidence.is_empty())
+                && activation.evidence.is_empty()
+                && activation.approximate_standard_libraries.is_empty())
         {
             return DependencyPackActivationOutcome {
                 ecosystems: outcomes,
@@ -1253,6 +1291,17 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
         let store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, None, store_context, None)
+    }
+
+    /// Build against an explicitly supplied store to exercise reader lifetimes.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn build_with_store_context_for_test(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        store_context: crate::analyzer::AnalyzerStoreContext,
+    ) -> Result<Self, StoreError> {
         Self::build_filtered(project, config, None, store_context, None)
     }
 
@@ -1456,9 +1505,12 @@ impl WorkspaceAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
-        crate::analyzer::languages::language_support(Language::Java)
-            .expect("Java support")
-            .configure_dependency_workspace(&mut config, project.root())?;
+        for support in Language::ANALYZABLE
+            .iter()
+            .filter_map(|&language| crate::analyzer::languages::language_support(language))
+        {
+            support.configure_dependency_workspace(&mut config, project.root())?;
+        }
         // A fresh abort per fan-out. The caller's context may outlive this
         // build and go on to serve lazy per-language delegate builds, and those
         // must not inherit a flag this build set.
@@ -1613,23 +1665,20 @@ impl WorkspaceAnalyzer {
             }
         }
 
-        // Give SQLite's query planner real cardinalities for what this build
-        // just persisted, while the build lock still holds every other
-        // worktree off this cache (issue #3016). Only the elected builder of a
-        // persisted cache reaches here with a lock, and the store skips the
-        // work when nothing was persisted or collected since the last refresh,
-        // so a repeated no-op build costs one indexed query. Blob cardinality
-        // provides a cheap staleness proxy that avoids refreshing every no-op
-        // build.
+        // Under the elected builder's lock, refresh all tables outside the
+        // blob-count tolerance, otherwise only non-empty stale tables.
+        // SQLite's dry-run optimize can take a write transaction even when
+        // nothing is stale.
         if build_lock.is_some()
             && brokk_bifrost_core::cache_gc::planner_statistics_enabled()
             && let Some(evidence) = store_context.store.refresh_planner_statistics_if_stale()?
         {
             profiling::note_with(|| {
                 format!(
-                    "workspace.planner_statistics refreshed: {:.1} ms, {} sqlite_stat1 rows",
+                    "workspace.planner_statistics refreshed: {:.1} ms, {} sqlite_stat1 rows, tables {:?}",
                     evidence.elapsed.as_secs_f64() * 1000.0,
-                    evidence.stat1_rows
+                    evidence.stat1_rows,
+                    evidence.analyzed_tables
                 )
             });
         }
@@ -1881,9 +1930,12 @@ impl WorkspaceAnalyzer {
     /// an unpublished live blob is exactly what makes a native graph report
     /// `unavailable_canonical_facts`.
     pub fn warm_rust_usage_facts(&self) {
-        crate::analyzer::languages::language_support(Language::Rust)
-            .expect("Rust support")
-            .warm_usage_facts(self.analyzer());
+        for support in Language::ANALYZABLE
+            .iter()
+            .filter_map(|&language| crate::analyzer::languages::language_support(language))
+        {
+            support.warm_usage_facts(self.analyzer());
+        }
     }
 
     /// Whether a Rust usage query would wait for a fact catch-up batch.
@@ -1893,9 +1945,10 @@ impl WorkspaceAnalyzer {
     /// persisted in the background. Answers without blocking behind that batch,
     /// which is the point (#1757). Always true for a workspace with no Rust.
     pub fn rust_usage_facts_ready(&self) -> bool {
-        crate::analyzer::languages::language_support(Language::Rust)
-            .expect("Rust support")
-            .usage_facts_ready(self.analyzer())
+        Language::ANALYZABLE
+            .iter()
+            .filter_map(|&language| crate::analyzer::languages::language_support(language))
+            .all(|support| support.usage_facts_ready(self.analyzer()))
     }
 
     /// Whether the Rust fact catch-up has run for this generation. The
@@ -1903,9 +1956,10 @@ impl WorkspaceAnalyzer {
     /// [`Self::rust_usage_facts_ready`] answers: a session that never warms and
     /// never queries is ready but not warm.
     pub fn rust_usage_facts_warm(&self) -> bool {
-        crate::analyzer::languages::language_support(Language::Rust)
-            .expect("Rust support")
-            .usage_facts_warm(self.analyzer())
+        Language::ANALYZABLE
+            .iter()
+            .filter_map(|&language| crate::analyzer::languages::language_support(language))
+            .all(|support| support.usage_facts_warm(self.analyzer()))
     }
 
     /// Select the execution-semantics provider for the requested file without
@@ -2193,7 +2247,7 @@ impl WorkspaceAnalyzer {
         }
         self.analyzer()
             .invalidate_cached_file_identities_for(changed_files);
-        match self {
+        let next = match self {
             Self::Empty(analyzer) => {
                 let Some(build_context) = analyzer.build_context.as_ref() else {
                     return Self::Empty(analyzer.clone());
@@ -2210,7 +2264,33 @@ impl WorkspaceAnalyzer {
                 })
             }
             Self::Multi(analyzer) => Self::from_updated_multi(analyzer.update(changed_files)),
+        };
+        next.reconcile_updated_build_context(Some(changed_files));
+        next
+    }
+
+    /// Refresh external-tool contexts for this updated snapshot without
+    /// activating semantic packs. Hosts publish the new snapshot first so a
+    /// failed refresh remains visible in its language's build-selection state.
+    pub fn refresh_updated_workspace_contexts(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        limits: &DependencyPackLimits,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<(), StoreError> {
+        let Some(config) = self.config() else {
+            return Ok(());
+        };
+        for support in crate::analyzer::languages::registered_language_supports() {
+            support.refresh_updated_workspace_context(
+                self,
+                changed_files,
+                config,
+                limits,
+                cancellation,
+            )?;
         }
+        Ok(())
     }
 
     pub fn update_all(&self) -> Self {
@@ -2228,7 +2308,7 @@ impl WorkspaceAnalyzer {
     fn update_all_reporting_progress(&self, progress: Option<BuildProgress>) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
         self.analyzer().invalidate_cached_file_identities();
-        match self {
+        let next = match self {
             Self::Empty(analyzer) => {
                 let Some(build_context) = analyzer.build_context.as_ref() else {
                     return Self::Empty(analyzer.clone());
@@ -2245,6 +2325,19 @@ impl WorkspaceAnalyzer {
             Self::Multi(analyzer) => {
                 Self::from_updated_multi(analyzer.update_all_with_progress(progress))
             }
+        };
+        next.reconcile_updated_build_context(None);
+        next
+    }
+
+    fn reconcile_updated_build_context(
+        &self,
+        changed: Option<&BTreeSet<crate::analyzer::ProjectFile>>,
+    ) {
+        for support in crate::analyzer::languages::registered_language_supports() {
+            if let Err(error) = support.reconcile_workspace_build_context(self, changed) {
+                self.analyzer().record_query_failure(error);
+            }
         }
     }
 }
@@ -2256,78 +2349,16 @@ mod tests {
     use crate::analyzer::store::liveness::Liveness;
 
     use crate::analyzer::FilesystemProject;
-    use crate::analyzer::OverlayProject;
-    use crate::analyzer::Project;
+
     use crate::analyzer::ProjectFile;
 
     use crate::gitblob::test_repo::commit_all;
     use crate::gitblob::test_repo::init_repo;
 
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    #[hardwon(
-        "#2542: overlay source identity was recomputed during workspace snapshot construction"
-    )]
-    fn build_snapshot_hashes_overlay_source_once_as_an_overlay_entry() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = ProjectFile::new(&root, "Sample.java");
-        std::fs::write(file.abs_path(), "class Disk {}\n").unwrap();
-        let repository = init_repo(&root);
-        commit_all(&repository, "overlay source");
-
-        let base: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let overlay = Arc::new(OverlayProject::new(base));
-        let overlay_source = "class Overlay {}\n";
-        assert!(overlay.set(file.abs_path(), overlay_source.to_owned()));
-        let repository = crate::gitblob::discover(&root).unwrap();
-        let liveness = Liveness::new(repository).unwrap();
-        let snapshot =
-            WorkspaceBuildSnapshot::capture(overlay.as_ref(), Some(&liveness), &[Language::Java])
-                .expect("Git-backed overlay snapshot");
-        let entry = snapshot
-            .live_entry(overlay.as_ref(), &file)
-            .expect("overlay live entry");
-        assert_eq!(
-            liveness.startup_oid_batch_counter().load(Ordering::Relaxed),
-            0
-        );
-        let expected =
-            git2::Oid::hash_object(git2::ObjectType::Blob, overlay_source.as_bytes()).unwrap();
-        assert_eq!(entry.oid(), expected);
-        assert!(entry.is_overlay());
-
-        let updated_overlay_source = "class OverlayTwo {}\n";
-        assert!(overlay.set(file.abs_path(), updated_overlay_source.to_owned()));
-        assert!(snapshot.live_entry(overlay.as_ref(), &file).is_none());
-        let refreshed =
-            WorkspaceBuildSnapshot::capture(overlay.as_ref(), Some(&liveness), &[Language::Java])
-                .expect("refreshed overlay snapshot");
-        let refreshed_entry = refreshed
-            .live_entry(overlay.as_ref(), &file)
-            .expect("refreshed overlay live entry");
-        let refreshed_expected =
-            git2::Oid::hash_object(git2::ObjectType::Blob, updated_overlay_source.as_bytes())
-                .unwrap();
-        assert_eq!(refreshed_entry.oid(), refreshed_expected);
-
-        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-            Arc::clone(&overlay) as Arc<dyn Project>,
-            AnalyzerConfig::default(),
-        )
-        .expect("ephemeral overlay workspace");
-        assert!(
-            workspace
-                .analyzer()
-                .declarations(&file)
-                .iter()
-                .any(|unit| unit.identifier() == "OverlayTwo")
-        );
-    }
-
+    #[cfg(test)]
     #[test]
     #[hardwon("#2542: workspace snapshot reused a disk identity after source bytes changed")]
     fn build_snapshot_rejects_changed_disk_identity_and_recomputes() {

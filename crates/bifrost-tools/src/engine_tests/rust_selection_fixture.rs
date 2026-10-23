@@ -1,6 +1,8 @@
-use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+use crate::selection_fixture_support::write_fixture_blob;
+use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
+
 use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::{
-    SelectionFixture, parsed_fixture_state, write_fixture_blob,
+    SelectionFixture, parsed_fixture_state,
 };
 use brokk_bifrost_analysis::analyzer::store::{AnalyzerStore, GenerationId};
 use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
@@ -99,7 +101,7 @@ impl RustSelectionFixture {
     // Preserve existing fixture call sites while supplying Rust's blob writer.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(mount_count: usize) -> SelectionFixture {
-        SelectionFixture::new(mount_count)
+        crate::selection_fixture_support::JvmSelectionFixture::new(mount_count)
     }
 }
 

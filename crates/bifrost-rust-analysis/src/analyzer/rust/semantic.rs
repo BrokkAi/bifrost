@@ -129,7 +129,9 @@ use brokk_bifrost_core::hash::HashSet;
 // change; the code-query tutorial pages elide such ids (#5016).
 // #5911: tuple component establishments and ownership change immutable effects;
 // unchanged source must not reuse artifacts that omitted those transfers.
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v44";
+// BrokkAi/tree-sitter-rust#3: grammar 0.24.7 changes inclusive prefix ranges
+// from assignments to ranges, changing effects for unchanged source.
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v48";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -936,6 +938,16 @@ struct ScopedNodeSchedule<'schedule, 'tree> {
     children: &'schedule [Node<'tree>],
     entries: &'schedule [ProgramPointId],
     scopes: &'schedule [ScopeFrameId],
+}
+
+#[derive(Clone, Copy)]
+enum RustAssignmentTarget {
+    Binding(ValueId),
+    Memory {
+        kind: MemoryAccessKind,
+        location: MemoryLocationId,
+    },
+    Unsupported,
 }
 
 struct LoweringContext<'tree, 'targets> {
@@ -2559,22 +2571,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.tuple_lets.insert(node.id(), proof);
                 }
             }
-            // A `for` pattern binds a local too. Without it the loop variable
+            // A `for` or match-arm pattern binds a local too. Without it the loop variable
             // resolved to nothing inside the body, so an element read there
             // began a fresh unrelated value. A destructuring pattern binds one
             // local per component, so `for (key, value) in map` mints two
             // (#2705); binding only the single-identifier form left both names
             // unbound and silently dropped every flow through such a loop.
-            if node.kind() == "for_expression"
+            if matches!(node.kind(), "for_expression" | "match_arm")
                 && let Some(pattern) = node.child_by_field_name("pattern")
-                && let Some(body) = node.child_by_field_name("body")
+                && let Some(body) = node
+                    .child_by_field_name("body")
+                    .or_else(|| node.child_by_field_name("value"))
             {
                 // An element proven non-dropping makes each component of that
                 // element non-dropping too: destructuring moves out of a value
                 // that owns no destructor.
-                let element_is_non_dropping = node
-                    .child_by_field_name("value")
-                    .is_some_and(rust_iteration_element_is_definitely_non_dropping);
+                let element_is_non_dropping = node.kind() == "for_expression"
+                    && node
+                        .child_by_field_name("value")
+                        .is_some_and(rust_iteration_element_is_definitely_non_dropping);
+                let visible_from = if node.kind() == "match_arm" {
+                    pattern.start_byte()
+                } else {
+                    body.start_byte()
+                };
+                let (scope_start, scope_end) = if node.kind() == "match_arm" {
+                    (node.start_byte(), node.end_byte())
+                } else {
+                    (body.start_byte(), body.end_byte())
+                };
                 for name in rust_pattern_binding_identifiers(pattern) {
                     let Some(text) = node_text(self.source, name) else {
                         continue;
@@ -2589,18 +2614,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.binding_places.insert(value, place);
                     self.binding_metadata.insert(value, metadata);
                     self.binding_nodes.insert(value, name);
-                    self.binding_scopes.insert(
-                        value,
-                        (body.start_byte(), body.start_byte(), body.end_byte()),
-                    );
+                    self.binding_scopes
+                        .insert(value, (visible_from, scope_start, scope_end));
                     self.locals
                         .entry(text.into())
                         .or_default()
                         .push(LocalBinding {
                             declaration_start: name.start_byte(),
-                            visible_from: body.start_byte(),
-                            scope_start: body.start_byte(),
-                            scope_end: body.end_byte(),
+                            visible_from,
+                            scope_start,
+                            scope_end,
                             value,
                             initializer: None,
                         });
@@ -5190,9 +5213,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// Publish the omitted implicit `Drop` at `point`.
     ///
     /// `discharge` is the proof obligation for cleanup routing, resource
-    /// release, and destructor unwinding: `InertDropGlue` when every value
+    /// and resource release: `InertDropGlue` when every value
     /// this drop can destroy is a parameter or a `let` binding of the
     /// procedure, which the workspace oracle can type (#3757); `None` otherwise.
+    /// Destructor unwinding uses the corresponding non-rejoining exit proof.
     fn add_drop_omission_gaps(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -5227,7 +5251,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             (
                 SemanticCapability::ExceptionalControlFlow,
                 SemanticGapKind::Unsupported,
-                discharge,
+                if discharge == SemanticGapDischarge::InertDropGlue {
+                    SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+                } else {
+                    SemanticGapDischarge::ExitOnlyProcedureCompletion
+                },
                 "destructor unwinding and destructor panic routing are not lowered",
             ),
         ] {
@@ -5241,6 +5269,113 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 gap_discharge,
                 format!("{context}; {detail}"),
             )?;
+        }
+        Ok(())
+    }
+
+    fn unsupported_pattern_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        pattern: Node<'tree>,
+        scrutinee: Node<'tree>,
+        detail: &str,
+    ) -> Result<(), RustLoweringError> {
+        let mut root = scrutinee;
+        let root_binding = loop {
+            root = unwrap_attributes(root);
+            match root.kind() {
+                "identifier" | "self" => break self.binding_value(root),
+                "field_expression" => root = required_field(root, "value")?,
+                "index_expression" | "parenthesized_expression" => {
+                    let Some(base) = first_named_child(root) else {
+                        break None;
+                    };
+                    root = base;
+                }
+                "unary_expression" => {
+                    let Some(base) = rust_dereference_operand(root) else {
+                        break None;
+                    };
+                    root = base;
+                }
+                _ => break None,
+            }
+        };
+        let mut bindings = Vec::new();
+        for name in rust_pattern_binding_identifiers(pattern) {
+            let text = node_text(self.source, name).expect("pattern identifier has source text");
+            if let Some(value) = self.local_declaration_value(text, name.start_byte()) {
+                let mut ancestor = name;
+                let by_reference = loop {
+                    if ancestor.kind() == "ref_pattern" {
+                        break true;
+                    }
+                    if ancestor.id() == pattern.id() {
+                        break false;
+                    }
+                    ancestor = ancestor.parent().expect("binding belongs to its pattern");
+                };
+                if by_reference && let Some(root_binding) = root_binding {
+                    // Retain the borrowed root and the reference's installation
+                    // in a lexical slot. The shared address-escape analysis
+                    // recognizes this store, conservatively opening the root
+                    // even when the pattern selects only a subplace (#6409).
+                    let address = self.value(builder, point, SemanticValueKind::Address)?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::Assignment {
+                            target: address,
+                            value: root_binding,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::Assignment {
+                            target: value,
+                            value: address,
+                        },
+                    )?;
+                    let location = self.session.add_memory_location(
+                        builder,
+                        point,
+                        MemoryLocationKind::LexicalCell { binding: value },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::LexicalCell,
+                            location,
+                            value: address,
+                        },
+                    )?;
+                }
+                bindings.push(value);
+            }
+        }
+        if bindings.is_empty() {
+            self.session.record_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::LocalFlow,
+                SemanticGapKind::Unsupported,
+                detail,
+            )?;
+        } else {
+            for binding in bindings {
+                self.session.record_gap(
+                    builder,
+                    point,
+                    SemanticGapSubject::Value(binding),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    detail,
+                )?;
+            }
         }
         Ok(())
     }
@@ -5301,12 +5436,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             } else if let Some(proof) = self.tuple_lets.remove(&node.id()) {
                 match proof {
                     Ok(proof) => initialized = self.append_tuple_let(builder, binding, proof)?,
-                    Err(reason) => self.session.record_gap(
+                    Err(reason) => self.unsupported_pattern_gaps(
                         builder,
                         binding,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::LocalFlow,
-                        SemanticGapKind::Unsupported,
+                        pattern,
+                        value,
                         &format!(
                             "tuple-let component ownership is unproved: {}",
                             ownership_gap_detail(reason)
@@ -5314,12 +5448,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?,
                 }
             } else {
-                self.session.record_gap(
+                self.unsupported_pattern_gaps(
                     builder,
                     binding,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::LocalFlow,
-                    SemanticGapKind::Unsupported,
+                    pattern,
+                    value,
                     "destructuring and by-reference Rust let patterns are not lowered as identity-preserving local flow",
                 )?;
             }
@@ -5329,8 +5462,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let alternative_entry = self.point(builder, alternative, Vec::new())?;
             // No control-flow gap: the matched and diverging successors are
             // both represented as edges below. What the pattern binds is a
-            // value question, already published by the `LocalFlow` gap above
-            // for any pattern this adapter does not lower as identity flow.
+            // value question, already published by the binding's `Values`
+            // gaps (or the point fallback for an unidentified pattern).
             self.session.add_target_edge(
                 builder,
                 binding,
@@ -5386,6 +5519,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "compound_assignment_expr" => {
+                self.compound_assignment_expression(builder, node, entry, next, scope, stack)
             }
             "parenthesized_expression" => {
                 let value = first_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
@@ -5768,13 +5904,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
         let terminal = self.point(builder, node, Vec::new())?;
+        let value = self.expression_value(builder, right, expression_value_kind(right))?;
+        let (target, mut evaluations) = self.assignment_target(builder, left, terminal, scope)?;
+        self.write_assignment_target(builder, terminal, target, right, value)?;
+        evaluations.push(right);
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn assignment_target(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        left: Node<'tree>,
+        terminal: ProgramPointId,
+        scope: ScopeFrameId,
+    ) -> Result<(RustAssignmentTarget, Vec<Node<'tree>>), RustLoweringError> {
         if left.kind() == "unary_expression"
             && let Some(pointer_node) = rust_dereference_operand(left)
             && self.is_raw_pointer_expression(pointer_node)
         {
             let pointer =
                 self.expression_value(builder, pointer_node, expression_value_kind(pointer_node))?;
-            let value = self.expression_value(builder, right, expression_value_kind(right))?;
             let width = self.pointer_width_for_expression(pointer_node);
             let metadata = self.metadata(terminal)?;
             self.add_pointer_access(terminal, pointer, PointerAccessKind::Write, width, metadata);
@@ -5791,25 +5948,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 terminal,
                 MemoryLocationKind::Dereference { address: pointer },
             )?;
-            self.append_effect(
-                builder,
-                terminal,
-                SemanticEffect::MemoryStore {
+            return Ok((
+                RustAssignmentTarget::Memory {
                     kind: MemoryAccessKind::Dereference,
                     location,
-                    value,
                 },
-            )?;
-            self.session.add_target_edge(builder, terminal, next)?;
-            self.schedule_expressions(
-                builder,
-                entry,
-                &[pointer_node, right],
-                EdgeTarget::normal(terminal),
-                scope,
-                stack,
-            )?;
-            return Ok(());
+                vec![pointer_node],
+            ));
         }
         if left.kind() == "identifier" {
             let name = node_text(self.source, left).ok_or_else(|| {
@@ -5819,18 +5964,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .local_at(name, left.start_byte())
                 .or_else(|| self.parameters.get(name).copied())
                 .or_else(|| self.captured_bindings.get(name).copied());
-            if let Some(target) = target {
-                let value = self.expression_value(builder, right, expression_value_kind(right))?;
-                let target_type = self.value_types.get(&target).copied();
-                self.append_ownership_transfer(
-                    builder,
-                    terminal,
-                    right,
-                    value,
-                    target,
-                    target_type,
-                )?;
-            } else {
+            if target.is_none() {
                 self.session.record_gap(
                     builder,
                     terminal,
@@ -5848,14 +5982,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapDischarge::None,
                 )?;
             }
-            self.session.add_target_edge(builder, terminal, next)?;
-            stack.push(Work::Expression {
-                node: right,
-                entry,
-                next: EdgeTarget::normal(terminal),
-                scope,
-            });
-            return Ok(());
+            return Ok((
+                target
+                    .map(RustAssignmentTarget::Binding)
+                    .unwrap_or(RustAssignmentTarget::Unsupported),
+                Vec::new(),
+            ));
         }
 
         // A single field or index target is a real store into memory. The
@@ -5867,9 +5999,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .filter(|place| {
                 place.kind() != "field_expression" || !self.field_denotes_no_location(*place)
             });
+        let mut target = RustAssignmentTarget::Unsupported;
         let evaluations = if let Some(place) = place {
-            let value = self.expression_value(builder, right, expression_value_kind(right))?;
-            let mut evaluations = vec![right];
+            let mut evaluations = Vec::new();
             match place.kind() {
                 "field_expression" => {
                     let base = required_field(place, "value")?;
@@ -5889,15 +6021,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     if !resolved {
                         self.add_field_identity_gap(builder, terminal, location, exact_member_key)?;
                     }
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::MemoryStore {
-                            kind: MemoryAccessKind::Field,
-                            location,
-                            value,
-                        },
-                    )?;
+                    target = RustAssignmentTarget::Memory {
+                        kind: MemoryAccessKind::Field,
+                        location,
+                    };
                     evaluations.insert(0, base);
                 }
                 _ => {
@@ -5927,15 +6054,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     if index.is_none() {
                         self.add_dynamic_index_gap(builder, terminal, location)?;
                     }
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::MemoryStore {
-                            kind: MemoryAccessKind::Index,
-                            location,
-                            value,
-                        },
-                    )?;
+                    target = RustAssignmentTarget::Memory {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                    };
                     evaluations.insert(0, *index_node);
                     evaluations.insert(0, *base);
                 }
@@ -5950,7 +6072,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "dereferenced, destructuring, and call-selector Rust assignment targets are not yet lowered into memory flow",
             )?;
-            runtime_expression_children(node)
+            vec![left]
         };
         // One scoped fact per point: the place-evaluation traits a field, index,
         // or dereference target may invoke are reported alongside the drop
@@ -5975,24 +6097,48 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // drop-omission family already carries this exact scoped fact in
             // that family's own `ExceptionalControlFlow` row, and #2638's
             // contract allows only one row per (point, subject, capability).
-            self.session.record_gap(
+            self.add_non_rejoining_exceptional_exit_gap(
                 builder,
                 terminal,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
+                scope,
                 SemanticGapKind::Unsupported,
                 "an index store may abort on an out-of-range index; that abort edge is not lowered",
             )?;
         }
-        self.session.add_target_edge(builder, terminal, next)?;
-        self.schedule_expressions(
-            builder,
-            entry,
-            &evaluations,
-            EdgeTarget::normal(terminal),
-            scope,
-            stack,
-        )
+        Ok((target, evaluations))
+    }
+
+    fn write_assignment_target(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        target: RustAssignmentTarget,
+        source_node: Node<'tree>,
+        value: ValueId,
+    ) -> Result<(), RustLoweringError> {
+        match target {
+            RustAssignmentTarget::Binding(target) => {
+                let target_type = self.value_types.get(&target).copied();
+                self.append_ownership_transfer(
+                    builder,
+                    point,
+                    source_node,
+                    value,
+                    target,
+                    target_type,
+                )
+            }
+            RustAssignmentTarget::Memory { kind, location } => self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind,
+                    location,
+                    value,
+                },
+            ),
+            RustAssignmentTarget::Unsupported => Ok(()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6243,6 +6389,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 terminal,
                 scope,
+                SemanticGapKind::Unsupported,
                 "arithmetic overflow, division by zero, or an invalid dereference may abort here; that abort edge is not lowered",
             )?;
         }
@@ -6306,11 +6453,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "field projection may require implicit autoderef operations that are not emitted as call sites",
             )?;
-            self.session.record_gap(
+            self.add_non_rejoining_exceptional_exit_gap(
                 builder,
                 access,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
+                scope,
                 SemanticGapKind::Unsupported,
                 "an implicit Rust autoderef may abort here; that abort edge is not lowered",
             )?;
@@ -6438,11 +6584,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         // Built in or not, an index read may abort on an out-of-range index.
-        self.session.record_gap(
+        self.add_non_rejoining_exceptional_exit_gap(
             builder,
             access,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
+            scope,
             SemanticGapKind::Unsupported,
             "indexing may abort on an out-of-range index; that abort edge is not lowered",
         )?;
@@ -6458,7 +6603,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn implicit_call_expression(
+    fn compound_assignment_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
@@ -6467,7 +6612,93 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
         let boundary = self.point(builder, node, Vec::new())?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let (target, mut evaluations) = self.assignment_target(builder, left, terminal, scope)?;
+        let old = match target {
+            RustAssignmentTarget::Binding(value) => value,
+            RustAssignmentTarget::Memory { kind, location } => {
+                if kind == MemoryAccessKind::Dereference {
+                    let pointer_node = rust_dereference_operand(left)
+                        .expect("a dereference assignment target has a pointer operand");
+                    let pointer = self.expression_value(
+                        builder,
+                        pointer_node,
+                        expression_value_kind(pointer_node),
+                    )?;
+                    let width = self.pointer_width_for_expression(pointer_node);
+                    let metadata = self.metadata(boundary)?;
+                    self.add_pointer_access(
+                        boundary,
+                        pointer,
+                        PointerAccessKind::Read,
+                        width,
+                        metadata,
+                    );
+                    if width == PointerAccessWidth::Unknown {
+                        self.add_incomplete_fact(
+                            boundary,
+                            SemanticIncompleteSubject::Value(pointer),
+                            SemanticIncompleteReason::Pointer(
+                                PointerIncompleteReason::UnknownLayout,
+                            ),
+                            metadata,
+                        );
+                    }
+                }
+                let result = self.expression_value(builder, left, expression_value_kind(left))?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::MemoryLoad {
+                        kind,
+                        location,
+                        result,
+                    },
+                )?;
+                result
+            }
+            RustAssignmentTarget::Unsupported => {
+                self.expression_value(builder, left, expression_value_kind(left))?
+            }
+        };
+        let operand = self.expression_value(builder, right, expression_value_kind(right))?;
+        // Place adjustments and replacement Drop are reported by
+        // assignment_target at the terminal, separately from the operator call.
+        self.implicit_call_boundary(builder, node, boundary, scope)?;
+        // Operator-assignment traits may compute anything. Keep both data
+        // dependencies for value-flow and taint, without preserving scalar facts.
+        let result = self.value(builder, boundary, SemanticValueKind::Temporary)?;
+        self.session.append_language_defined_value_flows(
+            builder,
+            boundary,
+            [old, operand],
+            result,
+        )?;
+        self.write_assignment_target(builder, terminal, target, node, result)?;
+        self.session
+            .add_target_edge(builder, boundary, EdgeTarget::normal(terminal))?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        evaluations.push(right);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    fn implicit_call_boundary(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        boundary: ProgramPointId,
+        scope: ScopeFrameId,
+    ) -> Result<(), RustLoweringError> {
         let reason = implicit_runtime_call_reason(node.kind())
             .expect("implicit-call expressions are dispatched by node kind");
         self.session.record_gap(
@@ -6482,39 +6713,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // Not lowering the abort edge is `Unsupported`, the shape the
             // shared implicit-abort discharge closes; an operation that cannot
             // abort publishes nothing at all.
-            self.session.record_gap(
+            self.add_non_rejoining_exceptional_exit_gap(
                 builder,
                 boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
+                scope,
                 SemanticGapKind::Unsupported,
                 "an implicit Rust built-in check may abort here; that abort edge is not lowered",
             )?;
         }
-        if matches!(
-            node.kind(),
-            "assignment_expression" | "compound_assignment_expr"
-        ) && node
-            .child_by_field_name("left")
-            .is_none_or(|left| self.assignment_replaces_droppable_value(left))
-        {
-            self.session.record_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::CleanupControlFlow,
-                SemanticGapKind::Unknown,
-                "assignment may replace a live value, but its implicit Drop order and cleanup control are not lowered",
-            )?;
-            self.session.record_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ResourceManagement,
-                SemanticGapKind::Unknown,
-                "resource release for the value replaced by assignment depends on its inferred type and Drop implementation",
-            )?;
-        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn implicit_call_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let boundary = self.point(builder, node, Vec::new())?;
+        self.implicit_call_boundary(builder, node, boundary, scope)?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.session.record_gap(
+            builder,
+            boundary,
+            SemanticGapSubject::Value(result),
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            "implicit call result is not modeled (#6409)",
+        )?;
         self.session.add_target_edge(builder, boundary, next)?;
         let children = runtime_expression_children(node);
         self.schedule_expressions(
@@ -6653,13 +6883,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if !binds {
                     continue;
                 }
-                let bound = self.value(builder, *candidate, SemanticValueKind::Local)?;
-                self.session.record_gap(
+                self.unsupported_pattern_gaps(
                     builder,
                     *candidate,
-                    SemanticGapSubject::Value(bound),
-                    SemanticCapability::Values,
-                    SemanticGapKind::Unknown,
+                    pattern,
+                    value,
                     "what a selected Rust match pattern binds depends on the scrutinee's runtime shape",
                 )?;
                 self.add_drop_omission_gaps(
@@ -7322,11 +7550,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "IntoFuture::into_future and Future::poll are implicit calls not emitted as fabricated call sites",
         )?;
-        self.session.record_gap(
+        self.add_non_rejoining_exceptional_exit_gap(
             builder,
             suspend,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
+            scope,
             SemanticGapKind::Unknown,
             "implicit future conversion and polling may panic, but their exceptional behavior is not refined",
         )?;
@@ -7397,7 +7624,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             lexical_context,
         );
         let Some(path) = node.child_by_field_name("macro") else {
-            self.macro_boundary(builder, node, entry)?;
+            self.macro_boundary(builder, node, entry, scope)?;
             return Ok(());
         };
         let address_of_name = brokk_bifrost_rust::graph_support::rust_path_segments(path)
@@ -8150,6 +8377,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
         entry: ProgramPointId,
+        scope: ScopeFrameId,
     ) -> Result<ProgramPointId, RustLoweringError> {
         // Keep macro-expansion uncertainty on a source-mapped boundary for the
         // invocation itself. The incoming point may carry a distinct gap (for
@@ -8184,12 +8412,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             "calls produced by macro expansion are unavailable and no textual macro parser is used",
         )?;
-        self.session.record_gap(
+        self.add_non_rejoining_exceptional_exit_gap(
             builder,
             boundary,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
+            scope,
+            SemanticGapKind::Unknown,
             "macro expansion may introduce panic or other exceptional behavior that is unavailable",
         )?;
         self.session.record_gap(
@@ -8506,6 +8733,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 invoke,
                 scope,
+                SemanticGapKind::Unsupported,
                 "implicit method receiver adjustments may abort; that abort edge is not lowered",
             )?;
         }
@@ -9729,6 +9957,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
         scope: ScopeFrameId,
+        kind: SemanticGapKind,
         detail: &str,
     ) -> Result<(), RustLoweringError> {
         let route = builder
@@ -9741,7 +9970,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // bindings, which the workspace oracle can prove inert (#3757).
             SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
         } else {
-            SemanticGapDischarge::None
+            SemanticGapDischarge::ExitOnlyProcedureCompletion
         };
         self.session.add_gap_with_impacts_and_discharge(
             builder,
@@ -9749,7 +9978,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapSubject::Point,
             SemanticCapability::ExceptionalControlFlow,
             SemanticGapImpacts::NONE,
-            SemanticGapKind::Unsupported,
+            kind,
             discharge,
             detail,
         )?;
@@ -11827,7 +12056,7 @@ fn implicit_runtime_call_reason(kind: &str) -> Option<&'static str> {
             "assignment place evaluation may invoke DerefMut or IndexMut and replacing the old value may invoke Drop::drop; no fabricated call sites are emitted",
         ),
         "compound_assignment_expr" => Some(
-            "compound assignment may invoke an operator-assignment trait, implicit place adjustments, and Drop::drop for a replaced value; no fabricated call sites are emitted",
+            "compound assignment may invoke an operator-assignment trait; no fabricated call sites are emitted",
         ),
         "field_expression" => Some(
             "field projection may require implicit autoderef operations that are not emitted as call sites",
@@ -11958,6 +12187,141 @@ mod semantic_lowering_tests {
             panic!("fixture lowering must complete");
         };
         value
+    }
+
+    #[test]
+    fn rust_exceptional_exit_discharge_corpus() {
+        // Keep this public unit test self-contained: the private root golden
+        // Rust sources are absent from the projected public workspace, so
+        // the corpus is inline.
+        let corpus = [
+            ("conditional", "fn choose(ready: bool) -> u8 { if ready { 3 } else { 4 } }"),
+            (
+                "inherent-and-trait-methods",
+                "struct Panel;
+             trait Draw { fn draw(&self, scale: u32) -> u32; }
+             impl Panel { fn draw(&self) -> u32 { 7 } }
+             impl Draw for Panel { fn draw(&self, scale: u32) -> u32 { scale } }
+             fn paint(panel: &Panel) -> u32 { panel.draw() }",
+            ),
+            (
+                "loops",
+                "struct Batch { items: Vec<u32> }
+             fn sort_outer(mut pending: Vec<u32>, rounds: Vec<Vec<u32>>) -> usize {
+                 let mut count = 0;
+                 for round in rounds { pending.sort(); count += round.len(); }
+                 count
+             }
+             fn sort_local(rounds: Vec<Vec<u32>>) -> usize {
+                 let mut count = 0;
+                 for round in rounds { let mut local = round; local.sort(); count += local.len(); }
+                 count
+             }
+             fn sort_collected(rounds: Vec<Vec<u32>>) -> usize {
+                 let mut count = 0;
+                 for round in rounds {
+                     let mut copy = round.iter().copied().collect::<Vec<u32>>();
+                     copy.sort();
+                     count += copy.len();
+                 }
+                 count
+             }
+             fn sort_field(batches: Vec<Batch>) -> usize {
+                 let mut count = 0;
+                 for mut batch in batches { batch.items.sort(); count += batch.items.len(); }
+                 count
+             }
+             fn sort_shadowed(mut pending: Vec<u32>, rounds: Vec<Vec<u32>>) -> usize {
+                 let mut count = 0;
+                 for round in rounds {
+                     pending.sort();
+                     { let mut pending = Vec::new(); pending = round; count += pending.len(); }
+                 }
+                 count
+             }
+             fn sort_in_closure(mut pending: Vec<u32>, times: usize) -> usize {
+                 let mut count = 0;
+                 for _ in 0..times { let mut run = || pending.sort(); run(); count += 1; }
+                 count
+             }
+             fn sort_reassigned(mut pending: Vec<u32>, rounds: Vec<Vec<u32>>) -> usize {
+                 let mut count = 0;
+                 for round in rounds { pending = round; pending.sort(); count += pending.len(); }
+                 count
+             }
+             fn sort_after_seed(mut pending: Vec<u32>, seed: Vec<u32>, rounds: Vec<Vec<u32>>) -> usize {
+                 let mut count = 0;
+                 pending = seed;
+                 for round in rounds { pending.sort(); count += pending.len() + round.len(); }
+                 count
+             }
+             fn sort_pushing(mut pending: Vec<u32>, rounds: Vec<Vec<u32>>) -> usize {
+                 let mut lens = Vec::new();
+                 for round in rounds { pending.sort(); lens.push(pending.len() + round.len()); }
+                 lens.len()
+             }
+             fn sort_tracking_last(mut pending: Vec<u32>, rounds: Vec<Vec<u32>>) -> usize {
+                 let mut lens = Vec::new();
+                 let mut last = 0;
+                 for round in rounds { pending.sort(); last = round.len(); lens.push(pending.len() + last); }
+                 lens.len()
+             }",
+            ),
+            (
+                "drop-guard-early-return",
+                "struct Lock;
+             impl Drop for Lock { fn drop(&mut self) {} }
+             fn guarded(stop: bool) -> u8 {
+                 let _held = Lock;
+                 if stop { return 5; }
+                 6
+             }",
+            ),
+        ];
+        let corpus = corpus
+            .into_iter()
+            .map(|(path, source)| (path, String::from(source)))
+            .chain(std::iter::once((
+                "exit-shapes",
+                String::from(
+                    "async fn polling(f: impl Future<Output = ()>) { f.await; }
+             fn opaque() { unknown!(); }
+             fn index(mut xs: [u8; 2], i: usize) { let y = xs[i]; xs[i] = y; }
+             fn field(x: Unknown) { consume(x.a); }
+             fn temporary() { consume(make() + make()); }
+             fn residual() { let _ = try { step()? }; }
+             fn reference_patterns(mut root: (u8, u8)) {
+                 let (ref left, ref mut right) = root; consume(left); consume(right);
+                 match root { (ref a, ref mut b) => { consume(a); consume(b); } }
+             }",
+                ),
+            )));
+        let mut checked = 0;
+        for (path, source) in corpus {
+            let procedures = lower_fixture(&source);
+            for procedure in &procedures {
+                for gap in &procedure.gaps {
+                    if gap.capability != SemanticCapability::ExceptionalControlFlow
+                        || gap.detail.as_ref()
+                            == "panic and residual behavior inside the unsupported try block are not lowered"
+                    {
+                        continue;
+                    }
+                    checked += 1;
+                    assert!(
+                        matches!(
+                            gap.discharge,
+                            SemanticGapDischarge::NonRejoiningExceptionalExit
+                                | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+                                | SemanticGapDischarge::ExitOnlyProcedureCompletion
+                        ),
+                        "{path}: {gap:?}"
+                    );
+                }
+            }
+            assert_artifact_builds(procedures, &source);
+        }
+        assert!(checked > 0, "corpus must exercise exceptional gaps");
     }
 
     #[test]
@@ -12164,7 +12528,9 @@ fn tuple_unknown<T>(sh: (usize, T)) -> usize {
                     procedure
                         .gaps
                         .iter()
-                        .any(|gap| gap.capability == SemanticCapability::LocalFlow),
+                        .any(|gap| gap.capability == SemanticCapability::Values
+                            && matches!(gap.subject, SemanticGapSubject::Value(_))
+                            && gap.impacts.contains(SemanticGapImpact::ValueFlow)),
                     "unknown sibling ownership cannot become initialized: {:#?}",
                     procedure.gaps
                 );
@@ -12370,7 +12736,9 @@ fn variable(sh: ((), usize)) -> usize {
                     procedure
                         .gaps
                         .iter()
-                        .any(|gap| gap.capability == SemanticCapability::LocalFlow),
+                        .any(|gap| gap.capability == SemanticCapability::Values
+                            && matches!(gap.subject, SemanticGapSubject::Value(_))
+                            && gap.impacts.contains(SemanticGapImpact::ValueFlow)),
                     "unproved constant-vs-binder ownership must retain the tuple refusal: {:#?}",
                     procedure.gaps
                 );

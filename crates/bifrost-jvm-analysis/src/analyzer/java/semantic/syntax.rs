@@ -1,0 +1,726 @@
+use crate::analyzer::java::semantic::*;
+
+use brokk_bifrost_analysis::analyzer::common::is_comment_kind;
+
+pub(super) use brokk_bifrost_jvm::java::declarations::java_field_access_is_selector_object;
+use brokk_bifrost_semantic::analyzer::semantic::lowering::field_matches;
+
+pub(in crate::analyzer::java::semantic) fn declaration_container_kind(
+    node: Node<'_>,
+) -> Option<DeclarationSegmentKind> {
+    match node.kind() {
+        "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration" => Some(DeclarationSegmentKind::Type),
+        "class_body"
+            if node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "object_creation_expression") =>
+        {
+            Some(DeclarationSegmentKind::Type)
+        }
+        _ => None,
+    }
+}
+
+pub(super) use brokk_bifrost_analysis::analyzer::common::declaration_container_name;
+
+pub(in crate::analyzer::java::semantic) fn callable_name(
+    source: &str,
+    node: Node<'_>,
+) -> Option<Box<str>> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::callable_name_with_binding(
+        source,
+        node,
+        || enclosing_variable_name(source, node),
+    )
+}
+
+fn enclosing_variable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    let parent = node.parent()?;
+    if parent.kind() != "variable_declarator" || !field_matches(parent, "value", node) {
+        return None;
+    }
+    parent
+        .child_by_field_name("name")
+        .and_then(|name| nonempty_node_text(source, name))
+        .map(Box::<str>::from)
+}
+
+pub(in crate::analyzer::java::semantic) fn callable_shape<'tree>(
+    node: Node<'tree>,
+) -> Option<(
+    ProcedureKind,
+    DeclarationSegmentKind,
+    Node<'tree>,
+    ProcedureProperties,
+)> {
+    let (kind, segment_kind, body, is_static) = match node.kind() {
+        "method_declaration" => (
+            ProcedureKind::Method,
+            DeclarationSegmentKind::Method,
+            node.child_by_field_name("body")?,
+            has_modifier(node, "static"),
+        ),
+        "constructor_declaration" => (
+            ProcedureKind::Constructor,
+            DeclarationSegmentKind::Constructor,
+            node.child_by_field_name("body")?,
+            false,
+        ),
+        "compact_constructor_declaration" => (
+            ProcedureKind::Constructor,
+            DeclarationSegmentKind::Constructor,
+            node.child_by_field_name("body")?,
+            false,
+        ),
+        "lambda_expression" => (
+            ProcedureKind::Lambda,
+            DeclarationSegmentKind::Lambda,
+            node.child_by_field_name("body")?,
+            false,
+        ),
+        "static_initializer" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            first_named_child(node)?,
+            true,
+        ),
+        "block"
+            if node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "class_body") =>
+        {
+            (
+                ProcedureKind::Initializer,
+                DeclarationSegmentKind::Initializer,
+                node,
+                false,
+            )
+        }
+        "variable_declarator"
+            if node.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "field_declaration" | "constant_declaration")
+            }) =>
+        {
+            let field = node.parent().expect("guarded field-declaration parent");
+            (
+                ProcedureKind::Initializer,
+                DeclarationSegmentKind::Initializer,
+                node.child_by_field_name("value")?,
+                field.kind() == "constant_declaration" || has_modifier(field, "static"),
+            )
+        }
+        "enum_constant" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            node,
+            true,
+        ),
+        _ => return None,
+    };
+    let dispatch_extensibility = if kind == ProcedureKind::Constructor
+        || is_static
+        || has_modifier(node, "private")
+        || has_modifier(node, "final")
+        || enclosing_type_is_final(node)
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    };
+    Some((
+        kind,
+        segment_kind,
+        body,
+        ProcedureProperties {
+            is_async: false,
+            is_generator: false,
+            is_static,
+            is_synthetic: false,
+            invocation: ProcedureInvocationKind::Immediate,
+            dispatch_extensibility,
+            call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
+            construction_return: Default::default(),
+        },
+    ))
+}
+
+/// Whether `node` (an Initializer-kind fragment's own syntax node, as
+/// matched by [`callable_shape`]: a `static_initializer`, an instance
+/// initializer `block`, or a field/constant `variable_declarator` that has
+/// a `value`) is provably the only member of its class's static-or-instance
+/// initializer scheduling group.
+///
+/// JLS 12.4.2 (the class initializer, `<clinit>`) and 12.5 (instance
+/// initialization, folded into `<init>`) each compose every field
+/// initializer and initializer block that shares one class body and one
+/// staticness into a single ordered sequence: a fragment's own value can
+/// depend on what an earlier sibling in that same sequence assigned. When a
+/// group has exactly one member, there is nothing to compose it with -- its
+/// value is exactly what that one fragment computes, independent of source
+/// order. This is a purely structural count over the enclosing `class_body`'s
+/// direct children; it does not require the lone member to be side-effect
+/// free or acyclic, only that no sibling exists in its own group to
+/// interleave with.
+///
+/// Returns `false` (conservative: the caller keeps the gap) when `node`'s
+/// container is not a plain `class_body` -- an interface, enum, or
+/// annotation body is not counted rather than guessed at.
+pub(in crate::analyzer::java::semantic) fn is_sole_initializer_fragment(
+    node: Node<'_>,
+    is_static: bool,
+) -> bool {
+    let Some(container) = enclosing_initializer_container(node) else {
+        return false;
+    };
+    let mut fragments = 0usize;
+    for child in named_children(container) {
+        fragments += match child.kind() {
+            "static_initializer" if is_static => 1,
+            "block" if !is_static => 1,
+            "field_declaration" | "constant_declaration" => {
+                let field_static =
+                    child.kind() == "constant_declaration" || has_modifier(child, "static");
+                if field_static == is_static {
+                    named_children(child)
+                        .into_iter()
+                        .filter(|declarator| {
+                            declarator.kind() == "variable_declarator"
+                                && declarator.child_by_field_name("value").is_some()
+                        })
+                        .count()
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        if fragments > 1 {
+            return false;
+        }
+    }
+    fragments == 1
+}
+
+/// The `class_body` that directly owns `node`'s initializer fragment. `None`
+/// when the immediate container is not a plain `class_body` -- for example
+/// an interface, enum, or annotation body, which use a different node kind
+/// and are outside this helper's scope.
+fn enclosing_initializer_container(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent()?;
+    if matches!(current.kind(), "field_declaration" | "constant_declaration") {
+        current = current.parent()?;
+    }
+    (current.kind() == "class_body").then_some(current)
+}
+
+fn enclosing_type_is_final(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "class_declaration" | "record_declaration") {
+            return parent.kind() == "record_declaration" || has_modifier(parent, "final");
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+pub(in crate::analyzer::java::semantic) fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
+    brokk_bifrost_jvm::java::declarations::java_modifier_keywords(node)
+        .any(|keyword| keyword == modifier)
+}
+
+pub(in crate::analyzer::java::semantic) fn java_switch_arms(
+    body: Node<'_>,
+) -> Vec<JavaSwitchArm<'_>> {
+    named_children(body)
+        .into_iter()
+        .filter_map(|node| {
+            let kind = match node.kind() {
+                "switch_block_statement_group" => JavaSwitchArmKind::Group,
+                "switch_rule" => JavaSwitchArmKind::Rule,
+                _ => return None,
+            };
+            let children = named_children(node);
+            let labels = children
+                .iter()
+                .copied()
+                .filter(|child| child.kind() == "switch_label")
+                .collect::<Vec<_>>();
+            let body = children
+                .into_iter()
+                .filter(|child| child.kind() != "switch_label")
+                .collect::<Vec<_>>();
+            Some(JavaSwitchArm {
+                node,
+                labels,
+                body,
+                kind,
+            })
+        })
+        .collect()
+}
+
+pub(in crate::analyzer::java::semantic) fn switch_label_is_default(label: Node<'_>) -> bool {
+    let mut cursor = label.walk();
+    label
+        .children(&mut cursor)
+        .any(|child| child.kind() == "default")
+}
+
+pub(in crate::analyzer::java::semantic) fn switch_label_has_pattern(label: Node<'_>) -> bool {
+    named_children(label)
+        .into_iter()
+        .any(|child| child.kind() == "pattern" || child.kind().ends_with("_pattern"))
+}
+
+pub(in crate::analyzer::java::semantic) fn switch_label_guard(label: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind(label, "guard")
+        .and_then(first_named_child)
+}
+
+pub(in crate::analyzer::java::semantic) fn object_creation_qualifier(
+    node: Node<'_>,
+) -> Option<Node<'_>> {
+    let type_node = node.child_by_field_name("type");
+    let arguments = node.child_by_field_name("arguments");
+    named_children(node).into_iter().find(|child| {
+        type_node.is_none_or(|candidate| candidate.id() != child.id())
+            && arguments.is_none_or(|candidate| candidate.id() != child.id())
+            && child.kind() != "class_body"
+            && !is_annotation_kind(child.kind())
+            && !is_type_syntax(child.kind())
+    })
+}
+
+pub(in crate::analyzer::java::semantic) fn method_reference_qualifier(
+    node: Node<'_>,
+) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let separator = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "::")?;
+    named_children(node).into_iter().rfind(|child| {
+        child.end_byte() <= separator.start_byte()
+            && !is_type_syntax(child.kind())
+            && child.kind() != "type_arguments"
+            && !is_annotation_kind(child.kind())
+    })
+}
+
+pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_child_kind;
+
+pub(in crate::analyzer::java::semantic) fn runtime_expression_children(
+    node: Node<'_>,
+) -> Vec<Node<'_>> {
+    let fields: &[&str] = match node.kind() {
+        "field_access" => &["object"],
+        "array_access" => &["array", "index"],
+        "assignment_expression" | "binary_expression" => &["left", "right"],
+        "unary_expression" => &["operand"],
+        "cast_expression" => &["value"],
+        "instanceof_expression" => &["left"],
+        "array_creation_expression" => &["dimensions", "value"],
+        _ => &[],
+    };
+    if !fields.is_empty() {
+        let mut result = Vec::new();
+        for field in fields {
+            for child in children_by_field_name(node, field) {
+                if is_type_syntax(child.kind()) || is_annotation_kind(child.kind()) {
+                    continue;
+                }
+                if !result
+                    .iter()
+                    .any(|existing: &Node<'_>| existing.id() == child.id())
+                {
+                    result.push(child);
+                }
+            }
+        }
+        result.sort_by_key(Node::start_byte);
+        return result;
+    }
+
+    named_children(node)
+        .into_iter()
+        .filter(|child| {
+            !is_type_syntax(child.kind())
+                && !is_annotation_kind(child.kind())
+                && !matches!(child.kind(), "modifiers" | "class_body")
+        })
+        .collect()
+}
+
+pub(in crate::analyzer::java::semantic) fn first_runtime_named_child(
+    node: Node<'_>,
+) -> Option<Node<'_>> {
+    named_children(node).into_iter().find(|child| {
+        !is_type_syntax(child.kind())
+            && !is_annotation_kind(child.kind())
+            && child.kind() != "modifiers"
+    })
+}
+
+fn is_type_syntax(kind: &str) -> bool {
+    matches!(
+        kind,
+        "type_identifier"
+            | "scoped_type_identifier"
+            | "generic_type"
+            | "array_type"
+            | "integral_type"
+            | "floating_point_type"
+            | "boolean_type"
+            | "void_type"
+            | "wildcard"
+            | "type_arguments"
+            | "type_parameters"
+            | "annotated_type"
+            | "dimensions"
+    )
+}
+
+fn is_annotation_kind(kind: &str) -> bool {
+    matches!(kind, "annotation" | "marker_annotation")
+}
+
+pub(in crate::analyzer::java::semantic) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::named_children_iter(node)
+        .filter(|child| !is_comment_kind(child.kind()))
+        .collect()
+}
+
+pub(in crate::analyzer::java::semantic) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    brokk_bifrost_core::analyzer::tree_walk::first_named_child_matching(node, |child| {
+        !is_comment_kind(child.kind())
+    })
+}
+
+pub(in crate::analyzer::java::semantic) fn catch_parameter_has_precise_type(
+    parameter: Node<'_>,
+) -> bool {
+    let Some(type_node) = parameter.child_by_field_name("type").or_else(|| {
+        named_children(parameter)
+            .into_iter()
+            .find(|child| child.kind() == "catch_type")
+    }) else {
+        return false;
+    };
+    if matches!(
+        type_node.kind(),
+        "type_identifier" | "scoped_type_identifier"
+    ) {
+        return true;
+    }
+    let children = named_children(type_node);
+    children.len() == 1
+        && matches!(
+            children[0].kind(),
+            "type_identifier" | "scoped_type_identifier"
+        )
+}
+
+pub(in crate::analyzer::java::semantic) fn required_field<'tree>(
+    node: Node<'tree>,
+    field: &str,
+) -> Result<Node<'tree>, JavaLoweringError> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::required_field_or_else(
+        node,
+        field,
+        missing_field,
+    )
+}
+
+pub(in crate::analyzer::java::semantic) fn is_java_nested_execution_boundary(
+    node: Node<'_>,
+) -> bool {
+    matches!(
+        node.kind(),
+        "lambda_expression"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "class_body"
+    )
+}
+
+pub(in crate::analyzer::java::semantic) fn body_contains_free_this(
+    body: Node<'_>,
+    cancellation: &CancellationToken,
+) -> Result<bool, LoweringCancelled> {
+    brokk_bifrost_semantic::analyzer::semantic::lowering::body_contains_matching_node(
+        body,
+        cancellation,
+        is_java_nested_execution_boundary,
+        |node| node.kind() == "this",
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::analyzer::java::semantic) struct JavaLocalBindingSyntax<'tree> {
+    pub(in crate::analyzer::java::semantic) declaration: Node<'tree>,
+    pub(in crate::analyzer::java::semantic) name: Node<'tree>,
+    pub(in crate::analyzer::java::semantic) visible_from: usize,
+    pub(in crate::analyzer::java::semantic) scope_start: usize,
+    pub(in crate::analyzer::java::semantic) scope_end: usize,
+}
+
+pub(in crate::analyzer::java::semantic) fn java_local_binding(
+    node: Node<'_>,
+) -> Option<JavaLocalBindingSyntax<'_>> {
+    let (name, visible_from, scope_start, scope_end) = match node.kind() {
+        "variable_declarator" | "catch_formal_parameter" => {
+            let name = node.child_by_field_name("name")?;
+            let (start, end) = java_local_scope(node)?;
+            (name, node.end_byte(), start, end)
+        }
+        "enhanced_for_statement" => {
+            let body = node.child_by_field_name("body")?;
+            let name = node.child_by_field_name("name")?;
+            (name, body.start_byte(), body.start_byte(), body.end_byte())
+        }
+        _ => return None,
+    };
+    (name.kind() == "identifier").then_some(JavaLocalBindingSyntax {
+        declaration: node,
+        name,
+        visible_from,
+        scope_start,
+        scope_end,
+    })
+}
+
+pub(in crate::analyzer::java::semantic) fn java_binding_type(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("type")
+        .or_else(|| {
+            node.parent()
+                .and_then(|parent| parent.child_by_field_name("type"))
+        })
+        .or_else(|| {
+            named_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "catch_type")
+        })
+}
+
+pub(in crate::analyzer::java::semantic) fn java_local_scope(
+    node: Node<'_>,
+) -> Option<(usize, usize)> {
+    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |parent| {
+        matches!(
+            parent.kind(),
+            "block"
+                | "constructor_body"
+                | "for_statement"
+                | "enhanced_for_statement"
+                | "switch_block_statement_group"
+                | "switch_rule"
+                | "catch_clause"
+        ) || is_java_nested_execution_boundary(parent)
+    })
+    .map(|scope| (scope.start_byte(), scope.end_byte()))
+}
+
+pub(in crate::analyzer::java::semantic) fn expression_value_kind(
+    node: Node<'_>,
+) -> SemanticValueKind {
+    match node.kind() {
+        "lambda_expression" | "method_reference" => SemanticValueKind::Callable,
+        "null_literal" => SemanticValueKind::Null,
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal"
+        | "decimal_floating_point_literal"
+        | "hex_floating_point_literal"
+        | "true"
+        | "false"
+        | "character_literal"
+        | "string_literal" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
+}
+
+pub(in crate::analyzer::java::semantic) fn binary_operator(node: Node<'_>) -> Option<&'static str> {
+    match node.child_by_field_name("operator")?.kind() {
+        "&&" => Some("&&"),
+        "||" => Some("||"),
+        _ => None,
+    }
+}
+
+pub(in crate::analyzer::java::semantic) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
+    match node.kind() {
+        "unary_expression"
+        | "update_expression"
+        | "binary_expression"
+        | "cast_expression"
+        | "template_expression" => true,
+        "assignment_expression" => node
+            .child_by_field_name("left")
+            .is_some_and(|left| matches!(left.kind(), "field_access" | "array_access")),
+        "array_creation_expression" => true,
+        _ => false,
+    }
+}
+
+/// Whether `name` is spelled like a Java type identifier: it starts with an
+/// uppercase letter and is not a constant (`HTTP_OK`). JLS 6.5 reclassifies
+/// an ambiguous name as a TypeName when it names a type; this is that
+/// spelling half, used only when the root of the chain is not a proven value.
+pub(in crate::analyzer::java::semantic) fn java_type_name_spelling(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_uppercase()) && !name.contains('_')
+}
+
+fn java_package_name_spelling(name: &str) -> bool {
+    matches!(name.chars().next(), Some(first) if first.is_ascii_lowercase())
+}
+
+/// Longest prefix of `segments` that is a package-or-type name ending in a
+/// type identifier (`java.net.URLDecoder`, `Outer.Inner`). Zero when no
+/// segment is a type spelling.
+pub(in crate::analyzer::java::semantic) fn java_type_name_prefix_len(segments: &[&str]) -> usize {
+    let mut last_type = 0;
+    for (index, segment) in segments.iter().enumerate() {
+        if java_type_name_spelling(segment) {
+            last_type = index + 1;
+            continue;
+        }
+        if last_type == 0 && java_package_name_spelling(segment) {
+            continue;
+        }
+        break;
+    }
+    last_type
+}
+
+/// The identifier chain of a `field_access`, root first.
+pub(in crate::analyzer::java::semantic) fn java_field_access_segments<'a>(
+    mut node: Node<'_>,
+    source: &'a str,
+) -> Vec<&'a str> {
+    let mut segments = Vec::new();
+    loop {
+        if node.kind() != "field_access" {
+            if let Some(text) = node_text(source, node) {
+                segments.push(text);
+            }
+            break;
+        }
+        let Some(field) = node.child_by_field_name("field") else {
+            break;
+        };
+        if let Some(text) = node_text(source, field) {
+            segments.push(text);
+        }
+        let Some(object) = node.child_by_field_name("object") else {
+            break;
+        };
+        node = object;
+    }
+    segments.reverse();
+    segments
+}
+
+fn java_field_access_identifier_count(mut node: Node<'_>) -> usize {
+    let mut count = 0;
+    loop {
+        if node.kind() != "field_access" {
+            count += 1;
+            break;
+        }
+        count += 1;
+        let Some(object) = node.child_by_field_name("object") else {
+            break;
+        };
+        node = object;
+    }
+    count
+}
+
+fn java_outermost_selector_field_access(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "field_access" && parent.child_by_field_name("object") == Some(node) {
+            node = parent;
+            continue;
+        }
+        break;
+    }
+    node
+}
+
+/// A `field_access` that is only a type or package qualifier, not heap memory.
+///
+/// The proof is JLS 6.5 reclassification of a PackageOrTypeName, not "the
+/// root is not a local". A root that is `this`, a parameter, a local, or an
+/// in-file field stays a value, so inherited-looking `field.nested` chains
+/// whose last segment is not a type spelling keep their Field lowering.
+pub(in crate::analyzer::java::semantic) fn java_field_access_is_type_qualifier(
+    node: Node<'_>,
+    source: &str,
+    root_is_value: impl Fn(&str) -> bool,
+    root_is_type: impl Fn(&str) -> bool,
+) -> bool {
+    if node.kind() != "field_access" || !java_field_access_is_selector_object(node) {
+        return false;
+    }
+    let outermost = java_outermost_selector_field_access(node);
+    let segments = java_field_access_segments(outermost, source);
+    if segments.is_empty() {
+        return false;
+    }
+    let Some(root) = segments.first().copied() else {
+        return false;
+    };
+    if root_is_value(root) || root == "this" || root == "super" {
+        return false;
+    }
+    // An uppercase root can name either a type or a value. Negative value
+    // evidence is not enough to discard heap flow: inherited fields are not
+    // present in this file's value inventory. Require a declared or explicitly
+    // imported type root; lowercase package roots retain qualified-name
+    // handling such as `java.net.URLDecoder` (#2452).
+    if java_type_name_spelling(root) && !root_is_type(root) {
+        return false;
+    }
+    let type_prefix = java_type_name_prefix_len(&segments);
+    if type_prefix == 0 {
+        return false;
+    }
+    java_field_access_identifier_count(node) <= type_prefix
+}
+
+pub(in crate::analyzer::java::semantic) fn is_runtime_leaf(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal"
+            | "decimal_floating_point_literal"
+            | "hex_floating_point_literal"
+            | "character_literal"
+            | "string_literal"
+            | "null_literal"
+            | "true"
+            | "false"
+            | "this"
+            | "super"
+            | "class_literal"
+            | "comment"
+            | "line_comment"
+            | "block_comment"
+    )
+}

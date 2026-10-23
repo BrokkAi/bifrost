@@ -67,6 +67,8 @@ pub struct CallShapeOutcome {
     pub receiver_range: Option<Range>,
     pub call_kind: CallKind,
     pub coverage: CallShapeCoverage,
+    pub callee_provenance:
+        Option<brokk_bifrost_core::analyzer::structural::callable::CalleeProvenanceFact>,
 }
 
 /// One ordered argument-list group of a call site.
@@ -220,6 +222,10 @@ pub fn call_shape_for_call(
             receiver_range,
             call_kind,
             coverage,
+            callee_provenance: call
+                .call_site
+                .as_ref()
+                .and_then(|site| site.callee_provenance.clone()),
         },
         groups,
         arguments,
@@ -336,6 +342,7 @@ fn continued_application_of(facts: &FileFacts, call_id: u32) -> Option<u32> {
     if !call.kind.satisfies(NormalizedKind::Call)
         || !call
             .call_site
+            .as_ref()
             .is_some_and(|site| site.continues_callee_groups)
     {
         return None;
@@ -362,6 +369,7 @@ fn continued_application_of(facts: &FileFacts, call_id: u32) -> Option<u32> {
 
 fn site_coverage(node: &NormalizedNode) -> CallShapeCoverage {
     node.call_site
+        .as_ref()
         .map_or(CallShapeCoverage::Exact, |facts| facts.coverage)
 }
 
@@ -382,7 +390,12 @@ fn coverage_rank(coverage: CallShapeCoverage) -> u8 {
 /// are written.
 fn call_kind_for(facts: &FileFacts, applications: &[u32]) -> CallKind {
     let innermost = *applications.first().expect("a site has one application");
-    if let Some(kind) = facts.node(innermost).call_site.and_then(|f| f.call_kind) {
+    if let Some(kind) = facts
+        .node(innermost)
+        .call_site
+        .as_ref()
+        .and_then(|f| f.call_kind)
+    {
         return kind;
     }
     if applications

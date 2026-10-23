@@ -1921,6 +1921,7 @@ mod tests {
                 integer_literal_value: None,
                 duplicate_key: None,
                 is_async: None,
+                unsafe_context: None,
                 string_value: None,
                 construct: None,
                 range: Range {
@@ -1997,6 +1998,7 @@ mod tests {
                     integer_literal_value: None,
                     duplicate_key: None,
                     is_async: None,
+                    unsafe_context: None,
                     string_value: None,
                     construct: None,
                     range: Range {
@@ -2404,6 +2406,7 @@ mod tests {
                 integer_literal_value: None,
                 duplicate_key: None,
                 is_async: None,
+                unsafe_context: None,
                 string_value: None,
                 construct: None,
                 range: Range {

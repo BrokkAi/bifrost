@@ -25,16 +25,20 @@ use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::imports::{
-    csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_namespace,
+    csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_alias_from_node,
+    csharp_using_namespace,
 };
 use crate::syntax::{
-    csharp_arity_preserving_full_name, csharp_normalize_full_name, normalize_csharp_type_fragment,
-    strip_csharp_generic_arity,
+    csharp_arity_preserving_full_name, csharp_normalize_full_name, csharp_type_node_segments,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_using_directive_namespace, normalize_csharp_type_fragment, strip_csharp_generic_arity,
 };
+use tree_sitter::Node;
 
 /// The analyzer-resident products C#'s language logic resolves through, on top
 /// of the two core capability traits it reads declarations and imports with.
@@ -116,6 +120,43 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// it to tell a namespace-qualified prefix from a type name spelled the
     /// same way.
     fn workspace_namespace_exists(&self, namespace: &str) -> bool;
+
+    /// Where `candidate`'s source sits relative to the compilation that holds
+    /// `reference`, from the revision's recorded compilation membership.
+    /// `None` when the membership read failed; a lookup treats it as aborted.
+    fn compilation_visibility(
+        &self,
+        reference: &ProjectFile,
+        candidate: &ProjectFile,
+    ) -> Option<CSharpCompilationVisibility>;
+
+    /// An owned handle to this source, for a view that must outlive the
+    /// borrow it was reached through.
+    fn shared_source(&self) -> Arc<dyn CSharpSource>;
+
+    /// `code_unit`'s direct logical ancestors with every input read through
+    /// `view`: its partial parts, each part's base list and the candidates
+    /// of the base names. A view that filters declarations then decides each
+    /// base-list contribution by the membership of the part that wrote it.
+    fn direct_ancestors_through(
+        &self,
+        view: &dyn CSharpSource,
+        code_unit: &CodeUnit,
+    ) -> Vec<CodeUnit>;
+
+    /// The direct children of `parent` that `keep` selects. A view that
+    /// admits declarations admits only the selected ones, so a lookup by
+    /// name does not count its unrelated siblings as doubt.
+    fn direct_children_where(
+        &self,
+        parent: &CodeUnit,
+        keep: &dyn Fn(&CodeUnit) -> bool,
+    ) -> Vec<CodeUnit> {
+        self.direct_children(parent)
+            .into_iter()
+            .filter(|child| keep(child))
+            .collect()
+    }
 
     /// Run one synchronous usage-resolution step against a request-local
     /// bounded definition lookup. The callback boundary lets the analysis
@@ -365,6 +406,49 @@ pub fn declaration_candidates_by_fqn(
         .into_iter()
         .filter(|candidate| has_csharp_arity_key(candidate, &arity_key))
         .collect()
+}
+
+/// Whether the compilation holding `reference` sees the identity that
+/// `matches` selects among the physical declarations of `fqn`.
+///
+/// Physical declarations that share a fully qualified name are one identity
+/// only where each is visible: a proven declaration proves its own members,
+/// never a member that only an unproven or invisible copy declares. So the
+/// identity is visible when some matching declaration is, unresolved when the
+/// best is unresolved, and not visible when every one is provably invisible.
+/// A name with no workspace declaration (an external or intrinsic member)
+/// is outside compilation membership and answers `Visible`, as before.
+/// `None` when a membership read failed.
+pub fn identity_visibility(
+    source: &dyn CSharpSource,
+    reference: &ProjectFile,
+    fqn: &str,
+    known: Option<&CodeUnit>,
+    matches: impl Fn(&CodeUnit) -> bool,
+) -> Option<CSharpCompilationVisibility> {
+    // A declaration the caller already holds is one of the identity's
+    // physical declarations even if the name lookup spells it differently.
+    let mut physical = declaration_candidates_by_fqn(source, fqn, true)
+        .into_iter()
+        .chain(known.cloned())
+        .filter(|candidate| matches(candidate))
+        .peekable();
+    if physical.peek().is_none() {
+        return Some(CSharpCompilationVisibility::Visible);
+    }
+    let mut answer = CSharpCompilationVisibility::NotVisible;
+    for candidate in physical {
+        match source.compilation_visibility(reference, candidate.source())? {
+            CSharpCompilationVisibility::Visible => {
+                return Some(CSharpCompilationVisibility::Visible);
+            }
+            CSharpCompilationVisibility::Unresolved => {
+                answer = CSharpCompilationVisibility::Unresolved
+            }
+            CSharpCompilationVisibility::NotVisible => {}
+        }
+    }
+    Some(answer)
 }
 
 pub fn declaration_candidates_by_fqn_limited(
@@ -1312,6 +1396,700 @@ where
     )
 }
 
+/// The syntax-local namespace and import scopes visible at one C# source node.
+///
+/// A context is a query-local value built from the current syntax tree. It does
+/// not cache workspace facts: namespace existence and declaration candidates
+/// are still resolved through the bounded callbacks in
+/// [`visible_type_candidates_at_with_lookups`]. Scopes are ordered from the
+/// nearest namespace outward. A namespace declaration's directives stay with
+/// the declaration that introduced them, so a relative import in one sibling
+/// namespace cannot leak into another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CSharpLookupContext {
+    scopes: Vec<CSharpLookupScope>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CSharpLookupScope {
+    namespace: String,
+    using_namespaces: Vec<CSharpScopedName>,
+    using_aliases: Vec<(String, CSharpScopedName)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CSharpScopedName {
+    target: String,
+    declared_in: Vec<String>,
+}
+
+impl CSharpLookupContext {
+    /// Build the ordered namespace scopes enclosing `node` and their direct
+    /// plain `using` and alias directives. `continue_lookup` is polled during
+    /// both ancestry and directive walks; `None` means the caller's bounded
+    /// query stopped before the context was complete.
+    pub fn at(
+        source: &str,
+        node: Node<'_>,
+        mut continue_lookup: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        let mut namespace_nodes = Vec::new();
+        let mut current = node;
+        while let Some(parent) = current.parent() {
+            if !continue_lookup() {
+                return None;
+            }
+            if parent.kind() == "namespace_declaration" {
+                namespace_nodes.push(parent);
+            }
+            current = parent;
+        }
+        let root = current;
+        namespace_nodes.reverse();
+
+        // File-scoped namespaces are compilation-unit siblings, not ancestors.
+        // Record one only when the requested node lies within its namespace
+        // body, including when that body contains a nested block namespace.
+        let mut root_cursor = root.walk();
+        let mut file_scoped = None;
+        for child in root.named_children(&mut root_cursor) {
+            if !continue_lookup() {
+                return None;
+            }
+            if child.kind() == "file_scoped_namespace_declaration"
+                && child.end_byte() <= node.start_byte()
+            {
+                file_scoped = Some(child);
+                break;
+            }
+        }
+        let file_namespace_segments = file_scoped
+            .and_then(|declaration| declaration.child_by_field_name("name"))
+            .map(|name| csharp_type_node_segments(name, source))
+            .filter(|segments| !segments.is_empty())
+            .unwrap_or_default();
+
+        let mut declarations = Vec::with_capacity(namespace_nodes.len());
+        let mut namespace_segments = file_namespace_segments.clone();
+        for declaration in namespace_nodes {
+            if !continue_lookup() {
+                return None;
+            }
+            let Some(name) = declaration.child_by_field_name("name") else {
+                continue;
+            };
+            let segments = csharp_type_node_segments(name, source);
+            if segments.is_empty() {
+                continue;
+            }
+            let parent_segments = namespace_segments.clone();
+            namespace_segments.extend(segments);
+            declarations.push((declaration, parent_segments, namespace_segments.clone()));
+        }
+
+        let mut scopes = Vec::new();
+        for (declaration, parent_segments, declaration_segments) in declarations.iter().rev() {
+            let namespace = declaration_segments.join(".");
+            let mut scope = CSharpLookupScope {
+                namespace,
+                ..CSharpLookupScope::default()
+            };
+            if let Some(body) = declaration.child_by_field_name("body") {
+                collect_context_usings(
+                    source,
+                    body,
+                    0,
+                    usize::MAX,
+                    declaration_segments,
+                    &mut scope,
+                    &mut continue_lookup,
+                )?;
+            }
+            scopes.push(scope);
+
+            // A dotted namespace declaration introduces each containing
+            // namespace for lookup, but its imports belong only to the exact
+            // namespace declaration above.
+            for end in (parent_segments.len() + 1..declaration_segments.len()).rev() {
+                if !continue_lookup() {
+                    return None;
+                }
+                scopes.push(CSharpLookupScope {
+                    namespace: declaration_segments[..end].join("."),
+                    ..CSharpLookupScope::default()
+                });
+            }
+        }
+
+        // A file-scoped namespace is a direct compilation-unit child rather
+        // than an AST ancestor of its declarations. Its root-level usings
+        // after the declaration belong to that namespace; preceding root
+        // usings remain compilation-unit imports.
+        if let Some(declaration) = file_scoped {
+            let file_namespace = &file_namespace_segments;
+            if !file_namespace.is_empty() {
+                let mut scope = CSharpLookupScope {
+                    namespace: file_namespace.join("."),
+                    ..CSharpLookupScope::default()
+                };
+                collect_context_usings(
+                    source,
+                    root,
+                    declaration.end_byte(),
+                    usize::MAX,
+                    file_namespace,
+                    &mut scope,
+                    &mut continue_lookup,
+                )?;
+                scopes.push(scope);
+                for end in (1..file_namespace.len()).rev() {
+                    if !continue_lookup() {
+                        return None;
+                    }
+                    scopes.push(CSharpLookupScope {
+                        namespace: file_namespace[..end].join("."),
+                        ..CSharpLookupScope::default()
+                    });
+                }
+            }
+        }
+
+        // Compilation-unit directives are a distinct outer scope. In a
+        // file-scoped source only directives preceding that declaration are
+        // compilation-unit imports; later directives were collected above.
+        let mut compilation_scope = CSharpLookupScope::default();
+        let compilation_using_end =
+            file_scoped.map_or(usize::MAX, |declaration| declaration.start_byte());
+        collect_context_usings(
+            source,
+            root,
+            0,
+            compilation_using_end,
+            &[],
+            &mut compilation_scope,
+            &mut continue_lookup,
+        )?;
+        scopes.push(compilation_scope);
+
+        Some(Self { scopes })
+    }
+}
+
+fn collect_context_usings(
+    source: &str,
+    scope_node: Node<'_>,
+    using_start: usize,
+    using_end: usize,
+    namespace_segments: &[String],
+    scope: &mut CSharpLookupScope,
+    continue_lookup: &mut impl FnMut() -> bool,
+) -> Option<()> {
+    let mut cursor = scope_node.walk();
+    for directive in scope_node.named_children(&mut cursor) {
+        if !continue_lookup() {
+            return None;
+        }
+        if directive.kind() != "using_directive"
+            || directive.start_byte() < using_start
+            || directive.end_byte() > using_end
+            || csharp_using_directive_is_global(directive)
+            || csharp_using_directive_is_static(directive)
+        {
+            continue;
+        }
+        let declared_in = namespace_segments.to_vec();
+        if let Some(target) = csharp_using_directive_namespace(directive, source) {
+            scope.using_namespaces.push(CSharpScopedName {
+                target,
+                declared_in,
+            });
+        } else if let Some((alias, target)) = csharp_using_alias_from_node(directive, source) {
+            scope.using_aliases.push((
+                alias,
+                CSharpScopedName {
+                    target,
+                    declared_in,
+                },
+            ));
+        }
+    }
+    Some(())
+}
+
+/// Where a candidate declaration's source sits relative to the compilation
+/// that contains the reference being resolved.
+///
+/// C# merges the global namespace across a compilation and the assemblies it
+/// references, and that merged namespace precedes every `using` directive. An
+/// analyzed workspace can hold many compilations, so a source file's identity
+/// alone does not say whether a global-namespace declaration in another file
+/// takes part in that precedence: only compilation membership does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CSharpCompilationVisibility {
+    /// The candidate belongs to the reference's compilation or to one that it
+    /// references.
+    Visible,
+    /// Membership proves that the reference's compilation cannot see the
+    /// candidate.
+    NotVisible,
+    /// The membership of the reference or of the candidate is not proven.
+    Unresolved,
+}
+
+/// C# visible-type lookup for an AST-site context. Every external/workspace
+/// lookup is injectable and abortable: outer `None` from any callback, or a
+/// false continuation poll, returns `None` rather than a false clean miss.
+/// `compilation_visibility` places each global-namespace candidate relative to
+/// the reference's compilation (see [`CSharpCompilationVisibility`]).
+#[allow(clippy::too_many_arguments)]
+pub fn visible_type_candidates_at_with_lookups<
+    GlobalAliasTarget,
+    GlobalUsings,
+    NamespaceExists,
+    Candidates,
+    Visibility,
+    Continue,
+>(
+    name: &str,
+    context: &CSharpLookupContext,
+    global_alias_target: &mut GlobalAliasTarget,
+    global_using_namespaces: &mut GlobalUsings,
+    namespace_exists: &mut NamespaceExists,
+    type_candidates_by_fqn: &mut Candidates,
+    compilation_visibility: &mut Visibility,
+    continue_lookup: &mut Continue,
+) -> Option<VisibleTypes>
+where
+    GlobalAliasTarget: FnMut(&str) -> Option<Option<String>>,
+    GlobalUsings: FnMut() -> Option<Vec<String>>,
+    NamespaceExists: FnMut(&str) -> Option<bool>,
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Visibility: FnMut(&CodeUnit) -> Option<CSharpCompilationVisibility>,
+    Continue: FnMut() -> bool,
+{
+    let result = visible_type_lookup_result_at_with_lookups(
+        name,
+        context,
+        global_alias_target,
+        global_using_namespaces,
+        namespace_exists,
+        type_candidates_by_fqn,
+        compilation_visibility,
+        continue_lookup,
+    )?;
+    // This view names types, so an unproven declaration that shares its
+    // fully qualified name with a proven one leaves the named type proven
+    // and is dropped: it adds no name, and its own members are not proven
+    // by the proven twin. Any other unproven declaration is doubt.
+    let proven_name = |unresolved: &CodeUnit| {
+        result.declarations.iter().any(|declaration| {
+            declaration.fq_name() == unresolved.fq_name()
+                && !result.unresolved.contains(declaration)
+        })
+    };
+    let (covered, unproven): (Vec<_>, Vec<_>) = result
+        .unresolved
+        .iter()
+        .cloned()
+        .partition(|unresolved| proven_name(unresolved));
+    let mut declarations = result.declarations;
+    declarations.retain(|declaration| !covered.contains(declaration));
+    if result.imported_scope {
+        sort_dedup_type_candidates(&mut declarations);
+    }
+    Some(VisibleTypes {
+        declarations,
+        unproven,
+    })
+}
+
+/// C# visible declaration lookup for an AST-site context. Unlike
+/// [`visible_type_candidates_at_with_lookups`], this preserves path-distinct
+/// declarations with the same fully qualified name; it removes only repeated
+/// identical `CodeUnit`s. Attribute lookup uses this physical declaration view
+/// because each declaration carries its own syntax-site identity.
+#[allow(clippy::too_many_arguments)]
+pub fn visible_type_declarations_at_with_lookups<
+    GlobalAliasTarget,
+    GlobalUsings,
+    NamespaceExists,
+    Candidates,
+    Visibility,
+    Continue,
+>(
+    name: &str,
+    context: &CSharpLookupContext,
+    global_alias_target: &mut GlobalAliasTarget,
+    global_using_namespaces: &mut GlobalUsings,
+    namespace_exists: &mut NamespaceExists,
+    type_candidates_by_fqn: &mut Candidates,
+    compilation_visibility: &mut Visibility,
+    continue_lookup: &mut Continue,
+) -> Option<VisibleTypes>
+where
+    GlobalAliasTarget: FnMut(&str) -> Option<Option<String>>,
+    GlobalUsings: FnMut() -> Option<Vec<String>>,
+    NamespaceExists: FnMut(&str) -> Option<bool>,
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Visibility: FnMut(&CodeUnit) -> Option<CSharpCompilationVisibility>,
+    Continue: FnMut() -> bool,
+{
+    let result = visible_type_lookup_result_at_with_lookups(
+        name,
+        context,
+        global_alias_target,
+        global_using_namespaces,
+        namespace_exists,
+        type_candidates_by_fqn,
+        compilation_visibility,
+        continue_lookup,
+    )?;
+    // This view keeps physical declarations, so every unproven one is doubt.
+    let mut declarations = result.declarations;
+    let mut seen = HashSet::default();
+    declarations.retain(|declaration| seen.insert(declaration.clone()));
+    sort_type_candidates(&mut declarations);
+    Some(VisibleTypes {
+        declarations,
+        unproven: result.unresolved,
+    })
+}
+
+#[derive(Debug)]
+struct VisibleTypeLookupResult {
+    declarations: Vec<CodeUnit>,
+    imported_scope: bool,
+    /// Global-namespace declarations in `declarations` whose compilation
+    /// membership is unproven.
+    unresolved: Vec<CodeUnit>,
+}
+
+/// The types a name denotes at one site.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct VisibleTypes {
+    pub declarations: Vec<CodeUnit>,
+    /// Declarations in `declarations` that are there only because their
+    /// compilation membership is unproven. When non-empty the answer is not a
+    /// proven resolution, even if it names one type: a caller reports the
+    /// doubt instead of resolving.
+    pub unproven: Vec<CodeUnit>,
+}
+
+impl VisibleTypes {
+    /// The declarations, if compilation membership proves all of them.
+    pub fn proven(self) -> Option<Vec<CodeUnit>> {
+        self.unproven.is_empty().then_some(self.declarations)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visible_type_lookup_result_at_with_lookups<
+    GlobalAliasTarget,
+    GlobalUsings,
+    NamespaceExists,
+    Candidates,
+    Visibility,
+    Continue,
+>(
+    name: &str,
+    context: &CSharpLookupContext,
+    global_alias_target: &mut GlobalAliasTarget,
+    global_using_namespaces: &mut GlobalUsings,
+    namespace_exists: &mut NamespaceExists,
+    type_candidates_by_fqn: &mut Candidates,
+    compilation_visibility: &mut Visibility,
+    continue_lookup: &mut Continue,
+) -> Option<VisibleTypeLookupResult>
+where
+    GlobalAliasTarget: FnMut(&str) -> Option<Option<String>>,
+    GlobalUsings: FnMut() -> Option<Vec<String>>,
+    NamespaceExists: FnMut(&str) -> Option<bool>,
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Visibility: FnMut(&CodeUnit) -> Option<CSharpCompilationVisibility>,
+    Continue: FnMut() -> bool,
+{
+    let normalized = normalize_csharp_type_fragment(name);
+    if normalized.is_empty() {
+        return Some(VisibleTypeLookupResult {
+            declarations: Vec::new(),
+            imported_scope: false,
+            unresolved: Vec::new(),
+        });
+    }
+
+    // Every tier, qualified or not, sees only declarations its compilation
+    // can see: a candidate the reference's compilation provably cannot see
+    // is not a member of the namespace there, and one of unproven membership
+    // is set aside as doubt. Set-aside candidates of an inner tier would
+    // take precedence if visible, so they travel with whatever an outer tier
+    // finds.
+    let unresolved = RefCell::new(Vec::new());
+    let mut visible_candidates = |fqn: &str| -> Option<Vec<CodeUnit>> {
+        let mut visible = Vec::new();
+        for candidate in type_candidates_by_fqn(fqn)? {
+            match compilation_visibility(&candidate)? {
+                CSharpCompilationVisibility::Visible => visible.push(candidate),
+                CSharpCompilationVisibility::Unresolved => unresolved.borrow_mut().push(candidate),
+                CSharpCompilationVisibility::NotVisible => {}
+            }
+        }
+        Some(visible)
+    };
+    let found = |mut declarations: Vec<CodeUnit>, imported_scope: bool| {
+        let unresolved = unresolved.take();
+        declarations.extend(unresolved.iter().cloned());
+        VisibleTypeLookupResult {
+            declarations,
+            imported_scope,
+            unresolved,
+        }
+    };
+
+    if let Some((alias, suffix)) = normalized.split_once("::") {
+        if alias == "global" {
+            let declarations =
+                lookup_exact_type_candidates(suffix, &mut visible_candidates, continue_lookup)?;
+            return Some(found(declarations, false));
+        }
+        let Some(target) =
+            lookup_alias_target(alias, context, global_alias_target, continue_lookup)?
+        else {
+            return Some(found(Vec::new(), false));
+        };
+        let declarations = lookup_scoped_alias_target(
+            &target.target,
+            suffix,
+            &target.declared_in,
+            &mut visible_candidates,
+            continue_lookup,
+        )?;
+        return Some(found(declarations, false));
+    }
+
+    let bare_name = !normalized.contains(['.', '$', '+']);
+    for scope in &context.scopes {
+        if !continue_lookup() {
+            return None;
+        }
+        if bare_name
+            && let Some((_, target)) = scope
+                .using_aliases
+                .iter()
+                .find(|(alias, _)| alias == &normalized)
+        {
+            let declarations = lookup_scoped_alias_target(
+                &target.target,
+                "",
+                &target.declared_in,
+                &mut visible_candidates,
+                continue_lookup,
+            )?;
+            return Some(found(declarations, false));
+        }
+
+        // The global namespace is the containing namespace of the
+        // compilation-unit scope. Probe it before either ordinary or global
+        // `using` namespaces so an import cannot redirect a type that the
+        // reference's compilation sees in the global namespace.
+        let fqn = if scope.namespace.is_empty() {
+            normalized.clone()
+        } else {
+            format!("{}.{}", scope.namespace, normalized)
+        };
+        let candidates =
+            lookup_exact_type_candidates(&fqn, &mut visible_candidates, continue_lookup)?;
+        if !candidates.is_empty() {
+            return Some(found(candidates, false));
+        }
+        if scope.namespace.is_empty() && bare_name {
+            if !continue_lookup() {
+                return None;
+            }
+            if let Some(target) = global_alias_target(&normalized)? {
+                let declarations = lookup_scoped_alias_target(
+                    &target,
+                    "",
+                    &[],
+                    &mut visible_candidates,
+                    continue_lookup,
+                )?;
+                return Some(found(declarations, false));
+            }
+        }
+
+        let mut visible = Vec::new();
+        for import in &scope.using_namespaces {
+            if !continue_lookup() {
+                return None;
+            }
+            let Some(namespace) =
+                resolve_scoped_namespace(import, namespace_exists, continue_lookup)?
+            else {
+                continue;
+            };
+            let candidates = lookup_exact_type_candidates(
+                &format!("{namespace}.{normalized}"),
+                &mut visible_candidates,
+                continue_lookup,
+            )?;
+            visible.extend(
+                candidates
+                    .into_iter()
+                    .filter(|candidate| candidate.package_name() == namespace),
+            );
+        }
+
+        if scope.namespace.is_empty() {
+            // Both compilation-unit imports and workspace global usings have
+            // compilation-wide scope. Keep them in one ambiguity tier instead
+            // of returning the first group's candidates early.
+            if !continue_lookup() {
+                return None;
+            }
+            for namespace in global_using_namespaces()? {
+                if !continue_lookup() {
+                    return None;
+                }
+                let exists = namespace_exists(&namespace)?;
+                if !exists {
+                    continue;
+                }
+                let candidates = lookup_exact_type_candidates(
+                    &format!("{namespace}.{normalized}"),
+                    &mut visible_candidates,
+                    continue_lookup,
+                )?;
+                visible.extend(
+                    candidates
+                        .into_iter()
+                        .filter(|candidate| candidate.package_name() == namespace),
+                );
+            }
+        }
+        if !visible.is_empty() {
+            return Some(found(visible, true));
+        }
+    }
+
+    // `CSharpLookupContext::at` always appends a compilation-unit scope. Set
+    // aside candidates are all that remains, and all are doubt.
+    Some(found(Vec::new(), false))
+}
+
+fn lookup_alias_target(
+    alias: &str,
+    context: &CSharpLookupContext,
+    global_alias_target: &mut impl FnMut(&str) -> Option<Option<String>>,
+    continue_lookup: &mut impl FnMut() -> bool,
+) -> Option<Option<CSharpScopedName>> {
+    for scope in &context.scopes {
+        if !continue_lookup() {
+            return None;
+        }
+        if let Some((_, target)) = scope
+            .using_aliases
+            .iter()
+            .find(|(candidate, _)| candidate == alias)
+        {
+            return Some(Some(target.clone()));
+        }
+    }
+    if !continue_lookup() {
+        return None;
+    }
+    global_alias_target(alias).map(|target| {
+        target.map(|target| CSharpScopedName {
+            target,
+            declared_in: Vec::new(),
+        })
+    })
+}
+
+fn lookup_scoped_alias_target(
+    target: &str,
+    suffix: &str,
+    declared_in: &[String],
+    type_candidates_by_fqn: &mut impl FnMut(&str) -> Option<Vec<CodeUnit>>,
+    continue_lookup: &mut impl FnMut() -> bool,
+) -> Option<Vec<CodeUnit>> {
+    let mut target = normalize_csharp_type_fragment(target);
+    let explicitly_global = if let Some(absolute) = target.strip_prefix("global::") {
+        target = absolute.to_string();
+        true
+    } else {
+        false
+    };
+    let target = if suffix.is_empty() {
+        target
+    } else {
+        format!("{target}.{suffix}")
+    };
+    let target = normalize_csharp_type_fragment(&target);
+
+    if explicitly_global {
+        return lookup_exact_type_candidates(&target, type_candidates_by_fqn, continue_lookup);
+    }
+
+    for prefix_len in (0..=declared_in.len()).rev() {
+        if !continue_lookup() {
+            return None;
+        }
+        let prefix = declared_in[..prefix_len].join(".");
+        let candidate = if prefix.is_empty() {
+            target.clone()
+        } else {
+            format!("{prefix}.{target}")
+        };
+        let candidates =
+            lookup_exact_type_candidates(&candidate, type_candidates_by_fqn, continue_lookup)?;
+        if !candidates.is_empty() {
+            return Some(candidates);
+        }
+    }
+    Some(Vec::new())
+}
+
+fn resolve_scoped_namespace(
+    import: &CSharpScopedName,
+    namespace_exists: &mut impl FnMut(&str) -> Option<bool>,
+    continue_lookup: &mut impl FnMut() -> bool,
+) -> Option<Option<String>> {
+    let target = normalize_csharp_type_fragment(&import.target);
+    if let Some(absolute) = target.strip_prefix("global::") {
+        if !continue_lookup() {
+            return None;
+        }
+        return namespace_exists(absolute).map(|exists| exists.then(|| absolute.to_string()));
+    }
+    for prefix_len in (0..=import.declared_in.len()).rev() {
+        if !continue_lookup() {
+            return None;
+        }
+        let prefix = import.declared_in[..prefix_len].join(".");
+        let candidate = if prefix.is_empty() {
+            target.clone()
+        } else {
+            format!("{prefix}.{target}")
+        };
+        let exists = namespace_exists(&candidate)?;
+        if exists {
+            return Some(Some(candidate));
+        }
+    }
+    Some(None)
+}
+
+fn lookup_exact_type_candidates(
+    fqn: &str,
+    type_candidates_by_fqn: &mut impl FnMut(&str) -> Option<Vec<CodeUnit>>,
+    continue_lookup: &mut impl FnMut() -> bool,
+) -> Option<Vec<CodeUnit>> {
+    if !continue_lookup() {
+        return None;
+    }
+    type_candidates_by_fqn(fqn)
+}
+
 /// C#'s visible-type search, as a function of the lookups it needs. Each
 /// `Option`-returning one answers `None` when its own bounded budget ran out,
 /// which aborts the search rather than reporting a miss.
@@ -1831,4 +2609,634 @@ pub fn compute_implicit_reference_index(
         },
         parallel,
     )
+}
+
+#[cfg(test)]
+mod lookup_context_tests {
+    use super::{
+        CSharpCompilationVisibility, CSharpLookupContext, visible_type_candidates_at_with_lookups,
+        visible_type_declarations_at_with_lookups,
+    };
+    use brokk_bifrost_core::analyzer::model::CodeUnitType;
+    use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+    use brokk_bifrost_core::hash::HashMap;
+    use tree_sitter::{Parser, Tree};
+
+    /// Every candidate shares the reference's compilation.
+    fn single_compilation_visibility(_: &CodeUnit) -> Option<CSharpCompilationVisibility> {
+        Some(CSharpCompilationVisibility::Visible)
+    }
+
+    fn parsed_tree(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar loads");
+        parser.parse(source, None).expect("C# source parses")
+    }
+
+    fn context_at(source: &str, marker: &str, occurrence: usize) -> CSharpLookupContext {
+        let tree = parsed_tree(source);
+        let start = source
+            .match_indices(marker)
+            .nth(occurrence)
+            .map(|(start, _)| start)
+            .expect("source marker exists");
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, start + marker.len())
+            .expect("marker has a syntax node");
+        CSharpLookupContext::at(source, node, || true).expect("lookup context completes")
+    }
+
+    fn unit(path: &str, namespace: &str, name: &str) -> CodeUnit {
+        CodeUnit::new(
+            ProjectFile::new(
+                std::env::temp_dir().join("csharp-lookup-context-test"),
+                path,
+            ),
+            CodeUnitType::Class,
+            namespace,
+            name,
+        )
+    }
+
+    fn lookup(
+        context: &CSharpLookupContext,
+        name: &str,
+        by_fqn: &HashMap<String, Vec<CodeUnit>>,
+        namespaces: &[&str],
+    ) -> Option<Vec<CodeUnit>> {
+        let mut global_alias = |_: &str| Some(None::<String>);
+        let mut global_namespaces = || Some(Vec::new());
+        let mut namespace_exists = |namespace: &str| Some(namespaces.contains(&namespace));
+        let mut candidates = |fqn: &str| Some(by_fqn.get(fqn).cloned().unwrap_or_default());
+        let mut continue_lookup = || true;
+        visible_type_candidates_at_with_lookups(
+            name,
+            context,
+            &mut global_alias,
+            &mut global_namespaces,
+            &mut namespace_exists,
+            &mut candidates,
+            &mut single_compilation_visibility,
+            &mut continue_lookup,
+        )
+        .map(|types| types.declarations)
+    }
+
+    fn lookup_declarations(
+        context: &CSharpLookupContext,
+        name: &str,
+        by_fqn: &HashMap<String, Vec<CodeUnit>>,
+        namespaces: &[&str],
+    ) -> Option<Vec<CodeUnit>> {
+        let mut global_alias = |_: &str| Some(None::<String>);
+        let mut global_namespaces = || Some(Vec::new());
+        let mut namespace_exists = |namespace: &str| Some(namespaces.contains(&namespace));
+        let mut candidates = |fqn: &str| Some(by_fqn.get(fqn).cloned().unwrap_or_default());
+        let mut continue_lookup = || true;
+        visible_type_declarations_at_with_lookups(
+            name,
+            context,
+            &mut global_alias,
+            &mut global_namespaces,
+            &mut namespace_exists,
+            &mut candidates,
+            &mut single_compilation_visibility,
+            &mut continue_lookup,
+        )
+        .map(|types| types.declarations)
+    }
+
+    #[test]
+    fn context_keeps_nested_and_sibling_using_scopes_separate() {
+        let source = r#"
+namespace Outer {
+    using OuterScope;
+    namespace Inner {
+        using InnerScope;
+        using InnerOther;
+        using Svc = global::Targets.Service;
+        class Current { InnerOnly inner; OuterOnly outer; Svc alias; }
+    }
+}
+namespace InnerScope { class InnerOnly {} }
+namespace InnerOther { class InnerOnly {} }
+namespace OuterScope { class OuterOnly {} }
+namespace Targets { class Service {} }
+namespace Sibling { class Current { InnerOnly missing; Svc missingAlias; } }
+"#;
+        let inner_context = context_at(source, "InnerOnly", 0);
+        assert!(
+            inner_context
+                .scopes
+                .iter()
+                .any(|scope| scope.namespace == "Outer.Inner")
+        );
+        assert!(
+            inner_context
+                .scopes
+                .iter()
+                .any(|scope| scope.namespace == "Outer")
+        );
+
+        let mut by_fqn = HashMap::default();
+        by_fqn.insert(
+            "InnerScope.InnerOnly".to_string(),
+            vec![unit("one.cs", "InnerScope", "InnerOnly")],
+        );
+        by_fqn.insert(
+            "InnerOther.InnerOnly".to_string(),
+            vec![unit("two.cs", "InnerOther", "InnerOnly")],
+        );
+        by_fqn.insert(
+            "OuterScope.OuterOnly".to_string(),
+            vec![unit("outer.cs", "OuterScope", "OuterOnly")],
+        );
+        by_fqn.insert(
+            "Targets.Service".to_string(),
+            vec![unit("service.cs", "Targets", "Service")],
+        );
+        let namespaces = ["InnerScope", "InnerOther", "OuterScope", "Targets"];
+        let inner =
+            lookup(&inner_context, "InnerOnly", &by_fqn, &namespaces).expect("lookup completes");
+        assert_eq!(inner.len(), 2, "ambiguous candidate sets stay intact");
+
+        let outer_context = context_at(source, "OuterOnly", 0);
+        let outer =
+            lookup(&outer_context, "OuterOnly", &by_fqn, &namespaces).expect("lookup completes");
+        assert_eq!(outer.len(), 1);
+        assert_eq!(outer[0].package_name(), "OuterScope");
+
+        let alias_context = context_at(source, "Svc", 1);
+        let alias = lookup(&alias_context, "Svc", &by_fqn, &namespaces).expect("lookup completes");
+        assert_eq!(alias.len(), 1);
+        assert_eq!(alias[0].package_name(), "Targets");
+
+        let sibling_context = context_at(source, "Svc", 2);
+        assert!(
+            lookup(&sibling_context, "Svc", &by_fqn, &namespaces)
+                .expect("sibling miss completes")
+                .is_empty()
+        );
+        assert!(
+            lookup(&sibling_context, "InnerOnly", &by_fqn, &namespaces)
+                .expect("sibling miss completes")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn file_scoped_namespace_separates_compilation_and_namespace_imports() {
+        let source = r#"
+using Before;
+namespace Scoped.Path;
+using After;
+using Alias = global::Targets.Service;
+class Current { BeforeType before; AfterType after; Alias service; }
+namespace Nested {
+    using NestedAfter;
+    class NestedCurrent { NestedType nested; }
+}
+"#;
+        let before_context = context_at(source, "BeforeType", 0);
+        let after_context = context_at(source, "AfterType", 0);
+        let nested_context = context_at(source, "NestedType", 0);
+        assert!(
+            after_context
+                .scopes
+                .iter()
+                .any(|scope| scope.namespace == "Scoped.Path")
+        );
+        assert!(
+            nested_context
+                .scopes
+                .iter()
+                .any(|scope| scope.namespace == "Scoped.Path.Nested")
+        );
+
+        let mut by_fqn = HashMap::default();
+        by_fqn.insert(
+            "Before.BeforeType".to_string(),
+            vec![unit("before.cs", "Before", "BeforeType")],
+        );
+        by_fqn.insert(
+            "After.AfterType".to_string(),
+            vec![unit("after.cs", "After", "AfterType")],
+        );
+        by_fqn.insert(
+            "Targets.Service".to_string(),
+            vec![unit("service.cs", "Targets", "Service")],
+        );
+        by_fqn.insert(
+            "NestedAfter.NestedType".to_string(),
+            vec![unit("nested.cs", "NestedAfter", "NestedType")],
+        );
+        let namespaces = ["Before", "After", "NestedAfter", "Targets"];
+        assert_eq!(
+            lookup(&before_context, "BeforeType", &by_fqn, &namespaces).expect("lookup completes")
+                [0]
+            .package_name(),
+            "Before"
+        );
+        assert_eq!(
+            lookup(&after_context, "AfterType", &by_fqn, &namespaces).expect("lookup completes")[0]
+                .package_name(),
+            "After"
+        );
+        assert_eq!(
+            lookup(&nested_context, "NestedType", &by_fqn, &namespaces).expect("lookup completes")
+                [0]
+            .package_name(),
+            "NestedAfter"
+        );
+        let alias_context = context_at(source, "Alias", 1);
+        assert_eq!(
+            lookup(&alias_context, "Alias", &by_fqn, &namespaces).expect("lookup completes")[0]
+                .package_name(),
+            "Targets"
+        );
+    }
+
+    #[test]
+    fn compilation_imports_keep_one_ambiguity_tier_after_global_namespace_types() {
+        let source = r#"
+using FileImport;
+namespace Outer { class Current { Service field; } }
+namespace FileImport { class Service {} }
+namespace GlobalImport { class Service {} }
+"#;
+        let context = context_at(source, "Service", 0);
+        let mut by_fqn = HashMap::default();
+        by_fqn.insert(
+            "FileImport.Service".to_string(),
+            vec![unit("file-import.cs", "FileImport", "Service")],
+        );
+        by_fqn.insert(
+            "GlobalImport.Service".to_string(),
+            vec![unit("global-import.cs", "GlobalImport", "Service")],
+        );
+
+        let mut global_alias = |_: &str| Some(None::<String>);
+        let mut global_namespaces = || Some(vec!["GlobalImport".to_string()]);
+        let mut namespace_exists =
+            |namespace: &str| Some(matches!(namespace, "FileImport" | "GlobalImport"));
+        let mut candidates = |fqn: &str| Some(by_fqn.get(fqn).cloned().unwrap_or_default());
+        let mut continue_lookup = || true;
+        let imported = visible_type_candidates_at_with_lookups(
+            "Service",
+            &context,
+            &mut global_alias,
+            &mut global_namespaces,
+            &mut namespace_exists,
+            &mut candidates,
+            &mut single_compilation_visibility,
+            &mut continue_lookup,
+        )
+        .map(|types| types.declarations)
+        .expect("lookup completes");
+        assert_eq!(
+            imported.len(),
+            2,
+            "ordinary and global usings share an ambiguity tier"
+        );
+
+        by_fqn.insert(
+            "Service".to_string(),
+            vec![unit("global.cs", "", "Service")],
+        );
+        let mut global_alias = |_: &str| Some(None::<String>);
+        let mut global_namespaces = || Some(vec!["GlobalImport".to_string()]);
+        let mut namespace_exists =
+            |namespace: &str| Some(matches!(namespace, "FileImport" | "GlobalImport"));
+        let mut candidates = |fqn: &str| Some(by_fqn.get(fqn).cloned().unwrap_or_default());
+        let mut continue_lookup = || true;
+        let global_type = visible_type_candidates_at_with_lookups(
+            "Service",
+            &context,
+            &mut global_alias,
+            &mut global_namespaces,
+            &mut namespace_exists,
+            &mut candidates,
+            &mut single_compilation_visibility,
+            &mut continue_lookup,
+        )
+        .map(|types| types.declarations)
+        .expect("lookup completes");
+        assert_eq!(global_type.len(), 1);
+        assert_eq!(global_type[0].package_name(), "");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6296: a global-namespace List<T> in another compilation stole imported receiver and constructor uses"
+    )]
+    fn global_namespace_precedence_follows_compilation_visibility() {
+        let source = r#"
+using Tools;
+class Consumer { Service field; Gadget other; }
+"#;
+        let mut by_fqn = HashMap::default();
+        by_fqn.insert(
+            "Tools.Service".to_string(),
+            vec![unit("App/Tools.cs", "Tools", "Service")],
+        );
+        // `Service` is declared in the global namespace by another file of the
+        // reference's compilation, by a file of an unrelated compilation, and
+        // by a file whose membership is unknown. Only the unknown file
+        // declares `Gadget`.
+        by_fqn.insert(
+            "Service".to_string(),
+            vec![
+                unit("App/Shadow.cs", "", "Service"),
+                unit("Tests/Service.cs", "", "Service"),
+                unit("Loose/Service.cs", "", "Service"),
+            ],
+        );
+        by_fqn.insert(
+            "Gadget".to_string(),
+            vec![unit("Loose/Gadget.cs", "", "Gadget")],
+        );
+        let paths = |units: &[CodeUnit]| {
+            let mut paths = units
+                .iter()
+                .map(|unit| brokk_bifrost_core::path_utils::rel_path_string(unit.source()))
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        // (candidate view, its unproven part, physical view's unproven part)
+        let lookup = |name: &str, visibility: &dyn Fn(&str) -> CSharpCompilationVisibility| {
+            let context = context_at(source, name, 0);
+            let mut global_alias = |_: &str| Some(None::<String>);
+            let mut global_namespaces = || Some(Vec::new());
+            let mut namespace_exists = |namespace: &str| Some(namespace == "Tools");
+            let mut candidates = |fqn: &str| Some(by_fqn.get(fqn).cloned().unwrap_or_default());
+            let mut compilation_visibility = |candidate: &CodeUnit| {
+                Some(visibility(
+                    &brokk_bifrost_core::path_utils::rel_path_string(candidate.source()),
+                ))
+            };
+            let mut continue_lookup = || true;
+            let types = visible_type_candidates_at_with_lookups(
+                name,
+                &context,
+                &mut global_alias,
+                &mut global_namespaces,
+                &mut namespace_exists,
+                &mut candidates,
+                &mut compilation_visibility,
+                &mut continue_lookup,
+            )
+            .expect("lookup completes");
+            let physical = visible_type_declarations_at_with_lookups(
+                name,
+                &context,
+                &mut global_alias,
+                &mut global_namespaces,
+                &mut namespace_exists,
+                &mut candidates,
+                &mut compilation_visibility,
+                &mut continue_lookup,
+            )
+            .expect("lookup completes");
+            (
+                paths(&types.declarations),
+                paths(&types.unproven),
+                paths(&physical.unproven),
+            )
+        };
+        let by_path = |visible: &'static [&'static str], unresolved: &'static [&'static str]| {
+            move |path: &str| {
+                if visible.contains(&path) {
+                    CSharpCompilationVisibility::Visible
+                } else if unresolved.contains(&path) {
+                    CSharpCompilationVisibility::Unresolved
+                } else {
+                    CSharpCompilationVisibility::NotVisible
+                }
+            }
+        };
+        let none = Vec::<String>::new();
+
+        assert_eq!(
+            lookup("Service", &by_path(&["App/Shadow.cs", "App/Tools.cs"], &[])),
+            (vec!["App/Shadow.cs".to_owned()], none.clone(), none.clone()),
+            "a global type in another file of the same compilation precedes the import"
+        );
+        assert_eq!(
+            lookup("Service", &by_path(&["App/Tools.cs"], &[])),
+            (vec!["App/Tools.cs".to_owned()], none.clone(), none.clone()),
+            "a global type the compilation cannot see does not shadow the import"
+        );
+        assert_eq!(
+            lookup(
+                "Service",
+                &by_path(&["App/Tools.cs"], &["Loose/Service.cs"])
+            ),
+            (
+                vec!["App/Tools.cs".to_owned(), "Loose/Service.cs".to_owned()],
+                vec!["Loose/Service.cs".to_owned()],
+                vec!["Loose/Service.cs".to_owned()],
+            ),
+            "an unproven global type and the import form one unproven ambiguity"
+        );
+        assert_eq!(
+            lookup(
+                "Service",
+                &by_path(&["App/Shadow.cs", "App/Tools.cs"], &["Loose/Service.cs"])
+            ),
+            (
+                vec!["App/Shadow.cs".to_owned()],
+                none.clone(),
+                vec!["Loose/Service.cs".to_owned()],
+            ),
+            "a proven global type names the type alone; its unproven physical twin stays doubt"
+        );
+        assert_eq!(
+            lookup("Gadget", &by_path(&["App/Tools.cs"], &["Loose/Gadget.cs"])),
+            (
+                vec!["Loose/Gadget.cs".to_owned()],
+                vec!["Loose/Gadget.cs".to_owned()],
+                vec!["Loose/Gadget.cs".to_owned()],
+            ),
+            "a lone unproven global type is reported, not resolved"
+        );
+    }
+
+    #[test]
+    fn inner_namespace_type_precedes_global_using_alias() {
+        let source = r#"
+global using Svc = GlobalTypes.Service;
+namespace Outer { class Svc {} class Current { Svc value; } }
+namespace GlobalTypes { class Service {} }
+"#;
+        let context = context_at(source, "Svc", 1);
+        let mut by_fqn = HashMap::default();
+        by_fqn.insert(
+            "Outer.Svc".to_string(),
+            vec![unit("local.cs", "Outer", "Svc")],
+        );
+        by_fqn.insert(
+            "GlobalTypes.Service".to_string(),
+            vec![unit("global.cs", "GlobalTypes", "Service")],
+        );
+        let mut global_alias =
+            |alias: &str| Some((alias == "Svc").then(|| "GlobalTypes.Service".to_string()));
+        let mut global_namespaces = || Some(Vec::new());
+        let mut namespace_exists = |_: &str| Some(false);
+        let mut candidates = |fqn: &str| Some(by_fqn.get(fqn).cloned().unwrap_or_default());
+        let mut continue_lookup = || true;
+        let selected = visible_type_candidates_at_with_lookups(
+            "Svc",
+            &context,
+            &mut global_alias,
+            &mut global_namespaces,
+            &mut namespace_exists,
+            &mut candidates,
+            &mut single_compilation_visibility,
+            &mut continue_lookup,
+        )
+        .map(|types| types.declarations)
+        .expect("lookup completes");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].package_name(), "Outer");
+    }
+
+    #[test]
+    fn imported_declaration_lookup_preserves_physical_sites_and_exact_dedups() {
+        let source = r#"
+using Imported;
+class Current { Marker field; }
+namespace Imported { class Marker {} }
+"#;
+        let context = context_at(source, "Marker", 0);
+        let first = unit("a/Marker.cs", "Imported", "Marker");
+        let second = unit("b/Marker.cs", "Imported", "Marker");
+        let mut by_fqn = HashMap::default();
+        by_fqn.insert(
+            "Imported.Marker".to_string(),
+            vec![first.clone(), second.clone(), first.clone()],
+        );
+        let namespaces = ["Imported"];
+
+        let ordinary = lookup(&context, "Marker", &by_fqn, &namespaces)
+            .expect("ordinary imported lookup completes");
+        assert_eq!(
+            ordinary,
+            vec![first.clone()],
+            "ordinary lookup preserves its existing one-logical-type import policy"
+        );
+
+        let declarations = lookup_declarations(&context, "Marker", &by_fqn, &namespaces)
+            .expect("declaration lookup completes");
+        assert_eq!(
+            declarations,
+            vec![first.clone(), second.clone()],
+            "declaration lookup keeps distinct source paths and drops only identical rows"
+        );
+
+        let direct_source = "namespace N { class Current { Marker field; } }";
+        let direct_context = context_at(direct_source, "Marker", 0);
+        let direct_first = unit("a/Marker.cs", "N", "Marker");
+        let direct_second = unit("b/Marker.cs", "N", "Marker");
+        let mut direct_by_fqn = HashMap::default();
+        direct_by_fqn.insert(
+            "N.Marker".to_string(),
+            vec![direct_first.clone(), direct_second.clone()],
+        );
+        let direct_ordinary = lookup(&direct_context, "Marker", &direct_by_fqn, &[])
+            .expect("direct lookup completes");
+        assert_eq!(
+            direct_ordinary,
+            vec![direct_first.clone(), direct_second.clone()],
+            "ordinary exact namespace lookup remains declaration-preserving"
+        );
+        let direct_declarations =
+            lookup_declarations(&direct_context, "Marker", &direct_by_fqn, &[])
+                .expect("direct declaration lookup completes");
+        assert_eq!(direct_declarations, vec![direct_first, direct_second]);
+    }
+
+    #[test]
+    fn repeated_import_rows_collapse_only_identical_declarations() {
+        let source = r#"
+using Imported;
+using Imported;
+class Current { Marker field; }
+namespace Imported { class Marker {} }
+"#;
+        let context = context_at(source, "Marker", 0);
+        assert_eq!(
+            context.scopes[0]
+                .using_namespaces
+                .iter()
+                .filter(|import| import.target == "Imported")
+                .count(),
+            2,
+            "fixture contains two independently traversed import directives"
+        );
+        let marker = unit("Imported/Marker.cs", "Imported", "Marker");
+        let mut candidate_calls = 0;
+        let mut global_alias = |_: &str| Some(None::<String>);
+        let mut global_namespaces = || Some(Vec::new());
+        let mut namespace_exists = |namespace: &str| Some(namespace == "Imported");
+        let mut candidates = |fqn: &str| {
+            if fqn == "Imported.Marker" {
+                candidate_calls += 1;
+                Some(vec![marker.clone()])
+            } else {
+                Some(Vec::new())
+            }
+        };
+        let mut continue_lookup = || true;
+
+        let declarations = visible_type_declarations_at_with_lookups(
+            "Marker",
+            &context,
+            &mut global_alias,
+            &mut global_namespaces,
+            &mut namespace_exists,
+            &mut candidates,
+            &mut single_compilation_visibility,
+            &mut continue_lookup,
+        )
+        .map(|types| types.declarations)
+        .expect("repeated-import lookup completes");
+        assert_eq!(candidate_calls, 2, "both real import rows were visited");
+        assert_eq!(declarations, vec![marker]);
+    }
+
+    #[test]
+    fn context_and_lookup_preserve_callback_abort() {
+        let source = "namespace N { class C { Missing field; } }";
+        let tree = parsed_tree(source);
+        let start = source.find("Missing").expect("marker exists");
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, start + "Missing".len())
+            .expect("marker has a syntax node");
+        assert!(CSharpLookupContext::at(source, node, || false).is_none());
+
+        let context = CSharpLookupContext::at(source, node, || true).unwrap();
+        let mut global_alias = |_: &str| Some(None::<String>);
+        let mut global_namespaces = || None;
+        let mut namespace_exists = |_: &str| Some(false);
+        let mut candidates = |_: &str| Some(Vec::new());
+        let mut continue_lookup = || true;
+        assert!(
+            visible_type_candidates_at_with_lookups(
+                "Missing",
+                &context,
+                &mut global_alias,
+                &mut global_namespaces,
+                &mut namespace_exists,
+                &mut candidates,
+                &mut single_compilation_visibility,
+                &mut continue_lookup,
+            )
+            .is_none()
+        );
+    }
 }

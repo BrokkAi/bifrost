@@ -108,6 +108,7 @@ impl PathTraversalCache {
                     continue;
                 }
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code: CodeQueryDiagnosticCode::IdentityAxisUnsupported,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -128,6 +129,7 @@ impl PathTraversalCache {
                 continue;
             }
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,

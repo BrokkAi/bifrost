@@ -147,6 +147,27 @@ pub struct OpenPackSelection {
     pub cache_reused: bool,
 }
 
+/// The release set the acquirer would select for a request, found from the
+/// verified inventory without downloading or installing any artifact. The
+/// release gate uses it to prove that a candidate engine admits a published
+/// release of every pack stream, including streams such as
+/// `bifrost.public.packs` that are installed only as a dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackAdmission {
+    pub selection_reason: String,
+    /// The root release, then its dependencies.
+    pub releases: Vec<AdmittedRelease>,
+    pub rejections: Vec<Value>,
+    pub inventory: PackInventorySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdmittedRelease {
+    pub pack_id: String,
+    pub release_version: String,
+    pub manifest_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenPackFallbackKind {
     Disabled,
@@ -1312,44 +1333,94 @@ pub fn prepare_pack_request_at(
     request: &PackRequest,
     cache_root: Option<&Path>,
 ) -> Result<OpenPackSelection, OpenPackError> {
-    if env_flag("BIFROST_OPEN_PACKS_DISABLE") {
-        return Err(OpenPackError::Configuration(
-            "open-pack acquisition is disabled by BIFROST_OPEN_PACKS_DISABLE".to_owned(),
-        ));
-    }
-    let request = validate_pack_request(request.clone())?;
-    let profile = parse_engine_profile(engine_profile)?;
-    let offline = open_packs_offline_from_environment();
-    let refresh = env_flag("BIFROST_OPEN_PACKS_REFRESH");
-    if offline && refresh {
-        return Err(OpenPackError::Configuration(
-            "BIFROST_OPEN_PACKS_OFFLINE and BIFROST_OPEN_PACKS_REFRESH cannot both be enabled"
-                .to_owned(),
-        ));
-    }
-    let token = std::env::var("PACK_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty());
-    validate_token(token.as_deref())?;
-    if token.is_some() && request.inventory.is_some() {
-        return Err(OpenPackError::InvalidSource(
-            "PACK_TOKEN cannot be used with a trusted HTTPS inventory mirror".to_owned(),
-        ));
-    }
-    let source = request_source(&request);
-    let transport = UreqTransport::new(Some(source.clone()), token);
-    let root = cache_root
-        .map(Path::to_path_buf)
-        .map_or_else(default_cache_root, Ok)?;
+    let run = PackRequestRun::from_environment(engine_profile, request, cache_root)?;
     prepare_with_request(
-        &root,
-        &profile,
-        &request,
-        offline,
-        refresh,
-        Some(&source),
-        &transport,
+        &run.cache_root,
+        &run.profile,
+        &run.request,
+        run.offline,
+        run.refresh,
+        Some(&run.source),
+        &run.transport,
     )
+}
+
+/// Find the release set `prepare_pack_request_at` would select for exactly
+/// this request, with the same discovery, engine-contract admission and
+/// qualification rules, without downloading or installing its artifacts.
+pub fn admit_pack_request_at(
+    engine_profile: &Value,
+    request: &PackRequest,
+    cache_root: &Path,
+) -> Result<PackAdmission, OpenPackError> {
+    let run = PackRequestRun::from_environment(engine_profile, request, Some(cache_root))?;
+    admit_with_request(
+        &run.cache_root,
+        &run.profile,
+        &run.request,
+        run.offline,
+        run.refresh,
+        Some(&run.source),
+        &run.transport,
+    )
+}
+
+/// A validated request with the acquisition settings the environment selects.
+struct PackRequestRun {
+    profile: EngineProfile,
+    request: PackRequest,
+    offline: bool,
+    refresh: bool,
+    source: PackSource,
+    transport: UreqTransport,
+    cache_root: PathBuf,
+}
+
+impl PackRequestRun {
+    fn from_environment(
+        engine_profile: &Value,
+        request: &PackRequest,
+        cache_root: Option<&Path>,
+    ) -> Result<Self, OpenPackError> {
+        if env_flag("BIFROST_OPEN_PACKS_DISABLE") {
+            return Err(OpenPackError::Configuration(
+                "open-pack acquisition is disabled by BIFROST_OPEN_PACKS_DISABLE".to_owned(),
+            ));
+        }
+        let request = validate_pack_request(request.clone())?;
+        let profile = parse_engine_profile(engine_profile)?;
+        let offline = open_packs_offline_from_environment();
+        let refresh = env_flag("BIFROST_OPEN_PACKS_REFRESH");
+        if offline && refresh {
+            return Err(OpenPackError::Configuration(
+                "BIFROST_OPEN_PACKS_OFFLINE and BIFROST_OPEN_PACKS_REFRESH cannot both be enabled"
+                    .to_owned(),
+            ));
+        }
+        let token = std::env::var("PACK_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty());
+        validate_token(token.as_deref())?;
+        if token.is_some() && request.inventory.is_some() {
+            return Err(OpenPackError::InvalidSource(
+                "PACK_TOKEN cannot be used with a trusted HTTPS inventory mirror".to_owned(),
+            ));
+        }
+        let source = request_source(&request);
+        let transport = UreqTransport::new(Some(source.clone()), token);
+        let cache_root = cache_root
+            .map(Path::to_path_buf)
+            .map_or_else(default_cache_root, Ok)?;
+        Ok(Self {
+            profile,
+            request,
+            offline,
+            refresh,
+            source,
+            transport,
+            cache_root,
+        })
+    }
 }
 
 /// Select verified open packs for scan and server bootstrap. Public discovery
@@ -1588,6 +1659,60 @@ fn prepare_with_request(
     source: Option<&PackSource>,
     transport: &dyn HttpTransport,
 ) -> Result<OpenPackSelection, OpenPackError> {
+    let (root, inventory, selected) = discover_and_select(
+        cache_root, profile, request, offline, refresh, source, transport,
+    )?;
+    prepare_selected_set(
+        &root, inventory, profile, request, source, offline, transport, selected,
+    )
+}
+
+fn admit_with_request(
+    cache_root: &Path,
+    profile: &EngineProfile,
+    request: &PackRequest,
+    offline: bool,
+    refresh: bool,
+    source: Option<&PackSource>,
+    transport: &dyn HttpTransport,
+) -> Result<PackAdmission, OpenPackError> {
+    let (_, inventory, selected) = discover_and_select(
+        cache_root, profile, request, offline, refresh, source, transport,
+    )?;
+    let releases = std::iter::once(selected.root_index)
+        .chain(selected.dependency_indices.iter().copied())
+        .map(|index| {
+            let release = &inventory.releases[index];
+            AdmittedRelease {
+                pack_id: release.manifest.pack.id.clone(),
+                release_version: release.manifest.release_version.clone(),
+                manifest_sha256: release.cached.manifest_sha256.clone(),
+            }
+        })
+        .collect();
+    Ok(PackAdmission {
+        selection_reason: selected.selection_reason.to_owned(),
+        releases,
+        rejections: selected.rejections,
+        inventory: PackInventorySnapshot {
+            index_sha256: inventory.inventory_sha256,
+            fetched_at: inventory.fetched_at,
+            fetched_online: inventory.fetched_online,
+        },
+    })
+}
+
+/// The request's cache root, its verified inventory, and the release set the
+/// acquirer selects from it.
+fn discover_and_select(
+    cache_root: &Path,
+    profile: &EngineProfile,
+    request: &PackRequest,
+    offline: bool,
+    refresh: bool,
+    source: Option<&PackSource>,
+    transport: &dyn HttpTransport,
+) -> Result<(PathBuf, Inventory, SelectedSet), OpenPackError> {
     if offline && refresh {
         return Err(OpenPackError::Configuration(
             "offline and refresh cannot both be enabled".to_owned(),
@@ -1600,9 +1725,7 @@ fn prepare_with_request(
     })?;
     let inventory = load_or_discover_inventory(&root, source, transport, offline, refresh)?;
     let selected = select_pack_request(&inventory, profile, request)?;
-    prepare_selected_set(
-        &root, inventory, profile, request, source, offline, transport, selected,
-    )
+    Ok((root, inventory, selected))
 }
 
 #[cfg(test)]
@@ -4244,6 +4367,38 @@ pub fn acquisition_outcome(
                 Err(error) => failed_outcome(engine, request, error, created_at),
             }
         }
+        Err(error) => failed_outcome(engine, request, error, created_at),
+    }
+}
+
+/// Render `admit_pack_request_at`'s result in the acquisition outcome's
+/// shape, with status `admitted` and the admitted releases as the selection.
+pub fn admission_outcome(
+    engine_profile: &Value,
+    request: Option<&PackRequest>,
+    result: Result<PackAdmission, OpenPackError>,
+) -> Value {
+    let engine = json!({
+        "version": engine_profile.get("engine_version").cloned().unwrap_or(Value::Null),
+        "build_identity": engine_profile.get("build_identity").cloned().unwrap_or(Value::Null),
+    });
+    let created_at =
+        format_iso_utc(SystemTime::now()).unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_owned());
+    match result {
+        Ok(admission) => json!({
+            "outcome_schema_version": 1,
+            "status": "admitted",
+            "engine": engine,
+            "request": request,
+            "failure": Value::Null,
+            "rejections": admission.rejections,
+            "inventory": admission.inventory,
+            "selection": {
+                "selection_reason": admission.selection_reason,
+                "releases": admission.releases,
+            },
+            "created_at": created_at,
+        }),
         Err(error) => failed_outcome(engine, request, error, created_at),
     }
 }

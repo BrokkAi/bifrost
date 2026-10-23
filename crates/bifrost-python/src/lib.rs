@@ -32,6 +32,7 @@ pub mod format_string;
 pub mod graph;
 pub mod graph_support;
 pub mod imports;
+pub mod intrinsics;
 pub mod queries;
 mod regex;
 pub use regex::{decode_python_fstring_literal_segments, decode_python_string_value};

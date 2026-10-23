@@ -75,7 +75,8 @@ const BASELINE_MIGRATION_VERSION: i64 = 125;
 /// distinguishes nominal and receiver projection outputs on qualified routes.
 /// Once #2771 lands, this floor must not advance for compatible migrations.
 const FIRST_NATIVE_CACHE_VERSION: i64 = 125;
-const CURRENT_MIGRATION_VERSION: i64 = 196;
+const CURRENT_MIGRATION_VERSION: i64 =
+    POST_BASELINE_MIGRATIONS[POST_BASELINE_MIGRATIONS.len() - 1].version;
 const _: () = assert!(CURRENT_MIGRATION_VERSION >= FIRST_NATIVE_CACHE_VERSION);
 pub const OPTIONAL_FACT_KIND_CPP_CLASS_TEMPLATE: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -380,6 +381,46 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 196,
         sql: include_str!("../migrations/cache/0196-python-environment-summaries.sql"),
     },
+    CacheMigration {
+        version: 197,
+        sql: include_str!("../migrations/cache/0197-rust-expanding-attribute-contexts.sql"),
+    },
+    CacheMigration {
+        version: 198,
+        sql: include_str!("../migrations/cache/0198-jvm-package-private-visibility.sql"),
+    },
+    CacheMigration {
+        version: 199,
+        sql: include_str!("../migrations/cache/0199-temporal-binding-inputs.sql"),
+    },
+    CacheMigration {
+        version: 200,
+        sql: include_str!("../migrations/cache/0200-python-reverse-inputs.sql"),
+    },
+    CacheMigration {
+        version: 201,
+        sql: include_str!("../migrations/cache/0201-python-member-inputs.sql"),
+    },
+    CacheMigration {
+        version: 202,
+        sql: include_str!("../migrations/cache/0202-python-member-operations.sql"),
+    },
+    CacheMigration {
+        version: 203,
+        sql: include_str!("../migrations/cache/0203-csharp-compilation-membership.sql"),
+    },
+    CacheMigration {
+        version: 204,
+        sql: include_str!("../migrations/cache/0204-rust-inherent-impl-subjects.sql"),
+    },
+    CacheMigration {
+        version: 205,
+        sql: include_str!("../migrations/cache/0205-shared-package-member-names.sql"),
+    },
+    CacheMigration {
+        version: 206,
+        sql: include_str!("../migrations/cache/0206-go-domain-contexts.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -405,8 +446,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    162, 114, 100, 17, 99, 253, 219, 162, 248, 104, 142, 228, 31, 11, 212, 158, 243, 24, 82, 14,
-    228, 23, 134, 175, 109, 249, 253, 18, 37, 200, 77, 185,
+    49, 146, 248, 104, 56, 34, 140, 212, 135, 115, 127, 253, 91, 56, 45, 53, 111, 136, 203, 131,
+    20, 187, 120, 165, 159, 203, 200, 126, 36, 0, 28, 16,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -442,6 +483,10 @@ const COLLECTION_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 /// one request. The bound is per connection and does not depend on the
 /// workspace.
 const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 256;
+/// The writer prepares each hot table's insert at up to three row counts
+/// (bifrost-store's `row_batch`), on top of the statements every reader also
+/// uses, so its cache holds more. Still one bound per connection.
+const WRITER_PREPARED_STATEMENT_CACHE_CAPACITY: usize = 1024;
 /// The page size the cache store uses and upgrades to. Every hot fact table is
 /// `WITHOUT ROWID` keyed by a random 40-char blob_oid, so bulk inserts scatter
 /// across the b-tree: at the SQLite default 4 KiB a cold self-workspace build
@@ -1130,11 +1175,39 @@ fn configure_readonly_connection(conn: &Connection) -> Result<()> {
 const READER_PAGE_CACHE_KIB: i64 = -8192;
 
 /// Memory-map window for interactive read-only connections, in bytes. A
-/// mapping is file-backed and shared by every pooled reader of the same store,
-/// so the window does not multiply with the reader count the way the page
-/// cache does. The reasoning and measurements are in
-/// `configure_readonly_page_cache`.
-const READER_MMAP_SIZE_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+/// mapping's file-backed pages are shared by pooled readers of the same
+/// store, so those pages do not multiply with the reader count the way the
+/// private page cache does. Each reader still pays for its own page tables.
+/// The reasoning and measurements are in `configure_readonly_page_cache`.
+#[doc(hidden)]
+pub const READER_MMAP_SIZE_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+
+/// Mapping budget borrowed only for crate derivation, restored on pool checkin.
+///
+/// Measured 2026-10-22 on MinasMorgulWSL (120 logical CPUs, ZFS), deriving
+/// all 31 root-package test/bin/example crates of the Bifrost workspace at 92f1099b31
+/// concurrently against a copy of its finished 31.7 GB store. These are wave
+/// replays, not full cold builds; timings include debugger pauses and host
+/// contention. Cache/map columns are MiB/GiB; memory columns are GiB.
+///   cache/map       wave s    bench bindings s    peak RSS    peak PSS
+///     8/2           179.70          170.82            8.23        8.10
+///     8/32          113.50           54.94           13.31        8.27
+///     8/2 repeat    210.60          201.80            9.08        8.34
+///     8/32 repeat    38.84           24.89           13.23        8.69
+/// Wave read calls fell from about 52 million (1 TiB of logical reads) to
+/// 3,500-3,700 (0.09 GiB); storage-read counters stayed near 2.1-2.3 GiB.
+/// Whole-command system CPU fell from 3,862-4,435 to 85-122 seconds. SQLite's
+/// direct overflow reads bypass its page cache, but its VFS serves in-window
+/// reads from the mapping. Keep the page cache at 8 MiB: larger private caches
+/// did not remove that traffic and added 1.7-5.9 GiB of anonymous residency.
+///
+/// File pages are shared, but every mapping has its own page tables. The
+/// larger window added about 0.8 GiB of shared file residency and 0.13 GiB of
+/// page tables in this wave. Applying it to up to 120 pooled interactive
+/// readers of a 30 GB store could cost several GiB of page tables; that needs
+/// its own measurement. Ordinary readers therefore keep their smaller map.
+#[doc(hidden)]
+pub const DERIVATION_MMAP_SIZE_BYTES: i64 = 32 * 1024 * 1024 * 1024;
 
 fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
@@ -1147,8 +1220,9 @@ fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     // SQLITE_ENABLE_MEMORY_MANAGEMENT (BrokkAi/bifrost#21). Workspace builds
     // undefine that option through LIBSQLITE3_FLAGS in .cargo/config.toml, so
     // each page cache has a private reclamation group. Downstream Rust builds
-    // do not inherit our Cargo configuration and must apply the build flag
-    // themselves.
+    // do not inherit our Cargo configuration and must apply the build flags
+    // themselves. Without SQLITE_MAX_MMAP_SIZE=68719476736LL, requests for
+    // the larger derivation map silently clamp to SQLite's old ~2 GiB cap.
     //
     // Measured 2026-10-09 on Vector (2,796 files, 30.8 MB of source, 1.6 GB
     // store), whole-workspace cleartext-logging policy, one run per cell, host
@@ -1165,15 +1239,17 @@ fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     // (warm) and wall time by 42% and 51%. Major faults rose 2.3x (cold) and
     // 2.5x (warm). Peak RSS counts shared file-backed pages, so it overstates
     // the private memory each reader holds. Proportional set size was not
-    // measured. SQLite clamps mmap_size to 2,147,418,112 bytes on Linux; the
-    // store fits under that cap.
+    // measured. SQLite's default Linux mmap cap is 2,147,418,112 bytes;
+    // Vector's 1.6 GB store fits, but large workspaces exceed it. Our build
+    // raises the compiled cap to support the scoped derivation map above.
     //
     // Pool cost: every open reader keeps READER_PAGE_CACHE_KIB of private page
     // cache, so a 1 GiB cache would cost 1 GiB per pooled reader, up to 120 in
     // the MCP server. A mapping adds no private pages until a page is touched,
     // and touched pages are shared file-backed pages of one store file, which
     // the kernel can reclaim. The 1 GiB page cache also cut sys time in this
-    // cell, so the mapping's advantage is the further cut at no per-reader cost.
+    // cell, so the mapping avoids private page-cache growth; each reader's
+    // mapping still needs its own page tables.
     //
     // Latency, rust-mbx replay (2026-10-09, 10 repeats per case, three passes
     // per build, host load 17 to 150): definition and type p95 were lower with
@@ -1976,7 +2052,7 @@ fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> 
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+    conn.set_prepared_statement_cache_capacity(WRITER_PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
 }
 
@@ -2620,7 +2696,7 @@ fn recreate_schema(tx: &Transaction<'_>) -> Result<()> {
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn quote_sqlite_identifier(identifier: &str) -> String {
+pub(crate) fn quote_sqlite_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
@@ -4483,6 +4559,69 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#5664: Go summary retirement left members and containers orphaned during upgrades")]
+    fn go_domain_migration_withdraws_v1_contexts_and_summary_rows() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < CURRENT_MIGRATION_VERSION)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch("INSERT INTO workspace_revisions VALUES(printf('%064d',0),'go',0,1);
+          INSERT INTO go_context_selections VALUES(1,printf('%064d',0),'go',0,1,zeroblob(32),1);
+          INSERT INTO go_context_publications VALUES(1,1,zeroblob(32),0,jsonb('[]'));
+          INSERT INTO go_context_heads VALUES(1,1);
+          INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key)
+            VALUES(1,'example.test/root','root','','',zeroblob(32),0,jsonb('[]'),randomblob(32));
+          INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state)
+            VALUES(1,'go','go_package',randomblob(32),randomblob(32),'test',1,0,'building');
+          INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,valid_from,summary_id,profile_digest)
+            VALUES(printf('%064d',0),'go',0,randomblob(32),1,1,zeroblob(32));").unwrap();
+        conn.execute_batch("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(1,printf('%040d',1),'go',0);
+          INSERT INTO resolution_unit_summary_members VALUES(1,0,1,'main.go','source');
+          INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL);
+          INSERT INTO resolution_unit_summary_placements VALUES(1,'',0,0);
+          INSERT INTO resolution_unit_summary_dependencies VALUES(1,0,zeroblob(32),zeroblob(32),'external',NULL);
+          INSERT INTO resolution_unit_summary_dependency_names VALUES(1,'normal','dep',0);
+          INSERT INTO resolution_unit_summary_imports VALUES(1,1,0,'named',0,0,'resolved');
+          INSERT INTO resolution_unit_summary_reads VALUES(1,0,'epoch',zeroblob(32),zeroblob(32));
+          INSERT INTO resolution_unit_summary_gaps VALUES(1,'test','',jsonb('{}'));").unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        // Match migrate(): historical DDL cannot rely on cascading FK actions.
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(POST_BASELINE_MIGRATIONS.last().unwrap().sql)
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for table in [
+            "go_context_selections",
+            "go_context_publications",
+            "go_package_instances",
+            "go_package_files",
+            "go_package_imports",
+            "go_context_domain_modules",
+            "resolution_unit_summary_versions",
+            "resolution_unit_summaries",
+            "resolution_unit_summary_members",
+            "resolution_unit_summary_containers",
+            "resolution_unit_summary_placements",
+            "resolution_unit_summary_dependencies",
+            "resolution_unit_summary_dependency_names",
+            "resolution_unit_summary_imports",
+            "resolution_unit_summary_reads",
+            "resolution_unit_summary_gaps",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "migration must withdraw v1 {table}");
+        }
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
     fn shared_summary_placement_migration_and_foreign_keys() {
         let mut conn = create_current_baseline_without_migration();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -4527,7 +4666,15 @@ mod tests {
                 .version,
         )
         .unwrap();
-        migrate(&mut conn).unwrap();
+        // Preserve the Go row through the placement migration and its successors.
+        // Migration 0206 deliberately withdraws the old Go summary family.
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| (190..206).contains(&migration.version))
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 205).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT group_concat(lang) FROM resolution_unit_summaries",
@@ -4632,6 +4779,17 @@ mod tests {
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM resolution_unit_summary_dependency_names",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        validate_foreign_keys(&conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summaries WHERE lang='go'",
                 [],
                 |row| row.get::<_, i64>(0)
             )
@@ -4974,9 +5132,16 @@ mod tests {
         let indexes = conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name").unwrap()
             .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))).unwrap()
             .collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        // Normal migrate() owns the transaction; no FK-disable window is needed.
         conn.pragma_update(None, "user_version", 195).unwrap();
-        migrate(&mut conn).unwrap();
+        conn.execute_batch("SAVEPOINT python_environment_preservation")
+            .unwrap();
+        // Check preservation at the Python environment migration boundary.
+        // Later migration 0206 deliberately retires the Go rows seeded above.
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|m| m.version == 196)
+            .unwrap();
+        conn.execute_batch(migration.sql).unwrap();
         for ((name, sql), expected) in tables.iter().zip(before) {
             assert_eq!(
                 read(&conn, name, sql),
@@ -4994,6 +5159,32 @@ mod tests {
                 .unwrap();
             assert_eq!(actual, expected, "changed index {name}");
         }
+        validate_foreign_keys(&conn).unwrap();
+        // Restore the 0195 fixture so the production upgrader also exercises
+        // the entire populated-store path through 0206 in its own transaction.
+        conn.execute_batch(
+            "ROLLBACK TO python_environment_preservation; RELEASE python_environment_preservation",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summaries WHERE lang='go'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summary_members WHERE summary_id=71",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
         validate_foreign_keys(&conn).unwrap();
         assert!(current_schema_is_valid(&conn).unwrap());
         // Exactly the approved new kind and profile authority are admitted.
@@ -5015,6 +5206,37 @@ mod tests {
             schema_object_definitions_sha256(&conn).unwrap(),
             CURRENT_SCHEMA_OBJECTS_SHA256
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6214: existing JVM package visibility labels must migrate to the reader's canonical label"
+    )]
+    fn jvm_package_private_visibility_migration_rewrites_legacy_label() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version <= 196) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES('provider','example.Owner',1,1,1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb) VALUES('provider','example.Owner',0,'ordinary','method','package',0,0,0,jsonb('[]'))",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 196).unwrap();
+        migrate(&mut conn).unwrap();
+        let visibility: String = conn
+            .query_row(
+                "SELECT visibility FROM jvm_external_owner_members WHERE provider_id='provider' AND owner_fqn='example.Owner' AND ordinal=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visibility, "package_private");
     }
 
     #[test]

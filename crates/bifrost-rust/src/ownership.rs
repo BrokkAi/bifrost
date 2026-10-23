@@ -18,7 +18,7 @@ use crate::graph_support::{
 use crate::imports::RustImportBindingName;
 use crate::lexical_scope::{RustTypeHead, rust_type_head_at_bounded};
 use crate::prelude::rust_std_type_fact;
-use crate::syntax::unwrap_attributes;
+use crate::syntax::{attribute_payload, unwrap_attributes};
 use brokk_bifrost_core::analyzer::tree_walk::{
     has_child_of_kind as has_anonymous_child, named_children_vec as named_children,
 };
@@ -216,17 +216,56 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             module_path: Vec::new(),
             module_context: None,
             under_macro: false,
+            under_attribute: false,
         }];
 
         while let Some(frame) = stack.pop() {
             charge(1)?;
-            let node = unwrap_attributes(frame.node);
+            let mut node = frame.node;
+            while let Some(payload) = attribute_payload(node) {
+                module_context_by_node.insert(node.id(), frame.module_context);
+                for child in named_children(node).into_iter().rev() {
+                    charge(1)?;
+                    if child != payload {
+                        // Attributes on a module belong to its enclosing module.
+                        // They never enter the declaration/import collection below.
+                        stack.push(ScanFrame {
+                            node: child,
+                            module_path: frame.module_path.clone(),
+                            module_context: frame.module_context,
+                            under_macro: frame.under_macro,
+                            under_attribute: true,
+                        });
+                    }
+                }
+                node = payload;
+            }
+            if frame.under_attribute {
+                assert!(
+                    !matches!(
+                        node.kind(),
+                        "use_declaration"
+                            | "impl_item"
+                            | "mod_item"
+                            | "struct_item"
+                            | "enum_item"
+                            | "union_item"
+                            | "type_item"
+                            | "trait_item"
+                            | "function_item"
+                            | "const_item"
+                            | "static_item"
+                            | "foreign_mod_item"
+                    ),
+                    "attribute syntax cannot contribute declarations, imports, or impls"
+                );
+            }
             module_context_by_node.insert(frame.node.id(), frame.module_context);
             module_context_by_node.insert(node.id(), frame.module_context);
             let macro_context =
                 frame.under_macro || matches!(node.kind(), "macro_invocation" | "macro_definition");
 
-            if node.kind() == "use_declaration" && !macro_context {
+            if node.kind() == "use_declaration" && !macro_context && !frame.under_attribute {
                 collect_imports(
                     node,
                     source,
@@ -237,7 +276,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                 )?;
             }
 
-            if !macro_context {
+            if !macro_context && !frame.under_attribute {
                 if let Some(declaration) =
                     nominal_declaration(node, source, &frame.module_path, &mut shadowed_names)
                 {
@@ -290,6 +329,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                         frame.module_context
                     },
                     under_macro: macro_context,
+                    under_attribute: frame.under_attribute,
                 });
             }
         }
@@ -1481,6 +1521,7 @@ struct ScanFrame<'tree> {
     module_path: Vec<String>,
     module_context: Option<usize>,
     under_macro: bool,
+    under_attribute: bool,
 }
 
 fn nominal_declaration<'tree>(
@@ -2218,6 +2259,17 @@ pub fn rust_node_is_in_unsafe_context(node: Node<'_>) -> bool {
     has_unsafe_ancestor(node)
 }
 
+/// Charged variant used while collecting structural call facts.
+pub fn rust_node_is_in_unsafe_context_bounded<F, E>(
+    node: Node<'_>,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E> + ?Sized,
+{
+    has_unsafe_ancestor_bounded(node, &mut |amount| charge(amount))
+}
+
 /// The operand of an exact builtin dereference expression (`*value`).
 pub fn rust_dereference_operand(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "unary_expression"
@@ -2509,6 +2561,42 @@ mod tests {
             index.lexical_module_context_steps.load(Ordering::Relaxed),
             call_count * module_depth
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6249: outer module attributes must inherit the enclosing lexical module"
+    )]
+    fn attribute_macros_keep_the_enclosing_module_context() {
+        let source = r#"mod outer {
+            #[doc = concat!("module", "attribute")]
+            pub mod inner { fn body() { stringify!(body_macro); } }
+        }"#;
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let mut macros = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "macro_invocation" {
+                let name = rust_node_text(node.child_by_field_name("macro").unwrap(), source);
+                let expected = if name == "concat" {
+                    vec!["outer"]
+                } else {
+                    vec!["outer", "inner"]
+                };
+                assert!(index.module_context_by_node.contains_key(&node.id()));
+                assert_eq!(
+                    index.lexical_module_path(node),
+                    expected,
+                    "{}",
+                    node.to_sexp()
+                );
+                macros.push(name);
+            }
+            stack.extend(named_children(node));
+        }
+        assert_eq!(macros.len(), 2, "{macros:?}");
     }
 
     #[test]

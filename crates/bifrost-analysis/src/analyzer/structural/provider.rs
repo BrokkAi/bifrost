@@ -211,6 +211,10 @@ pub trait StructuralFactProvider: Send + Sync {
 
     /// Whether AST-backed callable asyncness is available. External providers
     /// default to unsupported so missing facts are diagnosed.
+    fn structural_supports_unsafe_context(&self) -> bool {
+        false
+    }
+
     fn structural_supports_async_callable_value(&self) -> bool {
         false
     }
@@ -1064,6 +1068,12 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.supports_boolean_literal_value())
+    }
+
+    fn structural_supports_unsafe_context(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_unsafe_context())
     }
 
     fn structural_supports_async_callable_value(&self) -> bool {

@@ -265,7 +265,7 @@ pub struct FlowRelationRow {
 }
 
 /// Why a derivation's rows are less than the whole truth.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum FlowStateIncompleteReason {
     /// The adapter declares the capability this axis stands on unsupported, so
     /// the absence of rows for it says nothing.
@@ -300,6 +300,8 @@ pub enum FlowStateIncompleteReason {
     /// derivation reads. The gap's own capability decides which axes it
     /// blocks; see [`axes_blocked_by`].
     LoweringGap {
+        /// Exact procedure-local gaps behind this reason, empty for synthetic reasons.
+        gaps: Vec<SemanticGapId>,
         capability: SemanticCapability,
         kind: SemanticGapKind,
         detail: String,
@@ -342,6 +344,91 @@ pub enum FlowStateIncompleteReason {
     },
 }
 
+// Procedure-local gap IDs are rendered as attributed sources, not allocation slots
+// in reason prose. Keep the existing reason text stable for downstream reports.
+impl std::fmt::Debug for FlowStateIncompleteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AxisUnsupported(value) => f.debug_tuple("AxisUnsupported").field(value).finish(),
+            Self::NoSemanticProvider => f.write_str("NoSemanticProvider"),
+            Self::SemanticProviderFailed { detail } => f
+                .debug_struct("SemanticProviderFailed")
+                .field("detail", detail)
+                .finish(),
+            Self::SemanticAnalysisPartial { detail } => f
+                .debug_struct("SemanticAnalysisPartial")
+                .field("detail", detail)
+                .finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::SourceGenerationChanged => f.write_str("SourceGenerationChanged"),
+            Self::BindingScopeLivenessUnavailable { detail } => f
+                .debug_struct("BindingScopeLivenessUnavailable")
+                .field("detail", detail)
+                .finish(),
+            Self::ControlProjectionRejected { detail } => f
+                .debug_struct("ControlProjectionRejected")
+                .field("detail", detail)
+                .finish(),
+            Self::ModeledControlProjectionIncomplete { detail } => f
+                .debug_struct("ModeledControlProjectionIncomplete")
+                .field("detail", detail)
+                .finish(),
+            Self::NoStructuralFacts => f.write_str("NoStructuralFacts"),
+            Self::LoweringGap {
+                capability,
+                kind,
+                detail,
+                ..
+            } => f
+                .debug_struct("LoweringGap")
+                .field("capability", capability)
+                .field("kind", kind)
+                .field("detail", detail)
+                .finish(),
+            Self::BudgetExhausted { axis, detail } => f
+                .debug_struct("BudgetExhausted")
+                .field("axis", axis)
+                .field("detail", detail)
+                .finish(),
+            Self::PropertyBaseNotCanonical { accesses } => f
+                .debug_struct("PropertyBaseNotCanonical")
+                .field("accesses", accesses)
+                .finish(),
+            Self::SelectedPropertyEndpointUnavailable {
+                point,
+                event_index,
+                source,
+            } => f
+                .debug_struct("SelectedPropertyEndpointUnavailable")
+                .field("point", point)
+                .field("event_index", event_index)
+                .field("source", source)
+                .finish(),
+            Self::BindingWithoutEstablishment { bindings } => f
+                .debug_struct("BindingWithoutEstablishment")
+                .field("bindings", bindings)
+                .finish(),
+            Self::BindingStateNotClosed { binding } => f
+                .debug_struct("BindingStateNotClosed")
+                .field("binding", binding)
+                .finish(),
+            Self::PropertyProviderUnavailable => f.write_str("PropertyProviderUnavailable"),
+            Self::PropertyProviderFailed { detail } => f
+                .debug_struct("PropertyProviderFailed")
+                .field("detail", detail)
+                .finish(),
+            Self::PropertyAnalysisPartial { detail } => f
+                .debug_struct("PropertyAnalysisPartial")
+                .field("detail", detail)
+                .finish(),
+            Self::PropertyReaching { reason } => f
+                .debug_struct("PropertyReaching")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 impl FlowStateIncompleteReason {
     /// Whether this one reason stops `axis` from being completely enumerated.
     ///
@@ -357,7 +444,9 @@ impl FlowStateIncompleteReason {
         match self {
             AxisUnsupported(blocked) => *blocked == axis,
             BudgetExhausted { axis: blocked, .. } => *blocked == axis,
-            LoweringGap { capability, .. } => axes_blocked_by(*capability).contains(&axis),
+            LoweringGap { capability, .. } => {
+                capability_axes_blocked_by(*capability).contains(&axis)
+            }
             PropertyBaseNotCanonical { .. } | SelectedPropertyEndpointUnavailable { .. } => {
                 property_axes().contains(&axis)
             }
@@ -452,11 +541,115 @@ const fn property_axes() -> &'static [FlowStateAxis] {
     ]
 }
 
+/// #6409: these exceptional discharges cannot resume ordinary body control.
+/// This is a control-only fact, not proof that the omitted effects are inert.
+pub fn gap_has_exit_only_control(gap: &SemanticGap) -> bool {
+    gap.capability == SemanticCapability::ExceptionalControlFlow
+        && matches!(
+            gap.discharge,
+            SemanticGapDischarge::NonRejoiningExceptionalExit
+                | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+                | SemanticGapDischarge::ExitOnlyProcedureCompletion
+        )
+}
+
+/// Cleanup can only continue its destination or unwind. Finally/recover
+/// languages and unchecked C++ remain excluded from this contract (#6409).
+pub fn destructor_style_cleanup(language: Language) -> bool {
+    language == Language::Rust
+}
+
+/// The completion edge retained by emit_cleanup_completion_route in semantic/
+/// lowering.rs carries the original destination and edge kind. Exit points
+/// themselves carry companion bookkeeping gaps and have no continuation.
+pub fn cleanup_has_retained_destination(
+    semantics: &ProcedureSemantics,
+    point: ProgramPointId,
+) -> bool {
+    point == semantics.normal_exit_point()
+        || point == semantics.exceptional_exit_point()
+        || semantics.successor_edges(point).next().is_some()
+}
+
+fn cleanup_is_control_irrelevant(semantics: &ProcedureSemantics, gap: &SemanticGap) -> bool {
+    matches!(semantics.locator().language(), brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language) if destructor_style_cleanup(language))
+        && gap.subject == SemanticGapSubject::Point
+        && gap.capability == SemanticCapability::CleanupControlFlow
+        && gap.impacts.iter().all(|impact| {
+            matches!(
+                impact,
+                SemanticGapImpact::ValueFlow
+                    | SemanticGapImpact::ReturnTransfer
+                    | SemanticGapImpact::DispatchCoverage
+                    | SemanticGapImpact::HeapRead
+                    | SemanticGapImpact::HeapWrite
+                    | SemanticGapImpact::Aliasing
+            )
+        })
+        && cleanup_has_retained_destination(semantics, gap.point)
+}
+
+fn axes_blocked_by(semantics: &ProcedureSemantics, gap: &SemanticGap) -> &'static [FlowStateAxis] {
+    // R-cleanup (#6409): emit_cleanup_completion_route retains destination;
+    // no Invoke havoc premise is needed for control-shaped axes. Binding and
+    // same-evaluation axes retain their original capability classifications.
+    if gap_has_exit_only_control(gap)
+        || cleanup_is_control_irrelevant(semantics, gap)
+        || (matches!(
+            gap.capability,
+            SemanticCapability::CleanupControlFlow | SemanticCapability::ResourceManagement
+        ) && !points_before_exit_only_exceptions(semantics).contains(&gap.point))
+    {
+        &[]
+    } else {
+        capability_axes_blocked_by(gap.capability)
+    }
+}
+
+// A target-scoped proof may query cleanup/completion code itself. Keep its
+// existing exceptional-region obligations even when the global ordinary-body
+// axes close (#6409); its own discharge logic judges those selected targets.
+fn scoped_axes_blocked_by(
+    semantics: &ProcedureSemantics,
+    gap: &SemanticGap,
+) -> &'static [FlowStateAxis] {
+    if gap_has_exit_only_control(gap) {
+        capability_axes_blocked_by(gap.capability)
+    } else {
+        axes_blocked_by(semantics, gap)
+    }
+}
+
+/// Entry reachability after removing only certified exit-only exceptional
+/// edges. Outside this set, cleanup cannot introduce an ordinary-body path.
+pub fn points_before_exit_only_exceptions(
+    semantics: &ProcedureSemantics,
+) -> std::collections::HashSet<ProgramPointId> {
+    let exits = semantics
+        .gaps()
+        .iter()
+        .filter(|gap| gap_has_exit_only_control(gap))
+        .map(|gap| gap.point)
+        .collect::<HashSet<_>>();
+    let mut reached = std::collections::HashSet::new();
+    let mut stack = vec![semantics.entry_point()];
+    while let Some(point) = stack.pop() {
+        if !reached.insert(point) {
+            continue;
+        }
+        stack.extend(semantics.successor_edges(point).filter_map(|(_, edge)| {
+            (edge.kind != ControlEdgeKind::Exceptional || !exits.contains(&point))
+                .then_some(edge.target_point)
+        }));
+    }
+    reached
+}
+
 /// Which axes one gap capability blocks.
 ///
 /// Total over the capability registry on purpose: a capability added later
 /// must be classified deliberately, not defaulted into silence.
-fn axes_blocked_by(capability: SemanticCapability) -> &'static [FlowStateAxis] {
+fn capability_axes_blocked_by(capability: SemanticCapability) -> &'static [FlowStateAxis] {
     use SemanticCapability::*;
     const CONTROL: &[FlowStateAxis] = &[
         FlowStateAxis::ReachingRelation,
@@ -833,32 +1026,26 @@ impl FlowStateDerivation {
             .cloned()
             .collect::<Vec<_>>();
         let semantics = procedure.semantics();
-        let lowering_gap = |gap: &SemanticGap| FlowStateIncompleteReason::LoweringGap {
-            capability: gap.capability,
-            kind: gap.kind,
-            detail: gap.detail.to_string(),
-        };
-        let mut open = HashSet::<(SemanticCapability, SemanticGapKind)>::default();
-        let mut discharged = HashSet::<(SemanticCapability, SemanticGapKind)>::default();
         // A discharged control gap still omits edges. They cannot uninitialize
         // the binding, but they can make a modeled-unreachable event reachable.
         let mut omitted_control = Vec::new();
         for gap in semantics.gaps() {
-            let axes = axes_blocked_by(gap.capability);
+            let axes = capability_axes_blocked_by(gap.capability);
             if !(axes.contains(&FlowStateAxis::BindingEvents)
                 || axes.contains(&FlowStateAxis::ReachingRelation)
                 || gap.capability == SemanticCapability::Captures)
             {
                 continue;
             }
-            if !self.initialization_gap_is_discharged(semantics, gap, binding) {
-                if open.insert((gap.capability, gap.kind)) {
-                    reasons.push(lowering_gap(gap));
-                }
-            } else if axes.contains(&FlowStateAxis::ReachingRelation)
-                && discharged.insert((gap.capability, gap.kind))
-            {
-                omitted_control.push(lowering_gap(gap));
+            if !self.initialization_gap_is_discharged(
+                semantics,
+                gap,
+                binding,
+                self.event(event).point,
+            ) {
+                push_gap_reason(&mut reasons, gap);
+            } else if axes.contains(&FlowStateAxis::ReachingRelation) {
+                push_gap_reason(&mut omitted_control, gap);
             }
         }
         if !reasons.is_empty() {
@@ -883,7 +1070,7 @@ impl FlowStateDerivation {
     }
 
     /// Whether one lowering gap cannot change the initialization state of
-    /// `binding` at any modeled point.
+    /// `binding` before the selected event at `read_point`.
     ///
     /// - A capture gap scoped to another value leaves that value's state open,
     ///   not this binding's.
@@ -910,30 +1097,46 @@ impl FlowStateDerivation {
     ///   A proven unbound-local read may route directly to its matching handler,
     ///   leaving the generic dispatcher available only to other exceptions.
     ///
-    /// Every other gap stays open. In particular, any other exceptional-control
-    /// gap is not discharged here: some producers publish one for an operation
-    /// whose state change is itself not lowered.
+    /// Other gaps may be discharged by the initialization-only reachability
+    /// rule below; any gap that can still affect the selected read stays open.
     fn initialization_gap_is_discharged(
         &self,
         semantics: &ProcedureSemantics,
         gap: &SemanticGap,
         binding: ValueId,
+        read_point: ProgramPointId,
     ) -> bool {
-        if gap.capability == SemanticCapability::ExceptionalControlFlow
-            && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
-        {
+        // #6409: initialization concerns only paths continuing in this body.
+        // All three discharges leave without rejoining it. AfterInertDrops is
+        // ExitOnly-equivalent here even if cleanup runs user code; inertness
+        // is required only by readers of effects on the exit route.
+        if gap_has_exit_only_control(gap) {
             return true;
         }
         if gap.capability == SemanticCapability::ExceptionalControlFlow
             && gap.discharge == SemanticGapDischarge::RetainedControlTopology
-        {
-            return self.dominance.as_ref().is_some_and(|dominance| {
+            && self.dominance.as_ref().is_some_and(|dominance| {
                 with_control_graph!(semantics, &self.control_edge_mask, |graph| {
                     !dominance.dominates(graph, semantics.entry_point(), gap.point)
                 })
-            });
+            })
+        {
+            return true;
         }
-        match gap.capability {
+        // #6409: destructor-style cleanup cannot uninitialize a fresh scalar
+        // local. Finally/recover cleanup can redirect control and stays open.
+        if cleanup_is_control_irrelevant(semantics, gap)
+            || (gap.capability == SemanticCapability::ResourceManagement
+                && (gap.impacts.iter().next().is_none()
+                    || (gap.subject == SemanticGapSubject::Point
+                        && matches!(semantics.locator().language(),
+                            brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language)
+                                if destructor_style_cleanup(language))
+                        && cleanup_has_retained_destination(semantics, gap.point))))
+        {
+            return true;
+        }
+        let discharged = match gap.capability {
             SemanticCapability::Captures => match gap.subject {
                 // A nested rebinding assigns the binding, so it cannot leave
                 // it uninitialized.
@@ -972,7 +1175,29 @@ impl FlowStateDerivation {
                 self.established_before_suspension(semantics, gap, binding)
             }
             _ => false,
-        }
+        };
+        // #6409: initialization is a forward property on entry-to-read paths.
+        // A gap at P hides only an establishment, a move-out, or a declaration
+        // at P, but none affects R if P cannot reach R. Reflexive reachability
+        // keeps same-point gaps open; back edges account for later loop trips.
+        // Captured closures execute only at calls reachable from creation.
+        // This assumes capabilities classify control: hiding control in a
+        // Values or Assignments gap violates the existing producer contract.
+        // Exit-only gaps leave the body and RetainedControlTopology keeps all
+        // successors, so the modeled graph over-approximates body reachability.
+        // Known limit: one other control gap anywhere disables this rule for
+        // the entire procedure. Procedure-subject gaps have no selected point.
+        // Do not reuse this rule for same-evaluation or reaching-relation
+        // proofs: those properties are not forward-only.
+        discharged
+            || (gap.subject != SemanticGapSubject::Procedure
+                && semantics.gaps().iter().all(|other| {
+                    !capability_axes_blocked_by(other.capability)
+                        .contains(&FlowStateAxis::ReachingRelation)
+                        || gap_has_exit_only_control(other)
+                        || other.discharge == SemanticGapDischarge::RetainedControlTopology
+                })
+                && !self.point_reaches(semantics, gap.point, read_point, true))
     }
 
     /// Whether `binding` is initialized on every path the point-scoped
@@ -1121,9 +1346,10 @@ impl FlowStateDerivation {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut seen = HashSet::<(SemanticCapability, SemanticGapKind)>::default();
         for gap in semantics.gaps() {
-            if !axes_blocked_by(gap.capability).contains(&FlowStateAxis::SameEvaluationRelation) {
+            if !scoped_axes_blocked_by(semantics, gap)
+                .contains(&FlowStateAxis::SameEvaluationRelation)
+            {
                 continue;
             }
             let relevant = match gap.subject {
@@ -1159,12 +1385,8 @@ impl FlowStateDerivation {
                 }
                 _ => false,
             } || chain.contains(&gap.point);
-            if relevant && seen.insert((gap.capability, gap.kind)) {
-                reasons.push(FlowStateIncompleteReason::LoweringGap {
-                    capability: gap.capability,
-                    kind: gap.kind,
-                    detail: gap.detail.to_string(),
-                });
+            if relevant {
+                push_gap_reason(&mut reasons, gap);
             }
         }
         if reasons.is_empty() {
@@ -1172,6 +1394,27 @@ impl FlowStateDerivation {
         } else {
             SameEvaluationAnswer::Open { reasons }
         }
+    }
+
+    /// Overwrite/absence proofs enumerate reads and completion, beyond the
+    /// retained topology. #6409 closes ordinary-body control axes but cannot
+    /// discharge omitted destructor observations or decide whether an abort
+    /// counts as leaving a value unread. Preserve that consumer's obligations.
+    pub fn overwrite_observation_completeness(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> FlowStateCompleteness {
+        assert_eq!(self.procedure, procedure.id());
+        let mut reasons = self.completeness.reasons().to_vec();
+        let semantics = procedure.semantics();
+        for gap in semantics.gaps() {
+            if capability_axes_blocked_by(gap.capability).contains(&FlowStateAxis::ReachingRelation)
+                && axes_blocked_by(semantics, gap).is_empty()
+            {
+                push_gap_reason(&mut reasons, gap);
+            }
+        }
+        FlowStateCompleteness::from_reasons(reasons)
     }
 
     /// Prove that the value created by one ordinary local establishment is
@@ -1212,8 +1455,8 @@ impl FlowStateDerivation {
             "overwrite proof requires an ordinary local or by-value parameter binding"
         );
 
-        let reasons = self
-            .completeness
+        let observation_completeness = self.overwrite_observation_completeness(procedure);
+        let reasons = observation_completeness
             .reasons()
             .iter()
             .filter(|reason| {
@@ -1375,7 +1618,7 @@ impl FlowStateDerivation {
         }
         let mut unclosed_evaluation_ranges = Vec::new();
         for gap in semantics.gaps().iter().filter(|gap| {
-            axes_blocked_by(gap.capability).contains(&FlowStateAxis::SameEvaluationRelation)
+            scoped_axes_blocked_by(semantics, gap).contains(&FlowStateAxis::SameEvaluationRelation)
                 && !matches!(
                     gap.capability,
                     SemanticCapability::Calls
@@ -1793,7 +2036,7 @@ impl FlowStateDerivation {
             .gaps()
             .iter()
             .filter(|gap| {
-                axes_blocked_by(gap.capability).contains(&FlowStateAxis::DominanceRelation)
+                scoped_axes_blocked_by(semantics, gap).contains(&FlowStateAxis::DominanceRelation)
             })
             .collect::<Vec<_>>();
         with_control_graph!(semantics, &self.control_edge_mask, |graph| {
@@ -1861,7 +2104,8 @@ impl FlowStateDerivation {
             .gaps()
             .iter()
             .filter(|gap| {
-                axes_blocked_by(gap.capability).contains(&FlowStateAxis::DominanceRelation)
+                scoped_axes_blocked_by(procedure.semantics(), gap)
+                    .contains(&FlowStateAxis::DominanceRelation)
                     && !matches!(
                         gap.discharge,
                         SemanticGapDischarge::RetainedEvaluationOrder
@@ -2113,7 +2357,7 @@ impl FlowStateDerivation {
             .gaps()
             .iter()
             .filter(|gap| {
-                axes_blocked_by(gap.capability).contains(&FlowStateAxis::DominanceRelation)
+                scoped_axes_blocked_by(semantics, gap).contains(&FlowStateAxis::DominanceRelation)
                     && gap.discharge != SemanticGapDischarge::RetainedControlTopology
             })
             .collect::<Vec<_>>();
@@ -2603,7 +2847,8 @@ impl FlowStateDerivation {
                     && !matches!(reason, FlowStateIncompleteReason::LoweringGap { .. })
             })
             && !procedure.semantics().gaps().iter().any(|gap| {
-                axes_blocked_by(gap.capability).contains(&FlowStateAxis::DominanceRelation)
+                scoped_axes_blocked_by(procedure.semantics(), gap)
+                    .contains(&FlowStateAxis::DominanceRelation)
                     && !matches!(
                         gap.discharge,
                         SemanticGapDischarge::RetainedControlTopology
@@ -3250,7 +3495,12 @@ pub(crate) fn address_escape_points(
                 payload: Some(SynchronizationPayload::Send { value, .. }),
                 ..
             } if address_aliases.contains(&value) => Some(point.id),
-            SemanticEffect::MemoryStore { value, .. } if address_aliases.contains(&value) => {
+            // #6409: storing a borrow inside a dropped aggregate retains a
+            // writer just as publishing it through a memory store does.
+            SemanticEffect::AggregateInitializer { value, .. }
+            | SemanticEffect::MemoryStore { value, .. }
+                if address_aliases.contains(&value) =>
+            {
                 Some(point.id)
             }
             SemanticEffect::AsyncSuspend {
@@ -3273,26 +3523,24 @@ pub(crate) fn address_alias_values(
     semantics: &ProcedureSemantics,
     relevant_values: &HashSet<ValueId>,
 ) -> HashSet<ValueId> {
-    // Address creation is represented by the existing structured Assignment
-    // into a typed Address result. Seed only from a directly tracked source:
-    // ordinary value propagation before `&` copies a value, not its binding
-    // identity. From the exact Address seed, assignments and value-flow events
-    // do preserve the escaping reference identity.
+    // #6409: a place read temporary can sit between a binding and its
+    // Address. Recover the nearest binding with the shared structured origin
+    // index; stopping at locals avoids treating &copy as an address of the
+    // local from which copy was initialized. After Address creation only
+    // identity-preserving flow transports the escaping reference.
+    let origins = BindingOriginIndex::from_semantics(semantics);
     let seeds = semantics
-        .points()
+        .values()
         .iter()
-        .flat_map(|point| &point.events)
-        .filter_map(|event| match event.effect {
-            SemanticEffect::Assignment { target, value }
-                if relevant_values.contains(&value)
-                    && semantics
-                        .value(target)
-                        .is_some_and(|value| value.kind == SemanticValueKind::Address) =>
-            {
-                Some(target)
-            }
-            _ => None,
+        .filter(|value| value.kind == SemanticValueKind::Address)
+        .filter(|value| {
+            origins
+                .addressed_binding_origins(value.id)
+                .bindings()
+                .iter()
+                .any(|binding| relevant_values.contains(binding))
         })
+        .map(|value| value.id)
         .collect::<HashSet<_>>();
     crate::value_flow::identity_alias_closure(semantics, &seeds)
 }
@@ -3485,7 +3733,7 @@ where
         .gaps()
         .iter()
         .filter(|gap| {
-            axes_blocked_by(gap.capability).contains(&FlowStateAxis::DominanceRelation)
+            scoped_axes_blocked_by(semantics, gap).contains(&FlowStateAxis::DominanceRelation)
                 && discharge_blocks(gap.discharge)
                 && !(gap.subject != SemanticGapSubject::Procedure
                     && matches!(
@@ -6782,15 +7030,22 @@ fn collect_gap_reasons(
     procedure: &ProcedureSemantics,
     reasons: &mut Vec<FlowStateIncompleteReason>,
 ) {
-    let mut seen: HashSet<(SemanticCapability, SemanticGapKind)> = HashSet::default();
     for gap in procedure.gaps() {
-        if !seen.insert((gap.capability, gap.kind)) {
-            continue;
+        if !axes_blocked_by(procedure, gap).is_empty() {
+            push_gap_reason(reasons, gap);
         }
+    }
+}
+
+fn push_gap_reason(reasons: &mut Vec<FlowStateIncompleteReason>, gap: &SemanticGap) {
+    if let Some(FlowStateIncompleteReason::LoweringGap { gaps, .. }) = reasons.iter_mut().find(|reason| matches!(reason,
+        FlowStateIncompleteReason::LoweringGap { capability, kind, .. } if *capability == gap.capability && *kind == gap.kind
+    )) {
+        gaps.push(gap.id);
+    } else {
+
         reasons.push(FlowStateIncompleteReason::LoweringGap {
-            capability: gap.capability,
-            kind: gap.kind,
-            detail: gap.detail.to_string(),
+            gaps: vec![gap.id], capability: gap.capability, kind: gap.kind, detail: gap.detail.to_string(),
         });
     }
 }
@@ -10827,6 +11082,161 @@ def deleted():
         );
     }
 
+    const RUST_INITIALIZATION_GAP_REACHABILITY: &str = r#"
+fn back_edge(mut low: usize) {
+    loop {
+        low = low;
+        const { 1 };
+    }
+}
+fn sibling(mut low: usize, flag: bool) {
+    if flag {
+        low = low;
+    } else {
+        const { 1 };
+    }
+}
+fn blocked(mut low: usize, flag: bool) -> (usize, usize) {
+    if flag { try { 1 }; }
+    low = low;
+    const { 1 };
+    (low, low)
+}
+fn add_scalar(mut low: usize) -> (usize, usize) {
+    low = low;
+    (low, low)
+}
+"#;
+
+    #[test]
+    fn initialization_gap_reachability_keeps_back_edges_and_unknown_control_open() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            &[("src/lib.rs", RUST_INITIALIZATION_GAP_REACHABILITY)],
+        );
+        let state = fixture.state(0);
+        for (name, expected_open, gap_detail) in [
+            ("back_edge", true, "inline const evaluation"),
+            ("sibling", false, "inline const evaluation"),
+            ("blocked", true, "inline const evaluation"),
+        ] {
+            let start = RUST_INITIALIZATION_GAP_REACHABILITY
+                .find(&format!("fn {name}("))
+                .expect("fixture procedure");
+            let read_at = start
+                + RUST_INITIALIZATION_GAP_REACHABILITY[start..]
+                    .find("low = low")
+                    .expect("self assignment")
+                + 6;
+            let derivation = procedure_containing(&state, |event| {
+                event.event_class == StateEventClass::Read && event.site.range.start_byte == read_at
+            });
+            let read = derivation
+                .events
+                .iter()
+                .find(|event| {
+                    event.event_class == StateEventClass::Read
+                        && event.site.range.start_byte == read_at
+                })
+                .expect("self-assignment read");
+            let procedure = fixture.procedure(0, derivation.procedure);
+            let semantics = procedure.semantics();
+            let gap = semantics
+                .gaps()
+                .iter()
+                .find(|gap| {
+                    gap.capability == SemanticCapability::Values
+                        && gap.detail.starts_with(gap_detail)
+                })
+                .expect("the producer publishes the vetoing Values gap");
+            assert_eq!(
+                derivation.point_reaches(semantics, gap.point, read.point, true),
+                name == "back_edge",
+                "{name}: modeled reachability includes loop back edges"
+            );
+            if name == "blocked" {
+                assert!(
+                    semantics.gaps().iter().any(|gap| {
+                        matches!(
+                            gap.capability,
+                            SemanticCapability::NonLocalControl
+                                | SemanticCapability::NormalControlFlow
+                        ) && !gap_has_exit_only_control(gap)
+                            && gap.discharge != SemanticGapDischarge::RetainedControlTopology
+                    }),
+                    "the procedure-wide precondition must fail: {:?}",
+                    semantics.gaps()
+                );
+            }
+            let answer = derivation.binding_initialization_at_read(&procedure, read.event);
+            if expected_open {
+                let BindingInitializationAnswer::Open { reasons } = answer else {
+                    panic!("{name}: expected an open proof, got {answer:?}");
+                };
+                assert!(reasons.iter().any(|reason| matches!(reason,
+                    FlowStateIncompleteReason::LoweringGap { capability: SemanticCapability::Values, gaps, .. }
+                        if gaps.contains(&gap.id)
+                )), "{name}: the selected Values gap still vetoes: {reasons:?}");
+            } else {
+                assert_eq!(answer, BindingInitializationAnswer::Proven, "{name}");
+            }
+            assert!(
+                !derivation.initialization_gap_is_discharged(
+                    semantics,
+                    gap,
+                    read.subject.value(),
+                    gap.point,
+                ),
+                "reflexive reachability keeps the gap's own point open"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6409: a tail-expression gap after the read kept a self-assignment's initialization open"
+    )]
+    fn initialization_ignores_a_tail_expression_gap_after_the_read() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            &[("src/lib.rs", RUST_INITIALIZATION_GAP_REACHABILITY)],
+        );
+        let state = fixture.state(0);
+        let start = RUST_INITIALIZATION_GAP_REACHABILITY
+            .find("fn add_scalar(")
+            .unwrap();
+        let read_at = start
+            + RUST_INITIALIZATION_GAP_REACHABILITY[start..]
+                .find("low = low")
+                .unwrap()
+            + 6;
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Read && event.site.range.start_byte == read_at
+        });
+        let read = derivation
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read && event.site.range.start_byte == read_at
+            })
+            .unwrap();
+        let procedure = fixture.procedure(0, derivation.procedure);
+        let gap = procedure
+            .semantics()
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.capability == SemanticCapability::Values
+                    && gap.detail.starts_with("tail-expression result transfer")
+            })
+            .expect("the implicit return still publishes its Values gap");
+        assert!(matches!(gap.subject, SemanticGapSubject::Value(_)));
+        assert_eq!(
+            derivation.binding_initialization_at_read(&procedure, read.event),
+            BindingInitializationAnswer::Proven
+        );
+    }
+
     #[test]
     fn binding_initialization_distinguishes_join_bypass_loop_and_parameter() {
         let fixture = Fixture::new(
@@ -12912,11 +13322,20 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>, guard: Guard
         let unrelated_macro_call = semantics
             .call_site(unrelated_macro.id())
             .expect("unknown_macro!() call site");
+        let adjustment = call_handle_spelled(
+            &procedure,
+            RUST_OPEN_TARGET_OPERAND_ORDER,
+            "receiver.consume(false)",
+        );
         assert!(semantics.gaps().iter().any(|gap| {
             gap.point != target_call.point
-                && gap.subject == SemanticGapSubject::Point
+                && gap.subject == SemanticGapSubject::CallSite(adjustment.id())
                 && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
         }));
+        assert!(target_call_evaluation_is_open(
+            semantics,
+            semantics.call_site(adjustment.id()).expect("adjusted call"),
+        ));
         assert!(
             !target_call_evaluation_is_open(semantics, target_call),
             "a later call's evaluation gap must not contaminate the exact target"

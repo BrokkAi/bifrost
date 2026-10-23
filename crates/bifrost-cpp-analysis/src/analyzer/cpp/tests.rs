@@ -47,6 +47,183 @@ fn macro_composed_fields_fixture() -> (
 }
 
 #[test]
+#[hardwon(
+    "#6375: incomplete macro-composed-field reads were never cached, so each call-target resolution rebuilt the include closure"
+)]
+fn incomplete_macro_composed_fields_are_cached_and_replayed() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("fields.h", "#define OWNER_FIELDS int value;\n")
+        .file("unavailable.h", "\0")
+        .file(
+            "owner.c",
+            "#include \"fields.h\"\n#include \"unavailable.h\"\nstruct Owner { OWNER_FIELDS };\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let owner = fixture.file("owner.c");
+    let unavailable = fixture.file("unavailable.h");
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+
+    let first = {
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let fields = analyzer.macro_composed_fields(&owner);
+        assert!(
+            matches!(scope.read_completion(), Err(QueryReadIncomplete::StructureUnavailable(file)) if file == unavailable)
+        );
+        fields
+    };
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    assert!(
+        scope.read_completion().is_ok(),
+        "the second reader starts clean"
+    );
+    let second = analyzer.macro_composed_fields(&owner);
+    assert!(Arc::ptr_eq(&first, &second), "reuse the incomplete value");
+    assert!(
+        matches!(scope.read_completion(), Err(QueryReadIncomplete::StructureUnavailable(file)) if file == unavailable)
+    );
+    assert_eq!(analyzer.macro_composed_fields_build_count_for_test(), 1);
+}
+
+#[test]
+fn unavailable_macro_source_io_is_retried_after_recovery() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
+    let (fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let donor = fixture.file("fields.h");
+    let original = std::fs::read(donor.abs_path()).expect("read donor");
+    std::fs::remove_file(donor.abs_path()).expect("temporarily remove donor");
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    {
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.macro_composed_fields(&owner);
+        let reasons = scope.captured_read_incompleteness();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_))),
+            "I/O provenance: {reasons:?}"
+        );
+        assert!(!analyzer.macro_composed_fields_by_file.contains_key(&owner));
+    }
+    std::fs::write(donor.abs_path(), original).expect("restore identical donor");
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let fields = analyzer.macro_composed_fields(&owner);
+    assert!(
+        scope.read_completion().is_ok(),
+        "the recovered read completes"
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.unit.fq_name() == "Owner.value")
+    );
+    assert_eq!(analyzer.macro_composed_fields_build_count_for_test(), 2);
+}
+
+#[test]
+#[hardwon("#6380: review: an absent-file membership probe was reported as an incomplete read")]
+fn absent_file_membership_memo_preserves_complete_read() {
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("owner.c", "struct Owner {};\n")
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let absent = fixture.file("never_existed.c");
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    for _ in 0..2 {
+        assert!(!analyzer.is_analyzed(&absent));
+        assert_eq!(scope.read_completion(), Ok(()));
+    }
+}
+
+#[test]
+#[hardwon(
+    "#6380: review: a memoized transient source-read failure was cached as a stable StructureUnavailable"
+)]
+fn negative_source_memo_replays_transient_failure_into_later_builder() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
+    let (fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let donor = fixture.file("fields.h");
+    let original = std::fs::read(donor.abs_path()).expect("read donor");
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    {
+        let outer = AnalyzerQueryScope::new(&analyzer);
+        analyzer.record_query_incomplete(QueryReadIncomplete::StructureUnavailable(owner.clone()));
+        std::fs::remove_file(donor.abs_path()).expect("temporarily remove donor");
+        assert!(
+            analyzer
+                .inner
+                .source_snapshot_limited(&donor, usize::MAX)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(donor.abs_path(), original).expect("restore identical donor");
+        assert!(
+            matches!(outer.read_completion(), Err(QueryReadIncomplete::StructureUnavailable(file)) if file == owner)
+        );
+
+        let reader = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.macro_composed_fields(&owner);
+        let reasons = reader.captured_read_incompleteness();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_))),
+            "memo must replay I/O provenance: {reasons:?}"
+        );
+        assert!(!analyzer.macro_composed_fields_by_file.contains_key(&owner));
+    }
+    let fresh = AnalyzerQueryScope::new(&analyzer);
+    let fields = analyzer.macro_composed_fields(&owner);
+    assert!(
+        fresh.read_completion().is_ok(),
+        "recovered read: {:?}",
+        fresh.read_completion()
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.unit.fq_name() == "Owner.value")
+    );
+    assert_eq!(analyzer.macro_composed_fields_build_count_for_test(), 2);
+}
+
+#[test]
+fn stable_first_reason_does_not_cache_a_later_cancellation() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let cache = cache::build_file_read_cache(1024, |_: &ProjectFile, _: &Arc<Vec<usize>>| 1);
+    {
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.cached_complete_read(&cache, &owner, || {
+            analyzer
+                .record_query_incomplete(QueryReadIncomplete::StructureUnavailable(owner.clone()));
+            analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+            vec![1]
+        });
+        assert_eq!(
+            scope.captured_read_incompleteness(),
+            vec![
+                QueryReadIncomplete::StructureUnavailable(owner.clone()),
+                QueryReadIncomplete::Cancelled,
+            ]
+        );
+    }
+    assert!(
+        !cache.contains_key(&owner),
+        "a transient reason cannot be hidden behind a stable one"
+    );
+    assert_eq!(
+        *analyzer.cached_complete_read(&cache, &owner, || vec![2]),
+        vec![2]
+    );
+}
+
+#[test]
 #[hardwon("#3078: an incomplete type lookup was cached as an empty include boundary")]
 fn cancelled_macro_composed_fields_does_not_poison_cache() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
@@ -890,14 +1067,16 @@ void SidePanelContentProxy::ResetAvailableCallback() {
             "declaration must not carry an empty owner chain: {unit:?}"
         );
     }
-    // The error envelope swallows the ctor's leading identifier, so the
-    // recovered spelling is the explicitly-global `::SidePanelContentProxy`:
-    // a free function, not an empty-owner member.
+    // The macro-declaration grammar parses the out-of-line constructor
+    // cleanly, so it keeps its owner chain; before that, the error envelope
+    // swallowed the ctor's leading identifier and it landed as a global free
+    // function spelled `::SidePanelContentProxy`.
     assert!(
         declarations.iter().any(|unit| {
-            unit.kind() == CodeUnitType::Function && unit.fq_name() == "SidePanelContentProxy"
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "SidePanelContentProxy.SidePanelContentProxy"
         }),
-        "recovered ctor must land as a global free function: {declarations:?}"
+        "ctor after the UI property macro keeps its owner chain: {declarations:?}"
     );
     // Members whose qualifier survived recovery keep their owner.
     assert!(

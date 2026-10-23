@@ -187,7 +187,6 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
     ) {
         if !cancellation.is_cancelled() {
             let _ = self.file_dependencies_by_namespace();
-            let _ = self.compilation_index();
         }
     }
 
@@ -219,22 +218,18 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if cancellation.is_cancelled() {
             return None;
         }
-        let compilation_index = self.compilation_index();
-        if !compilation_index.is_complete() && brokk_bifrost_core::profiling::enabled() {
-            brokk_bifrost_core::profiling::note(format!(
-                "csharp compilation scopes unresolved: {:?}",
-                compilation_index.unresolved_scopes()
-            ));
-        }
-        let dependencies = if global_using_files.is_empty() {
-            HashMap::default()
-        } else {
-            compilation_index.global_using_dependencies(files, global_using_files.as_slice())
-        };
+        // Global usings reach only sources of their own compilation; the
+        // membership rows are published with this revision. Completeness
+        // comes from those rows even when no selected source declares a
+        // global using: an explicitly included source the revision does not
+        // select, or a recorded gap, can still hold one.
+        let (dependencies, membership_complete) = self
+            .global_using_dependencies(files, global_using_files.as_slice())
+            .unwrap_or_default();
         if cancellation.is_cancelled() {
             return None;
         }
-        Some(if imports_complete && compilation_index.is_complete() {
+        Some(if imports_complete && membership_complete {
             brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::complete(
                 dependencies,
             )

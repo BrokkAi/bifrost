@@ -899,6 +899,32 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::workspace_namespace_exists(self, namespace)
     }
 
+    fn compilation_visibility(
+        &self,
+        reference: &ProjectFile,
+        candidate: &ProjectFile,
+    ) -> Option<graph_support::CSharpCompilationVisibility> {
+        CSharpAnalyzer::compilation_visibility(self, reference, candidate)
+    }
+
+    fn shared_source(&self) -> Arc<dyn graph_support::CSharpSource> {
+        Arc::new(self.clone())
+    }
+
+    fn direct_ancestors_through(
+        &self,
+        view: &dyn graph_support::CSharpSource,
+        code_unit: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(self);
+        brokk_bifrost_csharp::hierarchy::logical_direct_ancestors(
+            view,
+            scope.token(),
+            code_unit,
+            false,
+        )
+    }
+
     fn with_usage_definitions(
         &self,
         _token: QueryToken<'_>,
@@ -1181,6 +1207,10 @@ impl CodeUnitIndex for CSharpAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
+    }
+
+    delegate_inner_methods! {
         fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     }
 
@@ -1399,7 +1429,7 @@ impl IAnalyzer for CSharpAnalyzer {
         &self,
     ) -> Option<brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentities>
     {
-        let compilation_digest = self.compilation_index().config_digest()?;
+        let compilation_digest = self.compilation_config_digest()?;
         let mut hasher = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
             b"bifrost-csharp-content-with-compilation-config:v1",
         );
@@ -2122,6 +2152,28 @@ mod dependency_packs {
         ) -> DependencyDiscoveryOutcome {
             resolve_csharp_semantic_pack_dependencies(&config.csharp, project, limits, cancellation)
         }
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CSharpSupport {
+    /// MSBuild project, props and targets files decide compilation membership,
+    /// so each revision retains their exact bytes.
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["csproj", "props", "targets"]
+                    .iter()
+                    .any(|expected| extension.eq_ignore_ascii_case(expected))
+            })
+    }
+
+    fn csharp_compilation_facts(
+        &self,
+        inputs: &[brokk_bifrost_analysis::analyzer::store::csharp_compilation::CSharpConfigurationInput],
+    ) -> Option<brokk_bifrost_analysis::analyzer::store::csharp_compilation::CSharpCompilationFacts>
+    {
+        Some(compilation::compilation_facts(inputs))
     }
 }
 

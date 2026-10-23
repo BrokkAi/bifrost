@@ -9,7 +9,7 @@ use crate::declarations::{
     CppComparableNode, CppComparableSlot, CppParameterType, cpp_active_template_type_parameter,
     cpp_callable_parameter_names, cpp_callable_parameter_type_identities,
     cpp_callable_return_type_identity, cpp_comparable_parameter_shapes, cpp_function_declarator_at,
-    node_text,
+    cpp_macro_swallowed_access_label, node_text,
 };
 use crate::graph::resolver::cpp_name_for;
 use crate::structural::is_cpp_preprocessor_conditional;
@@ -477,8 +477,13 @@ fn cpp_member_visibility(root: Node<'_>, source: &str, start_byte: usize) -> Cpp
                 if child.start_byte() > start_byte {
                     break;
                 }
-                if child.kind() == "access_specifier" {
-                    visibility = match node_text(child, source).trim_end_matches(':').trim() {
+                let access = if child.kind() == "access_specifier" {
+                    Some(node_text(child, source).trim_end_matches(':').trim())
+                } else {
+                    cpp_macro_swallowed_access_label(child, source).map(|label| label.access)
+                };
+                if let Some(access) = access {
+                    visibility = match access {
                         "public" => CppExternalVisibility::Public,
                         "protected" => CppExternalVisibility::Protected,
                         "private" => CppExternalVisibility::Private,

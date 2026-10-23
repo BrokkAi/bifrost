@@ -47,10 +47,10 @@ use brokk_bifrost_analysis::analyzer::languages::fqn_bulk_nodes;
 use brokk_bifrost_analysis::analyzer::languages::overloaded_function_fqns;
 use brokk_bifrost_analysis::analyzer::languages::ready_preflight;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::AnalyzerStoreContext;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BulkFileStateSource;
-use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome;
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
@@ -128,6 +128,9 @@ use std::sync::{Arc, OnceLock};
 pub mod adapter;
 mod cache;
 mod clones;
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CppSupport {}
+
 #[cfg(test)]
 mod diagnostics;
 pub mod expression_branch_facts;
@@ -150,7 +153,30 @@ mod structural;
 #[cfg(test)]
 mod tests;
 
-type CallMacroHazards = Arc<HashMap<(usize, usize), bool>>;
+type CallMacroHazards = Arc<CachedFileRead<HashMap<(usize, usize), bool>>>;
+
+/// A snapshot-derived value and the evidence that prevents a complete answer.
+/// Keeping them in one weighted entry makes eviction and invalidation atomic.
+struct CachedFileRead<T> {
+    value: Arc<T>,
+    incompleteness: Box<[brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete]>,
+}
+
+impl<T> CachedFileRead<T> {
+    fn replay(&self, analyzer: &CppAnalyzer) -> Arc<T> {
+        for reason in &self.incompleteness {
+            analyzer.record_query_incomplete(reason.clone());
+        }
+        Arc::clone(&self.value)
+    }
+
+    fn complete(value: Arc<T>) -> Arc<Self> {
+        Arc::new(Self {
+            value,
+            incompleteness: Box::default(),
+        })
+    }
+}
 type CAssignmentCandidateKey = (
     brokk_bifrost_analysis::analyzer::semantic::SemanticArtifactMaterializationId,
     brokk_bifrost_analysis::analyzer::semantic::ProcedureId,
@@ -181,11 +207,11 @@ pub struct CppAnalyzer {
     /// Owner-specific fields materialized from object-like macros in the
     /// owner's include closure. This remains an analyzer overlay because the
     /// donor macro and consuming aggregate live in different parsed blobs.
-    macro_composed_fields_by_file: Cache<ProjectFile, Arc<Vec<MacroComposedField>>>,
+    macro_composed_fields_by_file: Cache<ProjectFile, Arc<CachedFileRead<Vec<MacroComposedField>>>>,
     /// Structured facts shared by C++ semantic lowering and assignment
     /// candidates. The cache is per file and byte bounded so a policy query
     /// does not re-walk the translation unit for every procedure.
-    file_facts_by_file: Cache<ProjectFile, Arc<semantic::CppFileFacts>>,
+    file_facts_by_file: Cache<ProjectFile, Arc<CachedFileRead<semantic::CppFileFacts>>>,
     /// Structured call-resolution macro hazards, computed once over a
     /// translation unit and reused by every procedure candidate in it.
     call_macro_hazards_by_file: Cache<ProjectFile, CallMacroHazards>,
@@ -195,24 +221,26 @@ pub struct CppAnalyzer {
     /// memo budget.
     statement_facts_by_file: Cache<
         ProjectFile,
-        Arc<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>,
+        Arc<CachedFileRead<brokk_bifrost_core::analyzer::statement_facts::CppStatementFactRows>>,
     >,
     /// C assignment syntax candidates are requested by more than one
     /// relation binding. Retain one completed answer per immutable procedure
     /// artifact so the prepared tree and semantic joins are not repeated.
-    c_assignment_candidates_by_procedure:
-        Cache<CAssignmentCandidateKey, Arc<expression_branch_facts::CAssignmentCandidates>>,
+    c_assignment_candidates_by_procedure: Cache<
+        CAssignmentCandidateKey,
+        Arc<CachedFileRead<expression_branch_facts::CAssignmentCandidates>>,
+    >,
     cpp_overwritten_candidates_by_procedure:
         Cache<CAssignmentCandidateKey, Arc<OverwrittenLocalCandidates>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
+    direct_ancestors: Cache<CodeUnit, Arc<CachedFileRead<Vec<CodeUnit>>>>,
+    visible_type_units_by_file: Cache<ProjectFile, Arc<CachedFileRead<Vec<CodeUnit>>>>,
     /// The per-file structured using index behind
     /// [`CppSource::source_using_index`]. Memoized here rather than on
     /// `VisibilityIndex` because a fresh visibility index is built per usage
     /// query, and rebuilding this index per query re-walked a 9.5 MB
     /// amalgamation's AST once per candidate (issue #1927).
-    source_using_index_by_file: Cache<ProjectFile, Arc<SourceUsingIndex>>,
+    source_using_index_by_file: Cache<ProjectFile, Arc<CachedFileRead<SourceUsingIndex>>>,
     /// The immutable analyzer generation and reference root determine the
     /// language and source-only guard proof without evaluating that proof
     /// before a cache lookup.
@@ -227,12 +255,14 @@ pub struct CppAnalyzer {
     /// The per-file embedded export-macro class recovery behind
     /// [`CppSource::recovered_export_class_index`], memoized here for the same
     /// reason as `source_using_index_by_file` (#1496).
-    recovered_export_class_index_by_file: Cache<ProjectFile, Arc<CppRecoveredExportClassIndex>>,
+    recovered_export_class_index_by_file:
+        Cache<ProjectFile, Arc<CachedFileRead<CppRecoveredExportClassIndex>>>,
     /// The per-file namespaces parse recovery dropped, behind
     /// [`CppSource::orphaned_namespace_scopes`]. Both lookup directions derive
     /// every lexical scope in a file through it, so it is memoized here for
     /// the same reason as `source_using_index_by_file` (#1537).
-    orphaned_namespace_scopes_by_file: Cache<ProjectFile, Arc<OrphanedNamespaceScopeIndex>>,
+    orphaned_namespace_scopes_by_file:
+        Cache<ProjectFile, Arc<CachedFileRead<OrphanedNamespaceScopeIndex>>>,
     /// The C reading of a header blob, when the store holds one (#1970). See
     /// [`projection::CppCReading`]. `None` is a real, memoized answer: it says
     /// the two readings of that blob agree, so every question about the C view
@@ -255,7 +285,8 @@ pub struct CppAnalyzer {
     /// was walked, and each of its macro replacements re-parsed, once per
     /// owner whose closure reached it: 11.6 percent of the BehaviorTree
     /// `integer_sequence` query, for 161 distinct files (#1496).
-    object_macro_field_events_by_file: Cache<ProjectFile, Arc<Vec<ObjectMacroFieldEvent>>>,
+    object_macro_field_events_by_file:
+        Cache<ProjectFile, Arc<CachedFileRead<Vec<ObjectMacroFieldEvent>>>>,
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
     /// that produce it are what #1908 stopped repeating per queried fq name.
@@ -395,11 +426,12 @@ impl CppAnalyzer {
         self.with_updated_inner(self.inner.update_all_with_progress(progress))
     }
 
-    /// Share only completed file-derived values. A waiter receives the same
-    /// typed failure as its builder, and records it on its own open scopes.
+    /// Share snapshot-deterministic file reads, including their incompleteness.
+    /// Cancellation, store failures and ambiguous semantic failures stay local
+    /// to this attempt. Replay stable reasons into every reader's own scopes.
     fn cached_complete_read<K, T>(
         &self,
-        cache: &Cache<K, Arc<T>>,
+        cache: &Cache<K, Arc<CachedFileRead<T>>>,
         key: &K,
         read: impl FnOnce() -> T,
     ) -> Arc<T>
@@ -407,15 +439,26 @@ impl CppAnalyzer {
         K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
         T: Default + Send + Sync + 'static,
     {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
+
         match cache.try_get_with_by_ref(key, || {
-            let scope = AnalyzerQueryScope::new(self);
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(self);
             let value = read();
-            scope.read_completion()?;
-            Ok::<_, brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete>(Arc::new(
-                value,
-            ))
+            let incompleteness = scope.captured_read_incompleteness();
+            if let Some(reason) = incompleteness.iter().find(|reason| match reason {
+                QueryReadIncomplete::StructureUnavailable(_) => false,
+                QueryReadIncomplete::Cancelled
+                | QueryReadIncomplete::SemanticEvidenceUnavailable(_)
+                | QueryReadIncomplete::StoreFailure(_) => true,
+            }) {
+                return Err(reason.clone());
+            }
+            Ok(Arc::new(CachedFileRead {
+                value: Arc::new(value),
+                incompleteness: incompleteness.into_boxed_slice(),
+            }))
         }) {
-            Ok(value) => value,
+            Ok(value) => value.replay(self),
             Err(reason) => {
                 self.record_query_incomplete((*reason).clone());
                 Arc::default()
@@ -648,7 +691,7 @@ impl CppAnalyzer {
     /// visibility resolver's target-directed declaration reads, so the read
     /// stays on `prepared_syntax_limited`. A file whose source cannot be
     /// prepared returns an empty compatibility value with a query-incomplete
-    /// reason; that value must never be cached as a completed event set.
+    /// reason; cached readers must retain that incompleteness.
     fn object_macro_field_events(
         &self,
         token: QueryToken<'_>,
@@ -925,20 +968,23 @@ impl CppAnalyzer {
                 memo_budget / 4,
                 weight_code_unit_set_by_file,
             ),
-            macro_composed_fields_by_file: build_weighted_cache(
+            macro_composed_fields_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_macro_composed_field_vec_by_file,
             ),
-            file_facts_by_file: build_weighted_cache(memo_budget / 8, cache::weight_cpp_file_facts),
-            call_macro_hazards_by_file: build_weighted_cache(
+            file_facts_by_file: cache::build_file_read_cache(
+                memo_budget / 8,
+                cache::weight_cpp_file_facts,
+            ),
+            call_macro_hazards_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_call_macro_hazards,
             ),
-            statement_facts_by_file: build_weighted_cache(
+            statement_facts_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_statement_fact_rows,
             ),
-            c_assignment_candidates_by_procedure: build_weighted_cache(
+            c_assignment_candidates_by_procedure: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_c_assignment_candidates,
             ),
@@ -947,12 +993,15 @@ impl CppAnalyzer {
                 cache::weight_cpp_overwritten_candidates,
             ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            visible_type_units_by_file: build_weighted_cache(
+            direct_ancestors: cache::build_file_read_cache(
+                memo_budget / 8,
+                weight_code_unit_vec_by_unit,
+            ),
+            visible_type_units_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
-            source_using_index_by_file: build_weighted_cache(
+            source_using_index_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 weight_source_using_index,
             ),
@@ -964,11 +1013,11 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 cache::weight_class_declaration_strength,
             ),
-            recovered_export_class_index_by_file: build_weighted_cache(
+            recovered_export_class_index_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_recovered_export_class_index,
             ),
-            orphaned_namespace_scopes_by_file: build_weighted_cache(
+            orphaned_namespace_scopes_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_orphaned_namespace_scopes,
             ),
@@ -977,7 +1026,7 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 cache::weight_header_language_attribution,
             ),
-            object_macro_field_events_by_file: build_weighted_cache(
+            object_macro_field_events_by_file: cache::build_file_read_cache(
                 memo_budget / 8,
                 cache::weight_object_macro_field_events,
             ),
@@ -2379,6 +2428,10 @@ impl CodeUnitIndex for CppAnalyzer {
 
     brokk_bifrost_analysis::delegate_inner_methods! {
         fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
+    }
+
+    brokk_bifrost_analysis::delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
     /// #1970/#3287: the `cpp` row-set answers for a header's C++ reading only,

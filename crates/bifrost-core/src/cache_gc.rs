@@ -429,6 +429,19 @@ fn automatic_gc_enabled(value: Option<&OsStr>) -> bool {
 /// (#3016).
 pub const PLANNER_ANALYSIS_LIMIT: i64 = 1000;
 
+/// Keep the blob count within [4/5, 5/4] of its recorded cardinality before
+/// relying on SQLite's per-table ten-fold rule. Blob-keyed fact tables hold
+/// most rows and grow roughly in proportion to the blob count.
+///
+/// The 645-pin populated-store sensitivity run (#6458) found these numbers
+/// of changed plans / lost properties: low 10x 70/24; low 2x 30/7;
+/// low 1.25x 22/4; low 1.1x 14/1; high 1.25x 8/1; uniform x0.5 74/23.
+/// Every flag at <=1.25x was a driver swap between tiny indexed tables,
+/// with no new scan, automatic index, or temporary B-tree. This is evidence
+/// for the tolerance, not a guarantee that every table follows blob growth.
+/// Use i128 products when comparing SQLite's i64 counts without overflow.
+const PLANNER_BLOB_COUNT_TOLERANCE: (i128, i128) = (4, 5);
+
 /// Operator switch for the planner-statistics hooks, alongside
 /// `BIFROST_CACHE_GC`. Setting it to `0`, `off`, or `disabled` stops both the
 /// post-build and the post-GC refresh, which is how a statistics-free plan is
@@ -436,10 +449,11 @@ pub const PLANNER_ANALYSIS_LIMIT: i64 = 1000;
 pub const STORE_STATISTICS_ENV: &str = "BIFROST_STORE_STATISTICS";
 
 /// What one planner-statistics refresh did, for the caller to log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannerStatisticsRefresh {
     pub elapsed: std::time::Duration,
     pub stat1_rows: i64,
+    pub analyzed_tables: Vec<String>,
 }
 
 /// Whether the planner-statistics hooks may run. See [`STORE_STATISTICS_ENV`].
@@ -471,6 +485,7 @@ fn statistics_enabled(value: Option<&OsStr>) -> bool {
 /// bare fact that it ran.
 pub fn refresh_planner_statistics(conn: &Connection) -> Result<PlannerStatisticsRefresh, String> {
     let started = std::time::Instant::now();
+    let analyzed_tables = planner_statistics_tables(conn)?;
     conn.pragma_update(None, "analysis_limit", PLANNER_ANALYSIS_LIMIT)
         .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
     conn.execute_batch("ANALYZE;")
@@ -482,6 +497,7 @@ pub fn refresh_planner_statistics(conn: &Connection) -> Result<PlannerStatistics
     Ok(PlannerStatisticsRefresh {
         elapsed,
         stat1_rows: planner_statistics_row_count(conn)?,
+        analyzed_tables,
     })
 }
 
@@ -504,12 +520,42 @@ pub fn planner_statistics_row_count(conn: &Connection) -> Result<i64, String> {
         .map_err(|err| format!("planner statistics SQLite error: {err}"))
 }
 
-/// Whether the stored statistics still describe the current blob cardinality.
-/// This is deliberately a staleness proxy: edits that replace one blob with
-/// another without changing the count are not detected here.
-pub fn planner_statistics_describe_database(conn: &Connection) -> Result<bool, String> {
+/// Ordinary main-schema tables that ANALYZE can consider. Virtual tables have
+/// no root page; their ordinary shadow tables are included, as in SQLite.
+fn planner_statistics_tables(conn: &Connection) -> Result<Vec<String>, String> {
+    conn.prepare(
+        "SELECT name FROM main.sqlite_schema
+         WHERE type = 'table' AND rootpage > 0
+           AND substr(name, 1, 7) != 'sqlite_' COLLATE NOCASE
+         ORDER BY name",
+    )
+    .and_then(|mut statement| statement.query_map([], |row| row.get(0))?.collect())
+    .map_err(|err| format!("planner statistics SQLite error: {err}"))
+}
+
+/// Refresh all tables when the recorded blob count is absent or the current
+/// count falls outside [0.8x, 1.25x] of it. Within that tolerance, refresh only
+/// non-empty tables SQLite reports as missing statistics or changed ten-fold.
+/// The dry run covers new tables, empty-to-populated tables and outliers that
+/// do not follow blob growth. A sensitive outlier needs targeted ANALYZE.
+///
+/// The bundled SQLite's report-only optimize still takes a write transaction
+/// when checking multiple tables. Build callers hold AnalyzerCacheBuildLock;
+/// GC callers hold their collection or build lock. Open repair may call this
+/// without either lock only after its read-only check finds a populated store
+/// with no statistics, so an analyzed store's open never takes a write transaction.
+///
+/// SQLite's B-tree size estimate can report a non-empty WITHOUT ROWID table
+/// again immediately after ANALYZE. On a 21 GB store, this affected
+/// rust_resolution_unit_summary_gaps (244,830 rows) and
+/// resolution_unit_summary_gaps (253,155 rows), despite exact stat1 counts.
+/// These repeated targeted analyses cost about one second, versus 84-124
+/// seconds for a full ANALYZE. Keep SQLite's rule rather than overriding it.
+pub fn refresh_planner_statistics_if_stale(
+    conn: &Connection,
+) -> Result<Option<PlannerStatisticsRefresh>, String> {
     if planner_statistics_row_count(conn)? == 0 {
-        return Ok(false);
+        return refresh_planner_statistics(conn).map(Some);
     }
     let recorded: i64 = conn
         .query_row(
@@ -524,7 +570,58 @@ pub fn planner_statistics_describe_database(conn: &Connection) -> Result<bool, S
             |row| row.get(0),
         )
         .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
-    Ok(recorded == total_blob_count_conn(conn)?)
+    let current = i128::from(total_blob_count_conn(conn)?);
+    let recorded = i128::from(recorded);
+    let (lower, upper) = PLANNER_BLOB_COUNT_TOLERANCE;
+    if recorded == 0 || current * upper < recorded * lower || current * lower > recorded * upper {
+        return refresh_planner_statistics(conn).map(Some);
+    }
+    let started = std::time::Instant::now();
+    conn.pragma_update(None, "analysis_limit", PLANNER_ANALYSIS_LIMIT)
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    let reported: Vec<String> = conn
+        .prepare("PRAGMA optimize(0x10013)")
+        .and_then(|mut statement| statement.query_map([], |row| row.get(0))?.collect())
+        .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+    let tables = planner_statistics_tables(conn)?;
+    let mut analyzed_tables = Vec::new();
+    for sql in reported {
+        let table = tables.iter().find(|table| {
+            sql == format!(
+                "ANALYZE \"main\".{}",
+                cache_db::quote_sqlite_identifier(table)
+            )
+        });
+        assert!(
+            table.is_some(),
+            "SQLite optimize reported an unknown statement: {sql:?}"
+        );
+        let table = table.expect("matched SQLite ANALYZE statement");
+        let nonempty: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM main.{})",
+                    cache_db::quote_sqlite_identifier(table)
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+        if nonempty {
+            conn.execute_batch(&sql)
+                .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
+            analyzed_tables.push(table.clone());
+        }
+    }
+    if analyzed_tables.is_empty() {
+        return Ok(None);
+    }
+    conn.flush_prepared_statement_cache();
+    Ok(Some(PlannerStatisticsRefresh {
+        elapsed: started.elapsed(),
+        stat1_rows: planner_statistics_row_count(conn)?,
+        analyzed_tables,
+    }))
 }
 
 /// How many times this process has repaired a store's planner statistics while
@@ -548,10 +645,13 @@ pub fn planner_statistics_repairs() -> i64 {
 /// those hooks and a store built while `BIFROST_STORE_STATISTICS=off` was set.
 /// Both are repaired here, once, when the database is opened.
 ///
-/// Runs nothing on an empty database -- `ANALYZE` writes no row for an empty
-/// table, so an empty store would read as stale forever -- and nothing when
-/// [`planner_statistics_describe_database`] says the stored statistics still
-/// describe this store.
+/// Runs nothing on an empty database or when sqlite_stat1 has any rows.
+/// This read-only preflight covers never-analyzed stores left by older binaries
+/// or builds with BIFROST_STORE_STATISTICS=off. Index-level missing-statistics
+/// checks are unsuitable: WITHOUT ROWID primary keys use the table name in
+/// stat1, and empty partial indexes never get a stat row. Build hooks cover
+/// ten-fold growth and tables added by migrations. Ephemeral stores do not
+/// call this hook. An analyzed store never takes a write transaction here.
 ///
 /// `ANALYZE` takes a write transaction, and opening a store deliberately takes
 /// no build lock, so this can meet another process mid-build. The connection's
@@ -568,12 +668,14 @@ pub fn repair_planner_statistics_on_open(
     if total_blob_count_conn(conn)? == 0 {
         return Ok(None);
     }
-    if planner_statistics_describe_database(conn)? {
+    if planner_statistics_row_count(conn)? > 0 {
         return Ok(None);
     }
-    let evidence = refresh_planner_statistics(conn)?;
-    PLANNER_STATISTICS_REPAIRS.fetch_add(1, Ordering::Relaxed);
-    Ok(Some(evidence))
+    let evidence = refresh_planner_statistics_if_stale(conn)?;
+    if evidence.is_some() {
+        PLANNER_STATISTICS_REPAIRS.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(evidence)
 }
 
 /// Planner statistics captured from real corpus stores, one workspace build
@@ -832,18 +934,19 @@ fn maintain_collected_store(
 ) -> Result<i64, GcStopped> {
     cache_db::drain_free_pages(conn)?;
 
-    // A collection that removed rows changed the cardinalities the planner
-    // reasons from, so the statistics it left behind now describe a database
-    // that no longer exists. Refreshing here is what keeps a collected store
-    // planning as well as a freshly built one (issue #3016).
-    if analyzer_dropped > 0 && planner_statistics_enabled() {
-        let evidence = refresh_planner_statistics(conn)?;
+    // The collection lock excludes another collector during this refresh.
+    // Bound blob drift before selectively re-analyzing individual stale tables.
+    if analyzer_dropped > 0
+        && planner_statistics_enabled()
+        && let Some(evidence) = refresh_planner_statistics_if_stale(conn)?
+    {
         crate::profiling::note_with(|| {
             format!(
                 "cache_gc.planner_statistics refreshed after dropping {analyzer_dropped} rows: \
-                 {:.1} ms, {} sqlite_stat1 rows",
+                 {:.1} ms, {} sqlite_stat1 rows, tables {:?}",
                 evidence.elapsed.as_secs_f64() * 1000.0,
-                evidence.stat1_rows
+                evidence.stat1_rows,
+                evidence.analyzed_tables
             )
         });
     }
@@ -1077,44 +1180,185 @@ mod tests {
     use super::*;
 
     #[test]
-    fn planner_statistics_refresh_tracks_blob_cardinality() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        cache_db::configure_connection(&mut conn).unwrap();
-        cache_db::migrate(&mut conn).unwrap();
-        conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1;")
-            .unwrap();
-        assert_eq!(planner_statistics_row_count(&conn).unwrap(), 0);
-        assert!(!planner_statistics_describe_database(&conn).unwrap());
-
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation)
-             VALUES('1111111111111111111111111111111111111111', 'rust', 0)",
-            [],
+    fn planner_statistics_bounds_blob_drift_and_refreshes_stale_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs(blob_oid TEXT PRIMARY KEY);
+             CREATE TABLE \"quoted\"\"table\"(value TEXT UNIQUE);
+             WITH RECURSIVE inputs(n) AS (
+               VALUES(1) UNION ALL SELECT n + 1 FROM inputs WHERE n < 100
+             ) INSERT INTO blobs SELECT printf('%040d', n) FROM inputs;",
         )
         .unwrap();
-        let evidence = refresh_planner_statistics(&conn).unwrap();
+        let evidence = refresh_planner_statistics_if_stale(&conn).unwrap().unwrap();
+        assert_eq!(evidence.analyzed_tables, ["blobs", "quoted\"table"]);
+        assert_eq!(
+            evidence.stat1_rows,
+            planner_statistics_row_count(&conn).unwrap()
+        );
         assert_eq!(
             conn.pragma_query_value(None, "analysis_limit", |row| row.get::<_, i64>(0))
                 .unwrap(),
             PLANNER_ANALYSIS_LIMIT
         );
-        assert_eq!(
-            evidence.stat1_rows,
-            planner_statistics_row_count(&conn).unwrap()
+        assert!(
+            refresh_planner_statistics_if_stale(&conn)
+                .unwrap()
+                .is_none()
         );
-        assert!(evidence.stat1_rows > 0);
-        assert!(planner_statistics_describe_database(&conn).unwrap());
+        conn.execute("INSERT INTO blobs VALUES('one more file')", [])
+            .unwrap();
+        assert!(
+            refresh_planner_statistics_if_stale(&conn)
+                .unwrap()
+                .is_none()
+        );
 
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation)
-             VALUES('2222222222222222222222222222222222222222', 'rust', 0)",
-            [],
+        conn.execute("INSERT INTO \"quoted\"\"table\" VALUES('first row')", [])
+            .unwrap();
+        let evidence = refresh_planner_statistics_if_stale(&conn).unwrap().unwrap();
+        assert_eq!(evidence.analyzed_tables, ["quoted\"table"]);
+        // Exactly 1.25x is still inside the tolerance and takes the dry run.
+        conn.execute_batch(
+            "WITH RECURSIVE inputs(n) AS (
+               VALUES(101) UNION ALL SELECT n + 1 FROM inputs WHERE n < 124
+             ) INSERT INTO blobs SELECT printf('%040d', n) FROM inputs;",
         )
         .unwrap();
-        assert!(!planner_statistics_describe_database(&conn).unwrap());
-        let repaired = repair_planner_statistics_on_open(&conn).unwrap();
-        assert!(repaired.is_some());
-        assert!(planner_statistics_describe_database(&conn).unwrap());
+        assert_eq!(total_blob_count_conn(&conn).unwrap(), 125);
+        assert!(
+            refresh_planner_statistics_if_stale(&conn)
+                .unwrap()
+                .is_none()
+        );
+        conn.execute("INSERT INTO blobs VALUES('beyond tolerance')", [])
+            .unwrap();
+        let evidence = refresh_planner_statistics_if_stale(&conn).unwrap().unwrap();
+        assert_eq!(evidence.analyzed_tables, ["blobs", "quoted\"table"]);
+
+        // 100/126 falls below 0.8, so shrinking also refreshes every table.
+        conn.execute("DELETE FROM blobs WHERE rowid > 100", [])
+            .unwrap();
+        let evidence = refresh_planner_statistics_if_stale(&conn).unwrap().unwrap();
+        assert_eq!(evidence.analyzed_tables, ["blobs", "quoted\"table"]);
+        conn.execute("DELETE FROM blobs WHERE rowid > 80", [])
+            .unwrap();
+        assert!(
+            refresh_planner_statistics_if_stale(&conn)
+                .unwrap()
+                .is_none()
+        );
+        conn.execute("DELETE FROM blobs WHERE rowid = 80", [])
+            .unwrap();
+        let evidence = refresh_planner_statistics_if_stale(&conn).unwrap().unwrap();
+        assert_eq!(evidence.analyzed_tables, ["blobs", "quoted\"table"]);
+
+        // A ten-fold outlier still gets targeted analysis without blob drift.
+        conn.execute_batch(
+            "WITH RECURSIVE inputs(n) AS (
+               VALUES(1) UNION ALL SELECT n + 1 FROM inputs WHERE n < 20
+             ) INSERT INTO \"quoted\"\"table\" SELECT printf('%040d', n) FROM inputs;",
+        )
+        .unwrap();
+        let evidence = refresh_planner_statistics_if_stale(&conn).unwrap().unwrap();
+        assert_eq!(evidence.analyzed_tables, ["quoted\"table"]);
+        assert!(
+            refresh_planner_statistics_if_stale(&conn)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn open_statistics_repair_skips_empty_tables_without_a_write_transaction() {
+        let _guard = planner_statistics_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("statistics.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE blobs(blob_oid TEXT PRIMARY KEY);
+             INSERT INTO blobs VALUES('first file');
+             CREATE TABLE empty(value TEXT PRIMARY KEY) WITHOUT ROWID;
+             ANALYZE;",
+        )
+        .unwrap();
+        // Prove the path executed on a populated store with an unanalyzed
+        // index. The held writer makes any attempted write transaction fail.
+        assert_eq!(total_blob_count_conn(&conn).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM pragma_index_list('empty')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_stat1 WHERE tbl = 'empty'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        assert!(repair_planner_statistics_on_open(&conn).unwrap().is_none());
+        writer.execute_batch("ROLLBACK").unwrap();
+
+        // Growth is deliberately left to build/GC, not repaired on open.
+        conn.execute_batch(
+            "WITH RECURSIVE inputs(n) AS (
+               VALUES(1) UNION ALL SELECT n + 1 FROM inputs WHERE n < 100
+             ) INSERT INTO blobs SELECT printf('%040d', n) FROM inputs;",
+        )
+        .unwrap();
+        assert!(repair_planner_statistics_on_open(&conn).unwrap().is_none());
+        conn.execute("INSERT INTO empty VALUES('now nonempty')", [])
+            .unwrap();
+        assert!(repair_planner_statistics_on_open(&conn).unwrap().is_none());
+
+        // A store with sqlite_stat1 cleared is repaired exactly once.
+        conn.execute_batch(
+            "DELETE FROM sqlite_stat1; DELETE FROM sqlite_stat4; ANALYZE sqlite_schema;",
+        )
+        .unwrap();
+        let repairs = planner_statistics_repairs();
+        assert!(repair_planner_statistics_on_open(&conn).unwrap().is_some());
+        assert_eq!(planner_statistics_repairs(), repairs + 1);
+        assert!(repair_planner_statistics_on_open(&conn).unwrap().is_none());
+        assert_eq!(planner_statistics_repairs(), repairs + 1);
+    }
+
+    #[test]
+    fn open_statistics_repair_respects_the_operator_switch() {
+        let _guard = planner_statistics_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs(blob_oid TEXT PRIMARY KEY); INSERT INTO blobs VALUES('file');",
+        )
+        .unwrap();
+        let previous = std::env::var_os(STORE_STATISTICS_ENV);
+        unsafe { std::env::set_var(STORE_STATISTICS_ENV, "off") };
+        let result = repair_planner_statistics_on_open(&conn);
+        let rows = planner_statistics_row_count(&conn);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(STORE_STATISTICS_ENV, value),
+                None => std::env::remove_var(STORE_STATISTICS_ENV),
+            }
+        }
+        assert!(result.unwrap().is_none());
+        assert_eq!(rows.unwrap(), 0);
+        assert!(repair_planner_statistics_on_open(&conn).unwrap().is_some());
     }
 
     /// Issue #1963: a workspace rooted inside a Git-ignored subtree. The

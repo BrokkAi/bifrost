@@ -342,6 +342,20 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
+    /// Blob-local callee provenance, charged against structural extraction's
+    /// existing work allowance. Other adapters do not publish this fact.
+    fn callee_provenance(
+        &self,
+        _node: Node<'_>,
+        _source: &str,
+        _charge: &mut dyn FnMut(usize) -> Result<(), super::collector::StructuralFactCollectorStop>,
+    ) -> Result<
+        Option<super::callable::CalleeProvenanceFact>,
+        super::collector::StructuralFactCollectorStop,
+    > {
+        Ok(None)
+    }
+
     /// Whether this adapter can model `role` precisely enough to evaluate a
     /// query that asks for it.
     fn supports_role(&self, _role: Role) -> bool {
@@ -441,9 +455,22 @@ pub trait StructuralSpec: Send + Sync + 'static {
         false
     }
 
-    /// Whether this adapter records AST-backed async modifiers for every
-    /// callable fact it extracts. The default is unsupported so an unknown
-    /// property cannot silently become a clean miss.
+    /// Whether this adapter records unsafe context for every call fact.
+    fn supports_unsafe_context(&self) -> bool {
+        false
+    }
+
+    /// Called only for call nodes while their AST is available. Syntax work
+    /// shares the collector allowance used by callee provenance.
+    fn unsafe_context_value(
+        &self,
+        _node: Node<'_>,
+        _charge: &mut dyn FnMut(usize) -> Result<(), super::collector::StructuralFactCollectorStop>,
+    ) -> Result<Option<bool>, super::collector::StructuralFactCollectorStop> {
+        Ok(None)
+    }
+
+    /// Whether this adapter records AST-backed async modifiers for callable facts.
     fn supports_async_callable_value(&self) -> bool {
         false
     }

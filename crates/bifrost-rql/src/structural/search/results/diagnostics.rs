@@ -192,6 +192,9 @@ pub struct CodeQueryDiagnostic {
     /// Exact source site responsible for this diagnostic, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<CodeQuerySourceSpan>,
+    /// Complete attribution of the evidence that left this result open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<CodeQueryRelatedSource>,
     /// Every root or file whose exhausted work produced this diagnostic.
     ///
     /// A budget diagnostic that says only that some budget ran out cannot be
@@ -228,6 +231,9 @@ impl std::fmt::Debug for CodeQueryDiagnostic {
         if self.source.is_some() {
             diagnostic.field("source", &self.source);
         }
+        if !self.related.is_empty() {
+            diagnostic.field("related", &self.related);
+        }
         diagnostic.field("exhausted_roots", &self.exhausted_roots);
         if self.withheld_rows_path.is_some() {
             diagnostic.field("withheld_rows_path", &self.withheld_rows_path);
@@ -243,6 +249,13 @@ pub struct CodeQuerySourceSpan {
     pub range: CodeQueryRange,
     pub start_byte: usize,
     pub end_byte: usize,
+}
+
+/// One source that explains a diagnostic's incompleteness.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CodeQueryRelatedSource {
+    pub source: CodeQuerySourceSpan,
+    pub label: String,
 }
 
 /// One root or file whose work stopped against a named limit.
@@ -360,6 +373,8 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             #[serde(default)]
             source: Option<CodeQuerySourceSpan>,
             #[serde(default)]
+            related: Vec<CodeQueryRelatedSource>,
+            #[serde(default)]
             exhausted_roots: Vec<CodeQueryExhaustedRoot>,
             #[serde(default)]
             withheld_rows_path: Option<String>,
@@ -379,6 +394,7 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             language,
             message: wire.message,
             source: wire.source,
+            related: wire.related,
             exhausted_roots: wire.exhausted_roots,
             withheld_rows_path: wire.withheld_rows_path,
         })

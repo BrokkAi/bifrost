@@ -1039,6 +1039,7 @@ impl ActivationInput {
             .map(|control| control.into_control(format))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version,
             evidence,
             controls,

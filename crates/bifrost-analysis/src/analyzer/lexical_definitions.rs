@@ -11,7 +11,7 @@ use brokk_bifrost_cpp::graph::resolver::{
 };
 use tree_sitter::Node;
 
-use super::languages::{LocalDeclarationVisibility, language_support};
+use super::languages::{LocalDeclarationVisibility, language_support_for_hook};
 pub use super::semantic::FormalParameterPassingMode;
 use super::{DeclarationKind, Language, Range};
 
@@ -290,7 +290,8 @@ fn python_method_binding_with_step(
     Some(PythonMethodBinding::Instance)
 }
 
-pub(crate) fn parameter_owner_for_range<'tree>(
+#[doc(hidden)]
+pub fn parameter_owner_for_range<'tree>(
     language: Language,
     root: Node<'tree>,
     declaration_range: &Range,
@@ -675,7 +676,9 @@ fn smallest_named_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<
 }
 
 fn focus_can_resolve_lexical(language: Language, focus: Node<'_>) -> bool {
-    if language_support(language).is_some_and(|support| !support.focus_resolves_lexically(focus)) {
+    if language_support_for_hook(language, "focus_resolves_lexically")
+        .is_some_and(|support| !support.focus_resolves_lexically(focus))
+    {
         return false;
     }
 
@@ -1047,7 +1050,7 @@ fn scope_matching_local(
             continue;
         }
         let starts_after_focus = node.start_byte() > focus_start;
-        let support = language_support(language);
+        let support = language_support_for_hook(language, "local_declaration_binding_scope");
         let binding_scope =
             support.and_then(|support| support.local_declaration_binding_scope(node));
         if starts_after_focus
@@ -1191,7 +1194,7 @@ fn js_ts_hoisted_var_binder<'tree>(
             continue;
         }
         if node.kind() == "variable_declarator"
-            && language_support(language)
+            && language_support_for_hook(language, "local_declaration_binding_scope")
                 .and_then(|support| support.local_declaration_binding_scope(node))
                 .is_some_and(|binding| {
                     binding.visibility == LocalDeclarationVisibility::Hoisted
@@ -1836,12 +1839,7 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
-    fn first_named_kind<'tree>(root: Node<'tree>, kind: &str) -> Node<'tree> {
-        crate::analyzer::test_support::first_named_node_matching_reverse_preorder(root, |node| {
-            node.kind() == kind
-        })
-        .unwrap_or_else(|| panic!("missing `{kind}` node"))
-    }
+    use crate::analyzer::test_support::first_named_kind;
 
     #[test]
     fn an_annotated_python_splat_parameter_is_still_variadic() {
@@ -2069,38 +2067,5 @@ mod tests {
         assert_eq!(complete.slots.len(), 64);
         assert_eq!(complete.slots[0].names, ["p0"]);
         assert_eq!(complete.slots[63].names, ["p63"]);
-    }
-
-    #[test]
-    #[hardwon(
-        "eb9926938572: a let tuple-struct pattern bound its constructor, so the shared resolver found Some inside a closure"
-    )]
-    fn a_tuple_struct_pattern_constructor_is_not_a_binding() {
-        let source = concat!(
-            "fn f(o: Option<i32>) {\n",
-            "    let Some(_x) = o;\n",
-            "    let c = || Some(1);\n",
-            "    c();\n",
-            "}\n",
-        );
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("load Rust grammar");
-        let tree = parser.parse(source, None).expect("parse Rust source");
-        let closure = first_named_kind(tree.root_node(), "closure_expression");
-        let some = crate::analyzer::test_support::first_named_node_matching_reverse_preorder(
-            closure,
-            |node| node.kind() == "identifier" && source.get(node.byte_range()) == Some("Some"),
-        )
-        .expect("closure names Some");
-        let resolution = resolve_lexical_binding_from_focus(
-            Language::Rust,
-            some,
-            source,
-            some.start_byte(),
-            "Some",
-        );
-        assert!(resolution.is_none(), "Some is not a local binding");
     }
 }

@@ -21,6 +21,10 @@ use serde_json::Value;
 type OutputSchemaSource = fn() -> Value;
 
 const OUTPUT_SCHEMAS: &[(&str, OutputSchemaSource)] = &[
+    (
+        "list_function_sources",
+        generate_output_schema::<brokk_bifrost_tools::function_sources::ListFunctionSourcesResult>,
+    ),
     ("blast_radius", generate_output_schema::<BlastRadiusResult>),
     (
         "cyclomatic_complexity",

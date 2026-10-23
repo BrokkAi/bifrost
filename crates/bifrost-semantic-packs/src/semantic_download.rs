@@ -1447,6 +1447,7 @@ mod tests {
             let outcome = resolve_active_semantic_models(
                 catalog,
                 &SemanticModelActivationRequest {
+                    approximate_standard_libraries: Vec::new(),
                     bifrost_version: query.bifrost_version.clone(),
                     evidence: vec![SemanticModelActivationEvidence {
                         language: query.language.clone(),

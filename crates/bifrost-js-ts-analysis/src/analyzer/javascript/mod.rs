@@ -109,52 +109,12 @@ pub(crate) const JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY: &str = "javascript:jsx";
 pub struct JavascriptAdapter;
 
 impl LanguageAdapter for JavascriptAdapter {
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::js_ts::source_publication::SOURCE_STORAGE)
-    }
-
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        true
-    }
-
-    fn produces_canonical_source_facts(&self) -> bool {
-        true
-    }
-
-    fn js_ts_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::js_ts_facts::JS_TS_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::JavaScript
-    }
-
     fn query_directory(&self) -> &'static str {
         JAVASCRIPT_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
         "js"
-    }
-
-    /// The `.js`/`.jsx` split applies only to files whose OWN language is
-    /// JavaScript, for the reason `TypescriptAdapter` states for `.ts`/`.tsx`:
-    /// the cross-adapter row guards discriminate on this answer, so a foreign
-    /// file must answer its own language's key.
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
-        let own_language = file_language(file);
-        if own_language != Language::JavaScript {
-            return own_language.config_label();
-        }
-        if LanguageDialect::for_path(Language::JavaScript, file.rel_path())
-            == LanguageDialect::JavaScriptJsx
-        {
-            return JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY;
-        }
-        Language::JavaScript.config_label()
     }
 
     fn storage_language_keys(&self) -> Vec<(String, tree_sitter::Language)> {
@@ -170,47 +130,12 @@ impl LanguageAdapter for JavascriptAdapter {
         ]
     }
 
-    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        brokk_bifrost_analysis::analyzer::common::should_persist_code_unit(code_unit)
-    }
-
     fn lookup_candidate_separators(&self) -> &'static [&'static str] {
         DOT_LOOKUP_CANDIDATE_SEPARATORS
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
         lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
-    }
-
-    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
-        crate::analyzer::js_ts::hydrate_contains_tests(stored, file)
-    }
-
-    fn synthesize_hydrated_units(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
-    ) {
-        synthesize_js_ts_hydrated_module_unit(file, source, state);
-    }
-
-    fn synthesize_summary_projection(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        has_structured_imports: bool,
-        projection: &mut brokk_bifrost_core::analyzer::model::SummaryFileProjection,
-    ) {
-        synthesize_js_ts_summary_module_unit(file, source, has_structured_imports, projection);
-    }
-
-    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
-        Some(module_code_unit(file))
-    }
-
-    fn has_path_synthetic_module_units(&self) -> bool {
-        true
     }
 
     fn path_synthetic_module_requires_imports(&self) -> bool {
@@ -248,6 +173,68 @@ impl LanguageAdapter for JavascriptAdapter {
         &self,
     ) -> Option<&'static brokk_bifrost_core::analyzer::cognitive_complexity::Config> {
         Some(crate::analyzer::js_ts::cognitive_complexity_config())
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for JavascriptAdapter {
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::js_ts::source_publication::SOURCE_STORAGE)
+    }
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+    fn js_ts_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::js_ts_facts::JS_TS_SOURCE_FACTS_VERSION)
+    }
+    fn language(&self) -> Language {
+        Language::JavaScript
+    }
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
+        let own_language = file_language(file);
+        if own_language != Language::JavaScript {
+            return own_language.config_label();
+        }
+        if LanguageDialect::for_path(Language::JavaScript, file.rel_path())
+            == LanguageDialect::JavaScriptJsx
+        {
+            return JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY;
+        }
+        Language::JavaScript.config_label()
+    }
+    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
+        brokk_bifrost_analysis::analyzer::common::should_persist_code_unit(code_unit)
+    }
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
+        crate::analyzer::js_ts::hydrate_contains_tests(stored, file)
+    }
+    fn synthesize_hydrated_units(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        state: &mut brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::FileState,
+    ) {
+        synthesize_js_ts_hydrated_module_unit(file, source, state);
+    }
+    fn synthesize_summary_projection(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        has_structured_imports: bool,
+        projection: &mut brokk_bifrost_core::analyzer::model::SummaryFileProjection,
+    ) {
+        synthesize_js_ts_summary_module_unit(file, source, has_structured_imports, projection);
+    }
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        Some(module_code_unit(file))
+    }
+    fn has_path_synthetic_module_units(&self) -> bool {
+        true
     }
 }
 
@@ -587,6 +574,10 @@ impl CodeUnitIndex for JavascriptAnalyzer {
 
     delegate_inner_methods! {
         fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
+    }
+
+    delegate_inner_methods! {
+        fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
     delegate_inner_methods! {
@@ -1085,6 +1076,7 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Java
 mod tests {
 
     use crate::analyzer::javascript::*;
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
 
     #[test]
     fn hydration_uses_persisted_facts_and_path_conventions_only() {

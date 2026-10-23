@@ -644,7 +644,8 @@ where
 /// indexed lookup for every file without becoming analyzer-lifetime state or
 /// rebuilding a workspace-wide definition materialization.
 /// Batched answers a session can hand to another.
-pub(crate) type FrontierAnswers =
+#[doc(hidden)]
+pub type FrontierAnswers =
     Arc<HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>>;
 
 #[doc(hidden)]
@@ -664,18 +665,21 @@ impl<'a> RelationalFrontierSession<'a> {
         }
     }
 
+    #[doc(hidden)]
     /// The answers this session has batched so far, shareable with sessions
     /// that ask the same workspace-derived questions.
-    pub(crate) fn answer_snapshot(&self) -> FrontierAnswers {
+    pub fn answer_snapshot(&self) -> FrontierAnswers {
         self.frontier.answer_snapshot()
     }
 
+    #[doc(hidden)]
     /// Start from answers another session already batched.
-    pub(crate) fn adopt_answers(&self, answers: &FrontierAnswers) {
+    pub fn adopt_answers(&self, answers: &FrontierAnswers) {
         self.frontier.adopt_answers(answers);
     }
 
-    pub(crate) fn resolve_owned<T>(
+    #[doc(hidden)]
+    pub fn resolve_owned<T>(
         &self,
         phase: &'static str,
         evaluate: impl FnMut(Arc<dyn RelationalDefinitionFrontier>) -> T,
@@ -706,6 +710,7 @@ impl<'a> RelationalFrontierSession<'a> {
         outcome
     }
 
+    #[doc(hidden)]
     /// Resolve ordered independent items over immutable answer snapshots.
     ///
     /// File workers can only read already converged answers and record misses.
@@ -713,7 +718,7 @@ impl<'a> RelationalFrontierSession<'a> {
     /// parallel barrier, then only the items that observed a miss are replayed.
     /// This restores pure semantic file concurrency without multiplying SQLite
     /// readers or publishing provisional empty answers.
-    pub(crate) fn resolve_owned_items<I, T>(
+    pub fn resolve_owned_items<I, T>(
         &self,
         phase: &'static str,
         items: &[I],

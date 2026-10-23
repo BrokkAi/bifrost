@@ -809,6 +809,7 @@ pub(super) fn receiver_budget_for_remaining_work(
             max_targets: base.max_targets.min(remaining_targets),
             max_summary_expansions: desired_summaries,
             max_resolution_rounds: base.max_resolution_rounds,
+            max_hierarchy_order_steps: base.max_hierarchy_order_steps,
             max_scope_nodes: desired_scope,
         };
     }
@@ -828,6 +829,7 @@ pub(super) fn receiver_budget_for_remaining_work(
         max_targets: base.max_targets.min(remaining_targets),
         max_summary_expansions,
         max_resolution_rounds: base.max_resolution_rounds,
+        max_hierarchy_order_steps: base.max_hierarchy_order_steps,
         max_scope_nodes,
     }
 }

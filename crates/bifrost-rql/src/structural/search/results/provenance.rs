@@ -647,6 +647,12 @@ pub enum CodeQueryResultRef {
         relation: &'static str,
         outcome: &'static str,
     },
+    RustMarkerImpl {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        relation: &'static str,
+    },
     RustPointerFinding {
         id: String,
         path: String,
@@ -826,6 +832,7 @@ impl CodeQueryResultRef {
             Self::StatementReachability { .. } => QueryKind::StatementReachability,
             Self::PendingCleanupFlow { .. } => QueryKind::PendingCleanupFlow,
             Self::PythonRuleFact { .. } => QueryKind::PythonRuleFact,
+            Self::RustMarkerImpl { .. } => QueryKind::RustMarkerImpl,
             Self::RustPointerFinding { .. } => QueryKind::RustPointerFinding,
             Self::Guard { .. } => QueryKind::Guard,
             Self::RewritePath { .. } => QueryKind::RewritePath,
@@ -919,6 +926,7 @@ impl CodeQueryResultRef {
             | Self::StatementReachability { path, .. }
             | Self::PendingCleanupFlow { path, .. }
             | Self::PythonRuleFact { path, .. }
+            | Self::RustMarkerImpl { path, .. }
             | Self::RustPointerFinding { path, .. }
             | Self::Guard { path, .. }
             | Self::RewritePath { path, .. }

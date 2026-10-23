@@ -534,13 +534,12 @@ impl<'a> PolicyCompositionProvider<'a> {
 /// The default filter keeps undecided values and removes only a proven
 /// predicate match. Its classifier and request are borrowed for one fixpoint;
 /// neither the filter nor its answers survive the query.
-struct ProcedureBarrierFilter<'a, 'w, 'r> {
+struct ProcedureBarrierFilter<'a, 'w> {
     provider: &'a PolicyCompositionProvider<'w>,
     procedure: &'a ProcedureHandle,
-    request: &'a mut SemanticRequest<'r>,
 }
 
-impl ObservationFilter for ProcedureBarrierFilter<'_, '_, '_> {
+impl ObservationFilter for ProcedureBarrierFilter<'_, '_> {
     type Error = TaintPolicyCompileError;
 
     fn permits(
@@ -548,6 +547,7 @@ impl ObservationFilter for ProcedureBarrierFilter<'_, '_, '_> {
         point: ProgramPointId,
         phase: ObservationPhase,
         endpoint: &ValueFlowEndpoint,
+        request: &mut SemanticRequest<'_>,
     ) -> Result<bool, Self::Error> {
         let value = observation_value(endpoint);
         let Some(value) = value else {
@@ -564,7 +564,7 @@ impl ObservationFilter for ProcedureBarrierFilter<'_, '_, '_> {
             let decision =
                 self.provider
                     .barrier_service
-                    .classify(&observation, *predicate, self.request)?;
+                    .classify(&observation, *predicate, request)?;
             if !self.provider.barrier_filter.borrow().permits(decision) {
                 return Ok(false);
             }
@@ -749,6 +749,7 @@ impl PolicyCompositionProvider<'_> {
                 }
             }
         }
+        let mut fixpoint_request = request.staged_with_execution_budget(&self.execution_budget);
         let ExtendedPartialFlows { partial, flows } =
             if self.barrier_chop.borrow().contains(&procedure) {
                 let _timing = brokk_bifrost_analysis::profiling::scope("taint.barriers.fixpoint");
@@ -766,8 +767,8 @@ impl PolicyCompositionProvider<'_> {
                     &mut ProcedureBarrierFilter {
                         provider: self,
                         procedure: &handle,
-                        request,
                     },
+                    &mut fixpoint_request,
                 )?
             } else {
                 compute_partial_flows_with_implicit_reads(
@@ -777,6 +778,7 @@ impl PolicyCompositionProvider<'_> {
                     &extra_observations,
                     witnesses,
                     &implicit_reads,
+                    &mut fixpoint_request,
                 )
             };
         if partial.outcome != PartialFlowOutcome::Complete {
@@ -1000,11 +1002,13 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 return Ok(Arc::clone(flows));
             }
             let handle = self.procedure(procedure, request)?;
-            let outcome =
-                file_local_procedure_relations(&handle, &OracleCallContext::empty(), request)
-                    .map_err(|error| {
-                        TaintPolicyCompileError::SemanticProvider(error.to_string())
-                    })?;
+            let mut fixpoint_request = request.staged_with_execution_budget(&self.execution_budget);
+            let outcome = file_local_procedure_relations(
+                &handle,
+                &OracleCallContext::empty(),
+                &mut fixpoint_request,
+            )
+            .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
             self.discovery
                 .require_outcome(&outcome, "barrier partial flows")?;
             let snapshot = outcome.available_value().ok_or_else(|| {
@@ -1027,8 +1031,8 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 &mut ProcedureBarrierFilter {
                     provider: self,
                     procedure: &handle,
-                    request,
                 },
+                &mut fixpoint_request,
             )?
             .partial;
             let stored = self.partial_flows.borrow();
@@ -1060,15 +1064,22 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             .stored_partial_flows(&handle)
             .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
         let flows = match stored {
-            Some(flows) if flows.outcome == PartialFlowOutcome::Complete => {
+            Some(flows)
+                if matches!(
+                    flows.outcome,
+                    PartialFlowOutcome::Complete | PartialFlowOutcome::ExceededBudget
+                ) =>
+            {
                 self.stored_reads.set(self.stored_reads.get() + 1);
                 Arc::new(flows)
             }
             _ => {
+                let mut fixpoint_request =
+                    request.staged_with_execution_budget(&self.execution_budget);
                 let outcome = file_local_procedure_relations(
                     &handle,
                     &OracleCallContext::empty(),
-                    &mut request.staged_with_execution_budget(&self.execution_budget),
+                    &mut fixpoint_request,
                 )
                 .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
                 self.discovery
@@ -1079,7 +1090,11 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                     )
                 })?;
                 self.computed.set(self.computed.get() + 1);
-                Arc::new(compute_partial_flows(&handle, snapshot))
+                Arc::new(compute_partial_flows(
+                    &handle,
+                    snapshot,
+                    &mut fixpoint_request,
+                ))
             }
         };
         self.partial_flows

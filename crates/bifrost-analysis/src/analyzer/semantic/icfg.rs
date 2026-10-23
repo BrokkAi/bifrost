@@ -4,118 +4,69 @@
 //! bounded, generation-local view on demand and never builds an eager
 //! whole-workspace graph.
 
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 
 use crate::analyzer::read_ledger::LookupKind;
-
 use crate::analyzer::read_ledger::ReadKey;
 
 use crate::analyzer::semantic::completeness_reason_bytes;
 
 use crate::analyzer::semantic::workspace_oracle::PreparedWorkspaceDispatchSession;
-
 use crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
-
 use crate::analyzer::semantic::workspace_oracle::exact_source_for_procedure;
-
 use crate::analyzer::semantic::workspace_oracle::semantic_locator_work;
 
 use crate::analyzer::semantic::AccessPathAtPoint;
-
 use crate::analyzer::semantic::AliasQuery;
-
 use crate::analyzer::semantic::AliasResult;
-
 use crate::analyzer::semantic::CallContinuationKind;
-
 use crate::analyzer::semantic::CallInvocationMode;
-
 use crate::analyzer::semantic::CallSiteHandle;
-
 use crate::analyzer::semantic::CallSiteId;
-
 use crate::analyzer::semantic::CandidateCoverage;
-
 use crate::analyzer::semantic::ControlContinuation;
-
 use crate::analyzer::semantic::DeferredInvocationKind;
-
 use crate::analyzer::semantic::DispatchBoundary;
-
 use crate::analyzer::semantic::DispatchBoundaryKind;
-
 use crate::analyzer::semantic::DispatchHints;
-
 use crate::analyzer::semantic::DispatchOracle;
-
 use crate::analyzer::semantic::DispatchResult;
-
 use crate::analyzer::semantic::EvidenceCompleteness;
-
 use crate::analyzer::semantic::FreshObjectPublicationQuery;
-
 use crate::analyzer::semantic::FreshObjectPublicationResult;
-
 use crate::analyzer::semantic::HeapOracle;
-
 use crate::analyzer::semantic::LengthDelimitedDigest;
-
 use crate::analyzer::semantic::LocationResult;
-
 use crate::analyzer::semantic::OracleCallContext;
-
 use crate::analyzer::semantic::OracleLimits;
-
 use crate::analyzer::semantic::PointsToResult;
-
 use crate::analyzer::semantic::ProcedureHandle;
-
 use crate::analyzer::semantic::ProcedureInvocationKind;
-
 use crate::analyzer::semantic::ProgramPointHandle;
-
 use crate::analyzer::semantic::ProgramPointId;
-
 use crate::analyzer::semantic::ProofStatus;
-
 use crate::analyzer::semantic::SemanticBudgetExceeded;
-
 use crate::analyzer::semantic::SemanticCallSite;
-
 use crate::analyzer::semantic::SemanticCapability;
-
 use crate::analyzer::semantic::SemanticGap;
-
 use crate::analyzer::semantic::SemanticGapDischarge;
-
 use crate::analyzer::semantic::SemanticOutcome;
-
 use crate::analyzer::semantic::SemanticProviderError;
-
 use crate::analyzer::semantic::SemanticRequest;
-
 use crate::analyzer::semantic::SemanticWork;
-
 use crate::analyzer::semantic::StableDigest;
-
 use crate::analyzer::semantic::StoreAtPoint;
-
 use crate::analyzer::semantic::UpdateEligibility;
-
 use crate::analyzer::semantic::ValueAtPoint;
 
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-
 use crate::analyzer::semantic_model::ProcedureSummaryMemberKey;
 
 use crate::analyzer::DispatchHierarchyExpansion;
-
 use crate::analyzer::Language;
-
 use crate::analyzer::WorkspaceAnalyzer;
 
 use crate::hash::HashMap;
-
 use crate::hash::HashSet;
 
 pub use brokk_bifrost_semantic::analyzer::semantic::icfg::*;
@@ -125,7 +76,6 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use std::sync::Arc;
-
 use std::sync::Mutex;
 
 /// Build the canonical read attribution for one handle-keyed dispatch answer.
@@ -336,7 +286,7 @@ impl IcfgProviderBehaviorIdentity {
             // Saved defaults depend on callable-scoped metadata mutation
             // evidence, not only on the callee file. Include its complete
             // bounded-scan fingerprint in both replay identity halves.
-            if language_support(Language::Python)
+            if language_support_for_hook(Language::Python, "forward_query_provider")
                 .and_then(|support| support.forward_query_provider(workspace.analyzer()))
                 .is_some()
             {
@@ -2586,6 +2536,7 @@ mod tests {
 
     use crate::cancellation::CancellationToken;
 
+    #[cfg(test)]
     #[test]
     fn detached_external_call_keeps_parent_normal_continuation() {
         assert_eq!(
@@ -2607,6 +2558,7 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn unsupported_snapshot_quality_uses_stable_capability_order() {
         let deferred = SnapshotQuality::Unsupported(SemanticCapability::DeferredExecution);
@@ -2617,6 +2569,7 @@ mod tests {
         assert_eq!(merge_quality(cleanup, deferred), expected);
     }
 
+    #[cfg(test)]
     #[test]
     fn cancelled_dispatch_precedes_a_failed_call_transfer_projection_charge() {
         let cancellation = CancellationToken::default();
@@ -2649,6 +2602,7 @@ mod tests {
         assert_eq!(budget.used(), SemanticWork::default());
     }
 
+    #[cfg(test)]
     #[test]
     fn snapshot_cancellation_precedes_an_existing_budget_exhaustion() {
         let attempted_work = SemanticWork {
@@ -2676,6 +2630,7 @@ mod tests {
         ));
     }
 
+    #[cfg(test)]
     #[test]
     fn authored_normal_continuation_absence_starts_with_unambiguous_go_calls() {
         assert!(supports_authored_normal_continuation_absence(

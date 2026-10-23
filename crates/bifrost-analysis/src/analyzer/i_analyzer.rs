@@ -653,7 +653,7 @@ fn escape_sigil_anchors(pattern: &str) -> String {
 }
 
 /// A typed reason a request could not establish a complete read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryReadIncomplete {
     /// Cooperative cancellation stopped a read before it could establish a
     /// complete answer.
@@ -688,6 +688,9 @@ pub enum QueryReadIncomplete {
 pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
     first_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
+    /// Only file-cache builders capture every reason, so a stable first reason
+    /// cannot conceal a later transient failure when deciding cache admission.
+    captured_read_incompleteness: Option<Mutex<Vec<QueryReadIncomplete>>>,
     cancellation: Option<CancellationToken>,
     identifier_candidate_memo_owner: Option<std::thread::ThreadId>,
     /// A resolver overlay frozen by this scope's owner thread. The outer
@@ -731,6 +734,7 @@ impl Default for AnalyzerQueryContext {
         Self {
             first_store_error: Mutex::new(None),
             first_read_incomplete: Mutex::new(None),
+            captured_read_incompleteness: None,
             cancellation: None,
             identifier_candidate_memo_owner: None,
             semantic_model_overlay_override: None,
@@ -913,7 +917,8 @@ impl AnalyzerSnapshotCaches {
         &self.usage_graphs
     }
 
-    pub(crate) fn java_usage_evidence(
+    #[doc(hidden)]
+    pub fn java_usage_evidence(
         &self,
     ) -> &crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache {
         &self.java_usage_evidence
@@ -1197,6 +1202,7 @@ impl AnalyzerQueryContext {
     }
 
     pub fn record_store_error(&self, error: StoreError) {
+        self.capture_read_incomplete(QueryReadIncomplete::StoreFailure(error.clone()));
         let mut slot = self
             .first_store_error
             .lock()
@@ -1217,12 +1223,22 @@ impl AnalyzerQueryContext {
     /// complete read. The reason is sticky so an outer scope retains an inner
     /// scope's cancellation after that inner scope closes.
     pub fn record_read_incomplete(&self, reason: QueryReadIncomplete) {
+        self.capture_read_incomplete(reason.clone());
         let mut slot = self
             .first_read_incomplete
             .lock()
             .expect("analyzer query incompleteness mutex poisoned");
         if slot.is_none() {
             *slot = Some(reason);
+        }
+    }
+
+    fn capture_read_incomplete(&self, reason: QueryReadIncomplete) {
+        if let Some(captured) = &self.captured_read_incompleteness {
+            let mut reasons = captured.lock().expect("read incompleteness mutex poisoned");
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
         }
     }
 
@@ -2727,6 +2743,31 @@ impl<'a> AnalyzerQueryScope<'a> {
 
     pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self::with_context(analyzer, AnalyzerQueryContext::default())
+    }
+
+    /// Capture every distinct incomplete-read reason for a file-derived cache
+    /// admission. Ordinary scopes retain their first-reason behavior.
+    #[doc(hidden)]
+    pub fn capturing_read_incompleteness(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext {
+                captured_read_incompleteness: Some(Mutex::new(Vec::new())),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Reasons observed by a scope opened with `capturing_read_incompleteness`.
+    #[doc(hidden)]
+    pub fn captured_read_incompleteness(&self) -> Vec<QueryReadIncomplete> {
+        self.context
+            .captured_read_incompleteness
+            .as_ref()
+            .expect("only a capturing scope can enumerate read incompleteness")
+            .lock()
+            .expect("read incompleteness mutex poisoned")
+            .clone()
     }
 
     /// Open a request boundary that memoizes identifier candidate results

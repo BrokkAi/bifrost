@@ -85,7 +85,9 @@ declared-contract reference, definition, or override declaration.
 
 Consumers select the roles appropriate to their surface. Editor
 find-references includes binding and self-reference sites for navigation;
-external usage, call-graph, and relevance surfaces omit them. Classification
+external usage and relevance surfaces omit them. Call-graph surfaces omit
+self-receiver sites unless the caller requests `include_same_owner`; even then,
+self-loops remain excluded. Classification
 happens once, so every surface uses the same resolution rules.
 
 ## Selected graph caller admission
@@ -188,6 +190,51 @@ unproven sites, and one proven edge says nothing about unexamined inbound edges.
 A call-site cap leaves the hot symbol in the bulk graph's node catalog and marks
 omitted inbound edges as truncated. A client can then narrow the request and
 retry.
+
+### Bounded gaps for reachability consumers
+
+Some consumers walk the usage graph backwards and need a superset of the true
+callers of every node, not a ranking. Test selection is the main example: it
+starts at a changed function and walks callee-to-caller edges until it reaches
+test functions. A missing caller hides a test. For these consumers, the Rust
+graph reports what it cannot resolve in a bounded, structured form. One
+unreadable site never makes the whole pass unusable.
+
+The graph reports four kinds of evidence:
+
+- Drawn edges, each marked proven or unproven. An unproven edge is still a
+  possible caller, so a superset consumer follows it.
+- Withheld references. Each one pairs the enclosing caller with either the
+  reference's terminal name, when the resolver did not close the target set, or
+  a known target whose edge was not drawn. The name comes from the lowering's
+  identifier facts, never from source text at a byte range. A consumer adds a
+  candidate edge from the caller to every node with that name, or to the target.
+  The graph reports separately whether every withheld reference could be named;
+  when one could not, that pass gives no evidence of absence.
+- An implicit-caller flag. It marks a method of an `impl Trait for Type` block
+  where `Trait` does not resolve to a workspace trait, and names the impl's self
+  type. Code outside the workspace can call such a method with no call site in
+  the workspace: compiler-inserted calls for operators, `Drop`, auto-deref and
+  formatting, derive output, and standard-library generic code such as `sort`
+  or `BTreeMap`. A consumer falls back to the callers of the self type, on the
+  reasoning that code calling `Prerelease::cmp` must hold a `Prerelease` value
+  and so must reach a declaration that names that type.
+- An `implements` link from a method of a workspace-trait impl to the trait
+  method it implements. Calls through the trait, for example from a generic
+  `T: Trait` parameter, reach only the trait method's node, so a backward walk
+  continues from the linked trait method.
+
+Self-receiver calls are real calls between two methods, so a reachability
+consumer requests them with `include_same_owner`, as described in
+[Publish hits with their roles](#4-publish-hits-with-their-roles).
+
+The graph does not draw edges for the calls Rust inserts implicitly, and it
+does not expand derive output. Those edges would point only at methods of
+external traits. Such methods keep the implicit-caller flag in any case,
+because standard-library generic code can call them on workspace types without
+any workspace call site. Under the self-type fallback the extra edges would not
+change which callers a consumer selects. A more precise answer would need
+summaries of calls that escape into external generic code.
 
 ## Workspace graph and relevance ranking
 

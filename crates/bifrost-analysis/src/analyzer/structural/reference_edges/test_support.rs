@@ -7,8 +7,9 @@ use crate::analyzer::{Language, WorkspaceAnalyzer};
 pub struct Fixture {
     pub(super) _temp: tempfile::TempDir,
     pub(super) workspace: WorkspaceAnalyzer,
-    #[cfg(test)]
-    pub(super) files: Vec<ProjectFile>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub files: Vec<ProjectFile>,
 }
 
 impl Fixture {
@@ -18,7 +19,7 @@ impl Fixture {
         Self {
             _temp: temp,
             workspace,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             files: _files,
         }
     }

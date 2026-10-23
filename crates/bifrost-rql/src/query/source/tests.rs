@@ -1190,3 +1190,87 @@ fn resolved_value_source_validation_and_help_are_registered() {
     assert_eq!(&invalid[diagnostic.range], "declared");
     assert!(diagnostic.message.contains("must be exact"));
 }
+
+#[test]
+fn rust_marker_impls_form_validation_ranges_and_hover() {
+    for form in ["rust-marker-impls-of", "rust_marker_impls_of"] {
+        let source = format!("({form} (language rust (class)))");
+        assert!(
+            validate_query_source(&source).is_empty(),
+            "{source}: {:?}",
+            validate_query_source(&source)
+        );
+        let help = query_source_help_at(&source, source.find(form).unwrap()).unwrap();
+        assert_eq!(&source[help.range], form);
+        assert!(help.description.contains("marker bounds"));
+        assert!(help.description.contains("completeness"));
+    }
+    let invalid = "(rust-marker-impls-of (file-of (class)))";
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|d| d.code == "invalid-query")
+        .unwrap();
+    assert_eq!(&invalid[diagnostic.range], "rust-marker-impls-of");
+}
+
+#[test]
+fn callee_provenance_columns_validate_with_hover_and_ranges() {
+    let source = "(project :columns (callee_provenance callee_supplier callee_type_shape callee_bounds) (call-shape (language rust (call))))";
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    let help =
+        query_source_help_at(source, source.find("call-shape").unwrap()).expect("call shape hover");
+    assert_eq!(&source[help.range], "call-shape");
+    for column in [
+        "callee_provenance",
+        "callee_supplier",
+        "callee_type_shape",
+        "callee_bounds",
+        "unsupported",
+    ] {
+        assert!(
+            help.description.contains(column),
+            "missing {column}: {}",
+            help.description
+        );
+    }
+    let invalid = "(project :columns (callee_suppllier) (call-shape (call)))";
+    let diagnostics = validate_query_source(invalid);
+    assert!(!diagnostics.is_empty());
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| invalid[diagnostic.range.clone()].contains("callee_suppllier")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn unsafe_context_call_property_has_help_and_diagnostic_ranges() {
+    let source = "(language rust (call :unsafe-context true))";
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:#?}",
+        validate_query_source(source)
+    );
+    let help = query_source_help_at(source, source.find("unsafe-context").unwrap())
+        .expect("unsafe-context hover");
+    assert!(help.description.contains("Rust"));
+    assert!(help.description.contains("call"));
+    for source in [
+        "(expression :unsafe-context true)",
+        "(call :unsafe-context 7)",
+    ] {
+        let diagnostics = validate_query_source(source);
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| !source[diagnostic.range.clone()].is_empty()),
+            "{diagnostics:#?}"
+        );
+    }
+}

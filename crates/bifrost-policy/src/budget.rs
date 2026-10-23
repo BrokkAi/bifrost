@@ -26,23 +26,33 @@ const MAX_PIPELINE_ROWS: usize = 50_000;
 // sites, so the query truncates and reports `ResultLimitReached` before binding
 // completes, which fails the require-model taint compile closed (#1935).  The
 // selection result cap is therefore the pipeline-row ceiling rather than 100: a
-// selection pipeline cannot emit more rows than `MAX_PIPELINE_ROWS` permits, so
+// selection pipeline cannot emit more rows than its effective pipeline budget, so
 // this bound never truncates before the pipeline budget -- the real
 // corpus-scale limit -- does.  A selector that genuinely exceeds the pipeline
 // budget still degrades honestly through the query's own incompleteness signal.
+// Both defaults are floors and scale together; the selector builder accepts
+// values through the pipeline hard cap for the same reason (#6420).
 const MAX_SELECTOR_RESULTS: usize = MAX_PIPELINE_ROWS;
 
-// The three scan lanes are the only lanes whose default is a floor rather than
-// a cap.  A whole-workspace policy subject scan costs Theta(workspace facts),
+// The scan and pipeline lanes have defaults that are floors rather than caps.
+// A whole-workspace policy subject scan costs Theta(workspace facts),
 // so `PolicyBudget::scaled_for_workspace` raises them with the audited
 // workspace's measured volume (#1771).  These hard caps, 16x the defaults,
 // bound the raised values and remain the builder's rejection threshold.
 const MAX_SCANNED_FILES_HARD_CAP: usize = 16 * MAX_SCANNED_FILES;
 const MAX_SCANNED_SOURCE_BYTES_HARD_CAP: usize = 16 * MAX_SCANNED_SOURCE_BYTES;
 const MAX_FACT_NODES_HARD_CAP: usize = 16 * MAX_FACT_NODES;
+const MAX_PIPELINE_ROWS_HARD_CAP: usize = 16 * MAX_PIPELINE_ROWS;
 
 /// Measured density on a large Rust workspace is ~1 fact node per 10.6 source
 /// bytes; 1 per 6 gives ~1.8x headroom for denser languages (#1771).
+// Reuse this density for cumulative pipeline rows (#6420): on 2026-10-22,
+// ripgrep's ignored-status-result policy charged about 70,000 rows over
+// 928,498 source bytes (51 files). Dividing by 6 grants 154,749 rows, about
+// 2.2x headroom, without inventing another density. Rows remain query-local;
+// the 800,000-row cap bounds their count, not an exact byte size: PipelineRow
+// owns variable-sized values, traces and projection columns, so retained bytes
+// cannot be inferred from row count alone.
 const SOURCE_BYTES_PER_SCALED_FACT_NODE: u64 = 6;
 const SCALED_SCAN_HEADROOM: u64 = 2;
 // Semantic lanes cap resident admissions only. Source scans and traversal of
@@ -299,12 +309,13 @@ impl PolicyBudget {
         self.max_selector_results
     }
 
-    /// Raise the scan and semantic lanes to fit one whole-workspace analysis.
+    /// Raise the scan, pipeline and semantic lanes to fit one whole-workspace analysis.
     ///
     /// The fixed defaults act as floors and the hard caps as ceilings, so a
     /// workspace smaller than the defaults is returned unchanged and an
-    /// explicitly widened budget is never narrowed.  `max_pipeline_rows` bounds
-    /// per-query memory rather than workspace volume and stays fixed.
+    /// explicitly widened budget is never narrowed. Pipeline rows follow the
+    /// fact-node density because whole-workspace seeds and their projections
+    /// grow with source volume (#6420); retention remains per query.
     ///
     /// The semantic file lane follows the scan-file volume because a policy
     /// compile materializes program semantics for the whole audited corpus, not
@@ -327,6 +338,15 @@ impl PolicyBudget {
         );
         let scaled_files = total_files.saturating_mul(SCALED_SCAN_HEADROOM as usize);
 
+        self.query.max_pipeline_rows = self
+            .query
+            .max_pipeline_rows
+            .max(scaled_fact_nodes)
+            .min(MAX_PIPELINE_ROWS_HARD_CAP);
+        self.max_selector_results = self
+            .max_selector_results
+            .max(self.query.max_pipeline_rows)
+            .min(MAX_PIPELINE_ROWS_HARD_CAP);
         self.query.max_fact_nodes = self
             .query
             .max_fact_nodes
@@ -697,7 +717,7 @@ impl PolicyBudgetBuilder {
         ensure_at_most(
             PolicyBudgetField::PipelineRows,
             limits.max_pipeline_rows,
-            MAX_PIPELINE_ROWS,
+            MAX_PIPELINE_ROWS_HARD_CAP,
         )?;
         ensure_at_most(
             PolicyBudgetField::SemanticMaterializedFiles,
@@ -728,7 +748,7 @@ impl PolicyBudgetBuilder {
         with_max_selector_results,
         max_selector_results,
         SelectorResults,
-        MAX_SELECTOR_RESULTS
+        MAX_PIPELINE_ROWS_HARD_CAP
     );
     // The findings lane's hard cap is the workspace-scaling ceiling, not the
     // fixed default floor (#2471), exactly as the scan and semantic lanes are.
@@ -1055,7 +1075,7 @@ mod tests {
 
         assert!(
             PolicyBudget::builder()
-                .with_max_selector_results(MAX_SELECTOR_RESULTS + 1)
+                .with_max_selector_results(MAX_PIPELINE_ROWS_HARD_CAP + 1)
                 .is_err()
         );
         // The findings lane's rejection threshold moved from the default floor
@@ -1198,7 +1218,7 @@ mod tests {
         // below the fixed defaults.
         assert_eq!(query.max_scanned_source_bytes, MAX_SCANNED_SOURCE_BYTES);
         assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES);
-        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
+        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS_HARD_CAP);
 
         let wide = PolicyBudget::default().scaled_for_workspace(1_024 * 1024 * 1024, 100_000);
         let wide_query = wide.query_limits();
@@ -1219,11 +1239,49 @@ mod tests {
             MAX_SCANNED_SOURCE_BYTES_HARD_CAP
         );
         assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES_HARD_CAP);
-        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
+        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS_HARD_CAP);
         assert_eq!(scaled.max_findings(), MAX_FINDINGS_HARD_CAP);
         PolicyBudget::builder()
             .with_query_limits(query)
             .expect("clamped scan lanes stay within the builder hard caps");
+    }
+
+    #[test]
+    fn pipeline_rows_scale_with_source_volume_within_hard_cap() {
+        let small = PolicyBudget::default().scaled_for_workspace(1_024, 1);
+        assert_eq!(small.query_limits().max_pipeline_rows, 50_000);
+        assert_eq!(small.max_selector_results(), 50_000);
+
+        let ripgrep = PolicyBudget::default().scaled_for_workspace(928_498, 51);
+        assert_eq!(ripgrep.query_limits().max_pipeline_rows, 154_749);
+        assert_eq!(ripgrep.max_selector_results(), 154_749);
+
+        let widened = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                max_pipeline_rows: MAX_PIPELINE_ROWS_HARD_CAP,
+                ..PolicyBudget::default().query_limits()
+            })
+            .unwrap()
+            .with_max_selector_results(MAX_PIPELINE_ROWS_HARD_CAP)
+            .unwrap()
+            .build()
+            .unwrap()
+            .scaled_for_workspace(1_024, 1);
+        assert_eq!(widened.query_limits().max_pipeline_rows, 800_000);
+        assert_eq!(widened.max_selector_results(), 800_000);
+        assert_eq!(
+            PolicyBudget::builder()
+                .with_query_limits(CodeQueryExecutionLimits {
+                    max_pipeline_rows: MAX_PIPELINE_ROWS_HARD_CAP + 1,
+                    ..PolicyBudget::default().query_limits()
+                })
+                .unwrap_err(),
+            PolicyBudgetError::ExceedsHardCap {
+                field: PolicyBudgetField::PipelineRows,
+                value: 800_001,
+                hard_cap: 800_000,
+            }
+        );
     }
 
     #[test]

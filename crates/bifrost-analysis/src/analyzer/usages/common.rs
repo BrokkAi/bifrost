@@ -2,30 +2,15 @@
 // reclassification need nothing but a node, a string, or the hit set, so they
 // moved to `brokk-bifrost-core` and are re-exported here at the paths their
 // callers already use. What stays needs an `IAnalyzer` or a `Language`.
-pub(crate) use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
-
-pub(crate) use brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count;
-
-pub(crate) use brokk_bifrost_core::analyzer::usages::common::namespace_prefixes;
+pub(crate) use brokk_bifrost_core::analyzer::usages::common::{
+    classify_recursive_hit, namespace_prefixes,
+};
 
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
-
 use crate::analyzer::usages::model::UsageHit;
-
-use crate::analyzer::CodeUnit;
-
-use crate::analyzer::CodeUnitIndex;
-
-use crate::analyzer::IAnalyzer;
-
-use crate::analyzer::Language;
-
-use crate::analyzer::ProjectFile;
-
-use crate::analyzer::Range;
-
-use crate::analyzer::SignatureMetadata;
-
+use crate::analyzer::{
+    CodeUnit, CodeUnitIndex, IAnalyzer, Language, ProjectFile, Range, SignatureMetadata,
+};
 use std::collections::BTreeSet;
 
 #[doc(hidden)]
@@ -119,7 +104,8 @@ pub fn analyzed_files_for_language(
     analyzer.analyzed_files_for_language(language)
 }
 
-pub(crate) fn analyzable_usage_graph_files(
+#[doc(hidden)]
+pub fn analyzable_usage_graph_files(
     analyzer: &dyn IAnalyzer,
     language: Language,
 ) -> Option<Vec<ProjectFile>> {
@@ -133,7 +119,8 @@ pub(crate) fn analyzable_usage_graph_files(
     )
 }
 
-pub(crate) fn select_usage_graph_files(
+#[doc(hidden)]
+pub fn select_usage_graph_files(
     files: &[ProjectFile],
     keep_file: impl Fn(&ProjectFile) -> bool,
 ) -> Vec<ProjectFile> {

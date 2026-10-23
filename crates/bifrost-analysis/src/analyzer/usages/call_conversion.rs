@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::languages::{LanguageSupport, language_support};
+use crate::analyzer::languages::{LanguageSupport, language_support_for_hook};
 use crate::analyzer::lexical_definitions::{
     formal_parameter_slots_for_owner_with_nodes, parameter_owner_for_range,
 };
@@ -51,7 +51,8 @@ pub struct ExternalConversionIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExternalConversionProvenance {
+#[doc(hidden)]
+pub enum ExternalConversionProvenance {
     /// A complete native scope result or selected declaration supplies a static
     /// type term without claiming that an external class has been indexed.
     #[cfg(any(test, feature = "test-support"))]
@@ -74,11 +75,12 @@ pub(crate) enum ExternalConversionProvenance {
 }
 
 impl ExternalConversionIdentity {
+    #[doc(hidden)]
     /// Construct an identity from resolver-owned artifact/model evidence.
     ///
     /// A semantic-pack declaration is not an exact identity without the active model-set
     /// digest, so construction refuses to produce one in that case.
-    pub(crate) fn from_provenance(
+    pub fn from_provenance(
         fqn: impl Into<String>,
         provenance: ExternalConversionProvenance,
         declaration_is_class: bool,
@@ -101,7 +103,8 @@ impl ExternalConversionIdentity {
         })
     }
 
-    pub(crate) fn model_declaration<'a>(
+    #[doc(hidden)]
+    pub fn model_declaration<'a>(
         &self,
         overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
     ) -> Option<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
@@ -133,7 +136,8 @@ impl ExternalConversionIdentity {
         &self.fqn
     }
 
-    pub(crate) fn digest(&self) -> StableDigest {
+    #[doc(hidden)]
+    pub fn digest(&self) -> StableDigest {
         let mut digest = LengthDelimitedDigest::new(b"bifrost.java.external-conversion.v1");
         digest.push(self.fqn.as_bytes());
         digest.push(if self.declaration_is_class {
@@ -187,7 +191,8 @@ impl ExternalConversionIdentity {
         digest.finish()
     }
 
-    pub(crate) fn declaration_is_class(&self) -> bool {
+    #[doc(hidden)]
+    pub fn declaration_is_class(&self) -> bool {
         self.declaration_is_class
     }
 }
@@ -767,12 +772,13 @@ impl CallConversionCache {
         signature: Option<&str>,
     ) {
         let language = language_for_file(&report.file);
-        let prerequisite = match language_support(language)
-            .and_then(LanguageSupport::call_argument_conversion_prover)
-        {
-            Some(prover) => self.prove(analyzer, report, signature, language, prover),
-            None => Err(ConversionUnknown::UnsupportedLanguage),
-        };
+        let prerequisite =
+            match language_support_for_hook(language, "call_argument_conversion_prover")
+                .and_then(LanguageSupport::call_argument_conversion_prover)
+            {
+                Some(prover) => self.prove(analyzer, report, signature, language, prover),
+                None => Err(ConversionUnknown::UnsupportedLanguage),
+            };
         report.conversion_facts = report
             .rows
             .iter()
@@ -912,8 +918,8 @@ impl CallConversionCache {
             return Err(ConversionUnknown::Cancelled);
         }
         let language = language_for_file(&shape.outcome.file);
-        let Some(prover) =
-            language_support(language).and_then(LanguageSupport::call_argument_conversion_prover)
+        let Some(prover) = language_support_for_hook(language, "call_argument_conversion_prover")
+            .and_then(LanguageSupport::call_argument_conversion_prover)
         else {
             return Err(ConversionUnknown::UnsupportedLanguage);
         };
@@ -1057,7 +1063,7 @@ impl CallConversionCache {
         signature: &Signature,
     ) {
         let language = language_for_file(&report.file);
-        let prerequisite = language_support(language)
+        let prerequisite = language_support_for_hook(language, "call_argument_conversion_prover")
             .and_then(LanguageSupport::call_argument_conversion_prover)
             .ok_or(ConversionUnknown::UnsupportedLanguage)
             .and_then(|prover| self.prove_model(analyzer, report, prover, signature));

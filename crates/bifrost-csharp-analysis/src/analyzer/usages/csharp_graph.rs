@@ -94,7 +94,7 @@ pub(crate) fn csharp_graph_source(analyzer: &dyn IAnalyzer) -> CSharpGraphSource
 pub(crate) fn csharp_usage_direct_base(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn brokk_bifrost_csharp::graph_support::CSharpSource,
     owner: &CodeUnit,
 ) -> Option<CodeUnit> {
     brokk_bifrost_csharp::graph::resolver::usage_direct_base(
@@ -107,7 +107,7 @@ pub(crate) fn csharp_usage_direct_base(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn csharp_extension_invocation_return_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn brokk_bifrost_csharp::graph_support::CSharpSource,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     source: &str,
@@ -136,7 +136,7 @@ pub(crate) fn csharp_extension_invocation_return_type_fq_name(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn csharp_extension_invocation_return_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn brokk_bifrost_csharp::graph_support::CSharpSource,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     source: &str,
@@ -167,7 +167,7 @@ pub(crate) fn csharp_extension_invocation_return_type_fq_name_in_session(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn csharp_visible_extension_method_candidates(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn brokk_bifrost_csharp::graph_support::CSharpSource,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
@@ -194,7 +194,7 @@ pub(crate) fn csharp_visible_extension_method_candidates(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn csharp_visible_extension_method_candidates_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn brokk_bifrost_csharp::graph_support::CSharpSource,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,

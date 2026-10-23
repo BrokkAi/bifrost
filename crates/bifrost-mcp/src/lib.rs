@@ -15,7 +15,7 @@ pub use brokk_bifrost_rql::{self as rql, sexp};
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 pub use brokk_bifrost_tools::{
     blast_radius, code_quality, cyclomatic_complexity_diff, diff_analysis, diff_scoring,
-    file_tools, searchtools, searchtools_render, symbol_rename,
+    file_tools, function_sources, searchtools, searchtools_render, symbol_rename,
 };
 
 pub mod analyzer_pool;

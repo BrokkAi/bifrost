@@ -2028,6 +2028,9 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
             jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
             runtime_bases: None,
             ambient_use: None,
             id: id.clone(),
@@ -2085,6 +2088,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 .and_then(|signature| signature.returns.as_ref()),
         });
         self.members.push(MemberFact {
+            implemented_trait: None,
+            self_form: None,
             non_overridable: None,
             ambient_use: None,
             value_type: None,

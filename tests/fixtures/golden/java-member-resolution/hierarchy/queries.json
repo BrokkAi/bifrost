@@ -1,0 +1,602 @@
+[
+  {
+    "name": "java_private_qualified_field_retains_visibility_incompleteness-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary5/Boundary.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "java_private_qualified_field_retains_visibility_incompleteness-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary5/Boundary.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "java_type_name_receiver_discharges_its_exact_implicit_receiver_gap-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary6/Boundary.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "java_type_name_receiver_discharges_its_exact_implicit_receiver_gap-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary6/Boundary.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_cycle_evidence_obeys_the_global_candidate_cutoff-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary12/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_cycle_evidence_obeys_the_global_candidate_cutoff-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary12/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_cycle_evidence_obeys_the_global_candidate_cutoff-1-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary13/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_cycle_evidence_obeys_the_global_candidate_cutoff-1-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary13/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_cycle_is_terminal_but_direct_root_still_wins-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary14/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_cycle_is_terminal_but_direct_root_still_wins-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary14/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_inherits_nested_types_but_not_callables-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary15/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_inherits_nested_types_but_not_callables-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary15/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_inherits_nested_types_but_not_callables-1-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary16/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_inherits_nested_types_but_not_callables-1-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary16/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_keeps_same_depth_ambiguity_and_deduplicates_diamond-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary17/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_keeps_same_depth_ambiguity_and_deduplicates_diamond-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary17/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_keeps_same_depth_ambiguity_and_deduplicates_diamond-1-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary18/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_keeps_same_depth_ambiguity_and_deduplicates_diamond-1-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary18/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_obeys_direct_shadow_and_nearest_cutoff-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary19/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "route_free_java_hierarchy_obeys_direct_shadow_and_nearest_cutoff-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary19/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "type_or_value_hierarchy_discharge_respects_route_precedence-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary23/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "type_or_value_hierarchy_discharge_respects_route_precedence-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "boundary23/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
+    "name": "definition-completeness",
+    "tool": "get_definitions_by_location",
+    "arguments": {
+      "references": [
+        {
+          "path": "boundary12/Fixture.java",
+          "line": 2,
+          "column": 248
+        },
+        {
+          "path": "boundary13/Fixture.java",
+          "line": 2,
+          "column": 284
+        },
+        {
+          "path": "boundary14/Fixture.java",
+          "line": 2,
+          "column": 190
+        },
+        {
+          "path": "boundary14/Fixture.java",
+          "line": 2,
+          "column": 229
+        },
+        {
+          "path": "boundary15/Fixture.java",
+          "line": 2,
+          "column": 190
+        },
+        {
+          "path": "boundary16/Fixture.java",
+          "line": 2,
+          "column": 217
+        },
+        {
+          "path": "boundary16/Fixture.java",
+          "line": 2,
+          "column": 257
+        },
+        {
+          "path": "boundary17/Fixture.java",
+          "line": 2,
+          "column": 226
+        },
+        {
+          "path": "boundary18/Fixture.java",
+          "line": 2,
+          "column": 262
+        },
+        {
+          "path": "boundary19/Fixture.java",
+          "line": 2,
+          "column": 245
+        },
+        {
+          "path": "boundary19/Fixture.java",
+          "line": 2,
+          "column": 289
+        },
+        {
+          "path": "boundary23/Fixture.java",
+          "line": 2,
+          "column": 160
+        },
+        {
+          "path": "boundary5/Boundary.java",
+          "line": 2,
+          "column": 60
+        },
+        {
+          "path": "boundary6/Boundary.java",
+          "line": 2,
+          "column": 64
+        },
+        {
+          "path": "boundary6/Boundary.java",
+          "line": 2,
+          "column": 57
+        }
+      ]
+    }
+  }
+]

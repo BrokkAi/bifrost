@@ -87,21 +87,6 @@ impl LanguageAdapter for PythonAdapter {
         brokk_bifrost_python::adapter::is_string_line_data(node, should_stop)
     }
 
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::python::source_publication::SOURCE_STORAGE)
-    }
-
-    fn python_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::python_facts::PYTHON_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::Python
-    }
-
     /// Relative to `brokk-bifrost-python`'s crate root: the `.scm` assets moved
     /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
@@ -112,28 +97,64 @@ impl LanguageAdapter for PythonAdapter {
         PYTHON_FILE_EXTENSION
     }
 
-    fn storage_content_qualifier(&self, _code_unit: &CodeUnit, _content_qualifier: &str) -> String {
-        String::new()
-    }
-
     fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
         false
     }
 
+    /// Every Python declaration is packaged by the module its file backs, so
+    fn contains_tests(
+        &self,
+        _file: &ProjectFile,
+        source: &str,
+        _tree: &Tree,
+        _parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    ) -> bool {
+        python_source_contains_tests(source)
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        python_extract_call_receiver(reference)
+    }
+
+    fn parse_file(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+    ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
+        parse_python_file(self.project(), file, source, tree)
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&PYTHON_COGNITIVE_CONFIG)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for PythonAdapter {
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::python::source_publication::SOURCE_STORAGE)
+    }
+    fn python_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::python_facts::PYTHON_SOURCE_FACTS_VERSION)
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+    fn storage_content_qualifier(&self, _code_unit: &CodeUnit, _content_qualifier: &str) -> String {
+        String::new()
+    }
     fn storage_file_content_qualifier(&self, _package_name: &str) -> String {
         String::new()
     }
-
     fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
         python_module_name(self.project(), file)
     }
-
     fn default_package_anchor(&self) -> Option<brokk_bifrost_core::analyzer::model::PackageAnchor> {
         Some(brokk_bifrost_core::analyzer::model::PackageAnchor::OwnModule { pop: 0 })
     }
-
-    /// Every Python declaration is packaged by the module its file backs, so
-    /// the file's own module is the only anchor this adapter can place.
     fn resolve_package_anchor(
         &self,
         anchor: brokk_bifrost_core::analyzer::model::PackageAnchor,
@@ -147,11 +168,9 @@ impl LanguageAdapter for PythonAdapter {
             _ => None,
         }
     }
-
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
         brokk_bifrost_analysis::analyzer::common::should_persist_code_unit(code_unit)
     }
-
     fn synthesize_hydrated_units(
         &self,
         file: &ProjectFile,
@@ -177,47 +196,16 @@ impl LanguageAdapter for PythonAdapter {
             state.children.insert(module, module_children);
         }
     }
-
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
         module_code_unit(self.project(), file)
     }
-
     fn has_path_synthetic_module_units(&self) -> bool {
         true
     }
-
-    fn contains_tests(
-        &self,
-        _file: &ProjectFile,
-        source: &str,
-        _tree: &Tree,
-        _parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    ) -> bool {
-        python_source_contains_tests(source)
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        python_extract_call_receiver(reference)
-    }
-
     fn requires_source_declaration_metadata_bridges(&self) -> bool {
         true
     }
-
     fn produces_canonical_source_facts(&self) -> bool {
         true
-    }
-
-    fn parse_file(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-        tree: &Tree,
-    ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
-        parse_python_file(self.project(), file, source, tree)
-    }
-
-    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
-        Some(&PYTHON_COGNITIVE_CONFIG)
     }
 }

@@ -707,6 +707,150 @@ fn row_trait_of_impl_member(
     })
 }
 
+/// Query-local trait dispatch information for one authored impl method.
+pub struct RustImplicitImplCallers {
+    pub implements: Option<CodeUnit>,
+    pub method: CodeUnit,
+    pub trait_name: String,
+    pub self_type: Option<CodeUnit>,
+}
+
+/// Impl methods with their workspace trait member or implicit-caller fallback.
+/// Reads canonical source facts and uses the hierarchy resolver for both header types.
+/// The returned vector belongs to one graph query.
+pub fn rust_implicit_impl_callers_for_file(
+    rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Result<Vec<RustImplicitImplCallers>, RustCargoRouteError> {
+    let facts = rust.canonical_rust_hierarchy_source_facts(file, &|| true)?;
+    let contexts = RustSourceContextIndex::new(facts.as_ref(), &|| true)?;
+    let types = facts
+        .types
+        .iter()
+        .map(|ty| (ty.occurrence, ty))
+        .collect::<HashMap<_, _>>();
+    let mut result = Vec::new();
+    for implementation in &facts.items.impls {
+        let Some(trait_occurrence) = implementation.trait_type else {
+            continue;
+        };
+        if implementation.negation.is_some() {
+            continue;
+        }
+        let trait_type = types[&trait_occurrence];
+        let binder =
+            contexts.primary_import_binder(facts.as_ref(), implementation.context, &|| true)?;
+        let workspace_trait = resolve_rust_hierarchy_source_ref(
+            rust,
+            token,
+            file,
+            &contexts,
+            facts.as_ref(),
+            implementation.context,
+            &binder,
+            trait_type,
+            |candidate| is_rust_trait_declaration(rust, candidate),
+        )?;
+        let mut trait_methods = Vec::new();
+        if let Some(trait_unit) = &workspace_trait {
+            let trait_facts =
+                rust.canonical_rust_hierarchy_source_facts(trait_unit.source(), &|| true)?;
+            let trait_index = RustHierarchyFileIndex::new(trait_facts.as_ref(), &|| true)?;
+            for trait_fact in &trait_facts.items.traits {
+                if trait_facts
+                    .declaration_units
+                    .iter()
+                    .any(|(declaration, unit)| {
+                        *declaration == trait_fact.declaration && unit == trait_unit
+                    })
+                    && let TraitMethodTable::Read { unit, methods, .. } =
+                        read_trait_method_table(&trait_index, trait_fact)
+                    && &unit == trait_unit
+                {
+                    trait_methods.extend(
+                        methods
+                            .into_iter()
+                            .filter(|method| method.unit.is_function()),
+                    );
+                }
+            }
+        }
+        let trait_name = match &trait_type.shape {
+            RustTypeSourceShape::Path { segments, .. } => segments
+                .iter()
+                .map(|part| part.name.as_str())
+                .collect::<Vec<_>>()
+                .join("::"),
+            _ => "<unresolved>".to_string(),
+        };
+        let self_type = if let Some(target) = implementation.target_type {
+            let target = types[&target];
+            let generic_parameters = facts
+                .items
+                .generics
+                .iter()
+                .find(|parameters| parameters.declaration == implementation.declaration)
+                .map_or(&[][..], |parameters| parameters.parameters.as_slice());
+            if generic_impl_target_is_dependent(generic_parameters, target) {
+                None
+            } else {
+                resolve_rust_hierarchy_source_ref(
+                    rust,
+                    token,
+                    file,
+                    &contexts,
+                    facts.as_ref(),
+                    implementation.context,
+                    &binder,
+                    target,
+                    |candidate| {
+                        Ok(is_rust_struct_declaration(rust, candidate)?
+                            || is_rust_enum_declaration(rust, candidate)?
+                            || is_rust_type_alias_declaration(rust, candidate)?)
+                    },
+                )?
+                .map(|unit| canonical_rust_hierarchy_type(rust, token, unit))
+                .transpose()?
+                .flatten()
+            }
+        } else {
+            None
+        };
+        for child in &implementation.body_children {
+            for (_, unit) in facts
+                .declaration_units
+                .iter()
+                .filter(|(declaration, _)| Some(*declaration) == child.declaration)
+            {
+                if unit.is_function() {
+                    let mut candidates = trait_methods
+                        .iter()
+                        .filter(|method| method.name == unit.identifier())
+                        .map(|method| method.unit.clone())
+                        .collect::<Vec<_>>();
+                    candidates.sort();
+                    candidates.dedup();
+                    // Incomplete source, macro bodies and invalid impl members can
+                    // leave no unique authored trait member. Keep the fallback in
+                    // that case rather than assuming compiler-valid source.
+                    let implements = match candidates.as_slice() {
+                        [member] => Some(member.clone()),
+                        _ => None,
+                    };
+                    result.push(RustImplicitImplCallers {
+                        implements,
+                        method: unit.clone(),
+                        trait_name: trait_name.clone(),
+                        self_type: self_type.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub fn rust_trait_for_impl_member(
     rust: &dyn RustFactSource,
     token: QueryToken<'_>,

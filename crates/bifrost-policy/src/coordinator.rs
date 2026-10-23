@@ -1505,16 +1505,15 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "absent-member",
     "actual-to-formal-binding",
     "assignment-relations",
-    "binding-resolution",
     "bounded-caller-reachability",
     "branch-relations",
     "call-argument-conversion",
+    "callable-metrics",
     "callable-signature",
     "canonical-external-dispatch",
     "class-set-type-flow",
     "conditional-result-contracts",
     "configuration-facts",
-    "control-flow",
     "declaration-attributes",
     "declaration-bounded-containment",
     "declaration-selection-imports",
@@ -1524,24 +1523,18 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "endpoint-set-imports",
     "exact-call-target",
     "exact-result-use",
-    "exact-value-identity",
-    "exception-hierarchy",
     "exhaustive-effect-coverage",
-    "expression-kind-facts",
     "external-api-identity",
     "failure-edge-control",
     "failure-handler-state",
     "flow",
-    "generic-type-facts",
     "guard-dominance",
     "interprocedural-transfer",
     "javadoc-facts",
     "language-rule-facts",
     "lexical-environment",
-    "literal-value-matching",
-    "local-value-flow",
+    "literal-occurrences",
     "loop-relations",
-    "member-resolution",
     "module-identity-declaration-selection",
     "native-result-obligation",
     "nilness-operations",
@@ -1550,6 +1543,7 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "normalized-call-roles",
     "operation-precondition-contracts",
     "origin-shape-assertion",
+    "pending-cleanup-flow",
     "prepared-c-syntax",
     "prepared-syntax",
     "procedure-local-scalar-refinement",
@@ -1559,7 +1553,6 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "python-declaration-models",
     "python-import-cycles",
     "python-import-site",
-    "python-syntax-diagnostics",
     "reaching-binding-assertion",
     "reaching-definitions",
     "resolved-call-target",
@@ -1588,7 +1581,6 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "taint",
     "terminal-obligation",
     "transitive-procedure-effects",
-    "type-hierarchy",
     "typestate",
     "value-origin-assertion",
 ];
@@ -1952,7 +1944,8 @@ fn pack_activation_review(
         .flat_map(|ecosystem| ecosystem.discovery.standard_library_pack_expectations())
         .flat_map(|expectation| match &expectation.selection {
             StandardLibraryPackSelection::Declared { dependency_ids } => dependency_ids.as_slice(),
-            StandardLibraryPackSelection::NotSelected { .. } => &[],
+            StandardLibraryPackSelection::NotSelected { .. }
+            | StandardLibraryPackSelection::Unpinned => &[],
         })
         .map(String::as_str)
         .collect::<HashSet<_>>();
@@ -2292,11 +2285,15 @@ fn record_standard_library_packs(
                 StandardLibraryPackSelection::NotSelected { reason } => {
                     (PolicyPackDecisionStatus::Rejected, reason.clone())
                 }
-                StandardLibraryPackSelection::Declared { .. }
+                StandardLibraryPackSelection::Declared { .. } | StandardLibraryPackSelection::Unpinned
                     if runtime_decided.contains(expectation.pack_id) =>
                 {
                     continue;
                 }
+                StandardLibraryPackSelection::Unpinned => (
+                    PolicyPackDecisionStatus::Missing,
+                    "the project's toolchain is unpinned; no installed standard-library pack is available for approximate activation. Install a Bifrost-packs release with `bifrost install-semantic-packs`".to_owned(),
+                ),
                 StandardLibraryPackSelection::Declared { dependency_ids } => {
                     declared_standard_library_pack_decision(
                         expectation,
@@ -3421,6 +3418,22 @@ fn evaluate_prepared_policy_inputs(
     // review gate is the one honest exception: a `review_required` model with
     // no matching `enable` entry is inert by design, so it is reported as a
     // warning the author can read rather than as a failed run.
+    if let Some(active) = activation_for_report.and_then(usable_active_semantic_models) {
+        let packs = active
+            .shards()
+            .iter()
+            .filter(|shard| shard.approximate)
+            .map(|shard| (&shard.manifest.pack_id, &shard.manifest.version))
+            .collect::<BTreeSet<_>>();
+        for (pack_id, version) in packs {
+            secondary_diagnostics.push(PolicyReportDiagnostic::try_new(
+                PolicyReportDiagnosticCode::ApproximateStandardLibrary,
+                PolicyDiagnosticSeverity::Note,
+                format!("ADVISORY: selected {pack_id}@{version}; the project's toolchain is unpinned, so std facts are approximate; pin a toolchain channel in rust-toolchain.toml for exact std facts"),
+                None, None, Vec::new(),
+            ).map_err(|error| PolicyCoordinatorError::new(format!("failed to construct approximate stdlib advisory: {error}")))?);
+        }
+    }
     for diagnostic in inactive_workspace_model_diagnostics(activation_for_report)? {
         secondary_diagnostics.push(diagnostic);
     }
@@ -7053,6 +7066,7 @@ mod tests {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
                     .expect("crate version is semver"),

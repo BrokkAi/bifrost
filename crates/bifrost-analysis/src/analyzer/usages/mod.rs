@@ -22,7 +22,6 @@ pub mod callable_signature;
 pub mod candidates;
 #[doc(hidden)]
 pub mod common;
-
 pub mod effects;
 #[doc(hidden)]
 pub mod file_usage_graph;
@@ -33,10 +32,10 @@ pub mod get_type;
 
 #[doc(hidden)]
 pub mod inverted_edges;
-pub(crate) mod java_graph;
-pub(crate) mod java_usage_evidence_cache;
 
-pub(crate) mod kotlin_graph;
+#[doc(hidden)]
+pub mod java_usage_evidence_cache;
+
 pub mod member_completion;
 pub mod member_family;
 pub mod overload_selection;
@@ -48,7 +47,6 @@ pub mod receiver_query;
 #[doc(hidden)]
 pub mod receiver_sites;
 
-pub(crate) mod scala_graph;
 pub mod target_kind;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -164,8 +162,6 @@ pub use finder::QueryResult;
 pub use finder::ReferenceEngine;
 pub use finder::UsageFinder;
 pub use finder::UsageQueryCompletion;
-
-pub use kotlin_graph::KotlinUsageGraphStrategy;
 
 pub use local_inference::LocalBindingsSnapshot;
 pub use local_inference::LocalInferenceConfig;

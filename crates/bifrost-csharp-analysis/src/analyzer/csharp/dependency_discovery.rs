@@ -15,7 +15,9 @@ pub(crate) fn project_assets_files(root: &Path) -> Vec<PathBuf> {
             !entry.file_type().is_dir()
                 || !matches!(
                     entry.file_name().to_str(),
-                    Some(".git" | "node_modules" | "target" | "bin")
+                    // `.dotnet` and `.nuget` hold a repository-local SDK and
+                    // package cache: thousands of files and no project.
+                    Some(".git" | "node_modules" | "target" | "bin" | ".dotnet" | ".nuget")
                 )
         })
         .filter_map(Result::ok)

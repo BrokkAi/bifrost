@@ -29,7 +29,6 @@ mod rust_departing_root_tests {
 
     use brokk_bifrost_analysis::analyzer::store::resolution_lexical::SelectedResolutionLexicalSource;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
     use rusqlite::params;
     #[test]
     fn prefix_spellings_use_the_path_producer_recipe_and_both_selected_hosts() {
@@ -39,7 +38,8 @@ mod rust_departing_root_tests {
         use brokk_bifrost_core::analyzer::{
             model::Language, resolution_facts::ResolutionNamespace,
         };
-        let fixture = SelectionFixture::custom_source(
+
+        let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
             2,
             "class Dependency {} class Model extends Dependency {}",
         );

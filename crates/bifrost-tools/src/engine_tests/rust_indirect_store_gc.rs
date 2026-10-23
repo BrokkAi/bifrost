@@ -4,7 +4,7 @@ mod rust_indirect_table_tests {
 
     use brokk_bifrost_analysis::analyzer::store::gc::run_gc;
 
-    use brokk_bifrost_analysis::analyzer::store::test_adapters::fixtures::two_revision_collection_fixture;
+    use crate::store_test_support::collection_fixtures::two_revision_collection_fixture;
 
     /// A collection that dropped rows leaves this store's pooled readers
     /// planning against statistics the collection invalidated, so the

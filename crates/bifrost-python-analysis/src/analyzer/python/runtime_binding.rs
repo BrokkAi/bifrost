@@ -1908,6 +1908,7 @@ mod tests {
             .expect("validated fixture registers");
         let evidence = exact_evidence();
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: vec![evidence.clone()],
             controls: Vec::new(),

@@ -610,6 +610,107 @@ ABSL_NAMESPACE_END
 
     #[test]
     #[hardwon(
+        "#6325: a displaced #else under #ifdef gave the recovered class the first branch's guard; a displaced #elif must stay unproven"
+    )]
+    fn displaced_branch_directives_keep_conditional_same_fqn_candidates_exact() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        // Grammar 0.24.4 reads each `END #else|#elif BEGIN class` run as one
+        // declaration holding the directive in an ERROR.
+        fs::write(
+            root.join("ifdef_location.h"),
+            "namespace ifdef_ns {\n#ifdef USE_STD\nABSL_NAMESPACE_BEGIN\nusing SourceLocation = std::source_location;\nABSL_NAMESPACE_END\n#else\nABSL_NAMESPACE_BEGIN\nclass SourceLocation {};\nABSL_NAMESPACE_END\n#endif\n}\n",
+        )
+        .expect("write #ifdef fixture");
+        fs::write(
+            root.join("elif_location.h"),
+            "namespace elif_ns {\n#if USE_STD\nABSL_NAMESPACE_BEGIN\nusing SourceLocation = std::source_location;\nABSL_NAMESPACE_END\n#elif USE_OTHER\nABSL_NAMESPACE_BEGIN\nclass SourceLocation {};\nABSL_NAMESPACE_END\n#endif\n}\n",
+        )
+        .expect("write #elif fixture");
+        let consumer = root.join("consumer.cpp");
+        fs::write(
+            &consumer,
+            "#include \"ifdef_location.h\"\n#include \"elif_location.h\"\nvoid Use(ifdef_ns::SourceLocation a, elif_ns::SourceLocation b) {}\n",
+        )
+        .expect("write consumer fixture");
+        let analyzer =
+            CppAnalyzer::from_project(brokk_bifrost_core::analyzer::project::TestProject::new(
+                root.clone(),
+                brokk_bifrost_core::analyzer::model::Language::Cpp,
+            ));
+        let query_scope =
+            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &HashSet::from_iter([consumer]),
+        );
+        let all = analyzer.get_all_declarations();
+        let pair = |header: &str, namespace: &str| {
+            let source = ProjectFile::new(root.clone(), header);
+            let declarations = all
+                .iter()
+                .filter(|unit| {
+                    unit.kind() == CodeUnitType::Class
+                        && unit.fq_name() == format!("{namespace}.SourceLocation")
+                        && unit.source() == &source
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(declarations.len(), 2, "{header}: {declarations:#?}");
+            let class_decl = *declarations
+                .iter()
+                .find(|unit| unit.signature().is_none())
+                .expect("recovered class declaration");
+            let alias_decl = *declarations
+                .iter()
+                .find(|unit| {
+                    unit.signature()
+                        .is_some_and(|signature| signature.starts_with("using"))
+                })
+                .expect("alias declaration");
+            (class_decl, alias_decl)
+        };
+
+        let (class_decl, alias_decl) = pair("ifdef_location.h", "ifdef_ns");
+        let source = CppGraphSource::from_source(&analyzer, query_token);
+        assert!(
+            visibility.alternate_same_fqn_type_declarations(
+                &source,
+                &[class_decl, alias_decl],
+                class_decl
+            ),
+            "the #ifdef branches are mutually exclusive"
+        );
+        assert!(
+            visibility.complementary_same_fqn_type_declarations(
+                &source,
+                &[class_decl, alias_decl],
+                class_decl
+            ),
+            "the displaced #else completes the #ifdef family"
+        );
+
+        let (class_decl, alias_decl) = pair("elif_location.h", "elif_ns");
+        assert!(
+            !visibility.alternate_same_fqn_type_declarations(
+                &source,
+                &[class_decl, alias_decl],
+                class_decl
+            ),
+            "a displaced #elif has no readable condition, so the class is not proven exclusive"
+        );
+        assert!(!visibility.complementary_same_fqn_type_declarations(
+            &source,
+            &[class_decl, alias_decl],
+            class_decl
+        ));
+    }
+
+    #[test]
+    #[hardwon(
         "214260884c3e: Checks dependency traversal deduplicates a shared declaration dependency across lookup paths"
     )]
     fn bounded_visibility_walks_shared_declaration_dependencies_once() {

@@ -973,6 +973,9 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
         brokk_bifrost_analysis::analyzer::semantic::module_identity_owner(Path::new(header))?;
     Some(TypeFact {
         jvm_inventory: None,
+        type_parameter_defaults: Vec::new(),
+        implemented_traits: Vec::new(),
+        generic_trait_impls: Vec::new(),
         runtime_bases: None,
         ambient_use: None,
         id: header_module_id(dependency_name, header),
@@ -1423,6 +1426,9 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             .into_iter()
             .map(|record| TypeFact {
                 jvm_inventory: None,
+                type_parameter_defaults: Vec::new(),
+                implemented_traits: Vec::new(),
+                generic_trait_impls: Vec::new(),
                 runtime_bases: None,
                 ambient_use: None,
                 id: type_ids[&record.name].clone(),
@@ -1617,6 +1623,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 && !parameter_variadics.iter().any(|variadic| *variadic)
                 && syntax_complete_headers.contains(&record.source_path);
             members.push(MemberFact {
+                implemented_trait: None,
+                self_form: None,
                 non_overridable: None,
                 ambient_use: None,
                 value_type: None,
@@ -3549,6 +3557,7 @@ mod tests {
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
             .expect("ephemeral catalog");
         let activation = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
             evidence: Vec::new(),
@@ -3675,6 +3684,7 @@ mod tests {
             .expect("ephemeral catalog");
         let cancellation = CancellationToken::new();
         let activation = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
             evidence: Vec::new(),
@@ -4404,6 +4414,7 @@ mod tests {
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
             .expect("ephemeral catalog");
         let activation = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
             evidence: Vec::new(),

@@ -3410,7 +3410,7 @@ mod tests {
 
     use brokk_bifrost_core::hash::HashMap;
 
-    use brokk_bifrost_analysis::test_support::java_analyzer;
+    use crate::language_test_support::java_analyzer;
 
     use brokk_bifrost_core::test_support::write_file;
     use git2::{Repository, Signature};

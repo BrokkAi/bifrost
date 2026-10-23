@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn two_language_analyzer() -> (tempfile::TempDir, MultiAnalyzer) {
-    use brokk_bifrost_analysis::analyzer::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::JavaAnalyzer;
+
     use brokk_bifrost_rust_analysis::RustAnalyzer;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

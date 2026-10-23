@@ -10,6 +10,7 @@ use crate::analyzer::semantic::{
 use crate::analyzer::{Language, Range, WorkspaceAnalyzer};
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use brokk_bifrost_js_ts::syntax::ts_type_wrapper_operand;
+use brokk_bifrost_rust::ownership::rust_dereference_operand;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -1847,6 +1848,9 @@ fn rust_plain_write<'tree>(node: Node<'tree>, source: &str) -> Option<PlainWrite
         "field_expression" | "index_expression" => {
             return Some(PlainWrite::Excluded(node, "indirect", "nonlocal_target"));
         }
+        "unary_expression" if rust_dereference_operand(left).is_some() => {
+            return Some(PlainWrite::Excluded(node, "indirect", "nonlocal_target"));
+        }
         "tuple_expression" if right.kind() == "tuple_expression" => {
             let elements = |tuple: Node<'tree>| {
                 let mut cursor = tuple.walk();
@@ -2855,6 +2859,9 @@ fn rust_single_target_write<'tree>(
                     source_kind: OverwrittenLocalSourceKind::PlainAssignment,
                 },
                 "field_expression" | "index_expression" => {
+                    SingleTargetWrite::Excluded(node, "nonlocal_target")
+                }
+                "unary_expression" if rust_dereference_operand(left).is_some() => {
                     SingleTargetWrite::Excluded(node, "nonlocal_target")
                 }
                 _ => SingleTargetWrite::Open(node, "destructuring_target_unmodeled"),

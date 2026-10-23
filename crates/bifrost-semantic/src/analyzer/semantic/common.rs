@@ -21,6 +21,16 @@ pub fn visit_declared_type_refs<'a>(
     let mut pending = types.into_iter().collect::<Vec<_>>();
     while let Some(reference) = pending.pop() {
         match reference {
+            TypeRef::Projection {
+                owner,
+                trait_type,
+                arguments,
+                ..
+            } => {
+                pending.push(owner);
+                pending.extend(trait_type.as_deref());
+                pending.extend(arguments);
+            }
             TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
                 if let TypeRef::Declared { id, .. } = reference {
                     visit(id);

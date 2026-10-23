@@ -5,7 +5,8 @@ use super::*;
 #[allow(unused_imports)]
 pub use brokk_bifrost_semantic::analyzer::semantic_model::overlay::java_hierarchy::*;
 impl SemanticModelOverlay {
-    pub(crate) fn java_reference_widening(
+    #[doc(hidden)]
+    pub fn java_reference_widening(
         &self,
         source: &SemanticModelSymbol,
         target: &SemanticModelSymbol,

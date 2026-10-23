@@ -203,6 +203,8 @@ pub(crate) fn definition_batch_resolver<'a>(
         factory: RustBatchFactory::Owned(factory),
         operation: None,
         borrowed_operation: None,
+        file_window: false,
+        retained_reader: None,
         reuse_disabled: false,
         precomputed: Vec::new(),
         precomputed_index: 0,
@@ -212,6 +214,28 @@ pub(crate) fn definition_batch_resolver<'a>(
 impl<'a: 'selection, 'factory, 'selection, 'borrow> DefinitionBatchResolver<'a>
     for RustDefinitionBatchOperation<'a, 'factory, 'selection, 'borrow>
 {
+    fn retain_file_operation(&mut self) {
+        self.file_window = true;
+    }
+
+    fn release_file_operation(&mut self) {
+        self.operation = None;
+        self.retained_reader = None;
+    }
+
+    fn release_before_store_read(&mut self) {
+        // Exclusive readers own the writer mutex and must not survive a scalar
+        // lookup. Keep the scalar lifetime, including the pre-existing #6018
+        // in-memory macro-publication limitation; pooled WAL readers may reuse.
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.ready.inventory.conn.excludes_store_access())
+        {
+            self.release_file_operation();
+        }
+    }
+
     fn precompute(
         &mut self,
         analyzer: &dyn IAnalyzer,
@@ -264,6 +288,8 @@ pub(crate) struct RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 
             'selection,
         >,
     >,
+    file_window: bool,
+    retained_reader: Option<brokk_bifrost_analysis::analyzer::store::writer::RetainedExclusiveReader>,
     reuse_disabled: bool,
     precomputed: Vec<Option<BoundedResolution<DefinitionLookupOutcome>>>,
     precomputed_index: usize,
@@ -313,7 +339,16 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                     brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(
                         operation,
                     ),
-                ) => self.operation = Some(*operation),
+                ) => {
+                    self.operation = Some(*operation);
+                    if self.file_window
+                        && self.operation.as_ref().is_some_and(|operation| {
+                            operation.ready.inventory.conn.excludes_store_access()
+                        })
+                    {
+                        self.retained_reader = Some(self.factory.retain_exclusive_reader());
+                    }
+                },
                 outcome => {
                     self.reuse_disabled = true;
                     let failure = match outcome {
@@ -366,7 +401,7 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                     })
             )
         }) {
-            self.operation.take();
+            self.release_file_operation();
             self.borrowed_operation.take();
             self.reuse_disabled = true;
         }
@@ -401,7 +436,16 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                     brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(
                         operation,
                     ),
-                ) => self.operation = Some(*operation),
+                ) => {
+                    self.operation = Some(*operation);
+                    if self.file_window
+                        && self.operation.as_ref().is_some_and(|operation| {
+                            operation.ready.inventory.conn.excludes_store_access()
+                        })
+                    {
+                        self.retained_reader = Some(self.factory.retain_exclusive_reader());
+                    }
+                },
                 outcome => {
                     self.reuse_disabled = true;
                     return crate::analyzer::rust::native_points::resolve_rust_definition_open_failure(
@@ -410,12 +454,19 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                 }
             }
         }
-        let result = self.factory.resolve(
-            self.borrowed_operation
-                .as_deref_mut()
-                .or(self.operation.as_mut())
-                .expect("ready Rust batch operation is retained"),
-            query,
+        let operation = self
+            .borrowed_operation
+            .as_deref_mut()
+            .or(self.operation.as_mut())
+            .expect("ready Rust batch operation is retained");
+        assert!(
+            operation.ready.inventory.connection().is_autocommit(),
+            "scalar entry must not retain a read transaction"
+        );
+        let result = self.factory.resolve(operation, query);
+        assert!(
+            operation.ready.inventory.connection().is_autocommit(),
+            "scalar exit must close its stage read transaction"
         );
         if matches!(
             &result,
@@ -424,7 +475,7 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                     matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error")
                 })
         ) {
-            self.operation.take();
+            self.release_file_operation();
             self.borrowed_operation.take();
             self.reuse_disabled = true;
         }
@@ -514,6 +565,8 @@ pub(crate) fn resolve_call_target_batch_in_operation<'a: 'selection, 'selection>
         factory: RustBatchFactory::Borrowed(factory),
         operation: None,
         borrowed_operation: Some(operation),
+        file_window: false,
+        retained_reader: None,
         reuse_disabled: false,
         precomputed: Vec::new(),
         precomputed_index: 0,

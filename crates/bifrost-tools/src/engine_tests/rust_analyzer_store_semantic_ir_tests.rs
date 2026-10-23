@@ -579,6 +579,30 @@ pub(crate) mod rust_departing_root_tests {
         (file, parts, flows)
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6415: compound assignments lost operand dependence after overwriting the target"
+    )]
+    fn compound_assignment_preserves_both_operand_dependencies() {
+        use brokk_bifrost_semantic::analyzer::semantic::partial_flow::ports::PartialFlowPort;
+
+        let (_, parts, flows) = partial_flows_of("fn f(mut x: u8, t: u8) -> u8 { x |= t; x }");
+        let index = parts
+            .iter()
+            .position(|part| part.locator.declaration().last_segment_name() == Some("f"))
+            .expect("f procedure");
+        let flow = &flows[index];
+        for ordinal in [0, 1] {
+            assert!(
+                flow.flows.iter().any(|edge| {
+                    flow.ports[edge.from.index()] == PartialFlowPort::Parameter { ordinal }
+                        && flow.ports[edge.to.index()] == PartialFlowPort::NormalReturn
+                }),
+                "operand {ordinal} must reach the target's later read: {flow:#?}"
+            );
+        }
+    }
+
     /// Partial flows survive the write and the read: each procedure's ports,
     /// flows with their crossed calls, openness and discharged gaps read back
     /// equal to the computed value.

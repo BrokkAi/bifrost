@@ -34,7 +34,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
 
     fn key_with_kind(
         content_seed: u64,
@@ -352,12 +351,10 @@ mod tests {
             ))
             .0
         });
-        for _ in 0..100 {
-            if cache.waiting_count_for_test() == 1 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        brokk_bifrost_core::test_support::wait_for_nonzero_count(
+            || cache.waiting_count_for_test(),
+            "same-key request did not enter the single-flight wait",
+        );
         assert_eq!(1, cache.waiting_count_for_test());
         release_tx.send(()).unwrap();
 

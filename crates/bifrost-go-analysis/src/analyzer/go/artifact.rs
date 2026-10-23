@@ -969,6 +969,9 @@ fn module_type_drafts(
                 TypeDraft {
                     fact: TypeFact {
                         jvm_inventory: None,
+                        type_parameter_defaults: Vec::new(),
+                        implemented_traits: Vec::new(),
+                        generic_trait_impls: Vec::new(),
                         runtime_bases: None,
                         ambient_use: None,
                         id: type_declaration_id(TypeIdentity {
@@ -1220,6 +1223,9 @@ fn collect_type_draft(
     types.push(TypeDraft {
         fact: TypeFact {
             jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
             runtime_bases: None,
             ambient_use: None,
             id: type_id.clone(),
@@ -1629,6 +1635,8 @@ fn push_member(
         .unwrap_or_default();
     members.push(MemberDraft {
         fact: MemberFact {
+            implemented_trait: None,
+            self_form: None,
             non_overridable: None,
             ambient_use: None,
             value_type: None,
@@ -2364,6 +2372,16 @@ fn type_ref_depth(reference: &TypeRef) -> usize {
     while let Some((reference, depth)) = pending.pop() {
         maximum = maximum.max(depth);
         match reference {
+            TypeRef::Projection {
+                owner,
+                trait_type,
+                arguments,
+                ..
+            } => {
+                pending.push((owner, depth + 1));
+                pending.extend(trait_type.as_deref().map(|ty| (ty, depth + 1)));
+                pending.extend(arguments.iter().map(|ty| (ty, depth + 1)));
+            }
             TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
                 pending.extend(arguments.iter().map(|argument| (argument, depth + 1)));
             }

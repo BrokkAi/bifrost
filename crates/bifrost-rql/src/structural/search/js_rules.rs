@@ -15,7 +15,10 @@ use crate::analyzer::{
     static_member_property, static_property_name,
 };
 use crate::query::JsRule;
-use brokk_bifrost_js_ts::syntax::object_literal_property_key_value;
+use brokk_bifrost_js_ts::syntax::{
+    js_ts_string_literal_code_units, object_literal_property_key_node,
+    object_literal_property_key_value,
+};
 use std::collections::HashMap;
 use strsim::damerau_levenshtein;
 use tree_sitter::{Node, Tree};
@@ -55,6 +58,7 @@ pub(super) fn matches_for_file(
     };
     let root = tree.root_node();
     let lexical = JsTsLexicalBindingIndex::build(root, source);
+    let mut unknown_property_keys = Vec::new();
     let mut ranges = match rule {
         JsRule::FunctionDeclarationConflict => function_declaration_conflicts(root, source),
         JsRule::VariableRedeclaration => variable_redeclarations(root, source, &lexical),
@@ -65,11 +69,24 @@ pub(super) fn matches_for_file(
         }
         JsRule::MissingThisQualifier => missing_this_qualifiers(&tree, source),
         JsRule::MixedStaticInstanceThisAccess => mixed_static_instance_this_accesses(&tree, source),
-        JsRule::OverwrittenProperty => overwritten_properties(&tree, source),
+        JsRule::OverwrittenProperty => {
+            overwritten_properties(&tree, source, &mut unknown_property_keys)
+        }
         JsRule::MisspelledIdentifier => misspelled_identifiers(&tree, source),
     };
     ranges.sort_unstable();
     ranges.dedup();
+    if !unknown_property_keys.is_empty() {
+        return LanguageRuleMatches::incomplete(
+            ranges,
+            language.config_label(),
+            format!(
+                "{} overwritten-property is incomplete for {}: computed property keys without a static value may equal any property at {unknown_property_keys:?}",
+                language.config_label(),
+                file.rel_path().display(),
+            ),
+        );
+    }
     if rule == JsRule::MissingVariableDeclaration {
         let dynamic_scopes = dynamic_scope_ranges(root, source);
         if !dynamic_scopes.is_empty() {
@@ -723,7 +740,11 @@ struct ObjectProperty<'tree> {
     order: usize,
 }
 
-fn overwritten_properties(tree: &Tree, source: &str) -> Vec<Range> {
+fn overwritten_properties(
+    tree: &Tree,
+    source: &str,
+    unknown_keys: &mut Vec<Range>,
+) -> Vec<Range> {
     let mut ranges = Vec::new();
     for object in descendants(tree.root_node()) {
         if object.kind() != "object" {
@@ -732,7 +753,7 @@ fn overwritten_properties(tree: &Tree, source: &str) -> Vec<Range> {
         let properties = named_children(object)
             .into_iter()
             .enumerate()
-            .filter_map(|(order, node)| object_property(node, source, order))
+            .filter_map(|(order, node)| object_property(node, source, order, unknown_keys))
             .collect::<Vec<_>>();
         for property in &properties {
             let Some(last) = properties
@@ -762,16 +783,34 @@ fn object_property<'tree>(
     node: Node<'tree>,
     source: &str,
     order: usize,
+    unknown_keys: &mut Vec<Range>,
 ) -> Option<ObjectProperty<'tree>> {
-    // Literal, shorthand, and method keys have stable identity. Computed
-    // keys stay incomplete when the shared helper cannot decode them.
+    // Literal, shorthand, and method keys have stable identity. A computed
+    // key has one only when its expression is a lone string literal; any
+    // other computed key may equal every property of the object, so its
+    // range is reported and the file's result is incomplete.
     if !matches!(
         node.kind(),
         "pair" | "method_definition" | "shorthand_property_identifier"
     ) {
         return None;
     }
-    let key = object_literal_property_key_value(node, source)?;
+    let key_node = object_literal_property_key_node(node)?;
+    let key = if key_node.kind() == "computed_property_name" {
+        let mut cursor = key_node.walk();
+        let mut expressions = key_node.named_children(&mut cursor);
+        let value = expressions
+            .next()
+            .filter(|_| expressions.next().is_none())
+            .and_then(|value| js_ts_string_literal_code_units(value, source));
+        let Some(value) = value else {
+            unknown_keys.push(node_range(key_node));
+            return None;
+        };
+        value
+    } else {
+        object_literal_property_key_value(node, source)?
+    };
     let kind = object_property_kind(node);
     Some(ObjectProperty {
         node,

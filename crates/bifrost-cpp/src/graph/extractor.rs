@@ -6482,11 +6482,17 @@ fn free_function_target_matches(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
 /// arity; publish a proven hit only when ordinary visibility leaves one
 /// callable identity for the bare name.
 fn maybe_record_recovered_error_free_function_call(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx
-        .ancestry
-        .parent(node)
-        .is_none_or(|parent| parent.kind() != "ERROR")
-        || !has_ancestor_kind(node, "compound_statement")
+    // The macro-declaration grammar keeps the same call as a bogus
+    // `function_definition` whose damaged declarator ends at the block
+    // literal's `(`: its parameter list is the call's argument prefix, so
+    // unlike the ERROR shape it carries countable arity evidence.
+    let block_call_envelope = recovered_c_block_call_envelope(node).is_some();
+    if !block_call_envelope
+        && (ctx
+            .ancestry
+            .parent(node)
+            .is_none_or(|parent| parent.kind() != "ERROR")
+            || !has_ancestor_kind(node, "compound_statement"))
     {
         return;
     }
@@ -6523,6 +6529,16 @@ fn maybe_record_recovered_error_free_function_call(node: Node<'_>, ctx: &mut Sca
             continue;
         }
         *ctx.raw_match_count += 1;
+        if block_call_envelope
+            && let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
+            && ctx
+                .visibility
+                .call_arity_evidence(ctx.file, node, ctx.source)
+                .accepts(expected)
+                == Some(false)
+        {
+            continue;
+        }
         if bare_name_at_binds_only_target(function.start_byte(), name, ctx) {
             push_hit(function, ctx);
             continue;
@@ -10169,9 +10185,21 @@ fn has_malformed_wrapper_function_definition_ancestor(node: Node<'_>) -> bool {
     false
 }
 
-/// Whether an errored function definition has a non-function wrapper declarator.
+/// Whether a function definition is a recovery wrapper with a non-function
+/// declarator. The older grammar's evidence is parser damage; the
+/// macro-declaration grammar keeps the same envelope clean, where a
+/// `macro_modifier`/`macro_modifier_declarator`/`macro_type_specifier` head is
+/// admitted only where the parse would otherwise contain an error.
 pub fn is_malformed_wrapper_function_definition(node: Node<'_>) -> bool {
-    node.has_error()
+    let mut cursor = node.walk();
+    let recovery_evidence = node.has_error()
+        || node.named_children(&mut cursor).any(|child| {
+            matches!(
+                child.kind(),
+                "macro_modifier" | "macro_modifier_declarator" | "macro_type_specifier"
+            )
+        });
+    recovery_evidence
         && node
             .child_by_field_name("declarator")
             .is_some_and(|declarator| {
@@ -12553,10 +12581,13 @@ fn resolve_type_components_in_authoritative_scope(
     // with aliases from mutually exclusive included headers. C++ lookup uses
     // the declaration physically present earlier in this file; the visibility
     // index deliberately retains every configuration alternative. Restore
-    // that precedence only for the exact recovered scope and lexical tier.
+    // that precedence only for the exact macro-decorated head (recovered by
+    // the older grammar, or its clean macro-declaration reading) and lexical
+    // tier.
     if !global
         && components.len() == 1
-        && recovered_macro_decorated_type_node(node).is_some()
+        && (recovered_macro_decorated_type_node(node).is_some()
+            || macro_modifier_decorated_type_node(node))
         && let Some(resolution) = recovered_same_file_type_alias_resolution(
             node,
             components,
@@ -12759,7 +12790,10 @@ fn recovered_same_file_type_alias_resolution(
     lexical_scope: &[String],
 ) -> Option<LexicalTypeResolution> {
     debug_assert_eq!(components.len(), 1);
-    debug_assert!(recovered_macro_decorated_type_node(node).is_some());
+    debug_assert!(
+        recovered_macro_decorated_type_node(node).is_some()
+            || macro_modifier_decorated_type_node(node)
+    );
     let alias_provider = analyzer.type_alias_provider()?;
     for qualified in lexical_component_tiers(components, false, lexical_scope) {
         let candidates = visibility

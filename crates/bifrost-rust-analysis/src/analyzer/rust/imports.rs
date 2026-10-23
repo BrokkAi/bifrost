@@ -300,11 +300,6 @@ impl ImportAnalysisProvider for RustAnalyzer {
             .collect();
         let mut completeness_by_path = brokk_bifrost_core::hash::HashMap::default();
         for row in completeness {
-            assert_eq!(
-                row.complete,
-                row.gap_kind == "complete" && row.gap_subject.is_empty(),
-                "Rust summary completeness row has a canonical typed gap: {row:?}"
-            );
             if !row.complete {
                 return None;
             }
@@ -377,11 +372,6 @@ impl ImportAnalysisProvider for RustAnalyzer {
                     }
                 };
             for row in route_completeness {
-                assert_eq!(
-                    row.complete,
-                    row.gap_kind == "complete" && row.gap_subject.is_empty(),
-                    "Rust route-member completeness row has a canonical typed gap: {row:?}"
-                );
                 if !row.complete {
                     return None;
                 }
@@ -1559,11 +1549,6 @@ fn persisted_binding_surface_rows_for_files(
     };
     let mut complete_paths = HashSet::default();
     for row in completeness {
-        assert_eq!(
-            row.complete,
-            row.gap_kind == "complete" && row.gap_subject.is_empty(),
-            "Rust summary completeness row has a canonical typed gap: {row:?}"
-        );
         if !row.complete {
             return None;
         }

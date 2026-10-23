@@ -877,6 +877,9 @@ fn semantic_unit_row_key(key_value: &SemanticPipelineKey) -> UnitRowKey {
             key("semantic_absent_member_witness").text(id).finish()
         }
         SemanticPipelineKey::TaintFinding(id) => key("semantic_taint_finding").text(id).finish(),
+        SemanticPipelineKey::RustMarkerImpl(id) => {
+            key("semantic_rust_marker_impl").text(id).finish()
+        }
         SemanticPipelineKey::RustPointerFinding(id) => {
             key("semantic_rust_pointer_finding").text(id).finish()
         }
@@ -1752,6 +1755,7 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::StatementReachability { .. }
             | CodeQueryResultValue::PendingCleanupFlow { .. }
             | CodeQueryResultValue::PythonRuleFact { .. }
+            | CodeQueryResultValue::RustMarkerImpl { .. }
             | CodeQueryResultValue::RustPointerFinding { .. }
             | CodeQueryResultValue::Guard { .. }
             | CodeQueryResultValue::ReferenceEdge { .. }
@@ -1915,6 +1919,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::FlowWitness { value } => &value.path,
         CodeQueryResultValue::AbsentMemberWitness { value } => &value.path,
         CodeQueryResultValue::TaintFinding { value } => &value.path,
+        CodeQueryResultValue::RustMarkerImpl { value } => &value.path,
         CodeQueryResultValue::RustPointerFinding { value } => &value.path,
         CodeQueryResultValue::ClassSetRow { value } => &value.file,
         CodeQueryResultValue::AbsentMemberFinding { value } => &value.file,
@@ -2330,6 +2335,12 @@ impl UnitRowItemRef {
                 capture: capture.as_deref().map(boxed),
             },
             CodeQueryResultRef::PythonRuleFact {
+                range, relation, ..
+            } => UnitRowItemRefValue::StructuralMatch {
+                kind: boxed(relation),
+                node_range: Some(*range),
+            },
+            CodeQueryResultRef::RustMarkerImpl {
                 range, relation, ..
             } => UnitRowItemRefValue::StructuralMatch {
                 kind: boxed(relation),

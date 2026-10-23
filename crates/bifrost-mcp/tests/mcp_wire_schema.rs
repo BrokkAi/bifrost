@@ -24,13 +24,14 @@ use brokk_bifrost_mcp::benchmark_api::{
     BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
 };
 use common::InlineTestProject;
+use common::mcp_wire::DrainedStderr;
 use jsonschema::Validator;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -470,7 +471,7 @@ struct WireSession {
     child: Child,
     stdin: Option<ChildStdin>,
     reader: BufReader<ChildStdout>,
-    stderr: ChildStderr,
+    stderr: DrainedStderr,
     messages: Vec<Recorded>,
     /// Outstanding requests, keyed by sender and JSON-RPC id: a response is
     /// matched against the request that came from the other direction.
@@ -520,7 +521,7 @@ impl WireSession {
             .expect("spawn bifrost");
         let stdin = child.stdin.take().expect("stdin");
         let reader = BufReader::new(child.stdout.take().expect("stdout"));
-        let stderr = child.stderr.take().expect("stderr");
+        let stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
         Self {
             revision,
             child,

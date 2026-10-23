@@ -44,10 +44,35 @@ pub struct PreparedSourceDispatchSession<'a> {
     materialized: SemanticOutcome<Arc<SemanticArtifact>>,
     pending_materialization_work: SemanticWork,
     budget_scope: Option<SemanticBudgetScopeIdentity>,
+    scalar_definitions:
+        Option<crate::analyzer::usages::get_definition::ScalarCallTargetSession<'a>>,
     calls: Option<PreparedWorkspaceDispatchSession<'a>>,
 }
 
-impl PreparedSourceDispatchSession<'_> {
+impl<'a> PreparedSourceDispatchSession<'a> {
+    /// Initialize this file window's scalar definition session. The
+    /// resolver itself remains unopened until an uncached callee is demanded.
+    #[doc(hidden)]
+    pub fn enable_definition_operation_reuse(&mut self) {
+        self.scalar_definitions.get_or_insert_with(|| {
+            crate::analyzer::usages::get_definition::ScalarCallTargetSession::new(
+                self.oracle.workspace.analyzer(),
+            )
+        });
+    }
+
+    #[doc(hidden)]
+    pub fn has_definition_operation(&self) -> bool {
+        self.scalar_definitions
+            .as_ref()
+            .is_some_and(|session| session.is_active())
+    }
+
+    #[doc(hidden)]
+    pub fn release_definition_operation(&mut self) {
+        self.scalar_definitions = None;
+    }
+
     /// Conservative physical footprint retained only for this prepared file
     /// window. The artifact itself is accounted by its lease owner.
     #[doc(hidden)]
@@ -173,7 +198,11 @@ impl PreparedSourceDispatchSession<'_> {
                 .calls
                 .as_mut()
                 .expect("an available artifact owns a dispatch session")
-                .resolve_call(&call, request)?;
+                .resolve_call_with_definition_session(
+                    &call,
+                    request,
+                    self.scalar_definitions.as_mut(),
+                )?;
             work = work.conservative_add(outcome.work());
             quality.absorb(SourceOutcomeQuality::from_outcome(&outcome));
             if let Some(result) = outcome.available_value() {
@@ -229,6 +258,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             materialized,
             pending_materialization_work,
             budget_scope: None,
+            scalar_definitions: None,
             calls,
         }
     }

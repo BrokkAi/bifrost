@@ -100,6 +100,11 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         json!({
             "type": "object",
             "properties": {
+                "include_same_owner": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include proven same-owner calls between distinct declarations in native graphs. Self-loops remain excluded."
+                },
                 "include_tests": {
                     "type": "boolean",
                     "default": false,

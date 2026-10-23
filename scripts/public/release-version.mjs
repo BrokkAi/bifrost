@@ -64,6 +64,7 @@ export const RELEASED_CARGO_MANIFESTS = [
   "crates/bifrost-go-analysis/Cargo.toml",
   "crates/bifrost-rust-analysis/Cargo.toml",
   "crates/bifrost-csharp-analysis/Cargo.toml",
+  "crates/bifrost-jvm-analysis/Cargo.toml",
   "crates/bifrost-php-analysis/Cargo.toml",
   "crates/bifrost-cpp-analysis/Cargo.toml",
   "crates/bifrost-python-analysis/Cargo.toml",

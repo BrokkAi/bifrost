@@ -572,6 +572,7 @@ fn modeled_result_matches_target(
                 | TypeRef::Wildcard { .. }
                 | TypeRef::Tuple { .. }
                 | TypeRef::Function { .. }
+                | TypeRef::Projection { .. }
                 | TypeRef::Unknown => return false,
             },
             TypeMatchFrame::DeclaredName(declaration_id, target_id) => {

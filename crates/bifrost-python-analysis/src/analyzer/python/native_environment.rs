@@ -7,6 +7,7 @@ use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
     PythonSummaryReceipt, portable,
 };
 use brokk_bifrost_analysis::analyzer::store::{Result, StoreError};
+use brokk_bifrost_analysis::analyzer::store_bridge::PythonEnvironmentPublicationEngineExt;
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::model::ProjectFile;
@@ -23,6 +24,32 @@ impl PythonNativeEnvironment {
             publication: PythonEnvironmentPublication::open(path, profile)?,
         })
     }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_probe(&self, project: &dyn Project, revision: i64) -> Result<String> {
+        brokk_bifrost_analysis::native_resolution_test_support::python_native_route_probe(
+            &self.publication,
+            project,
+            revision,
+        )
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn nomination_receipts(
+        &self,
+        project: &dyn Project,
+        revision: i64,
+        targets: &[brokk_bifrost_core::analyzer::CodeUnit],
+    ) -> Result<String> {
+        brokk_bifrost_analysis::native_resolution_test_support::python_native_reverse_nomination_probe(
+            &self.publication, project, revision, targets,
+        )
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn builtin_hierarchy_probe(&self, project: &dyn Project, revision: i64) -> Result<String> {
+        brokk_bifrost_analysis::native_resolution_test_support::python_native_builtin_hierarchy_probe(
+            &self.publication, project, revision,
+        )
+    }
+
     pub fn begin(&self, revision: i64) -> Result<()> {
         self.publication.begin(revision)
     }
@@ -130,6 +157,24 @@ impl PythonNativeEnvironment {
         };
         self.publication
             .stage_prepared_source(file, &syntax, oid, &adapter, state, revision, facts, roots)
+    }
+}
+
+impl PythonNativeEnvironment {
+    /// Read retained source inputs under this selected native environment.
+    pub fn render_binding_inputs(&self, revision: i64) -> Result<String> {
+        self.publication.render_binding_inputs(revision)
+    }
+    /// Exercise source lexical selection without enabling production dispatch.
+    pub fn temporal_binding_trace(
+        &self,
+        revision: i64,
+        path: &str,
+        point: usize,
+        name: &str,
+    ) -> Result<String> {
+        self.publication
+            .temporal_binding_trace(revision, path, point, name)
     }
 }
 

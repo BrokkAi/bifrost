@@ -9,8 +9,7 @@ use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 pub use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::tree_walk::push_unclosed_construct_errors;
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    BoundedNamedTreeWalk, WalkControl, expanded_comment_start, try_walk_named_tree_preorder,
-    walk_named_tree_preorder_bounded, walk_tree_preorder,
+    WalkControl, expanded_comment_start, walk_tree_preorder,
 };
 
 // `PreparedSyntaxTree` and its source backing hold model data plus a live
@@ -34,6 +33,7 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::{
     IdentifierSeek, decorated_identifier_seeks, identifier_addresses_target,
 };
+
 use crate::analyzer::fq_name::absent_segment_separators;
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, install_on_dedicated_build_pool};
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
@@ -41,18 +41,22 @@ use crate::analyzer::read_ledger::{
     IndexFamily, LookupKind, LookupQuestion, ReadKey, declaration_facts_digest,
     signature_metadata_digest,
 };
+
 use crate::analyzer::store::liveness::{
     FileStatStamp, LivePathEntry, LivePathMap, LiveSnapshot, Liveness,
 };
+
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::resolution_publication::{
     ResolutionContentInput, ResolutionContentPublicationOutcome,
     SelectedResolutionOverlayInputsOutcome,
 };
+
 use crate::analyzer::store::resolution_selection::{
     SelectedResolutionContentMountRequest, SelectedResolutionOverlayMask,
     SelectedResolutionUnavailable,
 };
+
 use crate::analyzer::store::{
     ActiveSearchBlob, AnalyzerStore, CompleteAnalysisBlobRequest, GenerationId,
     HierarchyStorageKey, HydratedCandidateRow, HydratedDefinitionOrderCandidateRow,
@@ -64,6 +68,7 @@ use crate::analyzer::store::{
     WorkspaceContentPackageFact, WorkspaceFileRow, WorkspacePackageEdgeRow,
     WorkspacePackageFileRow, WorkspaceSnapshots, require_complete_file_state,
 };
+
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::tier_demand::TierDemand;
 use crate::analyzer::{
@@ -76,6 +81,7 @@ use crate::analyzer::{
     RelationalDefinitionValue, RubyMethodDispatchMode, SearchSymbolCandidate,
     SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
 };
+
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
@@ -932,11 +938,8 @@ impl WorkspaceBuildSnapshot {
         self.files.as_ref()
     }
 
-    pub(crate) fn live_entry(
-        &self,
-        project: &dyn Project,
-        file: &ProjectFile,
-    ) -> Option<LivePathEntry> {
+    #[doc(hidden)]
+    pub fn live_entry(&self, project: &dyn Project, file: &ProjectFile) -> Option<LivePathEntry> {
         let entry = self.live_entries.get(file)?.clone();
         let is_overlay = project.has_overlay(file);
         if is_overlay != entry.is_overlay() {
@@ -1288,11 +1291,23 @@ pub fn store_context_from_shared_store(
     }
 }
 
-fn package_storage_content_qualifier(package_name: &str) -> String {
-    package_name.to_owned()
-}
+pub trait LanguageAdapter:
+    crate::analyzer::store::StoreLanguageAdapter + Send + Sync + 'static
+{
+    /// Language-owned, resolved members declared outside the owner's file.
+    /// None keeps the ordinary file-only child path for this owner kind.
+    fn cross_file_children(
+        &self,
+        _analyzer: &TreeSitterAnalyzer<Self>,
+        _owner: &CodeUnit,
+        _limit: usize,
+    ) -> Option<Vec<(CodeUnit, Option<Range>)>>
+    where
+        Self: Sized,
+    {
+        None
+    }
 
-pub trait LanguageAdapter: Send + Sync + 'static {
     /// Opt into bounded AST-proven data exclusion from default line accounting.
     fn supports_structural_line_data(&self) -> bool {
         false
@@ -1307,16 +1322,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         std::ops::ControlFlow::Continue(false)
     }
 
-    fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
-    /// The stateless lowerer for a language whose blobs' semantic IR is
-    /// written as rows at parse time. A language that returns `None` keeps
-    /// its semantic IR on the query-time path.
-    fn parse_time_semantic_lowerer(
-        &self,
-    ) -> Option<crate::analyzer::semantic::service::ParseTimeSemanticLowerer> {
-        None
-    }
     fn parser_language(&self) -> TsLanguage {
         crate::analyzer::parser_language_for(self.language())
             .expect("analyzable language must have a registered parser grammar")
@@ -1388,43 +1394,6 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     ) -> Vec<tree_sitter::Node<'tree>> {
         Vec::new()
     }
-    /// The storage key this specific `file` was (or would be) persisted
-    /// under. Derived from the file's own detected language rather than
-    /// this adapter's language, so the cross-adapter row guard in
-    /// `paths_for_row`/`resolve_candidate_rows_limited` actually
-    /// discriminates: two adapters can share a live file (or a stale
-    /// candidate row's blob oid can resolve to a path analyzed by a
-    /// different language) and must not serve each other's rows.
-    /// Multi-key adapters (e.g. TypeScript, which splits `.ts`/`.tsx`
-    /// into distinct storage keys) override this.
-    /// The storage language key a file's rows live under.
-    ///
-    /// `&'static str` rather than `String`: every key is a language config
-    /// label chosen from a fixed set, and this is asked once per candidate row
-    /// per live path on the query paths, where allocating a key only to compare
-    /// it to a stored one was a measurable share of a chromium probe phase
-    /// (issue #1928). A caller that needs ownership says so.
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
-        // An include-claimed file (#1837) has an extension no language owns, so
-        // the file-derived key would be `Language::None` and its rows would
-        // land under a storage key this adapter never serves a generation for.
-        // Claiming adapters own that whole unclaimed-extension key namespace,
-        // which is sound exactly while one language infers claims -- the
-        // invariant `LanguageAdapter::infer_claimed_files` documents.
-        if self.claims_included_files() && file.has_unclaimed_extension() {
-            return self.language().config_label();
-        }
-        crate::analyzer::common::language_for_file(file).config_label()
-    }
-    /// Whether this adapter infers additional analyzable files from the imports
-    /// of the files its extension list already selects (#1837).
-    ///
-    /// The gate exists so the generic pipeline can skip the whole inference
-    /// stage -- a workspace listing scan plus one import-fact hydration -- for
-    /// the eleven languages that do not infer.
-    fn claims_included_files(&self) -> bool {
-        false
-    }
     /// The claim edges this adapter contributes: for each source file, the
     /// workspace files it references that no language's extension registry
     /// claims and that this adapter therefore adopts for indexing (#1837).
@@ -1494,15 +1463,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         )]
     }
     fn file_extension(&self) -> &'static str;
-    fn normalize_full_name(&self, fq_name: &str) -> String {
-        fq_name.to_string()
-    }
-    /// Canonical lookup identity for a name that is already structured.
-    /// Persistence and relational queries use this method; rendered-string
-    /// normalization remains only for legacy input surfaces during migration.
-    fn normalize_fq_name(&self, fq_name: &FqName) -> FqName {
-        fq_name.clone()
-    }
+
     /// Additional containers through which a definition is directly visible,
     /// beyond its structured FqName parent. The returned names are structured
     /// full identities; persistence converts them to the same content tail as
@@ -1510,15 +1471,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn visibility_containers(&self, _unit: &CodeUnit) -> Vec<FqName> {
         Vec::new()
     }
-    fn simple_type_name(&self, unit: &CodeUnit) -> String {
-        unit.identifier().to_string()
-    }
-    /// Whether fully-qualified lookup keys are intrinsic to blob contents.
-    /// Path-derived adapters must leave these projections absent because one
-    /// blob may be mounted at multiple live workspace paths.
-    fn persist_content_stable_lookup_keys(&self) -> bool {
-        false
-    }
+
     /// The separators this adapter's lookup spellings are peeled on -- and, by
     /// the same declaration, the separators it treats as a *join* wherever one
     /// appears in a spelling.
@@ -1538,20 +1491,13 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
     }
-    fn storage_content_qualifier(&self, code_unit: &CodeUnit, _content_qualifier: &str) -> String {
-        package_storage_content_qualifier(code_unit.package_name())
-    }
+
     /// Whether an ASCII substring match over the persisted content qualifier
     /// is a sound candidate filter for this adapter's normalized FQNs.
     fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
         true
     }
-    fn storage_file_content_qualifier(&self, package_name: &str) -> String {
-        package_storage_content_qualifier(package_name)
-    }
-    fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
-        content_qualifier.to_string()
-    }
+
     /// The package prefix `file` contributes on its own, for the storage-side
     /// name prefilter of a symbol search.
     ///
@@ -1569,12 +1515,6 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// prefilter may drop this file's declarations.
     fn prefilter_path_package(&self, file: &ProjectFile) -> Option<String> {
         Some(self.hydrate_content_qualifier("", file))
-    }
-    /// The anchor a unit's persisted package prefix is resolved against when
-    /// the extractor recorded none. `None` means this language's packages are
-    /// intrinsic to the blob and must be persisted in full.
-    fn default_package_anchor(&self) -> Option<PackageAnchor> {
-        None
     }
     /// The anchor used to publish a parsed file's package membership even when
     /// the file contains no persisted declarations. `None` means declaration
@@ -1614,49 +1554,6 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// `vendor` directories where source imports a structured path suffix.
     fn workspace_package_aliases(&self, _file: &ProjectFile, _canonical: &FqName) -> Vec<FqName> {
         Vec::new()
-    }
-    /// Resolve `anchor` to the live package prefix it names for `file`. `None`
-    /// means this adapter cannot place that anchor, which makes the unit fall
-    /// back to a fully persisted name. `content_qualifier` is the unit's stored
-    /// qualifier text, which some languages (Go) need to reconstruct the
-    /// prefix.
-    fn resolve_package_anchor(
-        &self,
-        _anchor: PackageAnchor,
-        _content_qualifier: &str,
-        _file: &ProjectFile,
-    ) -> Option<FqName> {
-        None
-    }
-    fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
-        !code_unit.is_file_scope()
-    }
-    fn storage_contains_tests(&self, state: &FileState) -> bool {
-        state.contains_tests
-    }
-    fn hydrate_contains_tests(&self, stored: bool, _file: &ProjectFile, _source: &str) -> bool {
-        stored
-    }
-    fn synthesize_hydrated_units(
-        &self,
-        _file: &ProjectFile,
-        _source: &str,
-        _state: &mut FileState,
-    ) {
-    }
-    fn synthesize_summary_projection(
-        &self,
-        _file: &ProjectFile,
-        _source: &str,
-        _has_structured_imports: bool,
-        _projection: &mut SummaryFileProjection,
-    ) {
-    }
-    fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
-        None
-    }
-    fn has_path_synthetic_module_units(&self) -> bool {
-        false
     }
     fn path_synthetic_module_requires_imports(&self) -> bool {
         false
@@ -1728,83 +1625,12 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         crate::analyzer::structural_spec_for(self.language())
     }
 
-    /// Whether this adapter's primary analysis publishes canonical source
-    /// occurrences and structural projections together. Migrated adapters
-    /// must not silently substitute a second structural parser on a miss.
-    fn produces_canonical_source_facts(&self) -> bool {
-        false
-    }
-
-    /// The language-specific side-fact tables this language's parse can fill.
-    /// Publication asserts the parse stays inside them and hydration reads only
-    /// them; see [`crate::analyzer::store::SideFactFamilies`].
-    fn side_fact_families(&self) -> crate::analyzer::store::SideFactFamilies {
-        crate::analyzer::store::SideFactFamilies::EVERY
-    }
-
-    /// Every source-backed metadata projection has an exact declaration bridge.
-    /// Older source producers may retain their established sparse-link contract.
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        false
-    }
-
-    /// Required declaration-visibility publication for each parsed storage
-    /// projection. Absence denotes an unmigrated producer, not an empty file.
-    fn declaration_visibility_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    /// Expected Java type-construction metadata contract, distinct from an
-    /// absent constructor shape in a legacy or non-Java publication.
-    fn java_type_constructor_facts_version(&self) -> Option<i64> {
-        None
-    }
-
     /// Bind path-derived placement to the same project view as source reads.
     /// Content-local adapters need no additional context.
     fn for_project(&self, _project: Arc<dyn Project>) -> Option<Self>
     where
         Self: Sized,
     {
-        None
-    }
-
-    /// Language-owned accounting and insertion for this adapter's canonical family.
-    /// The prepared blob retains this capability so admission and publication use
-    /// the same implementation; the store owns transactions and common sealing.
-    fn source_fact_storage(&self) -> Option<&'static crate::analyzer::store::SourceFactStorage> {
-        None
-    }
-
-    fn cpp_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn php_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn go_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn ruby_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn python_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn java_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn scala_source_facts_version(&self) -> Option<i64> {
-        None
-    }
-
-    fn js_ts_source_facts_version(&self) -> Option<i64> {
         None
     }
 }
@@ -1940,6 +1766,25 @@ pub struct HierarchyDeclarationFacts {
     storage_key: Option<HierarchyStorageKey>,
 }
 
+impl HierarchyDeclarationFacts {
+    #[doc(hidden)]
+    pub fn primary_range(&self) -> Option<&Range> {
+        self.primary_range.as_ref()
+    }
+}
+
+impl AsRef<HierarchyDeclarationFacts> for HierarchyDeclarationFacts {
+    fn as_ref(&self) -> &HierarchyDeclarationFacts {
+        self
+    }
+}
+
+impl AsMut<HierarchyDeclarationFacts> for HierarchyDeclarationFacts {
+    fn as_mut(&mut self) -> &mut HierarchyDeclarationFacts {
+        self
+    }
+}
+
 /// One exact source identity selected without hydration or publication retry.
 /// Language-owned projections decide how their bounded caches admit its values.
 #[doc(hidden)]
@@ -2005,9 +1850,12 @@ impl<A: LanguageAdapter> CanonicalSourceRead<'_, A> {
     }
 }
 
-pub(crate) struct ImportFileFacts {
-    pub(crate) package_name: String,
-    pub(crate) imports: Vec<ImportInfo>,
+#[doc(hidden)]
+pub struct ImportFileFacts {
+    #[doc(hidden)]
+    pub package_name: String,
+    #[doc(hidden)]
+    pub imports: Vec<ImportInfo>,
     pub(crate) contains_tests: bool,
 }
 
@@ -3222,8 +3070,63 @@ impl QueryFileStateCache {
 
 type FileStateCache = SegmentedFileStateCache;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
+/// Request-local absence is a legal answer; only failed reads replay provenance.
+/// Nested readers can outlive the scope that observed a failure.
+#[derive(Clone)]
+enum RequestRead<T> {
+    Present(T),
+    Absent,
+    Failed(Box<[QueryReadIncomplete]>),
+}
+
+impl<T: Clone> RequestRead<T> {
+    fn capture<A: LanguageAdapter>(
+        analyzer: &TreeSitterAnalyzer<A>,
+        build: impl FnOnce() -> Option<T>,
+    ) -> Self {
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+        Self::from_scope(build(), &scope)
+    }
+
+    fn from_scope(value: Option<T>, scope: &crate::analyzer::AnalyzerQueryScope<'_>) -> Self {
+        match value {
+            Some(value) => Self::Present(value),
+            None => {
+                let reasons = scope.captured_read_incompleteness();
+                if reasons.is_empty() {
+                    Self::Absent
+                } else {
+                    Self::Failed(reasons.into_boxed_slice())
+                }
+            }
+        }
+    }
+
+    fn replay<A: LanguageAdapter>(&self, analyzer: &TreeSitterAnalyzer<A>) -> Option<T> {
+        match self {
+            Self::Present(value) => Some(value.clone()),
+            Self::Absent => None,
+            Self::Failed(reasons) => {
+                assert!(
+                    !reasons.is_empty(),
+                    "a failed request read needs provenance"
+                );
+                for reason in reasons {
+                    match reason {
+                        QueryReadIncomplete::StoreFailure(error) => {
+                            analyzer.record_store_error(error.clone())
+                        }
+                        reason => analyzer.record_query_incomplete(reason.clone()),
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
 type PreparedSyntaxRequestCache =
-    HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>;
+    HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<RequestRead<Arc<PreparedSyntaxTree>>>>>;
 // Snapshot file states belong to one immutable analyzer generation. Unlike the
 // transient cache, this index is seeded once when the generation is built and
 // never receives an insert or eviction. Keep its bounded seed as a plain map so
@@ -3268,14 +3171,14 @@ pub struct QueryReadCache {
     /// of another.
     #[doc(hidden)]
     pub analyzed_live_files: Arc<RwLock<Option<Vec<ProjectFile>>>>,
-    live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
+    live_sources: Arc<RwLock<HashMap<ProjectFile, RequestRead<ResolvedLiveSource>>>>,
     /// The working-tree text of a file and its content identity, read and
     /// hashed at most once per request. Declaration-location reads ask for a
     /// file's current state once per declaration; cloning and hashing the
     /// whole text on each ask made a location lookup in an 850 KB generated
     /// file copy and hash 850 KB for each of its 8,494 declarations.
-    current_sources: Arc<RwLock<HashMap<ProjectFile, Option<CurrentSource>>>>,
-    prepared_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedPreparedSource>>>>,
+    current_sources: Arc<RwLock<HashMap<ProjectFile, RequestRead<CurrentSource>>>>,
+    prepared_sources: Arc<RwLock<HashMap<ProjectFile, RequestRead<ResolvedPreparedSource>>>>,
     #[doc(hidden)]
     pub file_states: Arc<RwLock<QueryFileStateCache>>,
     prepared_syntax: Arc<RwLock<PreparedSyntaxRequestCache>>,
@@ -6646,6 +6549,7 @@ where
             language,
             Language::Rust
                 | Language::Python
+                | Language::CSharp
                 | Language::Go
                 | Language::Java
                 | Language::Kotlin
@@ -7912,7 +7816,13 @@ where
         self.fetch_file_state(file)
             .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| state.source.clone())
-            .or_else(|| self.project.read_source(file).ok())
+            .or_else(|| match self.project.read_source(file) {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    self.record_source_read_failure(file, &error);
+                    None
+                }
+            })
     }
 
     /// The analyzed blob's source text for `file`, without hydrating its
@@ -8510,9 +8420,16 @@ where
                 .get(file)
                 .cloned()
         {
-            return source;
+            return source.replay(self);
         }
-        let source = self.project.read_source(file).ok().and_then(|text| {
+        let source = RequestRead::capture(self, || {
+            let text = self
+                .project
+                .read_source(file)
+                .map_err(|error| {
+                    self.record_source_read_failure(file, &error);
+                })
+                .ok()?;
             let oid = self.content_oid_of(file, &text)?;
             Some(CurrentSource {
                 text: Arc::from(text),
@@ -8525,7 +8442,7 @@ where
                 .expect("query current-source cache write lock poisoned")
                 .insert(file.clone(), source.clone());
         }
-        source
+        source.replay(self)
     }
 
     fn structural_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -8650,7 +8567,7 @@ where
     fn prepared_syntax_cache_cell(
         &self,
         key: PreparedSyntaxCacheKey,
-    ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
+    ) -> Option<Arc<OnceLock<RequestRead<Arc<PreparedSyntaxTree>>>>> {
         let prepared_syntax = self.active_query_cache_handle(|cache| &cache.prepared_syntax)?;
         if let Some(cell) = prepared_syntax
             .read()
@@ -8764,13 +8681,16 @@ where
         };
         let cell = self.prepared_syntax_cache_cell(prepared_key.clone());
         if let Some(cached) = cell.as_ref().and_then(|cell| cell.get()).cloned() {
-            return cached.map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
-                PreparedSyntaxLimitedOutcome::Available(resolved.oid, prepared)
-            });
+            return cached
+                .replay(self)
+                .map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
+                    PreparedSyntaxLimitedOutcome::Available(resolved.oid, prepared)
+                });
         }
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
             if let Some(cell) = &cell {
-                let _ = cell.set(Some(Arc::clone(&retained)));
+                let _ = cell.set(RequestRead::from_scope(Some(Arc::clone(&retained)), &scope));
             }
             return PreparedSyntaxLimitedOutcome::Available(resolved.oid, retained);
         }
@@ -8820,8 +8740,11 @@ where
         // failures retain the existing negative-cache behavior. If another
         // request won the race, its coherent result is authoritative.
         let prepared = if let Some(cell) = cell {
-            let _ = cell.set(prepared.clone());
-            cell.get().cloned().unwrap_or(prepared)
+            let read = RequestRead::from_scope(prepared, &scope);
+            let _ = cell.set(read);
+            cell.get()
+                .expect("prepared syntax cell initialized")
+                .replay(self)
         } else {
             prepared
         };
@@ -8844,7 +8767,7 @@ where
                     .read()
                     .expect("query prepared-syntax cache read lock poisoned")
                     .get(key)
-                    .and_then(|cell| cell.get().cloned().flatten())
+                    .and_then(|cell| cell.get().and_then(|read| read.replay(self)))
             })
             .or_else(|| self.prepared_syntax_store_get(key))
     }
@@ -8907,16 +8830,18 @@ where
             );
         };
         cell.get_or_init(|| {
-            self.retained_or_prepared_syntax_for_key(
-                prepared_key,
-                file,
-                &key,
-                origin,
-                overlay_revision,
-                resolved.snapshot.source(),
-            )
+            RequestRead::capture(self, || {
+                self.retained_or_prepared_syntax_for_key(
+                    prepared_key,
+                    file,
+                    &key,
+                    origin,
+                    overlay_revision,
+                    resolved.snapshot.source(),
+                )
+            })
         })
-        .clone()
+        .replay(self)
     }
 
     /// Read-through against the cross-request store, which sits behind the
@@ -9366,7 +9291,8 @@ where
             .collect()
     }
 
-    pub(crate) fn bulk_import_facts(
+    #[doc(hidden)]
+    pub fn bulk_import_facts(
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
     ) -> HashMap<ProjectFile, ImportFileFacts> {
@@ -9475,11 +9401,12 @@ where
         out
     }
 
+    #[doc(hidden)]
     /// Prefilter a broad reverse-reference universe with persisted structured
     /// import and lexical identifier indexes. The answer is intentionally a
     /// superset: the language provider hydrates and resolves these files to
     /// decide exact matches.
-    pub(crate) fn reverse_reference_candidates(
+    pub fn reverse_reference_candidates(
         &self,
         explicit_import_segments: &HashSet<String>,
         wildcard_import_segments: &HashSet<String>,
@@ -9690,6 +9617,7 @@ where
                 .get(file)
                 .cloned()
         {
+            let cached = cached.replay(self);
             if let (Some(source), Some(max_source_bytes)) = (&cached, max_source_bytes)
                 && source.snapshot.source().len() > max_source_bytes
             {
@@ -9702,6 +9630,7 @@ where
             return Ok(cached);
         }
 
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let snapshot = match max_source_bytes {
             Some(limit) => self.project.read_source_snapshot_limited(file, limit),
             None => self.project.read_source_snapshot(file).map(Some),
@@ -9717,16 +9646,17 @@ where
                     },
                 ));
             }
-            Err(error)
+            Err(error) => {
+                self.record_source_read_failure(file, &error);
                 if error.get_ref().is_some_and(|cause| {
                     cause.is::<brokk_bifrost_core::analyzer::project::BinarySourceRejection>()
-                }) =>
-            {
-                let reason = SourceAdmissionRefusal::Binary;
-                self.record_admission_refusal(file, reason.clone());
-                return Err(PreparedSourceFailure::Refused(reason));
+                }) {
+                    return Err(PreparedSourceFailure::Refused(
+                        SourceAdmissionRefusal::Binary,
+                    ));
+                }
+                None
             }
-            Err(_) => None,
         };
         // The snapshot carries the raw disk identity alongside its decoded
         // parser text. Retaining that identity keeps lossy source publication
@@ -9744,7 +9674,10 @@ where
             if prepared_sources.contains_key(file)
                 || prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
             {
-                prepared_sources.insert(file.clone(), resolved.clone());
+                prepared_sources.insert(
+                    file.clone(),
+                    RequestRead::from_scope(resolved.clone(), &scope),
+                );
             }
         }
         Ok(resolved)
@@ -9762,9 +9695,9 @@ where
                 .read()
                 .expect("query live-source cache read lock poisoned")
                 .get(file)
-                .copied()
+                .cloned()
         {
-            return source;
+            return source.replay(self);
         }
         #[cfg(any(test, feature = "test-support"))]
         if !self.project.has_overlay(file) {
@@ -9775,38 +9708,58 @@ where
                 .entry(file.clone())
                 .or_default() += 1;
         }
-        let source = if self.project.has_overlay(file) {
-            // Keep identity and text from one admitted snapshot. Resolving an
-            // OID from separately read text would capture the overlay twice.
-            self.resolve_prepared_source_unbounded(file)
-                .map(|source| ResolvedLiveSource { oid: source.oid })
-        } else if let Some(oid) = self
-            .store_context
-            .live_paths
-            .snapshot()
-            .validated_oid_for_path(file)
-        {
-            Some(ResolvedLiveSource { oid })
-        } else if let Some(liveness) = self.store_context.liveness.as_ref()
-            && let Ok(Some(oid)) = liveness.oid_for_path(file)
-        {
-            Some(ResolvedLiveSource { oid })
-        } else if file.exists()
-            && let Ok(bytes) = std::fs::read(file.abs_path())
-            && let Ok(oid) = Oid::hash_object(ObjectType::Blob, &bytes)
-        {
-            Some(ResolvedLiveSource { oid })
-        } else {
-            self.git_index_oid_for_file(file)
-                .map(|oid| ResolvedLiveSource { oid })
-        };
+        let source = RequestRead::capture(self, || {
+            if self.project.has_overlay(file) {
+                // Keep identity and text from one admitted snapshot. Resolving an
+                // OID from separately read text would capture the overlay twice.
+                self.resolve_prepared_source_unbounded(file)
+                    .map(|source| ResolvedLiveSource { oid: source.oid })
+            } else if let Some(oid) = self
+                .store_context
+                .live_paths
+                .snapshot()
+                .validated_oid_for_path(file)
+            {
+                Some(ResolvedLiveSource { oid })
+            } else if let Some(liveness) = self.store_context.liveness.as_ref()
+                && let Some(oid) = liveness
+                    .oid_for_path(file)
+                    .map_err(|error| {
+                        self.record_store_error(StoreError::new(format!(
+                            "resolving live source for {file:?}: {error}"
+                        )));
+                    })
+                    .ok()
+                    .flatten()
+            {
+                Some(ResolvedLiveSource { oid })
+            } else if file.exists()
+                && let Some(bytes) = std::fs::read(file.abs_path())
+                    .map_err(|error| {
+                        self.record_source_read_failure(file, &error);
+                    })
+                    .ok()
+                && let Some(oid) = Oid::hash_object(ObjectType::Blob, &bytes)
+                    .map_err(|error| {
+                        self.record_store_error(StoreError::new(format!(
+                            "hashing live source for {file:?}: {error}"
+                        )));
+                    })
+                    .ok()
+            {
+                Some(ResolvedLiveSource { oid })
+            } else {
+                self.git_index_oid_for_file(file)
+                    .map(|oid| ResolvedLiveSource { oid })
+            }
+        });
         if let Some(live_sources) = live_sources.as_ref() {
             live_sources
                 .write()
                 .expect("query live-source cache write lock poisoned")
-                .insert(file.clone(), source);
+                .insert(file.clone(), source.clone());
         }
-        source
+        source.replay(self)
     }
 
     #[doc(hidden)]
@@ -9816,7 +9769,14 @@ where
     }
     fn git_index_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
         let repo = gitblob::discover(self.project.root())?;
-        let index = repo.index().ok()?;
+        let index = repo
+            .index()
+            .map_err(|error| {
+                self.record_store_error(StoreError::new(format!(
+                    "reading git index for {file:?}: {error}"
+                )));
+            })
+            .ok()?;
         index.get_path(file.rel_path(), 0).map(|entry| entry.id)
     }
 
@@ -9831,6 +9791,21 @@ where
             return Some(source);
         }
         None
+    }
+
+    /// Preserve transient I/O provenance before a compatibility reader returns
+    /// no source. Otherwise a file cache could mistake the caller's later
+    /// StructureUnavailable reason for a snapshot-deterministic refusal.
+    fn record_source_read_failure(&self, file: &ProjectFile, error: &std::io::Error) {
+        if error.get_ref().is_some_and(|cause| {
+            cause.is::<brokk_bifrost_core::analyzer::project::BinarySourceRejection>()
+        }) {
+            self.record_admission_refusal(file, SourceAdmissionRefusal::Binary);
+        } else {
+            self.record_store_error(StoreError::new(format!(
+                "reading source for {file:?}: {error}"
+            )));
+        }
     }
 
     fn record_admission_refusal(&self, file: &ProjectFile, reason: SourceAdmissionRefusal) {
@@ -10393,7 +10368,7 @@ where
                 .extend(
                     live_source_entries
                         .iter()
-                        .map(|(file, source)| (file.clone(), Some(*source))),
+                        .map(|(file, source)| (file.clone(), RequestRead::Present(*source))),
                 );
             *analyzed_live_files
                 .write()
@@ -10408,6 +10383,40 @@ where
             }
         }
         files
+    }
+
+    fn merge_children(
+        &self,
+        in_file: Vec<CodeUnit>,
+        cross_file: Vec<(CodeUnit, Option<Range>)>,
+    ) -> Vec<CodeUnit> {
+        let mut seen = HashSet::default();
+        let mut children: Vec<_> = in_file
+            .into_iter()
+            .map(|unit| {
+                let range = self
+                    .ranges(&unit)
+                    .into_iter()
+                    .min_by_key(|range| (range.start_byte, range.end_byte));
+                (unit, range)
+            })
+            .chain(cross_file)
+            .filter(|(unit, _)| seen.insert(unit.clone()))
+            .collect();
+        children.sort_by(|(left, lr), (right, rr)| {
+            left.source()
+                .cmp(right.source())
+                .then_with(|| {
+                    let key = |r: &Option<Range>| {
+                        r.as_ref()
+                            .map(|r| (r.start_byte, r.end_byte))
+                            .unwrap_or((usize::MAX, usize::MAX))
+                    };
+                    key(lr).cmp(&key(rr))
+                })
+                .then_with(|| left.cmp(right))
+        });
+        children.into_iter().map(|(unit, _)| unit).collect()
     }
 
     fn resolve_candidate_rows(&self, rows: Vec<HydratedCandidateRow>) -> Vec<CodeUnit> {
@@ -11555,6 +11564,18 @@ where
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
 
+        if let Some(cross_file) = self.adapter.cross_file_children(self, owner, limit) {
+            let mut rows = self.merge_children(self.direct_children_in_file(owner), cross_file);
+            let inspected = rows.len();
+            let complete = inspected < limit;
+            rows.truncate(limit);
+            return if complete {
+                LimitedQueryRows::complete(rows, inspected)
+            } else {
+                LimitedQueryRows::incomplete(rows, inspected)
+            };
+        }
+
         let file = owner.source();
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
@@ -11920,6 +11941,8 @@ where
         cancellation: &CancellationToken,
     ) -> crate::analyzer::store::Result<SelectedResolutionOverlayInputsOutcome> {
         let language = self.adapter.language();
+        // Admitting Python starts production publication of Python native source rows.
+        // The same change must raise NATIVE_SOURCE_FORMAT once and carry its rejection test (#6108).
         assert!(
             matches!(
                 language,
@@ -12321,16 +12344,16 @@ where
         Some(facts)
     }
 
-    fn hydrate_hierarchy_declaration_facts_unrecorded(
-        &self,
-        facts: &mut [HierarchyDeclarationFacts],
-    ) -> Option<()> {
+    fn hydrate_hierarchy_declaration_facts_unrecorded<T>(&self, rows: &mut [T]) -> Option<()>
+    where
+        T: AsRef<HierarchyDeclarationFacts> + AsMut<HierarchyDeclarationFacts>,
+    {
         if !self.workspace_declaration_identities_authoritative() {
             return None;
         }
-        let keys = facts
+        let keys = rows
             .iter()
-            .filter_map(|facts| facts.storage_key.clone())
+            .filter_map(|row| row.as_ref().storage_key.clone())
             .collect::<Vec<_>>();
         let persisted = self.store_query_or_record(
             |_| {},
@@ -12339,7 +12362,8 @@ where
                 .hierarchy_facts_by_keys(&keys, self.store_context.generations.as_ref()),
             "hydrating hierarchy declaration facts",
         )?;
-        for facts in facts {
+        for row in rows {
+            let facts = row.as_mut();
             let Some(storage_key) = facts.storage_key.as_ref() else {
                 continue;
             };
@@ -12367,9 +12391,10 @@ where
         self.hierarchy_declaration_facts_by_kind_unrecorded(kind)
     }
 
+    #[doc(hidden)]
     /// Query hierarchy declaration candidates for Java's replayable direct
     /// descendant lookup. Only Java uses this narrower variant.
-    pub(crate) fn hierarchy_declaration_facts_by_kind_for_descendant_lookup(
+    pub fn hierarchy_declaration_facts_by_kind_for_descendant_lookup(
         &self,
         kind: CodeUnitType,
     ) -> Option<Vec<HierarchyDeclarationFacts>> {
@@ -12380,25 +12405,29 @@ where
     /// dependency used by callers whose result is not itself a replayable
     /// descendant lookup.
     #[doc(hidden)]
-    pub fn hydrate_hierarchy_declaration_facts(
-        &self,
-        facts: &mut [HierarchyDeclarationFacts],
-    ) -> Option<()> {
+    pub fn hydrate_hierarchy_declaration_facts<T>(&self, rows: &mut [T]) -> Option<()>
+    where
+        T: AsRef<HierarchyDeclarationFacts> + AsMut<HierarchyDeclarationFacts>,
+    {
         if !self.workspace_declaration_identities_authoritative() {
-            return self.hydrate_hierarchy_declaration_facts_unrecorded(facts);
+            return self.hydrate_hierarchy_declaration_facts_unrecorded(rows);
         }
         self.record_read_key(self.scope_read_key());
-        self.hydrate_hierarchy_declaration_facts_unrecorded(facts)
+        self.hydrate_hierarchy_declaration_facts_unrecorded(rows)
     }
 
+    #[doc(hidden)]
     /// Hydrate hierarchy facts for Java's replayable direct descendant lookup.
     /// The precise `Descendants` key is published by the Java provider only
     /// after its complete answer is available.
-    pub(crate) fn hydrate_hierarchy_declaration_facts_for_descendant_lookup(
+    pub fn hydrate_hierarchy_declaration_facts_for_descendant_lookup<T>(
         &self,
-        facts: &mut [HierarchyDeclarationFacts],
-    ) -> Option<()> {
-        self.hydrate_hierarchy_declaration_facts_unrecorded(facts)
+        rows: &mut [T],
+    ) -> Option<()>
+    where
+        T: AsRef<HierarchyDeclarationFacts> + AsMut<HierarchyDeclarationFacts>,
+    {
+        self.hydrate_hierarchy_declaration_facts_unrecorded(rows)
     }
 
     /// The spellings one fq name is looked up under in the `(lang, short_name)`
@@ -13675,7 +13704,8 @@ where
         }
     }
 
-    pub(crate) fn persisted_package_exists(&self, package: &str) -> bool {
+    #[doc(hidden)]
+    pub fn persisted_package_exists(&self, package: &str) -> bool {
         if !self
             .dirty_units_matching(false, |unit| unit.package_name() == package)
             .is_empty()
@@ -14848,7 +14878,8 @@ where
         .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
 
-    pub(crate) fn supertype_lookup_paths_limited(
+    #[doc(hidden)]
+    pub fn supertype_lookup_paths_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
@@ -14905,12 +14936,14 @@ where
         .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
 
-    pub(crate) fn is_scala_trait(&self, code_unit: &CodeUnit) -> bool {
+    #[doc(hidden)]
+    pub fn is_scala_trait(&self, code_unit: &CodeUnit) -> bool {
         self.fetch_file_state(code_unit.source())
             .is_some_and(|state| state.scala_traits.contains(code_unit))
     }
 
-    pub(crate) fn scala_traits(&self) -> Vec<CodeUnit> {
+    #[doc(hidden)]
+    pub fn scala_traits(&self) -> Vec<CodeUnit> {
         self.sql_all_declarations_vec()
             .unwrap_or_default()
             .into_iter()
@@ -16212,6 +16245,10 @@ where
         self.file_source(file)
     }
 
+    fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<Oid> {
+        self.indexed_live_snapshot.oid_for_path(file)
+    }
+
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
         let Some(indexed_oid) = self.indexed_live_snapshot.oid_for_path(file) else {
             return false;
@@ -16514,7 +16551,14 @@ where
             return self.class_declarations_in_package(&code_unit.fq_name());
         }
 
-        self.direct_children_in_file(code_unit)
+        let in_file = self.direct_children_in_file(code_unit);
+        match self
+            .adapter
+            .cross_file_children(self, code_unit, usize::MAX)
+        {
+            Some(cross_file) => self.merge_children(in_file, cross_file),
+            None => in_file,
+        }
     }
 
     fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -17678,7 +17722,8 @@ fn enclosing_code_unit_from_state(state: &FileState, range: &Range) -> Option<Co
 /// Graph scans that own a bulk [`FileState`] projection use this instead of
 /// returning through [`CodeUnitIndex::enclosing_code_unit`], which would
 /// redundantly reopen the store for facts already present in the request.
-pub(crate) fn enclosing_code_unit_from_declaration_ranges(
+#[doc(hidden)]
+pub fn enclosing_code_unit_from_declaration_ranges(
     declarations: &HashSet<CodeUnit>,
     ranges: &HashMap<CodeUnit, Vec<Range>>,
     range: &Range,
@@ -17890,6 +17935,7 @@ pub mod resolution_producer_tests;
 mod sigil_anchor_tests {
     use crate::analyzer::SearchSymbolPatternBatch;
 
+    #[cfg(test)]
     #[brokk_bifrost_test_macros::hardwon(
         "#1127: a trailing sigil was treated as a regex end anchor instead of identifier text"
     )]
@@ -17907,6 +17953,7 @@ mod sigil_anchor_tests {
         assert!(!anchored.is_match("foo.$"));
     }
 
+    #[cfg(test)]
     #[test]
     fn dollar_after_dollar_is_identifier_text_not_end_anchor() {
         // #1059 (reopened): `next_is_word` counted `$` as word-ish but

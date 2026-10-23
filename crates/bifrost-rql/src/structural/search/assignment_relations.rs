@@ -2,7 +2,10 @@
 
 use super::*;
 
-use crate::analyzer::semantic::{LengthDelimitedDigest, SemanticValueKind};
+use crate::analyzer::semantic::{
+    BindingOriginIndex, LengthDelimitedDigest, SemanticCapability, SemanticGapKind,
+    SemanticGapSubject, SemanticValueKind, SourceMappingKind,
+};
 use crate::analyzer::usages::effects::EffectCoverage;
 use crate::query::{AssignmentRelationFilter, AssignmentRelationKind};
 use brokk_bifrost_analysis::analyzer::{
@@ -176,7 +179,8 @@ fn ordinary_assignment_relation_expansions(
     }
     if !unsupported.is_empty() {
         diagnostics.push(CodeQueryDiagnostic {
-            source: None,
+            related: Vec::new(),
+            source: procedure.diagnostic_source(),
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -205,7 +209,8 @@ fn ordinary_assignment_relation_expansions(
     };
     if !candidates.complete {
         diagnostics.push(CodeQueryDiagnostic {
-            source: None,
+            related: Vec::new(),
+            source: procedure.diagnostic_source(),
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -239,7 +244,9 @@ fn ordinary_assignment_relation_expansions(
                     second + 1 == candidates.rows.len()
                         || candidates.rows[second + 1].range.start_byte != start
                 );
-                Some((first, second))
+                (candidate.verdict != PlainAssignmentVerdict::Excluded
+                    && candidates.rows[second].verdict != PlainAssignmentVerdict::Excluded)
+                    .then_some((first, second))
             })
             .collect::<Vec<_>>()
     } else {
@@ -304,7 +311,7 @@ fn ordinary_assignment_relation_expansions(
         report_open_candidates(procedure, &expansions, diagnostics);
         return expansions;
     };
-    let proof_complete = if cpp_family {
+    let (proof_complete, proof_reasons) = if cpp_family {
         // An unrelated local that has no establishment is handled by each
         // candidate's initialization proof below. It must not hide a
         // separately initialized ordinary binding in the same C/C++ procedure
@@ -327,20 +334,17 @@ fn ordinary_assignment_relation_expansions(
         let completeness = if reasons.is_empty() {
             FlowStateCompleteness::Complete
         } else {
-            FlowStateCompleteness::Incomplete { reasons }
+            FlowStateCompleteness::Incomplete {
+                reasons: reasons.clone(),
+            }
         };
-        flow_state_cache.report_completeness(
-            &procedure.wire_id(),
-            language,
-            &completeness,
-            ASSIGNMENT_RELATION_AXES,
-            derivation.generation,
-            diagnostics,
-        );
-        candidates.complete
-            && completeness.covers(FlowStateAxis::BindingEvents)
-            && completeness.covers(FlowStateAxis::ReachingRelation)
-            && completeness.covers(FlowStateAxis::SameEvaluationRelation)
+        (
+            candidates.complete
+                && completeness.covers(FlowStateAxis::BindingEvents)
+                && completeness.covers(FlowStateAxis::ReachingRelation)
+                && completeness.covers(FlowStateAxis::SameEvaluationRelation),
+            reasons,
+        )
     } else {
         // The same-evaluation, reaching, and initialization proofs below
         // scope lowering gaps to each assignment. Only a procedure-wide hole
@@ -361,17 +365,7 @@ fn ordinary_assignment_relation_expansions(
             .cloned()
             .collect::<Vec<_>>();
         let binding_events_complete = reasons.is_empty();
-        if !binding_events_complete {
-            flow_state_cache.report_completeness(
-                &procedure.wire_id(),
-                language,
-                &FlowStateCompleteness::Incomplete { reasons },
-                &[FlowStateAxis::BindingEvents],
-                derivation.generation,
-                diagnostics,
-            );
-        }
-        candidates.complete && binding_events_complete
+        (candidates.complete && binding_events_complete, reasons)
     };
 
     let mut expansions = if self_selected {
@@ -401,6 +395,43 @@ fn ordinary_assignment_relation_expansions(
             expansions.push(pair);
         }
     }
+    // #6409: excluded or identity-decided self/swap candidates need no global
+    // flow proof. Same-binding self assignments keep their scoped establishment,
+    // same-evaluation and initialization proofs. Report global axes only when
+    // a surviving candidate actually consults procedure-wide completeness.
+    if expansions.iter().any(|expansion| {
+        matches!(&expansion.value, PipelineValue::AssignmentRelation(value)
+            if value.reason == Some("flow_state_incomplete"))
+    }) {
+        let completeness = if proof_reasons.is_empty() {
+            FlowStateCompleteness::Complete
+        } else {
+            FlowStateCompleteness::Incomplete {
+                reasons: proof_reasons.clone(),
+            }
+        };
+        flow_state_cache.report_completeness(
+            &procedure.wire_id(),
+            Some(procedure),
+            language,
+            &completeness,
+            if cpp_family {
+                ASSIGNMENT_RELATION_AXES
+            } else {
+                &[FlowStateAxis::BindingEvents]
+            },
+            derivation.generation,
+            diagnostics,
+        );
+    }
+    let proof_related = procedure.related_flow_reasons(&proof_reasons);
+    for expansion in &mut expansions {
+        if let PipelineValue::AssignmentRelation(value) = &mut expansion.value
+            && value.reason == Some("flow_state_incomplete")
+        {
+            value.related.extend(proof_related.iter().cloned());
+        }
+    }
     report_open_candidates(procedure, &expansions, diagnostics);
     expansions
 }
@@ -421,7 +452,8 @@ fn overwritten_unread_expansions(
     );
     if !supports_relation(dialect, AssignmentRelationKind::OverwrittenUnread) {
         diagnostics.push(CodeQueryDiagnostic {
-            source: None,
+            related: Vec::new(),
+            source: procedure.diagnostic_source(),
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -482,7 +514,8 @@ fn overwritten_unread_expansions(
     }
     if !candidates.complete {
         diagnostics.push(CodeQueryDiagnostic {
-            source: None,
+            related: Vec::new(),
+            source: procedure.diagnostic_source(),
             code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
@@ -550,8 +583,9 @@ fn overwritten_unread_expansions(
     };
     flow_state_cache.report_completeness(
         &procedure.wire_id(),
+        Some(procedure),
         dialect.language(),
-        &derivation.completeness,
+        &derivation.overwrite_observation_completeness(&procedure.handle),
         OVERWRITTEN_UNREAD_AXES,
         derivation.generation,
         diagnostics,
@@ -606,6 +640,7 @@ fn overwritten_unread_expansions(
         let mut has_proven_copy = false;
         let mut counterexample = None;
         let mut incomplete = None;
+        let mut incomplete_reasons = Vec::new();
         for &point in &candidate.points {
             let Some(write) = unique_establishment(derivation, point, target) else {
                 incomplete = Some("assignment_establishment_ambiguous");
@@ -621,8 +656,12 @@ fn overwritten_unread_expansions(
                 {
                     BindingInitializationAnswer::Proven => {}
                     BindingInitializationAnswer::Unreachable => continue,
-                    BindingInitializationAnswer::MayBeUninitialized
-                    | BindingInitializationAnswer::Open { .. } => {
+                    BindingInitializationAnswer::MayBeUninitialized => {
+                        incomplete = Some("target_initialization_unproved");
+                        continue;
+                    }
+                    BindingInitializationAnswer::Open { reasons } => {
+                        incomplete_reasons.extend(reasons);
                         incomplete = Some("target_initialization_unproved");
                         continue;
                     }
@@ -644,8 +683,10 @@ fn overwritten_unread_expansions(
                 OverwrittenUnreadAnswer::Unreachable => {}
                 OverwrittenUnreadAnswer::Open { reasons } => {
                     incomplete = Some("overwrite_proof_open");
+                    incomplete_reasons.extend(reasons.iter().cloned());
                     diagnostics.push(CodeQueryDiagnostic {
-                        source: None,
+                        related: procedure.related_flow_reasons(&reasons),
+                        source: procedure.diagnostic_source(),
                         code: CodeQueryDiagnosticCode::EffectDerivationIncomplete,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
                         branch: Vec::new(),
@@ -707,7 +748,7 @@ fn overwritten_unread_expansions(
                 Vec::new(),
             )
         };
-        expansions.push(expansion);
+        expansions.push(with_flow_reasons(expansion, procedure, &incomplete_reasons));
     }
     report_open_candidates(procedure, &expansions, diagnostics);
     expansions
@@ -833,9 +874,39 @@ fn report_open_candidates(
             ),
             Vec::new(),
         );
+        diagnostic.source = procedure.diagnostic_source();
+        let mut seen = HashSet::default();
+        diagnostic.related = expansions
+            .iter()
+            .filter_map(|expansion| match &expansion.value {
+                PipelineValue::AssignmentRelation(value)
+                    if value.coverage == EffectCoverage::Open =>
+                {
+                    Some(&value.related)
+                }
+                _ => None,
+            })
+            .flatten()
+            .filter(|related| seen.insert((*related).clone()))
+            .cloned()
+            .collect();
         diagnostic.withheld_rows_path = Some(rel_path_string(procedure.file()));
         diagnostics.push(diagnostic);
     }
+}
+
+fn with_flow_reasons(
+    mut expansion: PipelineExpansion,
+    procedure: &semantic::SemanticProcedureValue,
+    reasons: &[brokk_bifrost_flow::flow_state::FlowStateIncompleteReason],
+) -> PipelineExpansion {
+    let PipelineValue::AssignmentRelation(value) = &mut expansion.value else {
+        unreachable!("assignment qualification returns an assignment row")
+    };
+    value
+        .related
+        .extend(procedure.related_flow_reasons(reasons));
+    expansion
 }
 
 /// Qualify one C candidate. C proves its prior definition by an exact unique
@@ -993,35 +1064,40 @@ fn qualify_c_candidate(
             None,
         );
     }
+    let mut initialization_reasons = Vec::new();
     if reaching.iter().all(Vec::is_empty)
-        && matches!(
-            procedure.handle.semantics().value(target),
-            Some(value) if matches!(&value.kind, SemanticValueKind::Parameter { .. })
-        )
-        && matches!(
-            derivation.binding_initialization_at_read(&procedure.handle, read.event),
-            BindingInitializationAnswer::Proven
-        )
+        && matches!(procedure.handle.semantics().value(target), Some(value) if matches!(&value.kind, SemanticValueKind::Parameter { .. }))
     {
-        return row(
-            procedure,
-            candidate,
-            Some(read.value),
-            "self_assignment",
-            "exact",
-            EffectCoverage::Exhaustive,
-            None,
-        );
+        match derivation.binding_initialization_at_read(&procedure.handle, read.event) {
+            BindingInitializationAnswer::Proven => {
+                return row(
+                    procedure,
+                    candidate,
+                    Some(read.value),
+                    "self_assignment",
+                    "exact",
+                    EffectCoverage::Exhaustive,
+                    None,
+                );
+            }
+            BindingInitializationAnswer::Open { reasons } => initialization_reasons = reasons,
+            BindingInitializationAnswer::Unreachable
+            | BindingInitializationAnswer::MayBeUninitialized => {}
+        }
     }
     if reaching.iter().all(Vec::is_empty) {
-        return row(
+        return with_flow_reasons(
+            row(
+                procedure,
+                candidate,
+                Some(read.value),
+                "unknown",
+                "unknown",
+                EffectCoverage::Open,
+                Some("initialization_unproved"),
+            ),
             procedure,
-            candidate,
-            Some(read.value),
-            "unknown",
-            "unknown",
-            EffectCoverage::Open,
-            Some("initialization_unproved"),
+            &initialization_reasons,
         );
     }
     row(
@@ -1035,7 +1111,7 @@ fn qualify_c_candidate(
     )
 }
 
-/// Qualify one Java, JavaScript, TypeScript, or Python candidate.
+/// Qualify one supported non-C assignment candidate.
 ///
 /// Every lowered copy of the assignment must read the target binding itself
 /// in its own evaluation, and the target must be initialized at that read.
@@ -1072,7 +1148,29 @@ fn qualify_candidate(
         }
         PlainAssignmentVerdict::Supported => {}
     }
-    if !flow_complete {
+    // #6409: binding identity precedes procedure-wide event completeness.
+    // Distinct identities refute self-assignment immediately. Equal identities
+    // still need every existing per-point and initialization proof below.
+    let origins = BindingOriginIndex::from_semantics(procedure.handle.semantics());
+    let identities =
+        exact_assignment_bindings(derivation, &origins, &candidate).filter(|&(target, rhs)| {
+            binding_identities_are_closed(procedure, derivation, &origins, &[target, rhs])
+        });
+    if let Some((target, rhs)) = identities
+        && target != rhs
+    {
+        let rhs_read = candidate.rhs_value;
+        return row(
+            procedure,
+            candidate,
+            rhs_read,
+            "different",
+            "exact",
+            EffectCoverage::Exhaustive,
+            Some("different_binding"),
+        );
+    }
+    if identities.is_none() && !flow_complete {
         return row(
             procedure,
             candidate,
@@ -1096,6 +1194,7 @@ fn qualify_candidate(
     };
     let mut proven_read = None;
     let mut open = None;
+    let mut open_reasons = Vec::new();
     for &point in &candidate.points {
         let Some(establishment) = unique_establishment(derivation, point, target) else {
             return row(
@@ -1108,16 +1207,23 @@ fn qualify_candidate(
                 Some("assignment_establishment_ambiguous"),
             );
         };
-        let Ok(reads) = rhs_reads(procedure, derivation, &candidate, establishment) else {
-            return row(
-                procedure,
-                candidate,
-                None,
-                "unknown",
-                "unknown",
-                EffectCoverage::Open,
-                Some("same_evaluation_open"),
-            );
+        let reads = match rhs_reads(procedure, derivation, &candidate, establishment) {
+            Ok(reads) => reads,
+            Err(reasons) => {
+                return with_flow_reasons(
+                    row(
+                        procedure,
+                        candidate,
+                        None,
+                        "unknown",
+                        "unknown",
+                        EffectCoverage::Open,
+                        Some("same_evaluation_open"),
+                    ),
+                    procedure,
+                    &reasons,
+                );
+            }
         };
         let Some(read) = reads.first() else {
             return row(
@@ -1163,21 +1269,26 @@ fn qualify_candidate(
                 BindingInitializationAnswer::MayBeUninitialized => {
                     open.get_or_insert((read.value, "initialization_unproved"));
                 }
-                BindingInitializationAnswer::Open { .. } => {
+                BindingInitializationAnswer::Open { reasons } => {
+                    open_reasons.extend(reasons);
                     open = Some((read.value, "initialization_proof_open"));
                 }
             }
         }
     }
     if let Some((read, reason)) = open {
-        return row(
+        return with_flow_reasons(
+            row(
+                procedure,
+                candidate,
+                Some(read),
+                "unknown",
+                "unknown",
+                EffectCoverage::Open,
+                Some(reason),
+            ),
             procedure,
-            candidate,
-            Some(read),
-            "unknown",
-            "unknown",
-            EffectCoverage::Open,
-            Some(reason),
+            &open_reasons,
         );
     }
     let Some(read) = proven_read else {
@@ -1214,29 +1325,39 @@ fn qualify_failed_swap(
     {
         return None;
     }
-    let open = |rhs_read, reason| {
-        Some(swap_row(
-            procedure,
-            first,
-            second,
-            rhs_read,
-            "unknown",
-            "unknown",
-            EffectCoverage::Open,
-            Some(reason),
-        ))
-    };
+    let open =
+        |rhs_read,
+         reason,
+         reasons: &[brokk_bifrost_flow::flow_state::FlowStateIncompleteReason]| {
+            Some(with_flow_reasons(
+                swap_row(
+                    procedure,
+                    first,
+                    second,
+                    rhs_read,
+                    "unknown",
+                    "unknown",
+                    EffectCoverage::Open,
+                    Some(reason),
+                ),
+                procedure,
+                reasons,
+            ))
+        };
     if first.verdict == PlainAssignmentVerdict::Unknown
         || second.verdict == PlainAssignmentVerdict::Unknown
     {
-        return open(None, "assignment_pair_unqualified");
+        return open(None, "assignment_pair_unqualified", &[]);
     }
     let (first_target, second_target) = (first.target?, second.target?);
     if first_target == second_target {
         return None;
     }
+    if failed_swap_is_refuted(procedure, derivation, first, second) {
+        return None;
+    }
     if !flow_complete {
-        return open(None, "flow_state_incomplete");
+        return open(None, "flow_state_incomplete", &[]);
     }
     let Some(first_writes) = first
         .points
@@ -1245,7 +1366,7 @@ fn qualify_failed_swap(
         .collect::<Option<Vec<_>>>()
         .filter(|writes| !writes.is_empty())
     else {
-        return open(None, "first_write_unproved");
+        return open(None, "first_write_unproved", &[]);
     };
     let Some(second_writes) = second
         .points
@@ -1254,7 +1375,7 @@ fn qualify_failed_swap(
         .collect::<Option<Vec<_>>>()
         .filter(|writes| !writes.is_empty())
     else {
-        return open(None, "second_write_unproved");
+        return open(None, "second_write_unproved", &[]);
     };
     // Each lowered copy of the second assignment must read the value that
     // its own copy of the first assignment wrote. An exact reaching row
@@ -1266,9 +1387,9 @@ fn qualify_failed_swap(
         let second_read = match rhs_reads(procedure, derivation, second, second_write) {
             Ok(reads) => match reads.as_slice() {
                 [read] => *read,
-                _ => return open(None, "second_read_unproved"),
+                _ => return open(None, "second_read_unproved", &[]),
             },
-            Err(_) => return open(None, "same_evaluation_open"),
+            Err(reasons) => return open(None, "same_evaluation_open", &reasons),
         };
         if second_read.subject
             != (FlowSubject::Binding {
@@ -1292,14 +1413,14 @@ fn qualify_failed_swap(
             _ => None,
         };
         let Some(first_write) = first_write else {
-            return open(Some(second_read.value), "ordered_write_unproved");
+            return open(Some(second_read.value), "ordered_write_unproved", &[]);
         };
         let first_read = match rhs_reads(procedure, derivation, first, first_write) {
             Ok(reads) => match reads.as_slice() {
                 [read] => *read,
-                _ => return open(Some(second_read.value), "first_read_unproved"),
+                _ => return open(Some(second_read.value), "first_read_unproved", &[]),
             },
-            Err(_) => return open(Some(second_read.value), "same_evaluation_open"),
+            Err(reasons) => return open(Some(second_read.value), "same_evaluation_open", &reasons),
         };
         if first_read.subject
             != (FlowSubject::Binding {
@@ -1313,7 +1434,11 @@ fn qualify_failed_swap(
             Language::Java | Language::CSharp
         ) && (first.swap_type.is_none() || first.swap_type != second.swap_type)
         {
-            return open(Some(second_read.value), "assignment_conversion_unproved");
+            return open(
+                Some(second_read.value),
+                "assignment_conversion_unproved",
+                &[],
+            );
         }
         match derivation.binding_initialization_at_read(&procedure.handle, first_read.event) {
             BindingInitializationAnswer::Proven => proven_read = Some(second_read.value),
@@ -1322,10 +1447,15 @@ fn qualify_failed_swap(
                 return open(
                     Some(second_read.value),
                     "first_value_initialization_unproved",
+                    &[],
                 );
             }
-            BindingInitializationAnswer::Open { .. } => {
-                return open(Some(second_read.value), "initialization_proof_open");
+            BindingInitializationAnswer::Open { reasons } => {
+                return open(
+                    Some(second_read.value),
+                    "initialization_proof_open",
+                    &reasons,
+                );
             }
         }
     }
@@ -1339,6 +1469,126 @@ fn qualify_failed_swap(
         EffectCoverage::Exhaustive,
         None,
     ))
+}
+
+fn failed_swap_is_refuted(
+    procedure: &semantic::SemanticProcedureValue,
+    derivation: &FlowStateDerivation,
+    first: &PlainAssignmentCandidate,
+    second: &PlainAssignmentCandidate,
+) -> bool {
+    let semantics = procedure.handle.semantics();
+    let origins = BindingOriginIndex::from_semantics(semantics);
+    let (Some((first_target, first_rhs)), Some((second_target, second_rhs))) = (
+        exact_assignment_bindings(derivation, &origins, first),
+        exact_assignment_bindings(derivation, &origins, second),
+    ) else {
+        return false;
+    };
+    if first_rhs == second_target && second_rhs == first_target {
+        return false;
+    }
+    if !binding_identities_are_closed(
+        procedure,
+        derivation,
+        &origins,
+        &[first_target, second_target, first_rhs, second_rhs],
+    ) {
+        return false;
+    }
+    // #6409: a Point pattern/LocalFlow gap can hide a shadow between the two
+    // statements of a swap. The IR has no lexical scope for it, so treat an
+    // earlier such gap as enclosing even if it could be a sibling scope.
+    // Self-assignment deliberately omits this blocker: inside one plain
+    // target = rhs statement nothing can occur between its read and write,
+    // and a shadow before it renames both sides alike. Initialization remains
+    // a separate scoped proof for a same-binding self-assignment.
+    !semantics.gaps().iter().any(|gap| {
+        gap.subject == SemanticGapSubject::Point
+            && (gap.capability == SemanticCapability::LocalFlow
+                || (gap.kind == SemanticGapKind::Unsupported
+                    && gap.capability == SemanticCapability::Values))
+            && semantics.source_mapping(gap.source).is_none_or(|mapping| {
+                mapping.kind != SourceMappingKind::Exact
+                    || mapping.locator.anchor().span().start_byte() as usize
+                        <= second.range.end_byte
+            })
+    })
+}
+
+/// Unique structured target and retained RHS read identities, never spelling.
+fn exact_assignment_bindings(
+    derivation: &FlowStateDerivation,
+    origins: &BindingOriginIndex,
+    candidate: &PlainAssignmentCandidate,
+) -> Option<(
+    crate::analyzer::semantic::ValueId,
+    crate::analyzer::semantic::ValueId,
+)> {
+    let target = candidate.target?;
+    let binding = origins.unique_binding_origin(candidate.rhs_value?)?;
+    let rhs = candidate
+        .rhs_identifier_range
+        .as_ref()
+        .or(candidate.rhs_range.as_ref())?;
+    let mut reads = derivation
+        .events
+        .iter()
+        .filter(|event| {
+            event.event_class == StateEventClass::Read && same_range(&event.site.range, rhs)
+        })
+        .peekable();
+    (reads.peek().is_some()
+        && reads.all(|read| {
+            read.subject == FlowSubject::Binding { value: binding }
+                && origins.unique_binding_origin(read.value) == Some(binding)
+        }))
+    .then_some((target, binding))
+}
+
+/// #6409: assignment relations compare binding identities before reaching or
+/// initialization proofs. All selected bindings need unique self-origins and
+/// exact retained read joins from exact_assignment_bindings. A Value-subject
+/// Values gap concerns content or Copy/move semantics, not which binding a read
+/// denotes; its kind and ValueFlow/Aliasing impacts cannot equate distinct
+/// bindings. Exempt it only when its binding has a unique self-origin.
+/// Assignments gaps still hide targets. Whole-procedure gaps, missing origins
+/// and non-lowering binding-event evidence keep identity open. This predicate
+/// proves identity alone; it discharges no initialization or crossed-pair gap.
+fn binding_identities_are_closed(
+    procedure: &semantic::SemanticProcedureValue,
+    derivation: &FlowStateDerivation,
+    origins: &BindingOriginIndex,
+    bindings: &[crate::analyzer::semantic::ValueId],
+) -> bool {
+    if derivation.completeness.reasons().iter().any(|reason| {
+        reason.blocks(FlowStateAxis::BindingEvents)
+            && !matches!(
+                reason,
+                FlowStateIncompleteReason::LoweringGap { .. }
+                    | FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
+            )
+    }) || bindings
+        .iter()
+        .any(|binding| origins.unique_binding_origin(*binding) != Some(*binding))
+    {
+        return false;
+    }
+    !procedure
+        .handle
+        .semantics()
+        .gaps()
+        .iter()
+        .any(|gap| match gap.subject {
+            _ if gap.capability == SemanticCapability::Assignments => true,
+            SemanticGapSubject::Value(value) => {
+                bindings.contains(&value)
+                    && !(gap.capability == SemanticCapability::Values
+                        && origins.unique_binding_origin(value) == Some(value))
+            }
+            SemanticGapSubject::Procedure => true,
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1446,6 +1696,7 @@ fn row(
     digest.push(verdict.as_bytes());
     pipeline_expansion(PipelineValue::AssignmentRelation(Box::new(
         AssignmentRelationValue {
+            related: Vec::new(),
             file: procedure.file().clone(),
             range: candidate.range,
             ast_id: None,

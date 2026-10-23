@@ -1067,6 +1067,14 @@ impl BoundedProducerDiagnostics {
         }
     }
 
+    /// Includes suppressed diagnostics so producer certification cannot depend
+    /// on the diagnostic retention limit.
+    pub fn total(&self) -> usize {
+        self.diagnostics
+            .len()
+            .saturating_add(self.suppressed.total())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.diagnostics.is_empty() && self.suppressed.total() == 0
     }

@@ -58,16 +58,19 @@ const ATTRIBUTE_WRAPPER_KINDS: [&str; 3] = [
 ///
 /// For any other node, this returns the node unchanged.
 pub fn unwrap_attributes(mut node: Node<'_>) -> Node<'_> {
-    while ATTRIBUTE_WRAPPER_KINDS.contains(&node.kind()) {
-        let Some(child) = node
-            .child_by_field_name("declaration")
-            .or_else(|| node.child_by_field_name("expression"))
-        else {
-            break;
-        };
+    while let Some(child) = attribute_payload(node) {
         node = child;
     }
     node
+}
+
+/// The direct declaration or expression carried by one attribute wrapper.
+pub(crate) fn attribute_payload(node: Node<'_>) -> Option<Node<'_>> {
+    if !ATTRIBUTE_WRAPPER_KINDS.contains(&node.kind()) {
+        return None;
+    }
+    node.child_by_field_name("declaration")
+        .or_else(|| node.child_by_field_name("expression"))
 }
 
 /// The containing syntax node outside an attribute wrapper owned by `node`.

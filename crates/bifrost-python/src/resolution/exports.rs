@@ -25,7 +25,7 @@ pub(super) fn produce(
                 hoisting: HoistingClass::SourceOrder,
             },
         );
-        // A source inventory is not a selected initialized module attribute.
+        // Availability is unknown for this export, not for other module names.
         let name = p
             .facts
             .identifiers
@@ -35,11 +35,10 @@ pub(super) fn produce(
             .name;
         p.facts.add_route_gap(
             declaration,
-            ResolutionRouteGap::UnknownBinder {
+            ResolutionRouteGap::UnprovenExport {
                 scope: module,
-                name: Some(name),
-                namespace: Some(ResolutionNamespace::Value),
-                may_publish: true,
+                name,
+                namespace: ResolutionNamespace::Value,
             },
         );
         p.facts.root_exports.push(ResolutionRootExportFact {

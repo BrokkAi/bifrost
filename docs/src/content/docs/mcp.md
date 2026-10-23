@@ -276,6 +276,25 @@ an empty result. For example,
 `compilation_scope_unresolved` means Bifrost preserved proven file-dependency
 evidence but could not fully establish a language compilation boundary.
 
+`list_function_sources` inventories callable declaration ranges in the current
+indexed workspace. `paths` optionally selects exact workspace-relative files;
+`include_tests` defaults to `true`. Its structured-only result contains `records`
+and a `summary` with `file_count` (files contributing records), `record_count`,
+and `skipped_files` with a path and reason when indexed source or blob identity
+is unavailable. Each record includes `declaration_id`, `site_id`, `fq_name`,
+`name`, `kind`, `signature`, `language`, `rel_path`, `blob_oid`, `start_line`,
+`end_line`, `start_byte`, `end_byte`, `is_test`, and `source`. There is one record
+per declaration range, including overload sites. Lines are
+one-based and byte ranges are end-exclusive; these coordinates and `site_id`
+refer to the declaration before comment expansion. `source` includes attached
+leading comments and preserves the indexed text. `blob_oid` identifies the raw
+indexed file bytes using Git's blob hash, even if disk contents later change.
+
+The inventory follows the analyzer's callable declarations. Rust block-local
+functions currently have native analysis facts but no declaration projection,
+so they are included within their enclosing function's source rather than
+returned as separate records.
+
 `cyclomatic_complexity` uses the same endpoints and the same heuristic scorer
 as the file-oriented `compute_cyclomatic_complexity` tool. It returns functions
 introduced or patch-edited by the diff. Introduced functions have a postimage

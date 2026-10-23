@@ -1256,6 +1256,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         activated_pack_ids.push(pack.pack_id);
     }
     let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .map_err(|error| format!("parse bifrost version: {error}"))?,
         evidence,
@@ -1928,6 +1929,7 @@ mod tests {
                 .expect("build ephemeral workspace");
         let cancellation = CancellationToken::new();
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             evidence: Vec::new(),
             controls: Vec::new(),

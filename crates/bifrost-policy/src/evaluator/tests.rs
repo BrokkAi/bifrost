@@ -836,6 +836,7 @@ fn cvss_overlay_hash_uses_canonical_labels_and_utc_time() {
 #[test]
 fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive() {
     let broad = CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
         impact: CodeQueryDiagnosticImpact::Advisory,
@@ -851,7 +852,7 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
     // raised it, and only a whole execution can raise it, so forwarding it
     // would make a sliced run and a full run differ in report bytes and at the
     // retention boundary.
-    let adapted = adapt_query_diagnostics(&[broad], 8);
+    let adapted = adapt_query_diagnostics(&[broad], 8, 64);
     assert!(adapted.diagnostics.is_empty());
     assert!(!adapted.truncated);
     assert!(!adapted.adaptation_failed);
@@ -896,6 +897,7 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
     // Any forwarded code will do; deliberately not `broad_query`, which a
     // policy run drops before it can be rejected for its length.
     let rejected = CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,
@@ -906,6 +908,7 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         withheld_rows_path: None,
     };
     let valid = CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,
@@ -916,7 +919,7 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         withheld_rows_path: None,
     };
 
-    let adapted = adapt_query_diagnostics(&[rejected, valid], 1);
+    let adapted = adapt_query_diagnostics(&[rejected, valid], 1, 64);
 
     assert!(adapted.adaptation_failed);
     assert!(adapted.truncated);
@@ -1874,6 +1877,7 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         steps: Vec::new(),
     };
     let diagnostic = CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
         impact: CodeQueryDiagnosticImpact::Advisory,

@@ -140,8 +140,9 @@ mod tests {
     use std::sync::Arc;
 
     use brokk_bifrost_analysis::CancellationToken;
-    use brokk_bifrost_analysis::analyzer::{IAnalyzer, JavaAnalyzer, Language};
+    use brokk_bifrost_analysis::analyzer::{IAnalyzer, Language};
     use brokk_bifrost_js_ts_analysis::TypescriptAnalyzer;
+    use brokk_bifrost_jvm_analysis::JavaAnalyzer;
     use brokk_bifrost_python_analysis::PythonAnalyzer;
     use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
     use brokk_bifrost_rust_analysis::RustAnalyzer;

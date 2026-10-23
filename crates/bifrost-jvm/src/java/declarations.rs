@@ -2782,6 +2782,26 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
     parsed
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn java_source_facts_for_test(
+    source: &str,
+) -> brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts {
+    use brokk_bifrost_core::analyzer::ProjectFile;
+    use tree_sitter::Parser;
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("Java grammar");
+    let tree = parser.parse(source, None).expect("Java fixture tree");
+    let root = std::env::current_dir()
+        .expect("current directory")
+        .join("fact-resolution-java-correctness");
+    let file = ProjectFile::new(root, "src/Fixture.java");
+    parse_java_file(&file, source, &tree).resolution_facts
+}
+
 #[cfg(test)]
 mod same_package_identifier_tests {
 

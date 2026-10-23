@@ -35,7 +35,7 @@ use brokk_bifrost_analysis::analyzer::languages::NativeWorkspaceGraphProvider;
 
 use brokk_bifrost_analysis::analyzer::languages::edge_passes;
 
-use brokk_bifrost_analysis::analyzer::languages::language_support;
+use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
 
@@ -258,7 +258,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let graph_passes = edge_passes();
     let mut native_buckets: HashMap<EdgePassId, NativeDeadCodeBucket> = HashMap::default();
     for candidate in &candidate_selection.candidates {
-        let support = language_support(code_unit_language(candidate));
+        let support = language_support_for_hook(code_unit_language(candidate), "dead_code");
         let dead_code = support
             .map(|support| support.dead_code())
             .unwrap_or_default();
@@ -882,7 +882,7 @@ mod tests {
 
         use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
-        use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+        use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
         use brokk_bifrost_core::hash::HashSet;
 
@@ -921,10 +921,13 @@ mod tests {
                     raw_proven_inbound: vec![0; nodes.len()],
                     nodes,
                     edges: Vec::new(),
+                    same_owner_edges: Vec::new(),
                     admitted_callers: HashSet::from_iter(admitted_callers.iter().cloned()),
                     skipped_callers: Default::default(),
                     build_selection_unavailable: None,
+                    domain_discovery_failures: Vec::new(),
                     unresolved_names: Some(self.unresolved_names.clone()),
+                    withheld_references: Vec::new(),
                     forward_completeness: self.completeness.clone(),
                     kind_projection_complete: self.completeness.is_complete(),
                     generation: analyzer.project().analysis_generation(),
@@ -1015,7 +1018,7 @@ mod tests {
 
     #[test]
     fn native_exact_callers_do_not_rebind_colliding_names() {
-        use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+        use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
         use std::collections::BTreeMap;
 
         let source = "package p; class C { void caller() {} void target() {} }\n";
@@ -1068,7 +1071,7 @@ mod tests {
     fn native_rust_dead_code_separates_same_named_impl_members() {
         use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
 
-        use brokk_bifrost_analysis::analyzer::languages::language_support;
+        use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 
         let source = concat!(
             "struct Left;\n",
@@ -1100,7 +1103,8 @@ mod tests {
         assert_eq!(candidates.len(), 2);
 
         let mut skipped = Vec::new();
-        let support = language_support(Language::Rust).expect("Rust language support");
+        let support = language_support_for_hook(Language::Rust, "dead_code_needs_precise_scan")
+            .expect("Rust language support");
         let findings = candidates
             .iter()
             .map(|candidate| {
@@ -2048,7 +2052,30 @@ fn prove_native_candidates(
     let mut incoming = HashMap::default();
     for candidate in candidates {
         if let Some(&index) = node_indices.get(&candidate.declaration_id()) {
-            incoming.insert(index, GraphIncomingUsage::default());
+            let node = &projection.nodes[index];
+            // GoNativeUsageStrategy::find_graph_usages uses CodeUnit::file_scope
+            // as the precise route's fallback for a site without an enclosing
+            // declaration. Score the same use the same way here: one non-same-owner
+            // caller per distinct file, weighted by that file's site count.
+            incoming.insert(
+                index,
+                GraphIncomingUsage {
+                    total: node.proven_non_graph_inbound_by_file.values().sum(),
+                    callers: node
+                        .proven_non_graph_inbound_by_file
+                        .iter()
+                        .map(|(file, count)| {
+                            (
+                                GraphIncomingCaller::Declaration(CodeUnit::file_scope(
+                                    file.clone(),
+                                )),
+                                *count,
+                            )
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            );
         }
     }
     for edge in &projection.edges {
@@ -2056,6 +2083,9 @@ fn prove_native_candidates(
             continue;
         };
         let count = edge.counts.total();
+        if count == 0 {
+            continue;
+        }
         usage.total = usage
             .total
             .checked_add(count)
@@ -3039,7 +3069,7 @@ fn query_graph_usages(
 /// `DeadCodeSupport::strategy` at `None` so a candidate that does reach this path is
 /// still skipped as inconclusive.
 fn graph_strategy_for(candidate: &CodeUnit) -> Option<&'static dyn UsageAnalyzer> {
-    language_support(code_unit_language(candidate))?
+    language_support_for_hook(code_unit_language(candidate), "dead_code")?
         .dead_code()
         .strategy
 }

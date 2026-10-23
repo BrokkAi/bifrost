@@ -13,6 +13,35 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
+    // A derivation that admitted a declaration of unproven membership does
+    // not prove this site.
+    if ctx.membership.doubt() > ctx.site_doubt {
+        push_unproven_hit(node, ctx);
+        return;
+    }
+    // A site binds the target's identity only where this file's compilation
+    // sees a declaration of it; a member only an invisible or unproven copy
+    // declares is not proven by a resolved owner name.
+    let target = ctx.spec.target.clone();
+    let visibility = *ctx.target_visibility.get_or_insert_with(|| {
+        crate::graph_support::identity_visibility(
+            ctx.membership.unscoped(),
+            ctx.file,
+            &target.fq_name(),
+            Some(&target),
+            |candidate| {
+                candidate.kind() == target.kind() && candidate.signature() == target.signature()
+            },
+        )
+    });
+    match visibility {
+        Some(crate::graph_support::CSharpCompilationVisibility::Visible) => {}
+        Some(crate::graph_support::CSharpCompilationVisibility::NotVisible) => return,
+        Some(crate::graph_support::CSharpCompilationVisibility::Unresolved) | None => {
+            push_unproven_hit(node, ctx);
+            return;
+        }
+    }
     let Some(hit) = node_hit(node, ctx) else {
         return;
     };

@@ -2618,3 +2618,96 @@ fn unit_summary_profile_migration_preserves_rust_and_rebinds_go() {
         );
     }
 }
+
+/// A source-owned operation survives upgrade and has only SQL-readable children.
+#[test]
+fn python_member_operations_migration_enforces_rows_and_cascade() {
+    for migrated in [false, true] {
+        let conn = if migrated {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn
+        } else {
+            open_in_memory_cache()
+        };
+        let blob = insert_resolution_test_blob(&conn, "member-operations", "python");
+        conn.execute("INSERT INTO python_binding_source VALUES(?1,6)", [blob])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_binding_scopes VALUES(?1,0,NULL)",
+            [blob],
+        )
+        .unwrap();
+        for site in 0..3 {
+            conn.execute(
+                "INSERT INTO python_member_sites VALUES(?1,?2,0,0,1)",
+                params![blob, site],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO python_member_type_slots VALUES(?1,0,2)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO python_member_operations(blob_id,site,name_site,form,effect,name_kind,receiver_slot) VALUES(?1,0,1,4,1,0,0)", [blob]).unwrap();
+        let operation = conn.last_insert_rowid();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_member_operation_names WHERE operation=?1",
+                [operation],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0,
+            "exact-empty needs no sentinel name"
+        );
+        conn.execute(
+            "INSERT INTO python_member_operation_names VALUES(?1,0,'known')",
+            [operation],
+        )
+        .unwrap();
+        for sql in [
+            "INSERT INTO python_member_operation_names VALUES(?1,-1,'bad')",
+            "INSERT INTO python_member_operation_names VALUES(?1,1,'known')",
+            "INSERT INTO python_member_operation_names VALUES(?1+1000000,0,'orphan')",
+        ] {
+            assert!(conn.execute(sql, [operation]).is_err(), "accepted {sql}");
+        }
+        for (column, value) in [
+            ("site", 99),
+            ("name_site", 99),
+            ("receiver_slot", 99),
+            ("callee_reference", 99),
+            ("receiver_reference", 99),
+            ("form", 7),
+            ("effect", 3),
+            ("effect", 0),
+            ("name_kind", 3),
+        ] {
+            assert!(
+                conn.execute(
+                    &format!("UPDATE python_member_operations SET {column}=?1 WHERE id=?2"),
+                    params![value, operation]
+                )
+                .is_err(),
+                "accepted invalid {column}"
+            );
+        }
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute("DELETE FROM python_binding_source WHERE blob_id=?1", [blob])
+            .unwrap();
+        for table in ["python_member_operations", "python_member_operation_names"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, usize>(0))
+                    .unwrap(),
+                0,
+                "withdrawal left {table}"
+            );
+        }
+        validate_foreign_keys(&conn).unwrap();
+    }
+}

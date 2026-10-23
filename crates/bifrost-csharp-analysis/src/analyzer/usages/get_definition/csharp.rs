@@ -92,8 +92,6 @@ use brokk_bifrost_csharp::graph::resolver::method_return_type_fq_name_for_arity_
 
 use brokk_bifrost_csharp::graph::resolver::resolve_type_fq_name as csharp_resolve_type_fq_name;
 
-use crate::analyzer::usages::csharp_graph::csharp_usage_direct_base;
-
 use crate::analyzer::usages::csharp_graph::csharp_visible_extension_method_candidates_in_session;
 
 use brokk_bifrost_csharp::graph::resolver::seed_bindings_before_in_session as seed_csharp_bindings_before_in_session;
@@ -107,8 +105,6 @@ use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 
 use brokk_bifrost_core::analyzer::model::ImportInfo;
-
-use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 
 use brokk_bifrost_csharp::syntax::csharp_attribute_name_node;
 
@@ -141,25 +137,80 @@ use brokk_bifrost_csharp::syntax::{
     csharp_nameof_type_candidates, csharp_parameter_name_and_type, csharp_type_node_identity,
     csharp_using_directive_is_static, csharp_using_directive_target_node,
 };
+use std::cell::RefCell;
 
 pub(crate) struct CSharpDefinitionProvider<'a> {
     csharp: &'a CSharpAnalyzer,
     session: Option<&'a ResolutionSession>,
+    // Complete demand answers die with this resolution request. In bounded
+    // sessions, the existing summary allowance bounds retained owners.
+    direct_ancestor_answers: RefCell<HashMap<CodeUnit, Vec<CodeUnit>>>,
+    parent_answers: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    /// Declarations this request admitted although their compilation
+    /// membership is unproven. An answer reached with one is not proven.
+    unproven_types: RefCell<Vec<CodeUnit>>,
+    /// The analyzer viewed through the compilation membership of the file
+    /// holding the reference being resolved. Every declaration this provider
+    /// returns, and every lookup of the shared usage resolver it calls, is
+    /// held to that one rule.
+    scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource,
 }
 
 impl<'a> CSharpDefinitionProvider<'a> {
-    pub(crate) fn new(csharp: &'a CSharpAnalyzer) -> Self {
+    pub(crate) fn new(csharp: &'a CSharpAnalyzer, reference: &ProjectFile) -> Self {
         Self {
             csharp,
             session: None,
+            direct_ancestor_answers: RefCell::default(),
+            parent_answers: RefCell::default(),
+            unproven_types: RefCell::default(),
+            scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
+                graph_support::CSharpSource::shared_source(csharp),
+                reference,
+            ),
         }
     }
 
-    fn bounded(csharp: &'a CSharpAnalyzer, session: &'a ResolutionSession) -> Self {
+    fn bounded(
+        csharp: &'a CSharpAnalyzer,
+        session: &'a ResolutionSession,
+        reference: &ProjectFile,
+    ) -> Self {
         Self {
             csharp,
             session: Some(session),
+            direct_ancestor_answers: RefCell::default(),
+            parent_answers: RefCell::default(),
+            unproven_types: RefCell::default(),
+            scoped: brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
+                graph_support::CSharpSource::shared_source(csharp),
+                reference,
+            ),
         }
+    }
+
+    /// The analyzer source for the shared usage resolver, held to the
+    /// reference's compilation membership.
+    fn source(&self) -> &dyn graph_support::CSharpSource {
+        &self.scoped
+    }
+
+    /// The declarations among `units` the reference's compilation may see.
+    /// Every lookup this provider makes passes through here, under the one
+    /// rule [`MembershipScopedSource::admit_all`] states for the shared
+    /// resolver too: invisible declarations are dropped, unproven parts are
+    /// kept, and a member identity without a visible declaration is doubt.
+    fn admit_units(&self, units: impl IntoIterator<Item = CodeUnit>) -> Vec<CodeUnit> {
+        self.scoped.admit_all(units)
+    }
+
+    /// The declarations of `types`, remembering the unproven ones so the
+    /// answer they reach is held to its proof.
+    fn admit_visible_types(&self, types: graph_support::VisibleTypes) -> Vec<CodeUnit> {
+        self.unproven_types
+            .borrow_mut()
+            .extend(types.unproven.iter().cloned());
+        types.declarations
     }
 
     fn scope_step(&self) -> bool {
@@ -198,6 +249,11 @@ impl<'a> CSharpDefinitionProvider<'a> {
     }
 
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let found = self.unadmitted_fqn(fqn);
+        self.admit_units(found)
+    }
+
+    fn unadmitted_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let exact = match self.session {
             Some(session) => session.query_limited_rows(|limit| {
                 graph_support::declaration_candidates_by_fqn_limited(
@@ -232,7 +288,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
     }
 
     fn arity_free_types_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        match self.session {
+        let found = match self.session {
             Some(session) => session.query_limited_rows(|limit| {
                 graph_support::arity_free_declaration_type_candidates_by_fqn_limited(
                     self.csharp,
@@ -242,11 +298,12 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 )
             }),
             None => graph_support::arity_free_declaration_type_candidates_by_fqn(self.csharp, fqn),
-        }
+        };
+        self.admit_units(found)
     }
 
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
-        match self.session {
+        let found: Vec<CodeUnit> = match self.session {
             Some(session) => session.query_limited_rows(|limit| {
                 self.csharp
                     .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
@@ -258,7 +315,8 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 .member_candidates_for_owner(owner_fqn, name)
                 .into_iter()
                 .collect(),
-        }
+        };
+        self.admit_units(found)
     }
 
     fn package_exists(&self, package: &str) -> bool {
@@ -276,10 +334,100 @@ impl<'a> CSharpDefinitionProvider<'a> {
         file: &ProjectFile,
         name: &str,
     ) -> Vec<CodeUnit> {
-        if self.session.is_none() {
-            return graph_support::visible_type_candidates(self.csharp, token, file, name);
-        }
         self.visible_type_candidates_with_lookup(token, file, name, &mut |fqn| self.fqn(fqn))
+    }
+
+    fn visible_type_candidates_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        source: &str,
+        node: Node<'_>,
+    ) -> Vec<CodeUnit> {
+        let Some(context) =
+            graph_support::CSharpLookupContext::at(source, node, &mut || self.scope_step())
+        else {
+            return Vec::new();
+        };
+        graph_support::visible_type_candidates_at_with_lookups(
+            name,
+            &context,
+            &mut |name| self.global_alias_target_at(name),
+            &mut || self.global_using_namespaces_at(),
+            &mut |namespace| self.query(|| self.csharp.workspace_namespace_exists(namespace)),
+            &mut |fqn| self.type_declarations_by_fqn(fqn),
+            &mut |candidate: &CodeUnit| {
+                self.csharp.compilation_visibility(file, candidate.source())
+            },
+            &mut || self.scope_step(),
+        )
+        .map(|types| self.admit_visible_types(types))
+        .unwrap_or_default()
+    }
+
+    fn visible_type_declarations_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        source: &str,
+        node: Node<'_>,
+    ) -> Vec<CodeUnit> {
+        let Some(context) =
+            graph_support::CSharpLookupContext::at(source, node, &mut || self.scope_step())
+        else {
+            return Vec::new();
+        };
+        graph_support::visible_type_declarations_at_with_lookups(
+            name,
+            &context,
+            &mut |name| self.global_alias_target_at(name),
+            &mut || self.global_using_namespaces_at(),
+            &mut |namespace| self.query(|| self.csharp.workspace_namespace_exists(namespace)),
+            &mut |fqn| self.type_declarations_by_fqn(fqn),
+            &mut |candidate: &CodeUnit| {
+                self.csharp.compilation_visibility(file, candidate.source())
+            },
+            &mut || self.scope_step(),
+        )
+        .map(|types| self.admit_visible_types(types))
+        .unwrap_or_default()
+    }
+
+    fn global_alias_target_at(&self, name: &str) -> Option<Option<String>> {
+        let target = match self.session {
+            Some(session) => session
+                .query_limited_rows(|limit| {
+                    self.csharp
+                        .global_using_aliases_limited(limit, || session.observe_cancellation())
+                })
+                .into_iter()
+                .find_map(|(alias, target)| (alias == name).then_some(target)),
+            None => CSharpSource::global_using_aliases(self.csharp)
+                .get(name)
+                .cloned(),
+        };
+        self.observe_cancellation().then_some(target)
+    }
+
+    fn global_using_namespaces_at(&self) -> Option<Vec<String>> {
+        let mut namespaces = match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                self.csharp
+                    .global_using_namespaces_limited(limit, || session.observe_cancellation())
+            }),
+            None => CSharpSource::sorted_global_using_namespaces(self.csharp),
+        };
+        namespaces.sort();
+        self.observe_cancellation().then_some(namespaces)
+    }
+
+    fn type_declarations_by_fqn(&self, fqn: &str) -> Option<Vec<CodeUnit>> {
+        let candidates = self
+            .fqn(fqn)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
+        self.observe_cancellation().then_some(candidates)
     }
 
     fn arity_free_visible_type_candidates(
@@ -288,14 +436,6 @@ impl<'a> CSharpDefinitionProvider<'a> {
         file: &ProjectFile,
         name: &str,
     ) -> Vec<CodeUnit> {
-        if self.session.is_none() {
-            return graph_support::arity_free_visible_type_candidates(
-                self.csharp,
-                token,
-                file,
-                name,
-            );
-        }
         self.visible_type_candidates_with_lookup(token, file, name, &mut |fqn| {
             self.arity_free_types_by_fqn(fqn)
         })
@@ -311,7 +451,6 @@ impl<'a> CSharpDefinitionProvider<'a> {
     where
         Candidates: FnMut(&str) -> Vec<CodeUnit>,
     {
-        debug_assert!(self.session.is_some());
         let mut using_aliases = || {
             let aliases = self.using_aliases(token, file);
             self.observe_cancellation().then_some(aliases)
@@ -394,14 +533,15 @@ impl<'a> CSharpDefinitionProvider<'a> {
     }
 
     fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        match self.session {
+        let parts = match self.session {
             Some(session) => session.query_limited_rows(|limit| {
                 graph_support::partial_type_parts_limited(self.csharp, owner, limit, || {
                     session.observe_cancellation()
                 })
             }),
             None => graph_support::partial_type_parts(self.csharp, owner),
-        }
+        };
+        self.admit_units(parts)
     }
 
     fn using_namespaces(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
@@ -480,8 +620,10 @@ impl<'a> CSharpDefinitionProvider<'a> {
     /// An attribute name is a type reference the grammar spells outside the
     /// type roles, so each spelling takes the same lookup ladder an ordinary
     /// C# type reference at `byte` takes: the enclosing type chain, then the
-    /// enclosing namespace scopes, then the file's namespace and `using`
-    /// scopes. Only the last of the three ran here, which is why `[Mark]`
+    /// enclosing namespace scopes and their lexically visible `using`
+    /// directives. File-wide namespace/import hints cannot establish a site's
+    /// context when sibling namespaces declare same-name types (#5198).
+    /// Only the file-wide stage originally ran here, which is why `[Mark]`
     /// could not name a `MarkAttribute` nested in the very class that writes
     /// it, and why any attribute name failed in a file whose recorded
     /// namespace is not the one enclosing the reference (#3300).
@@ -491,31 +633,25 @@ impl<'a> CSharpDefinitionProvider<'a> {
         token: QueryToken<'_>,
         file: &ProjectFile,
         names: &[String],
-        byte: usize,
+        source: &str,
+        node: Node<'_>,
     ) -> (Vec<CodeUnit>, bool) {
+        let byte = node.start_byte();
         let mut type_candidates = |name: &str| {
             if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
                 analyzer, token, self, file, name, byte,
-            )
-            .or_else(|| {
-                resolve_csharp_in_enclosing_scopes(
-                    analyzer,
-                    self,
-                    file,
-                    name,
-                    byte,
-                    CodeUnit::is_class,
-                )
-            }) {
+            ) {
                 return Some(vec![unit]);
             }
-            let candidates = self.visible_type_candidates(token, file, name);
+            let candidates = self.visible_type_declarations_at(file, name, source, node);
             self.observe_cancellation().then_some(candidates)
         };
         let mut attribute_class_is_applicable = |candidate: &CodeUnit| match self.session {
             Some(_) => self.attribute_class_is_applicable(token, candidate),
+            // Through the membership view, so a base list counts by its
+            // part's membership and its doubt reaches the answer.
             None => Some(hierarchy::attribute_class_is_applicable(
-                self.csharp,
+                self.source(),
                 token,
                 candidate,
             )),
@@ -562,8 +698,8 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 if !self.scope_step() {
                     return None;
                 }
-                let raw_supertypes = session
-                    .query_limited_rows(|limit| self.csharp.raw_supertypes_limited(&part, limit));
+                // Held to the part's membership, as in `raw_supertypes`.
+                let raw_supertypes = self.raw_supertypes(&part);
                 if !self.observe_cancellation() {
                     return None;
                 }
@@ -601,24 +737,36 @@ impl<'a> CSharpDefinitionProvider<'a> {
     /// Unlike [`Self::direct_ancestors`] this keeps a spelling the workspace
     /// cannot resolve, which is what tells a complete hierarchy apart from one
     /// that leaves the indexed workspace (#1797).
+    /// The base list of a physical part, held to membership: an unproven
+    /// part's bases are doubt and an invisible part has none.
     fn raw_supertypes(&self, part: &CodeUnit) -> Vec<String> {
+        let source = self.source();
         match self.session {
             Some(session) => {
-                session.query_limited_rows(|limit| self.csharp.raw_supertypes_limited(part, limit))
+                session.query_limited_rows(|limit| source.raw_supertypes_limited(part, limit))
             }
-            None => self.csharp.raw_supertypes_of(part),
+            None => source.raw_supertypes_of(part),
         }
     }
 
-    fn direct_ancestors(
-        &self,
-        provider: &dyn TypeHierarchyProvider,
-        token: QueryToken<'_>,
-        owner: &CodeUnit,
-    ) -> Vec<CodeUnit> {
-        let Some(session) = self.session else {
-            return provider.get_direct_ancestors(owner);
-        };
+    /// The direct ancestors of `owner` read from its admitted physical parts'
+    /// base lists, each base admitted too: a part outside the reference's
+    /// compilation contributes no base, and an unproven one contributes its
+    /// bases as doubt.
+    fn direct_ancestors(&self, token: QueryToken<'_>, owner: &CodeUnit) -> Vec<CodeUnit> {
+        if !self.observe_cancellation() {
+            return Vec::new();
+        }
+        if let Some(ancestors) = self.direct_ancestor_answers.borrow().get(owner) {
+            return if self
+                .session
+                .is_none_or(|session| session.scope_steps(ancestors.len()))
+            {
+                ancestors.clone()
+            } else {
+                Vec::new()
+            };
+        }
         if !self.summary_step() {
             return Vec::new();
         }
@@ -630,14 +778,13 @@ impl<'a> CSharpDefinitionProvider<'a> {
         if parts.is_empty() {
             parts.push(owner.clone());
         }
-        graph_support::logical_direct_ancestors(
+        let ancestors = graph_support::logical_direct_ancestors(
             parts,
             |part| {
                 if !self.scope_step() {
                     return None;
                 }
-                let raw = session
-                    .query_limited_rows(|limit| self.csharp.raw_supertypes_limited(part, limit));
+                let raw = self.raw_supertypes(part);
                 self.observe_cancellation().then_some(raw)
             },
             |part, raw| {
@@ -645,11 +792,29 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 self.observe_cancellation().then_some(candidates)
             },
             |_| Some(()),
-        )
-        .unwrap_or_default()
+        );
+        let Some(ancestors) = ancestors.filter(|_| self.observe_cancellation()) else {
+            return Vec::new();
+        };
+        self.direct_ancestor_answers
+            .borrow_mut()
+            .insert(owner.clone(), ancestors.clone());
+        ancestors
     }
 
     fn parent_of(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+        let Some(session) = self.session else {
+            return analyzer.parent_of(unit);
+        };
+        if !session.observe_cancellation() {
+            return None;
+        }
+        if let Some(parent) = self.parent_answers.borrow().get(unit) {
+            if parent.is_some() && !self.scope_step() {
+                return None;
+            }
+            return parent.clone();
+        }
         if !self.summary_step() {
             return None;
         }
@@ -657,8 +822,13 @@ impl<'a> CSharpDefinitionProvider<'a> {
         if !self.observe_cancellation() {
             return None;
         }
-        let parent = parent?;
-        self.scope_step().then_some(parent)
+        if parent.is_some() && !self.scope_step() {
+            return None;
+        }
+        self.parent_answers
+            .borrow_mut()
+            .insert(unit.clone(), parent.clone());
+        parent
     }
 
     fn session(&self) -> Option<&ResolutionSession> {
@@ -724,7 +894,7 @@ pub(crate) fn csharp_type_lookup_resolution_in_session(
     session: &ResolutionSession,
 ) -> Option<CSharpTypeLookupResolution> {
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-    let definitions = CSharpDefinitionProvider::bounded(csharp, session);
+    let definitions = CSharpDefinitionProvider::bounded(csharp, session, file);
     let node = csharp_smallest_named_node_covering(
         &definitions,
         root,
@@ -951,7 +1121,7 @@ pub(crate) fn resolve_csharp_bounded(
         let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
             return no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable");
         };
-        let definitions = CSharpDefinitionProvider::bounded(csharp, session);
+        let definitions = CSharpDefinitionProvider::bounded(csharp, session, file);
         resolve_csharp_in_session(
             analyzer,
             token,
@@ -967,6 +1137,128 @@ pub(crate) fn resolve_csharp_bounded(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_csharp_in_session(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    preserve_using_alias: bool,
+) -> DefinitionLookupOutcome {
+    let outcome = resolve_csharp_reference(
+        analyzer,
+        token,
+        definitions,
+        file,
+        source,
+        tree,
+        site,
+        preserve_using_alias,
+    );
+    hold_to_compilation_membership(analyzer, definitions, file, outcome)
+}
+
+/// Hold an answer to compilation membership.
+///
+/// A definition is proven only where the reference's compilation sees its
+/// identity (some physical declaration of it): one only an invisible copy
+/// declares is dropped, and one only an unproven copy declares leaves the
+/// answer `Incomplete`. A type of unproven membership that took part in this
+/// resolution (as a receiver, base, constructed or named type) also leaves a
+/// resolved or decided-negative answer `Incomplete`: the derivation through
+/// it is not proven even when the definition reached is. That is tracked for
+/// the whole request, which over-approximates the derivation rather than
+/// losing doubt. Definitions found still arrive under `Incomplete`.
+fn hold_to_compilation_membership(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    mut outcome: DefinitionLookupOutcome,
+) -> DefinitionLookupOutcome {
+    let mut doubt = Vec::new();
+    let root = analyzer.project().root();
+    let mut removed = Vec::new();
+    let mut unproven_definitions = Vec::new();
+    let mut failed = false;
+    outcome.definitions.retain(|definition| {
+        // Declarations outside the workspace carry their own provenance.
+        if definition.source().root() != root {
+            return true;
+        }
+        match graph_support::identity_visibility(
+            definitions.csharp,
+            file,
+            &definition.fq_name(),
+            Some(definition),
+            |candidate| {
+                candidate.kind() == definition.kind()
+                    && candidate.signature() == definition.signature()
+            },
+        ) {
+            Some(graph_support::CSharpCompilationVisibility::Visible) => true,
+            Some(graph_support::CSharpCompilationVisibility::NotVisible) => {
+                removed.push(definition.fq_name());
+                false
+            }
+            Some(graph_support::CSharpCompilationVisibility::Unresolved) => {
+                unproven_definitions.push(definition.fq_name());
+                true
+            }
+            None => {
+                failed = true;
+                true
+            }
+        }
+    });
+    if !removed.is_empty() {
+        doubt.push(format!(
+            "definitions {removed:?} are declared only where this compilation cannot see them"
+        ));
+    }
+    if !unproven_definitions.is_empty() {
+        doubt.push(format!(
+            "definitions {unproven_definitions:?} are declared only where compilation membership is unproven"
+        ));
+    }
+    if failed {
+        doubt.push("compilation membership could not be read".to_owned());
+    }
+    if definitions.scoped.doubt() > 0 {
+        doubt.push(format!(
+            "{} shared-resolver lookups admitted declarations of unproven compilation membership",
+            definitions.scoped.doubt()
+        ));
+    }
+    let unproven = definitions.unproven_types.borrow();
+    if !unproven.is_empty() {
+        doubt.push(format!(
+            "visible types {:?} depend on compilation membership the configuration does not prove",
+            unproven.iter().map(CodeUnit::fq_name).collect::<Vec<_>>()
+        ));
+    }
+    // Only an answer that claims something is downgraded; an ambiguity or a
+    // stop already makes no claim.
+    if !doubt.is_empty()
+        && matches!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved
+                | DefinitionLookupStatus::NoDefinition
+                | DefinitionLookupStatus::NotFound
+        )
+    {
+        outcome.status = DefinitionLookupStatus::Incomplete;
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "csharp_compilation_membership_unproven".to_owned(),
+            message: doubt.join("; "),
+        });
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_csharp_reference(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
@@ -1262,7 +1554,7 @@ fn resolve_csharp_in_session(
             if outcome.definitions.is_empty() && should_try_extensions {
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
-                        csharp,
+                        definitions.source(),
                         analyzer,
                         token,
                         file,
@@ -1275,7 +1567,7 @@ fn resolve_csharp_in_session(
                         session,
                     ),
                     None => csharp_visible_extension_method_candidates(
-                        csharp,
+                        definitions.source(),
                         analyzer,
                         token,
                         file,
@@ -1669,7 +1961,9 @@ fn csharp_structured_receiver_reference_type_names(
         if candidates.len() == 1 {
             return vec![candidates.remove(0).fq_name()];
         }
-    } else if let Some(resolved) = csharp_resolve_type_fq_name(csharp, token, file, &reference) {
+    } else if let Some(resolved) =
+        csharp_resolve_type_fq_name(definitions.source(), token, file, &reference)
+    {
         return vec![resolved];
     }
 
@@ -1728,13 +2022,8 @@ fn csharp_type_lookup_node_resolution(
     if let Some(name) = csharp_attribute_name_node(node) {
         if csharp_node_spells_whole_attribute_name(node, name) {
             let names = csharp_attribute_type_names(name, source);
-            let (candidates, ambiguous) = definitions.attribute_type_candidates(
-                analyzer,
-                token,
-                file,
-                &names,
-                name.start_byte(),
-            );
+            let (candidates, ambiguous) =
+                definitions.attribute_type_candidates(analyzer, token, file, &names, source, name);
             return csharp_type_candidates_resolution_with_kind(
                 names.first().map(String::as_str).unwrap_or_default(),
                 candidates,
@@ -2021,16 +2310,20 @@ fn csharp_declaration_name_type_resolution(
             let member_name = csharp_node_text(name, source);
             let fqn = match definitions.session() {
                 Some(session) => csharp_member_declared_type_fq_name_in_session(
-                    csharp,
+                    definitions.source(),
                     token,
                     file,
                     &owner,
                     member_name,
                     session,
                 ),
-                None => {
-                    csharp_member_declared_type_fq_name(csharp, token, file, &owner, member_name)
-                }
+                None => csharp_member_declared_type_fq_name(
+                    definitions.source(),
+                    token,
+                    file,
+                    &owner,
+                    member_name,
+                ),
             }?;
             csharp_type_candidates_resolution(csharp_node_text(name, source), definitions.fqn(&fqn))
         }
@@ -2490,14 +2783,14 @@ fn csharp_seed_type_binding(
                 };
                 if inferred {
                     let candidates = csharp_object_created_type(child)
-                        .map(|type_node| csharp_reference_type_text(type_node, source))
-                        .map(|reference| {
-                            csharp_logical_visible_type_candidates(
+                        .map(|type_node| {
+                            csharp_type_candidates_at(
                                 csharp,
                                 token,
                                 definitions,
                                 file,
-                                &reference,
+                                source,
+                                type_node,
                             )
                         })
                         .unwrap_or_default();
@@ -2536,14 +2829,37 @@ fn csharp_seed_symbol_for_type(
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     let binding_name = csharp_node_text(name, source);
-    let reference = csharp_reference_type_text(type_node, source);
-    let candidates =
-        csharp_logical_visible_type_candidates(csharp, token, definitions, file, &reference);
+    let candidates = csharp_type_candidates_at(csharp, token, definitions, file, source, type_node);
     if candidates.is_empty() {
         bindings.declare_shadow(binding_name);
     } else {
         bindings.seed_symbol_many(binding_name, candidates);
     }
+}
+
+fn csharp_type_candidates_at(
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Vec<CodeUnit> {
+    let reference = csharp_reference_type_text(type_node, source);
+    if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
+        csharp,
+        token,
+        definitions,
+        file,
+        &reference,
+        type_node.start_byte(),
+    ) {
+        return vec![unit];
+    }
+    let mut candidates =
+        definitions.visible_type_candidates_at(file, &reference, source, type_node);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
+    candidates
 }
 
 #[cfg(test)]
@@ -3455,7 +3771,7 @@ fn csharp_attribute_outcome(
 ) -> DefinitionLookupOutcome {
     let names = csharp_attribute_type_names(name, source);
     let (candidates, ambiguous_spelling) =
-        definitions.attribute_type_candidates(analyzer, token, file, &names, name.start_byte());
+        definitions.attribute_type_candidates(analyzer, token, file, &names, source, name);
     if !candidates.is_empty() {
         let mut outcome = candidates_outcome(candidates);
         if ambiguous_spelling {
@@ -3721,7 +4037,7 @@ fn csharp_member_outcome(
     }
     let mut fallback_candidates = direct_candidates;
 
-    if let Some(provider) = analyzer.type_hierarchy_provider() {
+    if analyzer.type_hierarchy_provider().is_some() {
         let mut seen = HashSet::default();
         let mut level = Vec::new();
         let mut depth = 0usize;
@@ -3730,7 +4046,7 @@ fn csharp_member_outcome(
                 break;
             }
             seen.insert(owner.clone());
-            let expanded = definitions.direct_ancestors(provider, token, owner);
+            let expanded = definitions.direct_ancestors(token, owner);
             if let Some(state) = member_trace.as_mut() {
                 brokk_bifrost_analysis::analyzer::usages::get_definition::record_hierarchy_parents(
                     &mut state.parents,
@@ -3764,7 +4080,7 @@ fn csharp_member_outcome(
                     state.record_found(&found, &ancestor, depth);
                 }
                 level_candidates.extend(found);
-                let expanded = definitions.direct_ancestors(provider, token, &ancestor);
+                let expanded = definitions.direct_ancestors(token, &ancestor);
                 if let Some(state) = member_trace.as_mut() {
                     brokk_bifrost_analysis::analyzer::usages::get_definition::record_hierarchy_parents(&mut state.parents, &ancestor, &expanded);
                 }
@@ -4358,18 +4674,25 @@ impl CSharpInitializerOwnerLookups for CSharpForwardInitializerOwnerLookups<'_, 
 
 fn csharp_member_element_type_owners(
     token: QueryToken<'_>,
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
     let element = match definitions.session() {
         Some(session) => csharp_member_declared_collection_element_type_fq_name_in_session(
-            csharp, token, owner, member, session,
+            definitions.source(),
+            token,
+            owner,
+            member,
+            session,
         ),
-        None => {
-            csharp_member_declared_collection_element_type_fq_name(csharp, token, owner, member)
-        }
+        None => csharp_member_declared_collection_element_type_fq_name(
+            definitions.source(),
+            token,
+            owner,
+            member,
+        ),
     };
     element
         .into_iter()
@@ -4466,9 +4789,9 @@ fn csharp_forward_call_methods_for_owner(
     owner: &CodeUnit,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let Some(provider) = analyzer.type_hierarchy_provider() else {
+    if analyzer.type_hierarchy_provider().is_none() {
         return csharp_non_constructor_member_candidates(analyzer, definitions, owner, name);
-    };
+    }
     let mut seen = HashSet::default();
     let mut level = vec![owner.clone()];
     while !level.is_empty() {
@@ -4490,7 +4813,7 @@ fn csharp_forward_call_methods_for_owner(
                     name,
                 ));
             }
-            next_level.extend(definitions.direct_ancestors(provider, token, &current));
+            next_level.extend(definitions.direct_ancestors(token, &current));
         }
         sort_units(&mut candidates);
         candidates.dedup();
@@ -4555,8 +4878,8 @@ fn csharp_collection_element_owner_types(
                         name,
                     );
                 }
-                if let Some(provider) = analyzer.type_hierarchy_provider() {
-                    next_level.extend(definitions.direct_ancestors(provider, token, &current));
+                if analyzer.type_hierarchy_provider().is_some() {
+                    next_level.extend(definitions.direct_ancestors(token, &current));
                 }
             }
             level = next_level;
@@ -4690,7 +5013,8 @@ fn csharp_named_argument_label_outcome(
         token,
         file,
         &attribute_names,
-        attribute_name.start_byte(),
+        source,
+        attribute_name,
     );
     if owners.is_empty() {
         let attribute = attribute_names
@@ -5286,7 +5610,14 @@ fn csharp_receiver_base_types(
         ),
         "base" => CSharpReceiverTypes::from_units(
             csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
-                .and_then(|owner| csharp_usage_direct_base(analyzer, token, csharp, &owner))
+                .and_then(|owner| {
+                    crate::analyzer::usages::csharp_graph::csharp_usage_direct_base(
+                        analyzer,
+                        token,
+                        definitions.source(),
+                        &owner,
+                    )
+                })
                 .into_iter()
                 .collect(),
         ),
@@ -5499,8 +5830,8 @@ fn csharp_nearest_member_types(
                     name,
                     &mut level_types,
                 );
-                if let Some(provider) = provider {
-                    next_level.extend(definitions.direct_ancestors(provider, token, &current));
+                if provider.is_some() {
+                    next_level.extend(definitions.direct_ancestors(token, &current));
                 }
             }
             if level_declares_member {
@@ -5559,7 +5890,7 @@ fn csharp_invocation_return_types(
         }
         let type_fqn = match definitions.session() {
             Some(session) => csharp_method_return_type_fq_name_for_arity_in_session(
-                csharp,
+                definitions.source(),
                 token,
                 file,
                 owner,
@@ -5570,7 +5901,7 @@ fn csharp_invocation_return_types(
                 session,
             ),
             None => csharp_method_return_type_fq_name_for_arity(
-                csharp,
+                definitions.source(),
                 token,
                 file,
                 owner,
@@ -5594,7 +5925,7 @@ fn csharp_invocation_return_types(
     {
         let type_fqn = match definitions.session() {
             Some(session) => csharp_extension_invocation_return_type_fq_name_in_session(
-                csharp,
+                definitions.source(),
                 analyzer,
                 token,
                 source,
@@ -5608,7 +5939,7 @@ fn csharp_invocation_return_types(
                 session,
             ),
             None => csharp_extension_invocation_return_type_fq_name(
-                csharp,
+                definitions.source(),
                 analyzer,
                 token,
                 source,
@@ -5686,9 +6017,9 @@ fn csharp_enclosing_member_types(
             name,
             &mut candidates,
         );
-        if let Some(provider) = analyzer.type_hierarchy_provider() {
+        if analyzer.type_hierarchy_provider().is_some() {
             let mut seen = HashSet::default();
-            let mut stack = definitions.direct_ancestors(provider, token, &owner);
+            let mut stack = definitions.direct_ancestors(token, &owner);
             while let Some(ancestor) = stack.pop() {
                 if !definitions.scope_step() {
                     return CSharpReceiverTypes::default();
@@ -5705,7 +6036,7 @@ fn csharp_enclosing_member_types(
                     name,
                     &mut candidates,
                 );
-                stack.extend(definitions.direct_ancestors(provider, token, &ancestor));
+                stack.extend(definitions.direct_ancestors(token, &ancestor));
             }
         }
         let candidates = candidates.normalized();
@@ -5717,7 +6048,7 @@ fn csharp_enclosing_member_types(
 }
 
 fn csharp_collect_member_types(
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
@@ -5730,9 +6061,14 @@ fn csharp_collect_member_types(
     }
     let type_fqn = match definitions.session() {
         Some(session) => csharp_member_declared_type_fq_name_in_session(
-            csharp, token, file, owner, name, session,
+            definitions.source(),
+            token,
+            file,
+            owner,
+            name,
+            session,
         ),
-        None => csharp_member_declared_type_fq_name(csharp, token, file, owner, name),
+        None => csharp_member_declared_type_fq_name(definitions.source(), token, file, owner, name),
     };
     if let Some(type_fqn) = type_fqn {
         candidates.push_fq_name(definitions, type_fqn);
@@ -6027,11 +6363,11 @@ where
     if let Some(unit) = nested_class(owner) {
         return Some(unit);
     }
-    let provider = analyzer.type_hierarchy_provider()?;
+    analyzer.type_hierarchy_provider()?;
     let mut seen = HashSet::default();
     seen.insert(owner.clone());
     let mut pending: std::collections::VecDeque<CodeUnit> = definitions
-        .direct_ancestors(provider, token, owner)
+        .direct_ancestors(token, owner)
         .into_iter()
         .filter(|ancestor| seen.insert(ancestor.clone()))
         .collect();
@@ -6044,7 +6380,7 @@ where
         }
         pending.extend(
             definitions
-                .direct_ancestors(provider, token, &ancestor)
+                .direct_ancestors(token, &ancestor)
                 .into_iter()
                 .filter(|next| seen.insert(next.clone())),
         );
@@ -6252,7 +6588,7 @@ fn csharp_seed_legacy_active_path(
     root: Node<'_>,
     token: QueryToken<'_>,
     cutoff_start: usize,
-    csharp: &CSharpAnalyzer,
+    _csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
@@ -6280,7 +6616,7 @@ fn csharp_seed_legacy_active_path(
                     Some(session) => seed_csharp_bindings_before_in_session(
                         node,
                         cutoff_start,
-                        csharp,
+                        definitions.source(),
                         token,
                         file,
                         source,
@@ -6291,7 +6627,7 @@ fn csharp_seed_legacy_active_path(
                         seed_csharp_bindings_before(
                             node,
                             cutoff_start,
-                            csharp,
+                            definitions.source(),
                             token,
                             file,
                             source,
@@ -6374,7 +6710,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     let outcome = resolve_analyzer::<CSharpAnalyzer>(analyzer).map_or_else(
         || no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable"),
         |csharp_analyzer| {
-            let definitions = CSharpDefinitionProvider::new(csharp_analyzer);
+            let definitions = CSharpDefinitionProvider::new(csharp_analyzer, &request.file);
             let resolution = resolve_csharp(
                 analyzer,
                 token,
@@ -6408,8 +6744,2268 @@ mod tests {
 
     use brokk_bifrost_core::path_utils::rel_path_string;
 
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::WorkspaceAnalyzer;
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+    use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+    use brokk_bifrost_test_macros::hardwon;
     use std::fmt::Write as _;
+
+    /// Some analyzed file, as the reference of a provider whose test needs
+    /// no particular one: these fixtures are one implicit compilation.
+    fn any_reference(analyzer: &dyn IAnalyzer) -> ProjectFile {
+        analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .next()
+            .expect("an analyzed file")
+    }
+
+    #[test]
+    #[hardwon("#5198: a later block-scoped namespace rebound earlier global bindings")]
+    fn reference_context_preserves_namespace_and_import_boundaries() {
+        const LIBRARY: &str = r#"
+namespace System { public class Attribute {} }
+namespace Tools {
+    public class MarkerAttribute : System.Attribute {}
+    public class Service { public void Work() {} }
+}
+namespace Other {
+    public class MarkerAttribute : System.Attribute {}
+    public class Service { public void Work() {} }
+}
+"#;
+        let cases = [
+            (
+                r#"
+using Tools;
+using Mark = Tools.MarkerAttribute;
+[Mark] class Service {
+    public void Work() {}
+    void Call(Service obj) { obj.Work(); }
+}
+namespace Custom {
+    using Other;
+    using Mark = Other.MarkerAttribute;
+    class Service { public void Work() {} }
+}
+"#,
+                "Service.Work",
+                "Tools.MarkerAttribute",
+            ),
+            (
+                r#"
+namespace Left {
+    using Tools;
+    using Mark = Tools.MarkerAttribute;
+    [Mark] class Consumer { void Call(Service obj) { obj.Work(); } }
+}
+namespace Right {
+    using Other;
+    using Mark = Other.MarkerAttribute;
+    class Consumer { void Call(Service obj) { obj.Work(); } }
+}
+"#,
+                "Tools.Service.Work",
+                "Tools.MarkerAttribute",
+            ),
+            (
+                r#"
+namespace Outer {
+    using Other;
+    namespace Inner {
+        using Tools;
+        using Mark = Tools.MarkerAttribute;
+        [Mark] class Consumer { void Call(Service obj) { obj.Work(); } }
+    }
+}
+"#,
+                "Tools.Service.Work",
+                "Tools.MarkerAttribute",
+            ),
+            (
+                r#"
+using Tools;
+namespace FileScoped;
+using Mark = Tools.MarkerAttribute;
+[Mark] class Consumer { void Call(Service obj) { obj.Work(); } }
+"#,
+                "Tools.Service.Work",
+                "Tools.MarkerAttribute",
+            ),
+        ];
+        for (source, method_target, attribute_target) in cases {
+            let fixture = AnalyzerFixture::new_for_language(
+                Language::CSharp,
+                // One explicit compilation holds both files, so the global
+                // namespace's precedence applies within it.
+                &[
+                    ("App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                    ("References.cs", source),
+                    ("Library.cs", LIBRARY),
+                ],
+            );
+            let analyzer = fixture.analyzer.analyzer();
+            let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+            let file = ProjectFile::new(fixture.project_root(), "References.cs");
+            let tree = parse_csharp_tree(source).expect("C# reference tree");
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let token = scope.token();
+            for (fragment, prefix, name, expected) in [
+                ("obj.Work();", "obj.", "Work", method_target),
+                ("[Mark]", "[", "Mark", attribute_target),
+            ] {
+                let start_byte = source.find(fragment).expect("reference fixture") + prefix.len();
+                let end_byte = start_byte + name.len();
+                let line = source[..start_byte]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                let site = ResolvedReferenceSite {
+                    path: rel_path_string(&file),
+                    text: name.to_owned(),
+                    range: Range {
+                        start_byte,
+                        end_byte,
+                        start_line: line,
+                        end_line: line,
+                    },
+                    focus_start_byte: start_byte,
+                    focus_end_byte: end_byte,
+                };
+                let definitions = CSharpDefinitionProvider::new(csharp, &file);
+                let unbounded = resolve_csharp(
+                    analyzer,
+                    token,
+                    &definitions,
+                    &file,
+                    source,
+                    Some(&tree),
+                    &site,
+                    false,
+                )
+                .outcome;
+                let bounded = resolve_csharp_bounded(
+                    analyzer,
+                    token,
+                    &file,
+                    source,
+                    Some(&tree),
+                    &site,
+                    ReceiverAnalysisBudget::default(),
+                    None,
+                );
+                let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+                    panic!("reference lookup must complete: {bounded:#?}");
+                };
+                for outcome in [unbounded, bounded] {
+                    assert_eq!(
+                        outcome.status,
+                        DefinitionLookupStatus::Resolved,
+                        "{source}\n{outcome:#?}"
+                    );
+                    assert_eq!(
+                        outcome
+                            .definitions
+                            .iter()
+                            .map(CodeUnit::fq_name)
+                            .collect::<Vec<_>>(),
+                        vec![expected.to_owned()],
+                        "{source}\n{outcome:#?}",
+                    );
+                }
+            }
+            let target = analyzer
+                .get_definitions(method_target)
+                .into_iter()
+                .find(CodeUnit::is_function)
+                .expect("exact method declaration");
+            let roots = HashSet::from_iter([file.clone()]);
+            let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+                analyzer, token, &roots,
+            )
+            .expect("C# authoritative usage batch");
+            let result = batch
+                .find_usages(std::slice::from_ref(&target), &roots, 100)
+                .into_fuzzy_result();
+            let FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                ..
+            } = result
+            else {
+                panic!("inverse reference lookup must complete: {result:#?}");
+            };
+            let start = source.find("obj.Work();").expect("method reference") + "obj.".len();
+            let actual = hits_by_overload
+                .get(&target)
+                .into_iter()
+                .flatten()
+                .map(|hit| {
+                    (
+                        hit.file.rel_path().to_string_lossy().into_owned(),
+                        hit.start_offset,
+                        hit.end_offset,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                vec![("References.cs".to_owned(), start, start + 4)],
+                "{source}"
+            );
+            assert!(
+                unproven_by_overload.values().all(|hits| hits.is_empty()),
+                "exact receiver identity must be proven: {source}\n{unproven_by_overload:#?}",
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: a global-namespace type in an unreferenced project shadowed an imported receiver type"
+    )]
+    fn global_namespace_precedence_follows_compilation_membership() {
+        const REFERENCES: &str = r#"
+using Tools;
+class Consumer {
+    void UseService(Service service) { service.Work(); }
+    void UseHelper(Helper helper) { helper.Run(); }
+    void UseWidget(Widget widget) { widget.Spin(); }
+    void UseGadget(Gadget gadget) { gadget.Go(); }
+    void UseLonely(Lonely lonely) { lonely.Hum(); }
+    void UseTwin(Twin twin) { twin.Beat(); }
+}
+"#;
+        let sdk = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[
+                (
+                    "App/App.csproj",
+                    r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../Tools/Tools.csproj" /><ProjectReference Include="../Lib/Lib.csproj" /></ItemGroup></Project>"#,
+                ),
+                ("App/References.cs", REFERENCES),
+                // Same compilation, another file: precedes the import.
+                (
+                    "App/Shadow.cs",
+                    "public class Service { public void Work() {} }",
+                ),
+                ("Tools/Tools.csproj", sdk),
+                (
+                    "Tools/Tools.cs",
+                    r#"
+namespace Tools {
+    public class Service { public void Work() {} }
+    public class Helper { public void Run() {} }
+    public class Widget { public void Spin() {} }
+    public class Gadget { public void Go() {} }
+}
+"#,
+                ),
+                // A referenced project's global namespace precedes the import.
+                ("Lib/Lib.csproj", sdk),
+                (
+                    "Lib/Helper.cs",
+                    "public class Helper { public void Run() {} }",
+                ),
+                // An unreferenced project's global namespace is not visible.
+                ("Tests/Tests.csproj", sdk),
+                (
+                    "Tests/Widget.cs",
+                    "public class Widget { public void Spin() {} }",
+                ),
+                // No project claims these sources: their membership is
+                // unproven. `Lonely` has no competitor at all; `Twin` has a
+                // proven same-name twin in the reference's compilation.
+                (
+                    "Loose/Gadget.cs",
+                    "public class Gadget { public void Go() {} }",
+                ),
+                (
+                    "Loose/Lonely.cs",
+                    "public class Lonely { public void Hum() {} }",
+                ),
+                ("App/Twin.cs", "public class Twin { public void Beat() {} }"),
+                (
+                    "Loose/Twin.cs",
+                    "public class Twin { public void Beat() {} }",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "App/References.cs");
+        let source = REFERENCES;
+        let tree = parse_csharp_tree(source).expect("C# reference tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let outcomes_at = |fragment: &str, name: &str| {
+            let start_byte = source.find(fragment).expect("reference fixture") + fragment.len()
+                - name.len()
+                - "();".len();
+            let end_byte = start_byte + name.len();
+            assert_eq!(&source[start_byte..end_byte], name);
+            let line = source[..start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let site = ResolvedReferenceSite {
+                path: rel_path_string(&file),
+                text: name.to_owned(),
+                range: Range {
+                    start_byte,
+                    end_byte,
+                    start_line: line,
+                    end_line: line,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: end_byte,
+            };
+            let definitions = CSharpDefinitionProvider::new(csharp, &file);
+            let unbounded = resolve_csharp(
+                analyzer,
+                token,
+                &definitions,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                false,
+            )
+            .outcome;
+            let bounded = resolve_csharp_bounded(
+                analyzer,
+                token,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+                panic!("reference lookup must complete: {bounded:#?}");
+            };
+            [unbounded, bounded]
+        };
+        for (fragment, name, expected) in [
+            ("service.Work();", "Work", "Service.Work"),
+            ("helper.Run();", "Run", "Helper.Run"),
+            ("widget.Spin();", "Spin", "Tools.Widget.Spin"),
+        ] {
+            for outcome in outcomes_at(fragment, name) {
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{fragment}\n{outcome:#?}"
+                );
+                assert_eq!(
+                    outcome
+                        .definitions
+                        .iter()
+                        .map(CodeUnit::fq_name)
+                        .collect::<Vec<_>>(),
+                    vec![expected.to_owned()],
+                    "{fragment}\n{outcome:#?}",
+                );
+            }
+        }
+        for outcome in outcomes_at("gadget.Go();", "Go") {
+            assert!(
+                outcome.status != DefinitionLookupStatus::Resolved
+                    || outcome.definitions.len() != 1,
+                "unproven membership must not resolve to one declaration: {outcome:#?}"
+            );
+        }
+
+        // The proven twin names the type, so the name is resolved. Members
+        // are found by the type's fully qualified name, so the unproven
+        // twin's same-name member is the same identity (as duplicate
+        // physical declarations are everywhere else).
+        for outcome in outcomes_at("twin.Beat();", "Beat") {
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outcome:#?}"
+            );
+            let mut names = outcome
+                .definitions
+                .iter()
+                .map(CodeUnit::fq_name)
+                .collect::<Vec<_>>();
+            names.dedup();
+            assert_eq!(names, vec!["Twin.Beat".to_owned()], "{outcome:#?}");
+        }
+        for outcome in outcomes_at("lonely.Hum();", "Hum") {
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Incomplete,
+                "a lone candidate of unproven membership is doubt, not a resolution: {outcome:#?}"
+            );
+            assert_eq!(
+                outcome
+                    .definitions
+                    .iter()
+                    .map(CodeUnit::fq_name)
+                    .collect::<Vec<_>>(),
+                vec!["Lonely.Hum".to_owned()],
+                "Incomplete still carries what it found: {outcome:#?}"
+            );
+            assert!(
+                outcome
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == "csharp_compilation_membership_unproven"),
+                "{outcome:#?}"
+            );
+        }
+
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+            analyzer, token, &roots,
+        )
+        .expect("C# authoritative usage batch");
+        let method = |fq_name: &str| {
+            analyzer
+                .get_definitions(fq_name)
+                .into_iter()
+                .find(CodeUnit::is_function)
+                .unwrap_or_else(|| panic!("exact method declaration {fq_name}"))
+        };
+        let usages = |target: &CodeUnit| {
+            batch
+                .find_usages(std::slice::from_ref(target), &roots, 100)
+                .into_fuzzy_result()
+        };
+        for (fq_name, hits) in [
+            ("Service.Work", 1),
+            ("Tools.Service.Work", 0),
+            ("Helper.Run", 1),
+            ("Tools.Helper.Run", 0),
+            ("Widget.Spin", 0),
+            ("Tools.Widget.Spin", 1),
+        ] {
+            let target = method(fq_name);
+            let result = usages(&target);
+            let FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                ..
+            } = &result
+            else {
+                panic!("{fq_name}: proven membership must complete: {result:#?}");
+            };
+            assert_eq!(
+                hits_by_overload.get(&target).map_or(0, |hits| hits.len()),
+                hits,
+                "{fq_name}: {result:#?}"
+            );
+            assert!(
+                unproven_by_overload.values().all(|hits| hits.is_empty()),
+                "{fq_name}: {result:#?}"
+            );
+        }
+        // The proven twin's member has its one proven use.
+        let twin = analyzer
+            .get_definitions("Twin.Beat")
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.source().rel_path() == std::path::Path::new("App/Twin.cs")
+            })
+            .expect("proven twin method");
+        let result = usages(&twin);
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = &result
+        else {
+            panic!("the proven twin's usages complete: {result:#?}");
+        };
+        assert_eq!(
+            hits_by_overload.get(&twin).map_or(0, |hits| hits.len()),
+            1,
+            "{result:#?}"
+        );
+        for fq_name in ["Gadget.Go", "Tools.Gadget.Go", "Lonely.Hum"] {
+            let target = method(fq_name);
+            let result = usages(&target);
+            let proven_empty = matches!(
+                &result,
+                FuzzyResult::Success { hits_by_overload, unproven_by_overload, .. }
+                    if hits_by_overload.values().all(|hits| hits.is_empty())
+                        && unproven_by_overload.values().all(|hits| hits.is_empty())
+            );
+            assert!(
+                !proven_empty,
+                "{fq_name}: an unproven membership must not prove the gadget call absent: {result:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: a member found only on an unproven or invisible physical twin resolved through the proven twin's name"
+    )]
+    fn members_of_an_unproven_physical_twin_are_not_proven_by_the_named_type() {
+        const USE: &str = r#"
+class Consumer {
+    void Use(Twin twin) { twin.OnlyOutside(); }
+    void Known(Twin twin) { twin.Known(); }
+}
+"#;
+        let sdk = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        for (outside_path, extra) in [
+            // Outside every project: membership unproven.
+            ("Loose/Twin.cs", None),
+            // In an SDK project App does not reference: provably invisible.
+            ("Other/Twin.cs", Some(("Other/Other.csproj", sdk))),
+        ] {
+            let mut files = vec![
+                ("App/App.csproj", sdk),
+                ("App/Use.cs", USE),
+                (
+                    "App/Twin.cs",
+                    "public class Twin { public void Known() {} }",
+                ),
+                (
+                    outside_path,
+                    "public class Twin { public void OnlyOutside() {} }",
+                ),
+            ];
+            files.extend(extra);
+            let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+            let analyzer = fixture.analyzer.analyzer();
+            let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+            let file = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+            let tree = parse_csharp_tree(USE).expect("C# reference tree");
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let token = scope.token();
+            let outcomes_at = |fragment: &str, name: &str| {
+                let start_byte = USE.find(fragment).expect("reference fixture") + fragment.len()
+                    - name.len()
+                    - "();".len();
+                let end_byte = start_byte + name.len();
+                let line = USE[..start_byte]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                let site = ResolvedReferenceSite {
+                    path: rel_path_string(&file),
+                    text: name.to_owned(),
+                    range: Range {
+                        start_byte,
+                        end_byte,
+                        start_line: line,
+                        end_line: line,
+                    },
+                    focus_start_byte: start_byte,
+                    focus_end_byte: end_byte,
+                };
+                let definitions = CSharpDefinitionProvider::new(csharp, &file);
+                let unbounded = resolve_csharp(
+                    analyzer,
+                    token,
+                    &definitions,
+                    &file,
+                    USE,
+                    Some(&tree),
+                    &site,
+                    false,
+                )
+                .outcome;
+                let bounded = resolve_csharp_bounded(
+                    analyzer,
+                    token,
+                    &file,
+                    USE,
+                    Some(&tree),
+                    &site,
+                    ReceiverAnalysisBudget::default(),
+                    None,
+                );
+                let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+                    panic!("reference lookup must complete: {bounded:#?}");
+                };
+                [unbounded, bounded]
+            };
+            for outcome in outcomes_at("twin.Known();", "Known") {
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{outside_path}: {outcome:#?}"
+                );
+            }
+            for outcome in outcomes_at("twin.OnlyOutside();", "OnlyOutside") {
+                // An unproven copy leaves doubt; a provably invisible copy is
+                // simply not part of the compilation, so no definition exists.
+                assert_eq!(
+                    outcome.status,
+                    if extra.is_some() {
+                        DefinitionLookupStatus::NoDefinition
+                    } else {
+                        DefinitionLookupStatus::Incomplete
+                    },
+                    "{outside_path}: a member only the excluded twin declares is not a proven definition: {outcome:#?}"
+                );
+                let paths = outcome
+                    .definitions
+                    .iter()
+                    .map(|unit| rel_path_string(unit.source()))
+                    .collect::<Vec<_>>();
+                if extra.is_some() {
+                    assert!(
+                        paths.is_empty(),
+                        "{outside_path}: a provably invisible declaration is no definition: {outcome:#?}"
+                    );
+                } else {
+                    assert_eq!(
+                        paths,
+                        vec![outside_path.to_owned()],
+                        "{outside_path}: Incomplete still carries the unproven declaration: {outcome:#?}"
+                    );
+                }
+            }
+
+            let roots = HashSet::from_iter([file.clone()]);
+            let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+                analyzer, token, &roots,
+            )
+            .expect("C# authoritative usage batch");
+            let target = analyzer
+                .get_definitions("Twin.OnlyOutside")
+                .into_iter()
+                .find(CodeUnit::is_function)
+                .expect("outside twin method");
+            let result = batch
+                .find_usages(std::slice::from_ref(&target), &roots, 100)
+                .into_fuzzy_result();
+            let FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                ..
+            } = &result
+            else {
+                panic!("{outside_path}: usages complete: {result:#?}");
+            };
+            assert!(
+                hits_by_overload.values().all(|hits| hits.is_empty()),
+                "{outside_path}: a call on the proven Twin cannot prove a use of the excluded twin's member: {result:#?}"
+            );
+            assert_eq!(
+                unproven_by_overload.values().any(|hits| !hits.is_empty()),
+                extra.is_none(),
+                "{outside_path}: an unproven copy's member use stays unproven; an invisible copy's is none: {result:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: an inherited member reached through a receiver of unproven membership resolved as proven"
+    )]
+    fn inherited_members_through_an_unproven_receiver_stay_unproven() {
+        const RUN: &str = r#"
+class Runner {
+    void Run(Lonely x) { x.Hum(); }
+    void Qualified(global::Lonely y) { y.Hum(); }
+    void Proven(Base z) { z.Hum(); }
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::CSharp,
+            &[
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Run.cs", RUN),
+                ("App/Base.cs", "public class Base { public void Hum() {} }"),
+                // No project claims this source.
+                ("Loose/Lonely.cs", "public class Lonely : Base {}"),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "App/Run.cs");
+        let tree = parse_csharp_tree(RUN).expect("C# reference tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let outcomes_at = |fragment: &str| {
+            let start_byte = RUN.find(fragment).expect("reference fixture") + 2;
+            let end_byte = start_byte + "Hum".len();
+            assert_eq!(&RUN[start_byte..end_byte], "Hum");
+            let line = RUN[..start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let site = ResolvedReferenceSite {
+                path: rel_path_string(&file),
+                text: "Hum".to_owned(),
+                range: Range {
+                    start_byte,
+                    end_byte,
+                    start_line: line,
+                    end_line: line,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: end_byte,
+            };
+            let definitions = CSharpDefinitionProvider::new(csharp, &file);
+            let unbounded = resolve_csharp(
+                analyzer,
+                token,
+                &definitions,
+                &file,
+                RUN,
+                Some(&tree),
+                &site,
+                false,
+            )
+            .outcome;
+            let bounded = resolve_csharp_bounded(
+                analyzer,
+                token,
+                &file,
+                RUN,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+                panic!("reference lookup must complete: {bounded:#?}");
+            };
+            [unbounded, bounded]
+        };
+        for outcome in outcomes_at("z.Hum();") {
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outcome:#?}"
+            );
+        }
+        for fragment in ["x.Hum();", "y.Hum();"] {
+            for outcome in outcomes_at(fragment) {
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::Incomplete,
+                    "{fragment}: the receiver's membership is unproven: {outcome:#?}"
+                );
+                assert_eq!(
+                    outcome
+                        .definitions
+                        .iter()
+                        .map(CodeUnit::fq_name)
+                        .collect::<Vec<_>>(),
+                    vec!["Base.Hum".to_owned()],
+                    "{fragment}: {outcome:#?}"
+                );
+            }
+        }
+
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+            analyzer, token, &roots,
+        )
+        .expect("C# authoritative usage batch");
+        let target = analyzer
+            .get_definitions("Base.Hum")
+            .into_iter()
+            .find(CodeUnit::is_function)
+            .expect("Base.Hum");
+        let result = batch
+            .find_usages(std::slice::from_ref(&target), &roots, 100)
+            .into_fuzzy_result();
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } = &result
+        else {
+            panic!("usages complete: {result:#?}");
+        };
+        let lines = |hits: &std::collections::BTreeSet<
+            brokk_bifrost_core::analyzer::usages::model::UsageHit,
+        >| {
+            hits.iter()
+                .map(|hit| {
+                    RUN[..hit.start_offset]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            hits_by_overload.get(&target).map(lines).unwrap_or_default(),
+            vec![4],
+            "only the Base-typed receiver is a proven use: {result:#?}"
+        );
+        assert_eq!(
+            unproven_by_overload
+                .get(&target)
+                .map(lines)
+                .unwrap_or_default(),
+            vec![2, 3],
+            "receivers of unproven membership are unproven uses: {result:#?}"
+        );
+    }
+
+    /// The definition outcome at `fragment`'s `name` in `use_path`, and the
+    /// proven and unproven usage hit counts of the method `target_fqn`
+    /// declared in `target_path`, both from one fixture.
+    fn membership_outcome(
+        files: &[(&str, &str)],
+        use_path: &str,
+        source: &str,
+        fragment: &str,
+        name: &str,
+        target_fqn: &str,
+        target_path: &str,
+    ) -> (DefinitionLookupOutcome, usize, usize) {
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, files);
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let file = ProjectFile::new(fixture.project_root(), use_path);
+        let tree = parse_csharp_tree(source).expect("C# reference tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let start_byte = source.find(fragment).expect("reference fixture")
+            + fragment.find(name).expect("name in fragment");
+        let line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: name.to_owned(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + name.len(),
+                start_line: line,
+                end_line: line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + name.len(),
+        };
+        let definitions = CSharpDefinitionProvider::new(csharp, &file);
+        let outcome = resolve_csharp(
+            analyzer,
+            token,
+            &definitions,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            false,
+        )
+        .outcome;
+        let bounded = resolve_csharp_bounded(
+            analyzer,
+            token,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+            panic!("reference lookup must complete: {bounded:#?}");
+        };
+        assert_eq!(outcome.status, bounded.status, "{outcome:#?}\n{bounded:#?}");
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+            analyzer, token, &roots,
+        )
+        .expect("C# authoritative usage batch");
+        let target = analyzer
+            .get_definitions(target_fqn)
+            .into_iter()
+            .find(|unit| {
+                unit.is_function() && unit.source().rel_path() == std::path::Path::new(target_path)
+            })
+            .unwrap_or_else(|| panic!("target {target_fqn} in {target_path}"));
+        let result = batch
+            .find_usages(std::slice::from_ref(&target), &roots, 100)
+            .into_fuzzy_result();
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } = &result
+        else {
+            panic!("usages complete: {result:#?}");
+        };
+        let count = |hits: &HashMap<CodeUnit, std::collections::BTreeSet<_>>| {
+            hits.values().map(|hits| hits.len()).sum::<usize>()
+        };
+        (
+            outcome,
+            count(hits_by_overload),
+            count(unproven_by_overload),
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: a static receiver of unproven or invisible membership resolved an inherited member"
+    )]
+    fn static_receivers_through_an_outside_type_are_not_proven() {
+        let sdk = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        let source = "class Use {\n void A() { global::Lonely.Hum(); }\n void B() { Lonely.Hum(); }\n void C() { Base.Hum(); }\n}\n";
+        for (outside, extra) in [
+            ("Loose", None),
+            ("Other", Some(("Other/Other.csproj", sdk))),
+        ] {
+            let lonely = format!("{outside}/Lonely.cs");
+            let mut files = vec![
+                ("App/App.csproj", sdk),
+                (
+                    "App/Base.cs",
+                    "public class Base { public static void Hum() {} }",
+                ),
+                (lonely.as_str(), "public class Lonely : Base {}"),
+                ("App/Use.cs", source),
+            ];
+            files.extend(extra);
+            for fragment in ["global::Lonely.Hum()", "{ Lonely.Hum()"] {
+                let (outcome, proven, _) = membership_outcome(
+                    &files,
+                    "App/Use.cs",
+                    source,
+                    fragment,
+                    "Hum",
+                    "Base.Hum",
+                    "App/Base.cs",
+                );
+                assert_ne!(
+                    outcome.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{outside} {fragment}: {outcome:#?}"
+                );
+                if extra.is_none() {
+                    assert_eq!(
+                        outcome.status,
+                        DefinitionLookupStatus::Incomplete,
+                        "{outside} {fragment}: {outcome:#?}"
+                    );
+                }
+                assert_eq!(proven, 1, "{outside}: only `Base.Hum()` is a proven use");
+            }
+            let (outcome, _, _) = membership_outcome(
+                &files,
+                "App/Use.cs",
+                source,
+                "{ Base.Hum()",
+                "Hum",
+                "Base.Hum",
+                "App/Base.cs",
+            );
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outcome:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: a base list on an unproven or invisible physical twin gave the proven type an inherited member"
+    )]
+    fn an_outside_physical_twin_contributes_no_proven_base() {
+        let sdk = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        let source = "class Use { void Run(Twin x) { x.Hum(); } }\n";
+        for (outside, extra) in [
+            ("Loose", None),
+            ("Other", Some(("Other/Other.csproj", sdk))),
+        ] {
+            let twin = format!("{outside}/Twin.cs");
+            let mut files = vec![
+                ("App/App.csproj", sdk),
+                ("App/Twin.cs", "public class Twin {}"),
+                ("App/Base.cs", "public class Base { public void Hum() {} }"),
+                (twin.as_str(), "public class Twin : Base {}"),
+                ("App/Use.cs", source),
+            ];
+            files.extend(extra);
+            let (outcome, proven, unproven) = membership_outcome(
+                &files,
+                "App/Use.cs",
+                source,
+                "x.Hum()",
+                "Hum",
+                "Base.Hum",
+                "App/Base.cs",
+            );
+            assert_ne!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outside}: {outcome:#?}"
+            );
+            assert_eq!(
+                proven, 0,
+                "{outside}: the base is not proven for App's Twin"
+            );
+            if extra.is_none() {
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::Incomplete,
+                    "{outcome:#?}"
+                );
+                assert_eq!(
+                    unproven, 1,
+                    "an unproven twin's base leaves an unproven use"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: an inverted edge to an overload only an outside copy declares was proven by a visible same-name overload"
+    )]
+    fn inverted_edges_keep_the_selected_overloads_membership() {
+        let sdk = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        let source =
+            "class Use { void Run(Twin x) { x.Work(1); } void Plain(Twin y) { y.Work(); } }\n";
+        let mut baseline = None;
+        for (outside, extra) in [
+            ("Absent", Some(("Absent/Absent.csproj", sdk))),
+            ("Loose", None),
+            ("Other", Some(("Other/Other.csproj", sdk))),
+        ] {
+            let twin = format!("{outside}/Twin.cs");
+            let mut files = vec![
+                ("App/App.csproj", sdk),
+                ("App/Twin.cs", "public class Twin { public void Work() {} }"),
+                (
+                    twin.as_str(),
+                    "public class Twin { public void Work(int n) {} }",
+                ),
+                ("App/Use.cs", source),
+            ];
+            files.extend(extra);
+            if outside == "Absent" {
+                files.retain(|(path, _)| !path.starts_with("Absent/Twin"));
+            }
+            let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+            let analyzer = fixture.analyzer.analyzer();
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let edges = match crate::analyzer::usages::csharp_graph::build_inbound_csharp_usage_edges_with_completeness(
+                analyzer,
+                scope.token(),
+                &HashSet::from_iter(["Twin.Work".to_owned()]),
+            )
+            .expect("C# edges")
+            {
+                brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildResult::Complete(edges) => edges,
+                other => {
+                    let brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildResult::Uncacheable {
+                        output,
+                        omitted_files,
+                    } = other
+                    else {
+                        unreachable!()
+                    };
+                    assert!(omitted_files.is_empty(), "{omitted_files:?}");
+                    output
+                }
+            };
+            let sites = edges
+                .edges
+                .iter()
+                .filter(|((_, callee), _)| callee == "Twin.Work")
+                .map(|((caller, _), sites)| (caller.clone(), sites.len()))
+                .collect::<Vec<_>>();
+            // `Run` calls the overload only the outside copy declares. With an
+            // unproven copy, every `Twin.Work` lookup admits that overload as
+            // doubt, so neither call is a proven edge (a conservative answer
+            // for `Plain`). With an invisible copy the edges are exactly those
+            // of a workspace without the copy ("Absent"): membership adds no
+            // claim. That baseline also records `Run`, because the inverted
+            // graph keeps a name-only edge when no overload is applicable,
+            // which predates compilation membership.
+            let unproven = edges
+                .unproven_inbound
+                .get("Twin.Work")
+                .copied()
+                .unwrap_or(0);
+            match outside {
+                "Absent" => baseline = Some(sites),
+                "Other" => assert_eq!(
+                    Some(sites),
+                    baseline.clone(),
+                    "an invisible copy changes no edge"
+                ),
+                _ => {
+                    assert!(
+                        sites.is_empty(),
+                        "{outside}: no call is a proven edge: {sites:?}"
+                    );
+                    assert_eq!(
+                        unproven, 2,
+                        "both calls are unproven inbound: {:?}",
+                        edges.unproven_inbound
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: local inference must carry unproven factory membership")]
+    fn inferred_locals_keep_the_membership_doubt_of_their_initializer() {
+        // The second source names the doubted local like a visible type: a
+        // shadowed local is still the receiver, not that type.
+        for source in [
+            "class Use { void Run(Twin t) { var x = t.Make(); x.Hum(); } }",
+            "class Use { void Run(Twin t) { var Target = t.Make(); Target.Hum(); } }",
+        ] {
+            let edges = inbound_edges(
+                &[
+                    ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                    ("App/Twin.cs", "public partial class Twin {}"),
+                    (
+                        "Loose/Twin.cs",
+                        "public partial class Twin { public Target Make() { return null; } }",
+                    ),
+                    (
+                        "App/Target.cs",
+                        "public class Target { public void Hum() {} }",
+                    ),
+                    ("App/Use.cs", source),
+                ],
+                "Target.Hum",
+            );
+            assert!(
+                edges
+                    .edges
+                    .iter()
+                    .all(|((_, callee), _)| callee != "Target.Hum"),
+                "{source}: unproven factory cannot prove an edge: {:?}, unproven={:?}",
+                edges.edges,
+                edges.unproven_inbound
+            );
+        }
+    }
+
+    /// The inbound C# usage edges of `callee` over `files`.
+    fn inbound_edges(
+        files: &[(&str, &str)],
+        callee: &str,
+    ) -> brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges {
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, files);
+        let analyzer = fixture.analyzer.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let result = crate::analyzer::usages::csharp_graph::build_inbound_csharp_usage_edges_with_completeness(
+            analyzer, scope.token(), &HashSet::from_iter([callee.to_owned()]),
+        ).expect("C# edges");
+        match result {
+            brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildResult::Complete(edges) => edges,
+            brokk_bifrost_analysis::analyzer::usages::inverted_edges::UsageEdgeBuildResult::Uncacheable { output, .. } => output,
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6296: an unproven partial part's unrelated nested class made a visible nested type's uses unproven"
+    )]
+    fn an_unproven_parts_unrelated_nested_class_leaves_a_visible_nested_type_proven() {
+        let source = "public partial class Outer { public class Inner { public void Hum() {} } void Run() { new Inner().Hum(); } }";
+        // Forward usage hits only: this definition lookup answers
+        // NoDefinition with or without the unproven part.
+        let (_, proven, unproven) = membership_outcome(
+            &[
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Outer.cs", source),
+                (
+                    "Loose/Outer.Part.cs",
+                    "public partial class Outer { public class Other {} }",
+                ),
+            ],
+            "App/Outer.cs",
+            source,
+            "new Inner().Hum()",
+            "Hum",
+            "Outer$Inner.Hum",
+            "App/Outer.cs",
+        );
+        assert_eq!((proven, unproven), (1, 0));
+    }
+
+    #[test]
+    #[hardwon("#6296: extension receiver construction must carry membership doubt")]
+    fn an_unproven_constructed_receiver_cannot_prove_an_extension() {
+        let source = "class Use { void Run() { new Lonely().Hum(); } }";
+        let files = [
+            ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+            ("Loose/Lonely.cs", "public class Lonely {}"),
+            (
+                "App/Extensions.cs",
+                "public static class Extensions { public static void Hum<T>(this T value) {} }",
+            ),
+            ("App/Use.cs", source),
+        ];
+        let (outcome, _, _) = membership_outcome(
+            &files,
+            "App/Use.cs",
+            source,
+            "new Lonely().Hum()",
+            "Hum",
+            "Extensions.Hum",
+            "App/Extensions.cs",
+        );
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Incomplete,
+            "unproven constructed receiver cannot resolve uniquely: {outcome:#?}"
+        );
+    }
+
+    fn review_chained_receiver_case(outside: &str, extra: Option<(&str, &str)>) {
+        let source = "class Use { void Run(Twin t) { t.Make().Hum(); } }";
+        let twin = format!("{outside}/Twin.cs");
+        let mut files = vec![
+            ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+            ("App/Twin.cs", "public partial class Twin {}"),
+            (twin.as_str(), "public partial class Twin : Base {}"),
+            (
+                "App/Base.cs",
+                "public class Base { public Target Make() { return null; } }",
+            ),
+            (
+                "App/Target.cs",
+                "public class Target { public void Hum() {} }",
+            ),
+            ("App/Use.cs", source),
+        ];
+        files.extend(extra);
+        let (outcome, _, _) = membership_outcome(
+            &files,
+            "App/Use.cs",
+            source,
+            "t.Make().Hum()",
+            "Hum",
+            "Target.Hum",
+            "App/Target.cs",
+        );
+        assert_ne!(
+            outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "outside base cannot prove a chained receiver: {outcome:#?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#6296: chained return-type inference must filter unproven physical bases")]
+    fn review_chained_receiver_through_unproven_base() {
+        review_chained_receiver_case("Loose", None);
+    }
+
+    #[test]
+    #[hardwon("#6296: chained return-type inference must filter invisible physical bases")]
+    fn review_chained_receiver_through_invisible_base() {
+        review_chained_receiver_case(
+            "Other",
+            Some((
+                "Other/Other.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk" />"#,
+            )),
+        );
+    }
+
+    #[test]
+    fn a_visible_parts_base_list_still_types_a_chained_receiver() {
+        // The visible part writes the base; the outside part adds nothing.
+        for (outside, extra) in [
+            ("Loose", None),
+            (
+                "Other",
+                Some((
+                    "Other/Other.csproj",
+                    r#"<Project Sdk="Microsoft.NET.Sdk" />"#,
+                )),
+            ),
+        ] {
+            let source = "class Use { void Run(Twin t) { t.Make().Hum(); } }";
+            let twin = format!("{outside}/Twin.cs");
+            let mut files = vec![
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Twin.cs", "public partial class Twin : Base {}"),
+                (twin.as_str(), "public partial class Twin {}"),
+                (
+                    "App/Base.cs",
+                    "public class Base { public Target Make() { return null; } }",
+                ),
+                (
+                    "App/Target.cs",
+                    "public class Target { public void Hum() {} }",
+                ),
+                ("App/Use.cs", source),
+            ];
+            files.extend(extra);
+            let (outcome, proven, unproven) = membership_outcome(
+                &files,
+                "App/Use.cs",
+                source,
+                "t.Make().Hum()",
+                "Hum",
+                "Target.Hum",
+                "App/Target.cs",
+            );
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outside}: {outcome:#?}"
+            );
+            assert_eq!((proven, unproven), (1, 0), "{outside}");
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: the membership view's hierarchy merged every physical part's base list")]
+    fn the_membership_view_derives_hierarchy_from_each_parts_membership() {
+        use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+        for (outside, extra, expected_descendants, expected_doubt) in [
+            ("Loose", None, 1, true),
+            (
+                "Other",
+                Some((
+                    "Other/Other.csproj",
+                    r#"<Project Sdk="Microsoft.NET.Sdk" />"#,
+                )),
+                0,
+                false,
+            ),
+        ] {
+            let twin = format!("{outside}/Twin.cs");
+            let mut files = vec![
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Twin.cs", "public partial class Twin {}"),
+                (twin.as_str(), "public partial class Twin : Base {}"),
+                ("App/Base.cs", "public class Base {}"),
+                ("App/Use.cs", "class Use {}"),
+            ];
+            files.extend(extra);
+            let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+            let analyzer = fixture.analyzer.analyzer();
+            let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+            let reference = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+            let view = brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
+                graph_support::CSharpSource::shared_source(csharp),
+                &reference,
+            );
+            let base = analyzer
+                .get_definitions("Base")
+                .into_iter()
+                .find(CodeUnit::is_class)
+                .expect("Base");
+            let twin = analyzer
+                .get_definitions("Twin")
+                .into_iter()
+                .find(|unit| unit.source().rel_path() == std::path::Path::new("App/Twin.cs"))
+                .expect("visible Twin part");
+            let ancestors = view.get_direct_ancestors(&twin);
+            let descendants = view.get_direct_descendants(&base);
+            assert_eq!(
+                ancestors.iter().any(|unit| unit.fq_name() == "Base"),
+                expected_doubt,
+                "{outside}: {ancestors:?}"
+            );
+            let descendant_types = descendants
+                .iter()
+                .map(CodeUnit::fq_name)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                descendant_types.len(),
+                expected_descendants,
+                "{outside}: {descendants:?}"
+            );
+            assert_eq!(view.doubt() > 0, expected_doubt, "{outside}");
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: generic nested alias and cast receiver identities carry doubt")]
+    fn review_receiver_forms_keep_membership_doubt() {
+        for source in [
+            "class Use { void Run() { new Lonely<int>().Hum(); } }",
+            "using Alias = Lonely; class Use { void Run() { new Alias().Hum(); } }",
+            "class Use { void Run() { ((Lonely)null).Hum(); } }",
+            "class Use { void Run() { new Outer.Inner().Hum(); } }",
+        ] {
+            let files = [
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                (
+                    "Loose/Lonely.cs",
+                    "public class Lonely {} public class Lonely<T> {} public class Outer { public class Inner {} }",
+                ),
+                (
+                    "App/Extensions.cs",
+                    "public static class Extensions { public static void Hum<T>(this T value) {} }",
+                ),
+                ("App/Use.cs", source),
+            ];
+            let (outcome, proven, _) = membership_outcome(
+                &files,
+                "App/Use.cs",
+                source,
+                ".Hum()",
+                "Hum",
+                "Extensions.Hum",
+                "App/Extensions.cs",
+            );
+            assert_ne!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{source}: {outcome:#?}"
+            );
+            assert_eq!(proven, 0, "{source}");
+        }
+    }
+
+    fn review_warm_membership_outcome(
+        files: &[(&str, &str)],
+        use_path: &str,
+        source: &str,
+        fragment: &str,
+        name: &str,
+        target_fqn: &str,
+        target_path: &str,
+    ) -> (DefinitionLookupOutcome, usize, usize) {
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, files);
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let file = ProjectFile::new(fixture.project_root(), use_path);
+        let tree = parse_csharp_tree(source).expect("C# reference tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let start_byte = source.find(fragment).expect("reference fixture")
+            + fragment.find(name).expect("name in fragment");
+        let line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: name.to_owned(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + name.len(),
+                start_line: line,
+                end_line: line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + name.len(),
+        };
+        let definitions = CSharpDefinitionProvider::new(csharp, &file);
+        let outcome = resolve_csharp(
+            analyzer,
+            token,
+            &definitions,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            false,
+        )
+        .outcome;
+        let bounded = resolve_csharp_bounded(
+            analyzer,
+            token,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+            panic!("reference lookup must complete: {bounded:#?}");
+        };
+        assert_eq!(outcome.status, bounded.status, "{outcome:#?}\n{bounded:#?}");
+        use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+        // Prime the unscoped memo after the cold query, then start fresh requests.
+        for unit in analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(CodeUnit::is_class)
+        {
+            csharp.get_ancestors(&unit);
+        }
+        for _ in 0..2 {
+            let warm_definitions = CSharpDefinitionProvider::new(csharp, &file);
+            let warm = resolve_csharp(
+                analyzer,
+                token,
+                &warm_definitions,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                false,
+            )
+            .outcome;
+            let warm_bounded = resolve_csharp_bounded(
+                analyzer,
+                token,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete {
+                value: warm_bounded,
+                ..
+            } = warm_bounded
+            else {
+                panic!("warm budget: {warm_bounded:#?}");
+            };
+            assert_eq!(
+                outcome.status, warm.status,
+                "cold={outcome:#?}, warm={warm:#?}"
+            );
+            assert_eq!(
+                outcome.status, warm_bounded.status,
+                "cold={outcome:#?}, warm bounded={warm_bounded:#?}"
+            );
+        }
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+            analyzer, token, &roots,
+        )
+        .expect("C# authoritative usage batch");
+        let target = analyzer
+            .get_definitions(target_fqn)
+            .into_iter()
+            .find(|unit| {
+                unit.is_function() && unit.source().rel_path() == std::path::Path::new(target_path)
+            })
+            .unwrap_or_else(|| panic!("target {target_fqn} in {target_path}"));
+        let result = batch
+            .find_usages(std::slice::from_ref(&target), &roots, 100)
+            .into_fuzzy_result();
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } = &result
+        else {
+            panic!("usages complete: {result:#?}");
+        };
+        let count = |hits: &HashMap<CodeUnit, std::collections::BTreeSet<_>>| {
+            hits.values().map(|hits| hits.len()).sum::<usize>()
+        };
+        let cold_counts = (count(hits_by_overload), count(unproven_by_overload));
+        let warm_result = batch
+            .find_usages(std::slice::from_ref(&target), &roots, 100)
+            .into_fuzzy_result();
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } = &warm_result
+        else {
+            panic!("warm usages: {warm_result:#?}");
+        };
+        assert_eq!(
+            cold_counts,
+            (count(hits_by_overload), count(unproven_by_overload)),
+            "usage parity"
+        );
+        (outcome, cold_counts.0, cold_counts.1)
+    }
+
+    #[test]
+    #[hardwon("#6296: ancestor membership must survive cold and warm chained lookups")]
+    fn review_ancestor_routes_cold_warm() {
+        let cases = [
+            (
+                "direct",
+                "public partial class Twin {}",
+                "public partial class Twin : Base {}",
+                "public class Base { public Target Make() { return null; } }",
+                "class Use { void Run(Twin t) { t.Make().Hum(); } }",
+            ),
+            (
+                "transitive",
+                "public partial class Twin {}",
+                "public partial class Twin : Middle {}",
+                "public class Middle : Base {} public class Base { public Target Make() { return null; } }",
+                "class Use { void Run(Twin t) { t.Make().Hum(); } }",
+            ),
+            (
+                "interface",
+                "public partial interface Twin {}",
+                "public partial interface Twin : IBase {}",
+                "public interface IBase { Target Make(); }",
+                "class Use { void Run(Twin t) { t.Make().Hum(); } }",
+            ),
+            (
+                "generic",
+                "public partial class Twin {}",
+                "public partial class Twin : Base<Target> {}",
+                "public class Base<T> { public Target Make() { return null; } }",
+                "class Use { void Run(Twin t) { t.Make().Hum(); } }",
+            ),
+            (
+                "nested",
+                "public partial class Twin {} public class Outer { public class Inner : Twin {} }",
+                "public partial class Twin : Base {}",
+                "public class Base { public Target Make() { return null; } }",
+                "class Use { void Run(Outer.Inner t) { t.Make().Hum(); } }",
+            ),
+        ];
+        for (kind, visible, outside_source, base, source) in cases {
+            for outside in ["Loose", "Other"] {
+                let path = format!("{outside}/Twin.cs");
+                let mut files = vec![
+                    ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                    ("App/Twin.cs", visible),
+                    (path.as_str(), outside_source),
+                    ("App/Base.cs", base),
+                    (
+                        "App/Target.cs",
+                        "public class Target { public void Hum() {} }",
+                    ),
+                    ("App/Use.cs", source),
+                ];
+                if outside == "Other" {
+                    files.push((
+                        "Other/Other.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk" />"#,
+                    ));
+                }
+                let (outcome, proven, unproven) = review_warm_membership_outcome(
+                    &files,
+                    "App/Use.cs",
+                    source,
+                    ".Hum()",
+                    "Hum",
+                    "Target.Hum",
+                    "App/Target.cs",
+                );
+                eprintln!(
+                    "{kind} {outside}: {:?}, proven={proven}, unproven={unproven}",
+                    outcome.status
+                );
+                assert_ne!(
+                    outcome.status,
+                    DefinitionLookupStatus::Resolved,
+                    "{kind} {outside}: {outcome:#?}"
+                );
+                assert_eq!(proven, 0, "{kind} {outside}");
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: scoped direct transitive and descendant accessors must replay base doubt")]
+    fn review_all_hierarchy_accessors_replay_doubt() {
+        use brokk_bifrost_core::analyzer::capabilities::{
+            DescendantIndexScope, TypeHierarchyProvider,
+        };
+        for outside in ["Loose", "Other"] {
+            let path = format!("{outside}/Twin.cs");
+            let mut files = vec![
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                (
+                    "App/Twin.cs",
+                    "public partial class Twin {} public class Child : Twin {}",
+                ),
+                (path.as_str(), "public partial class Twin : Middle {}"),
+                (
+                    "App/Base.cs",
+                    "public class Middle : Base {} public class Base {}",
+                ),
+                ("App/Use.cs", "class Use {}"),
+            ];
+            if outside == "Other" {
+                files.push((
+                    "Other/Other.csproj",
+                    r#"<Project Sdk="Microsoft.NET.Sdk" />"#,
+                ));
+            }
+            let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+            let analyzer = fixture.analyzer.analyzer();
+            let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C#");
+            let get = |name: &str| {
+                analyzer
+                    .get_definitions(name)
+                    .into_iter()
+                    .find(|u| u.source().rel_path() == std::path::Path::new("App/Twin.cs"))
+                    .expect("visible type")
+            };
+            let twin = get("Twin");
+            let child = get("Child");
+            let base = analyzer
+                .get_definitions("Base")
+                .into_iter()
+                .next()
+                .expect("Base");
+            csharp.get_ancestors(&child); // A populated inner memo must not affect the view.
+            let reference = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+            let view = brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource::new(
+                graph_support::CSharpSource::shared_source(csharp),
+                &reference,
+            );
+            let cancellation = CancellationToken::new();
+            let scope = DescendantIndexScope::whole_workspace(&cancellation);
+            for _ in 0..2 {
+                let before = view.doubt();
+                let direct = view.get_direct_ancestors(&twin);
+                assert_eq!(
+                    direct.iter().any(|u| u.fq_name() == "Middle"),
+                    outside == "Loose"
+                );
+                assert_eq!(view.doubt() > before, outside == "Loose");
+                let before = view.doubt();
+                let scoped = view
+                    .get_direct_ancestors_within(&twin, &scope)
+                    .expect("scope");
+                assert_eq!(direct, scoped);
+                assert_eq!(view.doubt() > before, outside == "Loose");
+                let before = view.doubt();
+                let ancestors = view.get_ancestors(&child);
+                assert_eq!(
+                    ancestors.iter().any(|u| u.fq_name() == "Base"),
+                    outside == "Loose"
+                );
+                assert_eq!(view.doubt() > before, outside == "Loose");
+                let before = view.doubt();
+                let descendants = view.get_descendants(&base);
+                assert_eq!(
+                    descendants.iter().any(|u| u.fq_name() == "Child"),
+                    outside == "Loose"
+                );
+                assert_eq!(view.doubt() > before, outside == "Loose");
+                let before = view.doubt();
+                let scoped_descendants = view.get_descendants_within(&base, &scope).expect("scope");
+                assert_eq!(
+                    scoped_descendants.iter().any(|u| u.fq_name() == "Child"),
+                    outside == "Loose"
+                );
+                assert_eq!(view.doubt() > before, outside == "Loose");
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: supported unknown local receivers must remain unproven")]
+    fn review_supported_local_bindings_remain_unproven() {
+        for source in [
+            "class Use { void Run() { using (Lonely Target = new Lonely()) { Target.Hum(); } } }",
+            "class Use { void Run() { using var Target = new Lonely(); Target.Hum(); } }",
+            "delegate void D(Lonely x); class Use { void Run() { D a = (Lonely Target) => Target.Hum(); } }",
+        ] {
+            let edges = inbound_edges(
+                &[
+                    ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                    (
+                        "App/Target.cs",
+                        "public class Target { public static void Hum() {} }",
+                    ),
+                    (
+                        "Loose/Lonely.cs",
+                        "public class Lonely { public void Hum() {} }",
+                    ),
+                    ("App/Use.cs", source),
+                ],
+                "Target.Hum",
+            );
+            assert!(
+                edges
+                    .edges
+                    .iter()
+                    .all(|((_, callee), _)| callee != "Target.Hum"),
+                "{source}: {:?}",
+                edges.edges
+            );
+            assert_eq!(edges.unproven_inbound.get("Target.Hum"), Some(&1));
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: extension applicability must not use an invisible partial base")]
+    fn review_extension_compatibility_uses_only_visible_bases() {
+        let source = "class Use { void Run(Twin t) { t.Hum(); } }";
+        let files = [
+            ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+            (
+                "Other/Other.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../App/App.csproj" /></ItemGroup></Project>"#,
+            ),
+            ("App/Twin.cs", "public partial class Twin {}"),
+            ("Other/Twin.cs", "public partial class Twin : Base {}"),
+            ("App/Base.cs", "public class Base {}"),
+            (
+                "App/Extensions.cs",
+                "public static class Extensions { public static void Hum(this Base value) {} }",
+            ),
+            ("App/Use.cs", source),
+        ];
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C#");
+        let file = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+        assert_eq!(
+            csharp.compilation_visibility(
+                &file,
+                &ProjectFile::new(fixture.project_root(), "Other/Twin.cs")
+            ),
+            Some(graph_support::CSharpCompilationVisibility::NotVisible)
+        );
+        let tree = parse_csharp_tree(source).expect("tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let start_byte = source.find("Hum()").expect("Hum");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "Hum".to_owned(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + 3,
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + 3,
+        };
+        let mut results = Vec::new();
+        for pass in 0..2 {
+            let definitions = CSharpDefinitionProvider::new(csharp, &file);
+            let unbounded = resolve_csharp(
+                analyzer,
+                token,
+                &definitions,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                false,
+            )
+            .outcome;
+            let bounded = resolve_csharp_bounded(
+                analyzer,
+                token,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+                panic!("budget: {bounded:#?}");
+            };
+            eprintln!("pass={pass}, unbounded={unbounded:#?}, bounded={bounded:#?}");
+            results.push((unbounded.status, bounded.status));
+        }
+        assert!(
+            results
+                .iter()
+                .all(|(u, b)| *u != DefinitionLookupStatus::Resolved
+                    && *b != DefinitionLookupStatus::Resolved),
+            "invisible base cannot prove an extension, cold/warm={results:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#6296: extension applicability must not use an invisible partial base")]
+    fn extension_applicability_reads_bases_through_the_reference_membership() {
+        use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+        let source = "class Use { void Run(Twin t) { t.Hum(); } }";
+        for (outside, base_on, expected) in [
+            ("Other", "outside", DefinitionLookupStatus::NoDefinition),
+            ("Loose", "outside", DefinitionLookupStatus::Incomplete),
+            ("Other", "visible", DefinitionLookupStatus::Resolved),
+            ("Loose", "visible", DefinitionLookupStatus::Resolved),
+        ] {
+            let other_project = r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../App/App.csproj" /></ItemGroup></Project>"#;
+            let outside_twin = format!("{outside}/Twin.cs");
+            let (visible_twin, outside_body) = if base_on == "visible" {
+                (
+                    "public partial class Twin : Base {}",
+                    "public partial class Twin {}",
+                )
+            } else {
+                (
+                    "public partial class Twin {}",
+                    "public partial class Twin : Base {}",
+                )
+            };
+            let mut files = vec![
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Twin.cs", visible_twin),
+                (outside_twin.as_str(), outside_body),
+                ("App/Base.cs", "public class Base {}"),
+                (
+                    "App/Extensions.cs",
+                    "public static class Extensions { public static void Hum(this Base value) {} }",
+                ),
+                ("App/Use.cs", source),
+            ];
+            if outside == "Other" {
+                files.push(("Other/Other.csproj", other_project));
+            }
+            let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+            let analyzer = fixture.analyzer.analyzer();
+            let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C#");
+            let file = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+            // Prime the analyzer's merged ancestor memo for every Twin part.
+            for twin in analyzer.get_definitions("Twin") {
+                csharp.get_direct_ancestors(&twin);
+            }
+            let tree = parse_csharp_tree(source).expect("tree");
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let token = scope.token();
+            let start_byte = source.find("Hum()").expect("Hum");
+            let site = ResolvedReferenceSite {
+                path: rel_path_string(&file),
+                text: "Hum".to_owned(),
+                range: Range {
+                    start_byte,
+                    end_byte: start_byte + 3,
+                    start_line: 0,
+                    end_line: 0,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: start_byte + 3,
+            };
+            for pass in ["cold", "warm"] {
+                let definitions = CSharpDefinitionProvider::new(csharp, &file);
+                let unbounded = resolve_csharp(
+                    analyzer,
+                    token,
+                    &definitions,
+                    &file,
+                    source,
+                    Some(&tree),
+                    &site,
+                    false,
+                )
+                .outcome;
+                let BoundedResolution::Complete { value: bounded, .. } = resolve_csharp_bounded(
+                    analyzer,
+                    token,
+                    &file,
+                    source,
+                    Some(&tree),
+                    &site,
+                    ReceiverAnalysisBudget::default(),
+                    None,
+                ) else {
+                    panic!("{outside} {base_on} {pass}: bounded lookup did not complete");
+                };
+                assert_eq!(
+                    (unbounded.status, bounded.status),
+                    (expected, expected),
+                    "{outside} {base_on} {pass}: {unbounded:#?}"
+                );
+            }
+        }
+    }
+
+    fn review_definition_statuses(
+        files: &[(&str, &str)],
+        source: &str,
+        fragment: &str,
+        name: &str,
+    ) -> Vec<(DefinitionLookupStatus, DefinitionLookupStatus)> {
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, files);
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C#");
+        let file = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+        let tree = parse_csharp_tree(source).expect("tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let start_byte =
+            source.find(fragment).expect("fragment") + fragment.find(name).expect("name");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: name.to_owned(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + name.len(),
+                start_line: 0,
+                end_line: 0,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + name.len(),
+        };
+        let mut results = Vec::new();
+        for pass in 0..2 {
+            let definitions = CSharpDefinitionProvider::new(csharp, &file);
+            let u = resolve_csharp(
+                analyzer,
+                token,
+                &definitions,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                false,
+            )
+            .outcome;
+            let b = resolve_csharp_bounded(
+                analyzer,
+                token,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value: b, .. } = b else {
+                panic!("budget: {b:#?}");
+            };
+            eprintln!("pass={pass}, unbounded={u:#?}, bounded={b:#?}");
+            results.push((u.status, b.status));
+        }
+        results
+    }
+
+    fn review_attribute_base_case(outside: &str) {
+        let source = "[Mark] class Use {}";
+        let twin = format!("{outside}/Twin.cs");
+        let mut files = vec![
+            ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+            ("App/Twin.cs", "public partial class Twin {}"),
+            (
+                twin.as_str(),
+                "public partial class Twin : System.Attribute {}",
+            ),
+            ("App/Mark.cs", "public class MarkAttribute : Twin {}"),
+            ("App/Use.cs", source),
+        ];
+        if outside == "Other" {
+            files.push(("Other/Other.csproj", r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../App/App.csproj" /></ItemGroup></Project>"#));
+        }
+        let results = review_definition_statuses(&files, source, "[Mark]", "Mark");
+        assert!(
+            results
+                .iter()
+                .all(|(u, b)| *u != DefinitionLookupStatus::Resolved
+                    && *b != DefinitionLookupStatus::Resolved),
+            "{outside}: attribute ancestry is not proven: {results:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#6296: attribute evidence must filter an unproven partial ancestor")]
+    fn review_attribute_base_membership_unresolved() {
+        review_attribute_base_case("Loose");
+    }
+
+    #[test]
+    #[hardwon("#6296: attribute evidence must filter an invisible partial ancestor")]
+    fn review_attribute_base_membership_invisible() {
+        review_attribute_base_case("Other");
+    }
+
+    fn review_extension_variant(
+        visible: &str,
+        outside_source: &str,
+        base: &str,
+        extension: &str,
+        source: &str,
+    ) {
+        for outside in ["Loose", "Other"] {
+            let path = format!("{outside}/Twin.cs");
+            let mut files = vec![
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Twin.cs", visible),
+                (path.as_str(), outside_source),
+                ("App/Base.cs", base),
+                ("App/Extensions.cs", extension),
+                ("App/Use.cs", source),
+            ];
+            if outside == "Other" {
+                files.push(("Other/Other.csproj", r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../App/App.csproj" /></ItemGroup></Project>"#));
+            }
+            let (outcome, proven, _) = review_warm_membership_outcome(
+                &files,
+                "App/Use.cs",
+                source,
+                ".Hum()",
+                "Hum",
+                "Extensions.Hum",
+                "App/Extensions.cs",
+            );
+            eprintln!("{outside}: {:?}, proven={proven}", outcome.status);
+            assert_ne!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outside}: {outcome:#?}"
+            );
+            assert_eq!(proven, 0);
+        }
+    }
+
+    #[test]
+    #[hardwon("#6296: extension class base applicability carries membership doubt")]
+    fn review_extension_variant_class() {
+        review_extension_variant(
+            "public partial class Twin {}",
+            "public partial class Twin : Base {}",
+            "public class Base {}",
+            "public static class Extensions { public static void Hum(this Base v) {} }",
+            "class Use { void Run(Twin t) { t.Hum(); } }",
+        );
+    }
+    #[test]
+    #[hardwon("#6296: extension interface base applicability carries membership doubt")]
+    fn review_extension_variant_interface() {
+        review_extension_variant(
+            "public partial class Twin {}",
+            "public partial class Twin : IBase {}",
+            "public interface IBase {}",
+            "public static class Extensions { public static void Hum(this IBase v) {} }",
+            "class Use { void Run(Twin t) { t.Hum(); } }",
+        );
+    }
+    #[test]
+    #[hardwon("#6296: constrained extension applicability carries membership doubt")]
+    fn review_extension_variant_constraint() {
+        review_extension_variant(
+            "public partial class Twin {}",
+            "public partial class Twin : Base {}",
+            "public class Base {}",
+            "public static class Extensions { public static void Hum<T>(this T v) where T : Base {} }",
+            "class Use { void Run(Twin t) { t.Hum(); } }",
+        );
+    }
+    #[test]
+    #[hardwon("#6296: nested receiver extension applicability carries membership doubt")]
+    fn review_extension_variant_nested() {
+        review_extension_variant(
+            "public partial class Twin {} public class Outer { public class Inner : Twin {} }",
+            "public partial class Twin : Base {}",
+            "public class Base {}",
+            "public static class Extensions { public static void Hum(this Base v) {} }",
+            "class Use { void Run(Outer.Inner t) { t.Hum(); } }",
+        );
+    }
+    #[test]
+    #[hardwon("#6296: generic receiver extension applicability carries membership doubt")]
+    fn review_extension_variant_generic() {
+        review_extension_variant(
+            "public partial class Twin<T> {}",
+            "public partial class Twin<T> : Base {}",
+            "public class Base {}",
+            "public static class Extensions { public static void Hum(this Base v) {} }",
+            "class Use { void Run(Twin<int> t) { t.Hum(); } }",
+        );
+    }
+
+    #[test]
+    #[hardwon("#6296: attribute evidence must filter an unproven or invisible partial ancestor")]
+    fn attribute_ancestry_reads_bases_through_the_reference_membership() {
+        use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+        let source = "[Mark] class Use {}";
+        for (outside, base_on, expected) in [
+            ("Loose", "outside", DefinitionLookupStatus::Incomplete),
+            ("Other", "outside", DefinitionLookupStatus::NoDefinition),
+            ("Loose", "visible", DefinitionLookupStatus::Resolved),
+            ("Other", "visible", DefinitionLookupStatus::Resolved),
+            ("Loose", "direct", DefinitionLookupStatus::Resolved),
+        ] {
+            let outside_twin = format!("{outside}/Twin.cs");
+            let (visible_twin, outside_body, mark) = match base_on {
+                "outside" => (
+                    "public partial class Twin {}",
+                    "public partial class Twin : System.Attribute {}",
+                    "public class MarkAttribute : Twin {}",
+                ),
+                "visible" => (
+                    "public partial class Twin : System.Attribute {}",
+                    "public partial class Twin {}",
+                    "public class MarkAttribute : Twin {}",
+                ),
+                _ => (
+                    "public partial class Twin {}",
+                    "public partial class Twin : System.Attribute {}",
+                    "public class MarkAttribute : System.Attribute {}",
+                ),
+            };
+            let mut files = vec![
+                ("App/App.csproj", r#"<Project Sdk="Microsoft.NET.Sdk" />"#),
+                ("App/Twin.cs", visible_twin),
+                (outside_twin.as_str(), outside_body),
+                ("App/Mark.cs", mark),
+                ("App/Use.cs", source),
+            ];
+            if outside == "Other" {
+                files.push((
+                    "Other/Other.csproj",
+                    r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../App/App.csproj" /></ItemGroup></Project>"#,
+                ));
+            }
+            let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &files);
+            let analyzer = fixture.analyzer.analyzer();
+            let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C#");
+            let file = ProjectFile::new(fixture.project_root(), "App/Use.cs");
+            // Prime the analyzer's merged ancestor memo.
+            for unit in analyzer
+                .get_definitions("Twin")
+                .into_iter()
+                .chain(analyzer.get_definitions("MarkAttribute"))
+            {
+                csharp.get_direct_ancestors(&unit);
+            }
+            let tree = parse_csharp_tree(source).expect("tree");
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let token = scope.token();
+            let start_byte = source.find("Mark").expect("Mark");
+            let site = ResolvedReferenceSite {
+                path: rel_path_string(&file),
+                text: "Mark".to_owned(),
+                range: Range {
+                    start_byte,
+                    end_byte: start_byte + 4,
+                    start_line: 0,
+                    end_line: 0,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: start_byte + 4,
+            };
+            for pass in ["cold", "warm"] {
+                let definitions = CSharpDefinitionProvider::new(csharp, &file);
+                let unbounded = resolve_csharp(
+                    analyzer,
+                    token,
+                    &definitions,
+                    &file,
+                    source,
+                    Some(&tree),
+                    &site,
+                    false,
+                )
+                .outcome;
+                let BoundedResolution::Complete { value: bounded, .. } = resolve_csharp_bounded(
+                    analyzer,
+                    token,
+                    &file,
+                    source,
+                    Some(&tree),
+                    &site,
+                    ReceiverAnalysisBudget::default(),
+                    None,
+                ) else {
+                    panic!("{outside} {base_on} {pass}: bounded lookup did not complete");
+                };
+                assert_eq!(
+                    (unbounded.status, bounded.status),
+                    (expected, expected),
+                    "{outside} {base_on} {pass}: {unbounded:#?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn event_field_variable_declaration_is_not_a_local_binding() {
@@ -6481,6 +9077,149 @@ public class Consumer
     }
 
     #[test]
+    fn repeated_ancestor_queries_reuse_complete_answers_and_keep_request_limits() {
+        let project = InlineTestProject::with_language(Language::CSharp)
+            .file(
+                "Ancestors.cs",
+                "namespace Demo { class Base {} class First : Base {} class Second : Base {} }",
+            )
+            .build();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("C# ancestor workspace");
+        let analyzer = workspace.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let unbounded = CSharpDefinitionProvider::new(csharp, &any_reference(csharp));
+        let first = unbounded.fqn("Demo.First").pop().expect("first owner");
+        let second = unbounded.fqn("Demo.Second").pop().expect("second owner");
+        let base = unbounded.fqn("Demo.Base").pop().expect("base class");
+        analyzer.type_hierarchy_provider().expect("C# hierarchy");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let budget = ReceiverAnalysisBudget {
+            max_summary_expansions: 1,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let session = ResolutionSession::bounded(budget, None);
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
+        assert_eq!(
+            definitions.direct_ancestors(token, &first),
+            vec![base.clone()]
+        );
+        let first_work = session.finish(()).work();
+        assert_eq!(
+            definitions.direct_ancestors(token, &first),
+            vec![base.clone()]
+        );
+        let mut cached_work = first_work;
+        cached_work.scope_nodes += 1;
+        assert!(
+            matches!(session.finish(()), BoundedResolution::Complete { work, .. }
+            if work == cached_work && work.summary_expansions == 1)
+        );
+        assert!(definitions.direct_ancestors(token, &second).is_empty());
+        assert!(matches!(session.finish(()), BoundedResolution::Exceeded {
+            limit: ReceiverBudgetLimit::SummaryExpansions, work,
+        } if work.summary_expansions == 1));
+
+        let cancellation = CancellationToken::new();
+        let session = ResolutionSession::bounded(budget, Some(&cancellation));
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
+        assert_eq!(definitions.direct_ancestors(token, &first), vec![base]);
+        cancellation.cancel();
+        assert!(definitions.direct_ancestors(token, &first).is_empty());
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn repeated_parent_queries_preserve_present_absent_and_cancelled_answers() {
+        let project = InlineTestProject::with_language(Language::CSharp)
+            .file("Parents.cs", "class Root { void Work() {} } class Other {}")
+            .build();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("C# parent workspace");
+        let analyzer = workspace.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let unbounded = CSharpDefinitionProvider::new(csharp, &any_reference(csharp));
+        let root = unbounded.fqn("Root").pop().expect("root class");
+        let work = unbounded.fqn("Root.Work").pop().expect("method");
+        let other = unbounded.fqn("Other").pop().expect("other class");
+        let budget = ReceiverAnalysisBudget {
+            max_summary_expansions: 1,
+            ..ReceiverAnalysisBudget::default()
+        };
+
+        let session = ResolutionSession::bounded(budget, None);
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
+        assert_eq!(definitions.parent_of(analyzer, &work), Some(root.clone()));
+        let first_work = session.finish(()).work();
+        assert_eq!(definitions.parent_of(analyzer, &work), Some(root.clone()));
+        let mut cached_work = first_work;
+        cached_work.scope_nodes += 1;
+        assert!(
+            matches!(session.finish(()), BoundedResolution::Complete { work, .. }
+            if work == cached_work && work.summary_expansions == 1)
+        );
+        assert_eq!(definitions.parent_of(analyzer, &root), None);
+        assert!(matches!(session.finish(()), BoundedResolution::Exceeded {
+            limit: ReceiverBudgetLimit::SummaryExpansions, work,
+        } if work.summary_expansions == 1));
+
+        let session = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 1,
+                ..budget
+            },
+            None,
+        );
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
+        assert_eq!(definitions.parent_of(analyzer, &work), Some(root.clone()));
+        assert_eq!(definitions.parent_of(analyzer, &work), None);
+        assert!(matches!(session.finish(()), BoundedResolution::Exceeded {
+            limit: ReceiverBudgetLimit::ScopeNodes, work,
+        } if work.scope_nodes == 1 && work.summary_expansions == 1));
+
+        let session = ResolutionSession::bounded(budget, None);
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
+        assert_eq!(definitions.parent_of(analyzer, &root), None);
+        let first_work = session.finish(()).work();
+        assert_eq!(definitions.parent_of(analyzer, &root), None);
+        assert!(
+            matches!(session.finish(()), BoundedResolution::Complete { work, .. }
+            if work == first_work && work.summary_expansions == 1)
+        );
+        assert_eq!(definitions.parent_of(analyzer, &other), None);
+        assert!(matches!(session.finish(()), BoundedResolution::Exceeded {
+            limit: ReceiverBudgetLimit::SummaryExpansions, work,
+        } if work.summary_expansions == 1));
+
+        let cancellation = CancellationToken::new();
+        let session = ResolutionSession::bounded(budget, Some(&cancellation));
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
+        assert_eq!(definitions.parent_of(analyzer, &work), Some(root));
+        cancellation.cancel();
+        assert_eq!(definitions.parent_of(analyzer, &work), None);
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Cancelled { .. }
+        ));
+    }
+
+    #[test]
     fn bounded_definition_lookup_stops_at_scope_budget() {
         let (fixture, file, source, tree, site) = member_fixture();
         let budget = ReceiverAnalysisBudget::tiny();
@@ -6531,7 +9270,8 @@ public class Consumer
 
         let budget = ReceiverAnalysisBudget::tiny();
         let budget_session = ResolutionSession::bounded(budget, None);
-        let budget_definitions = CSharpDefinitionProvider::bounded(csharp, &budget_session);
+        let budget_definitions =
+            CSharpDefinitionProvider::bounded(csharp, &budget_session, &any_reference(csharp));
         let mut budget_visits = 0usize;
         csharp_visit_bounded_active_path(&budget_definitions, block, cutoff_start, |_| {
             budget_visits += 1;
@@ -6549,7 +9289,8 @@ public class Consumer
         let cancellation = CancellationToken::cancel_after_checks_for_test(2);
         let cancel_session =
             ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
-        let cancel_definitions = CSharpDefinitionProvider::bounded(csharp, &cancel_session);
+        let cancel_definitions =
+            CSharpDefinitionProvider::bounded(csharp, &cancel_session, &any_reference(csharp));
         let mut cancel_visits = 0usize;
         csharp_visit_bounded_active_path(&cancel_definitions, block, cutoff_start, |_| {
             cancel_visits += 1;
@@ -6604,7 +9345,8 @@ public class Product
             ..ReceiverAnalysisBudget::default()
         };
         let session = ResolutionSession::bounded(budget, None);
-        let definitions = CSharpDefinitionProvider::bounded(csharp, &session);
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
         assert!(
             definitions
                 .members_for_owner_name("Demo.Product", "Work")
@@ -6656,7 +9398,8 @@ public class Product
             ..ReceiverAnalysisBudget::default()
         };
         let session = ResolutionSession::bounded(budget, None);
-        let definitions = CSharpDefinitionProvider::bounded(csharp, &session);
+        let definitions =
+            CSharpDefinitionProvider::bounded(csharp, &session, &any_reference(csharp));
         let file = ProjectFile::new(fixture.project_root(), "GlobalA.cs");
         let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
         let token = scope.token();
@@ -6701,7 +9444,8 @@ namespace Demo
                 .expect("unknown attribute");
 
         let proven_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let proven_definitions = CSharpDefinitionProvider::bounded(csharp, &proven_session);
+        let proven_definitions =
+            CSharpDefinitionProvider::bounded(csharp, &proven_session, &any_reference(csharp));
         let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
         let token = scope.token();
         assert_eq!(
@@ -6714,7 +9458,8 @@ namespace Demo
         ));
 
         let unknown_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let unknown_definitions = CSharpDefinitionProvider::bounded(csharp, &unknown_session);
+        let unknown_definitions =
+            CSharpDefinitionProvider::bounded(csharp, &unknown_session, &any_reference(csharp));
         assert_eq!(
             unknown_definitions.attribute_class_is_applicable(token, &unknown),
             None

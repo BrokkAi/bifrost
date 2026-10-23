@@ -352,7 +352,7 @@ fn parsed_go_aliases_forward_target_identity_without_nominal_alias_types() {
         let spelling = &facts.names[prefix.name.index()].spelling;
         let ty = if spelling == "Alias" {
             assert_eq!(answer.binding().targets(), &[definition("Alias")]);
-            let [ResolutionSlotValue::TypeObject(ty)] = values.as_slice() else {
+            let [ResolutionSlotValue::TypeObject(ty, _)] = values.as_slice() else {
                 panic!("alias prefix must be a type object: {values:?}")
             };
             *ty
@@ -361,6 +361,7 @@ fn parsed_go_aliases_forward_target_identity_without_nominal_alias_types() {
                 ResolutionSlotValue::Runtime {
                     ty,
                     addressable: true,
+                    obligation: None,
                 },
             ] = values.as_slice()
             else {

@@ -1,6 +1,11 @@
 // Preserve explicit engine visibility when an overlay shadows a public glob.
 #![allow(hidden_glob_reexports)]
 
+pub use crate::analyzer::store::model_provenance::{
+    activated_record_provenance, model_location, origin, provenance, provenance_with_visits,
+    source_kind,
+};
+
 pub use brokk_bifrost_semantic::analyzer::semantic_model::overlay::*;
 pub(crate) mod java_functional;
 #[doc(hidden)]
@@ -483,7 +488,8 @@ impl SemanticModelOverlay {
         self.collection_flow_match(self.collection_flows_by_callable.get(callable))
     }
 
-    pub(crate) fn unique_complete_collection_flow(
+    #[doc(hidden)]
+    pub fn unique_complete_collection_flow(
         &self,
         callable: &str,
     ) -> Option<&CollectionFlowContract> {
@@ -1734,7 +1740,12 @@ impl SemanticModelOverlay {
         target: &'a str,
     ) -> std::borrow::Cow<'a, str> {
         let qualified = Language::from_config_label(&class.language)
-            .and_then(crate::analyzer::languages::language_support)
+            .and_then(|language| {
+                crate::analyzer::languages::language_support_for_hook(
+                    language,
+                    "qualified_hierarchy_target",
+                )
+            })
             .and_then(|support| {
                 support.qualified_hierarchy_target(
                     class.locator_path.as_deref(),
@@ -2795,9 +2806,16 @@ pub(crate) fn generated_overlay_facts(
                         }
                     }
                 }
-                crate::analyzer::languages::language_support(provider.structural_language())
-                    .expect("every structural fact provider language has registered support")
-                    .bind_generated_symbols(file, facts.source(), &mut generated.symbols);
+                crate::analyzer::languages::language_support_for_hook(
+                    provider.structural_language(),
+                    "bind_generated_symbols",
+                )
+                .expect("every structural fact provider language has registered support")
+                .bind_generated_symbols(
+                    file,
+                    facts.source(),
+                    &mut generated.symbols,
+                );
                 Ok(generated)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3889,15 +3907,20 @@ pub fn activated_type_provenance<E>(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[cfg(test)]
     use crate::analyzer::semantic_model::overlay::go_extra_support_0::*;
 
+    #[cfg(test)]
     use crate::analyzer::semantic_model::SemanticModelCallableMatch;
+
+    #[cfg(test)]
     fn callable_key(parameter_count: u32) -> SemanticModelCallableKey<'static> {
         SemanticModelCallableKey::new("java", "pkg.Owner", "run", true, parameter_count)
     }
+    #[cfg(test)]
     fn lookup(
         overlay: &SemanticModelOverlay,
         parameter_count: u32,
@@ -3905,121 +3928,97 @@ pub mod tests {
         overlay.callable_for_target(callable_key(parameter_count))
     }
 
+    #[cfg(test)]
     pub(super) use super::test_support::*;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::CollectionFlowContract;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::Completeness;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::EmbeddedTypeFact;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::HierarchyFact;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::HierarchyKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::ImplicitOperation;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::java_hierarchy::JavaHierarchyIncomplete;
 
-    use brokk_bifrost_analysis::analyzer::semantic_model::model::Locator;
-
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCallApplication;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCallableDisposition;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCallableIncompleteReason;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCallableKey;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCompleteness;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelEdgeDefect;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelMemberTargetDisposition;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOriginKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlayDisposition;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOwnerSurface;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSurfaceGap;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbolKind;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelUnresolvedEdge;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::Signature;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::TypeRef;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::augment_go_overlay_surface;
 
-    use brokk_bifrost_analysis::analyzer::semantic_model::overlay::authored_anchor;
-
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::semantic_model_callable_family_id;
 
+    #[cfg(test)]
     use brokk_bifrost_core::analyzer::model::Language;
 
+    #[cfg(test)]
     use brokk_bifrost_analysis::analyzer::semantic_model::model::ParameterPassingMode;
 
-    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
-    #[test]
-    #[hardwon("#2634: unavailable dependency source locations lost their durable model anchor")]
-    fn unavailable_dependency_source_uses_a_durable_model_location() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Java,
-            &[("src/Main.java", "package app; class Main {}\n")],
-        );
-        let locator = Locator::Source {
-            path: "java.base/java/util/ArrayList.java".to_string(),
-            symbol: Some("java.util.ArrayList".to_string()),
-        };
-
-        assert!(
-            authored_anchor(
-                fixture.analyzer.analyzer(),
-                &[],
-                &locator,
-                "java.util.ArrayList"
-            )
-            .is_none(),
-            "a dependency source outside the indexed workspace and the pack's carried sources cannot be an authored navigation target"
-        );
-    }
-
-    #[test]
-    #[hardwon("#2634: carried source locations lost the authored declaration anchor")]
-    fn carried_dependency_source_preserves_the_authored_anchor() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Java,
-            &[("src/Main.java", "package app; class Main {}\n")],
-        );
-        let locator = Locator::Source {
-            path: "java.base/java/util/ArrayList.java".to_string(),
-            symbol: Some("java.util.ArrayList".to_string()),
-        };
-
-        let anchor = authored_anchor(
-            fixture.analyzer.analyzer(),
-            &["java.base/java/util/ArrayList.java".to_string()],
-            &locator,
-            "java.util.ArrayList",
-        )
-        .expect("a carried source stays an authored navigation target");
-        assert_eq!(anchor.path, "java.base/java/util/ArrayList.java");
-        assert_eq!(anchor.symbol, "java.util.ArrayList");
-        assert_eq!(anchor.range.start_line, 0);
-        assert_eq!(anchor.range.end_line, 0);
-    }
-
+    #[cfg(test)]
     fn collection_flow_contract(
         callable: &str,
         completeness: SemanticModelCompleteness,
@@ -4042,6 +4041,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn collection_flow_lookup_preserves_typed_contract_and_conflicts() {
         let contract = collection_flow_contract(
@@ -4081,6 +4081,7 @@ pub mod tests {
         assert_eq!(conflict.records.len(), 2);
     }
 
+    #[cfg(test)]
     #[test]
     fn type_flow_external_class_identity_filters_before_uniqueness_and_keeps_canonical_identity() {
         use brokk_bifrost_analysis::analyzer::semantic::type_flow::ExternalClassCache;
@@ -4122,6 +4123,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#4619: a colliding class alias hid the canonical open() return class")]
     fn type_flow_external_class_identity_prefers_exact_names_and_resolves_unique_aliases() {
@@ -4157,6 +4159,7 @@ pub mod tests {
         assert_eq!(alias.qualified_name(), "_thread.LockType");
     }
 
+    #[cfg(test)]
     fn named<'a>(
         overlay: &'a SemanticModelOverlay,
         qualified_name: &str,
@@ -4169,6 +4172,7 @@ pub mod tests {
             .unwrap_or_else(|| panic!("`{qualified_name}` is published"))
     }
 
+    #[cfg(test)]
     fn closure_names<'a>(surface: &'a SemanticModelOwnerSurface<'a>) -> Vec<&'a str> {
         surface
             .closure
@@ -4177,6 +4181,7 @@ pub mod tests {
             .collect()
     }
 
+    #[cfg(test)]
     fn global_value(
         owner: &SemanticModelSymbol,
         id: &str,
@@ -4203,6 +4208,7 @@ pub mod tests {
         value
     }
 
+    #[cfg(test)]
     #[test]
     fn callable_lookup_ignores_an_unrelated_same_named_owner() {
         let mut header = class("sqlite3", "cpp");
@@ -4232,6 +4238,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#3312: same-arity Java overloads selected by argument layout")]
     fn external_callable_lookup_keeps_same_arity_overloads_layout_compatible() {
@@ -4265,6 +4272,7 @@ pub mod tests {
         assert!(result.unique().is_none());
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_lookup_keeps_an_unmodeled_sibling_signature_incomplete() {
         let owner = class("pkg.Owner", "java");
@@ -4288,6 +4296,7 @@ pub mod tests {
         assert!(result.unique().is_none());
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_application_honors_defaults_names_and_passing_modes() {
         let owner = class("pkg.Owner", "java");
@@ -4334,6 +4343,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_application_rejects_duplicate_binding_before_keyword_variadic() {
         let owner = class("pkg.Owner", "java");
@@ -4355,6 +4365,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "#4709: a Kotlin vararg before named-only formals was rejected as a non-final keyword collector"
@@ -4421,6 +4432,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_application_keeps_shared_layout_overloads_distinct() {
         let owner = class("pkg.Owner", "java");
@@ -4449,6 +4461,7 @@ pub mod tests {
         assert!(result.unique().is_none(), "no overload was selected");
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#3312: same-layout overloads with different formal names were conflated")]
     fn external_callable_application_keeps_different_formal_names_in_one_layout() {
@@ -4479,6 +4492,7 @@ pub mod tests {
         assert_eq!(result.records.len(), 2);
     }
 
+    #[cfg(test)]
     #[test]
     fn callable_family_identity_is_stable_when_application_selects_one_overload() {
         let owner = class("pkg.Owner", "java");
@@ -4518,6 +4532,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn generated_c_variadic_function_uses_qualified_family_identity() {
         let mut owner = class("fcntl", "cpp");
@@ -4556,6 +4571,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("ae5ec7304945: callable owner filtering hid partial sibling coverage")]
     fn external_callable_lookup_uses_scoped_completeness_without_promoting_provenance() {
@@ -4607,6 +4623,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_lookup_reports_partial_and_missing_formals() {
         let owner = class("pkg.Owner", "java");
@@ -4658,6 +4675,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2482: exact declared arity lost to a variadic fallback")]
     fn external_callable_lookup_prefers_declared_arity_over_variadic_fallback() {
@@ -4685,6 +4703,7 @@ pub mod tests {
         assert_eq!(result.unique().unwrap().id, "member.run.exact");
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2741: incomplete TypeScript stdlib inventory produced a false member proof")]
     fn typescript_global_value_follows_declared_constructor_to_exact_member() {
@@ -4754,6 +4773,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn java_functional_return_requires_positive_inventory_and_an_agreeing_method() {
         let mut object = class("java.lang.Object", "java");
@@ -4878,8 +4898,12 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn java_functional_return_respects_inherited_default_overrides() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            brokk_bifrost_core::analyzer::Language::Java,
+        ]);
         let mut object = class("java.lang.Object", "java");
         object.callable_surface_complete = true;
         let mut parent = class("fixture.Parent", "java");
@@ -4952,8 +4976,12 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn java_argument_family_requires_complete_inherited_inventory() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            brokk_bifrost_core::analyzer::Language::Java,
+        ]);
         let mut parent = class("fixture.Parent", "java");
         parent.kind = SemanticModelSymbolKind::Interface;
         parent.callable_surface_complete = true;
@@ -5017,9 +5045,13 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#1789: unpublished ancestor edges were omitted from absence proofs")]
     fn a_direct_edge_to_an_unpublished_target_is_reported_rather_than_dropped() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Php,
+        ]);
         let child = class("pkg.Child", "php");
         let edge = extends(&child, "vendor.Base");
         let overlay = overlay(vec![child], vec![edge]);
@@ -5038,6 +5070,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn go_embedded_type_gaps_make_the_owner_surface_partial_at_every_depth() {
         let embed = |owner: &mut SemanticModelSymbol, target: TypeRef| {
@@ -5095,8 +5128,15 @@ pub mod tests {
         owner_is_partial(vec![nested_owner.clone(), nested_middle], &nested_owner.id);
     }
 
+    #[cfg(test)]
     #[test]
+    #[hardwon(
+        "8ea61138c182: unpublished ancestor edges were silently dropped, making an incomplete inherited surface look complete; transitive control"
+    )]
     fn a_dangling_edge_deeper_in_the_closure_still_fails_the_gate() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Php,
+        ]);
         let child = class("pkg.Child", "php");
         let middle = class("pkg.Middle", "php");
         let child_edge = extends(&child, "pkg.Middle");
@@ -5123,9 +5163,13 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2958: exact wildcard re-export alias failed across a hierarchy edge")]
     fn an_exact_re_export_alias_crosses_a_hierarchy_edge_and_proves_absence() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Python,
+        ]);
         let mut declaring = class("typing.MutableSet", "python");
         declaring.aliases.push("shim.MutableSet".to_string());
         let root = class("builtins.object", "python");
@@ -5154,9 +5198,13 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#2958: cross-language alias falsely proved hierarchy absence")]
     fn an_alias_another_language_published_never_crosses_a_hierarchy_edge() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Python,
+        ]);
         let mut foreign = class("widget.Local", "typescript");
         foreign.aliases.push("Base".to_string());
         let child = class("pkg.Child", "python");
@@ -5173,8 +5221,12 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_owner_member_lookup_prefers_a_direct_member_then_a_complete_base() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::TypeScript,
+        ]);
         let child = class("pkg.Child", "typescript");
         let base = class("pkg.Base", "typescript");
         let base_member = field(&base, "member.base.value", "value");
@@ -5217,6 +5269,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_owner_member_lookup_preserves_conflict_and_incompleteness() {
         let owner = class("pkg.Owner", "typescript");
@@ -5248,8 +5301,12 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_owner_member_presence_accepts_only_complete_callable_families() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Python,
+        ]);
         let owner = class("pkg.Owner", "python");
         let first = method(
             &owner,
@@ -5337,6 +5394,7 @@ pub mod tests {
         assert!(!incomplete.member_present_on_owner(&owner.id, "missing"));
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_owner_implicit_operation_lookup_preserves_conflicts_and_incompleteness() {
         let owner = class("std.basic_string", "cpp");
@@ -5404,8 +5462,15 @@ pub mod tests {
         assert_eq!(ambiguous_match.records.len(), 1);
     }
 
+    #[cfg(test)]
     #[test]
+    #[hardwon(
+        "8ea61138c182: the introducing repair explicitly identifies the #1619 simple-name-posting bug: navigation guesses cannot certify proof edges"
+    )]
     fn a_simple_name_edge_resolves_for_navigation_but_never_for_a_proof() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Php,
+        ]);
         // What Python's producer records for `class Child(Base)` is the source
         // spelling `Base`, which the overlay's simple-name postings will happily
         // match against any indexed `Base`.
@@ -5433,8 +5498,15 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
+    #[hardwon(
+        "8ea61138c182: the missing-ancestor repair must reject a partial published base as an absence proof"
+    )]
     fn a_partial_pack_anywhere_in_the_closure_fails_the_gate() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Php,
+        ]);
         let child = class("pkg.Child", "php");
         let mut base = class("pkg.Base", "php");
         base.provenance.completeness = SemanticModelCompleteness::Partial;
@@ -5451,6 +5523,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn a_python_class_without_a_published_object_root_cannot_prove_absence() {
         let klass = class("theta.Klass", "python");
@@ -5471,6 +5544,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     fn java_hierarchy_fixture() -> SemanticModelOverlay {
         let child = class("example.Child", "java");
         let parent = class("example.Parent", "java");
@@ -5496,6 +5570,7 @@ pub mod tests {
         result
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#3713: Java widening lost the exact hierarchy witness")]
     fn java_hierarchy_witness_retains_exact_path() {
@@ -5521,6 +5596,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#3713: partial Java hierarchy erased a known positive path")]
     fn java_hierarchy_partialness_does_not_erase_positive_path() {
@@ -5544,6 +5620,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#3713: missing or ambiguous generic hierarchy evidence proved widening")]
     fn java_hierarchy_missing_generic_and_ambiguous_do_not_prove_widening() {
@@ -5588,6 +5665,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#3713: implements and unrelated Java types shared a widening result")]
     fn java_hierarchy_implements_and_unrelated_types_keep_distinct_proof() {
@@ -5625,6 +5703,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_application_keeps_spread_incomplete() {
         let owner = class("pkg.Owner", "java");
@@ -5647,6 +5726,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn external_callable_lookup_preserves_variadic_metadata_for_the_binder() {
         let owner = class("pkg.Owner", "java");
@@ -5687,6 +5767,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn a_type_that_declares_no_supertype_bottoms_out_cleanly() {
         let root = class("pkg.Root", "php");
@@ -5698,8 +5779,15 @@ pub mod tests {
         assert_eq!(vec!["pkg.Root"], closure_names(&surface));
     }
 
+    #[cfg(test)]
     #[test]
+    #[hardwon(
+        "8ea61138c182: the missing-ancestor repair must still admit an exact fully published closure; positive control"
+    )]
     fn a_fully_qualified_edge_across_a_complete_closure_proves_absence() {
+        let _neutral_rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
+            crate::analyzer::Language::Php,
+        ]);
         let child = class("pkg.Child", "php");
         let base = class("pkg.Base", "php");
         let edge = extends(&child, "pkg.Base");
@@ -5711,6 +5799,7 @@ pub mod tests {
         assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_owner_implicit_operation_lookup_uses_owner_id_and_role() {
         let owner = class("std.basic_string", "cpp");
@@ -5779,6 +5868,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn a_python_class_reaches_the_published_object_root() {
         let klass = class("theta.Klass", "python");
@@ -5795,6 +5885,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     fn the_object_root_itself_does_not_inherit_itself() {
         let object = class("builtins.object", "python");
@@ -5805,6 +5896,7 @@ pub mod tests {
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["builtins.object"], closure_names(&surface));
     }
+    #[cfg(test)]
     #[hardwon(
         "#3713: Java hierarchy proof exhaustion and cancellation were not kept as typed incomplete evidence"
     )]
@@ -6034,7 +6126,5 @@ pub mod go_extra_support_0 {
     }
 }
 
-pub use crate::analyzer::store::model_provenance::{
-    activated_record_provenance, model_location, origin, provenance, provenance_with_visits,
-    source_kind,
-};
+#[doc(hidden)]
+pub mod jvm_external;

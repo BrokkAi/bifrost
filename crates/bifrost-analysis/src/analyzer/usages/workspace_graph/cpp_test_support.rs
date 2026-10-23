@@ -1,12 +1,7 @@
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::MultiAnalyzer;
 use crate::analyzer::usages::workspace_graph::*;
-use crate::analyzer::{
-    AnalyzerDelegate, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, ScalaAnalyzer, TestProject,
-};
 
-use std::collections::BTreeMap;
-
-use std::sync::Arc;
 /// Every catalog field a graph consumer can observe on one node.
 #[doc(hidden)]
 pub type CatalogNodeFields = (
@@ -91,63 +86,5 @@ pub fn parity_inventory(
     declarations.extend(cpp_redeclaration_pair(root));
     declarations
 }
-/// A persisted multi-language workspace, analyzed twice so the second
-/// analyzer reads the same cache-backed summary projections a warm real
-/// workspace reads.
-#[doc(hidden)]
-pub fn persisted_multilanguage_analyzer(root: std::path::PathBuf) -> MultiAnalyzer {
-    ProjectFile::new(root.clone(), "module-info.java")
-        .write("module example.module {}\n")
-        .unwrap();
-    ProjectFile::new(root.clone(), "app/Greeter.java")
-            .write(
-                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n",
-            )
-            .unwrap();
-    // Scala indexes the anonymous class as a synthetic owner and its `run`
-    // as an ordinary declaration, and the Scala summary wrapper prunes
-    // synthetic entries out of `children`. So `run` is reachable only
-    // through the persisted declaration inventory (#2992).
-    ProjectFile::new(root.clone(), "app/Service.scala")
-            .write(
-                "package app\n\nclass Service {\n  def task(): Runnable = new Runnable {\n    def run(): Unit = println(\"scala\")\n  }\n}\n",
-            )
-            .unwrap();
-    // The Kotlin declaration tier deliberately does not index members of an
-    // anonymous object, so this file has no equivalent hidden `run`. It is
-    // here so the Kotlin summary wrapper's synthetic pruning is covered by
-    // the exact-equality check below.
-    ProjectFile::new(root.clone(), "app/Task.kt")
-            .write(
-                "package app\n\nclass Task(private val label: String) {\n    fun make(): Runnable = object : Runnable {\n        override fun run() {}\n    }\n}\n",
-            )
-            .unwrap();
-    ProjectFile::new(root.clone(), "app/Caller.kt")
-        .write("package app\n\nclass Caller {\n    fun call(): String = Greeter().greet()\n}\n")
-        .unwrap();
-
-    let project = TestProject::new(root, Language::Java);
-    let make_analyzer = || {
-        MultiAnalyzer::new(BTreeMap::from([
-            (
-                Language::Java,
-                AnalyzerDelegate::new(JavaAnalyzer::new(Arc::new(project.clone()))),
-            ),
-            (
-                Language::Scala,
-                AnalyzerDelegate::new(ScalaAnalyzer::new(Arc::new(project.clone()))),
-            ),
-            (
-                Language::Kotlin,
-                AnalyzerDelegate::new(KotlinAnalyzer::new(Arc::new(project.clone()))),
-            ),
-        ]))
-    };
-    // The first generation persists the fixture. The second exercises the
-    // same cache-backed summary projections used by a warm real workspace.
-    drop(make_analyzer());
-    make_analyzer()
-}
-
 #[doc(hidden)]
 pub static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

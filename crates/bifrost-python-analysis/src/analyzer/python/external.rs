@@ -1849,6 +1849,9 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let guard = self.guard_of(guard).cloned();
         self.types.push(TypeFact {
             jvm_inventory: None,
+            type_parameter_defaults: Vec::new(),
+            implemented_traits: Vec::new(),
+            generic_trait_impls: Vec::new(),
             runtime_bases: None,
             ambient_use: None,
             id: type_declaration_id(TypeIdentity {
@@ -1952,6 +1955,8 @@ fn member_fact(
             .and_then(|signature| signature.returns.as_ref()),
     });
     MemberFact {
+        implemented_trait: None,
+        self_form: None,
         non_overridable: None,
         ambient_use: None,
         value_type: None,

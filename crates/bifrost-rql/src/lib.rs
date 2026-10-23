@@ -9,10 +9,29 @@ pub mod structural;
 
 pub use brokk_bifrost_analysis::{path_utils, profiling};
 pub mod analyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    pub use brokk_bifrost_jvm_analysis::analyzer::{
+        JavaNativeCallRelations, JavaNativeRenameProvider, JavaNativeSelectedInverseProvider,
+        JavaNativeSelectedReferenceIndex, JavaNativeUsageStrategy, JavaSelectedReverseOutcome,
+        java_native_incoming_calls, java_native_rename, java_selected_inverse_for,
+    };
+
+    pub use brokk_bifrost_jvm_analysis::analyzer::{
+        JavaAnalyzer, JavaAnnotationTypeResolution, JavaAnnotationTypeStatus, JavaCallResultUse,
+        JavaCallResultUseIndex, JavaCallResultUseOpen, JavaCallResultUseRelationIndex,
+        JavaJarPackProducer, JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence,
+        JdkSourceArchiveLayout, JdkSourceArchivePackProducer, JdkVersion, JvmDependencyPackAdapter,
+        KotlinAnalyzer, KotlinSourceJarPackProducer, ScalaAnalyzer, ScalaSourceJarPackProducer,
+        java_call_result_use_site, java_plain_string_literal, kotlin_declared_scalar_types,
+        resolve_java_annotation_type, resolve_jvm_semantic_pack_dependencies,
+        scala_declared_scalar_types,
+    };
+
     pub use brokk_bifrost_analysis::analyzer::semantic;
     pub use brokk_bifrost_analysis::analyzer::*;
     pub use brokk_bifrost_js_ts_analysis::analyzer::js_ts::*;
     pub use brokk_bifrost_js_ts_analysis::{JavascriptAnalyzer, TypescriptAnalyzer};
+    pub use brokk_bifrost_jvm_analysis::analyzer::{java, jvm, kotlin, scala};
     pub use brokk_bifrost_rust_analysis::analyzer::{
         RustAnalyzer, RustCallResultUseIndex, RustNativeObligationProof,
         rust_call_is_standard_drop, rust_native_result_obligation,

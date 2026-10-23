@@ -6,6 +6,7 @@ pub const DIFF_TOOL_NAMES: &[&str] = &[
     "analyze_diff",
     "blast_radius",
     "cyclomatic_complexity",
+    "list_function_sources",
     "missing_tests",
     "score_diff",
 ];
@@ -19,6 +20,18 @@ pub fn run_diff_stdio_server(
 
 pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
     vec![
+        tool_descriptor(
+            "list_function_sources",
+            "Inventory every non-synthetic callable declaration range in the indexed workspace. Returns stable declaration/site identities, raw indexed file Git blob OIDs, declaration coordinates and exact indexed source including attached comments. Tests are included by default. Summary counts contributing files and records and reports files skipped for unavailable indexed source or blob identity. Source is never read from the live filesystem.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Only these workspace-relative files; omit for the entire workspace."},
+                    "include_tests": {"type": "boolean", "default": true}
+                },
+                "additionalProperties": false
+            }),
+        ),
         tool_descriptor(
             "analyze_diff",
             "Compare Git endpoints and return changed files with insertion/deletion counts, edited/introduced/deleted/moved/resignatured symbols, import changes, dependencies and callsite truncation notices. Symbols carry is_test; edited records name both endpoints and touched old/new lines. Edited/moved records carry added_calls/removed_calls, introduced records calls, and deleted records called. Unattributed edges have no patch-symbol caller. call_edges defaults to changed_lines: resolve reference start lines changed on each side, not whole-caller relationships. Unchanged sites and import-only rebinding outside those lines are omitted. An addition needs a complete base scope; a removal needs a complete target scope. Exact selected deltas refuse ambiguous attribution and uncertain moved correspondence. changed_files retains full-file inventory and incumbent best-effort deltas, including renamed preimage comparisons. omit skips call analysis and leaves its arrays empty; import_changes remains available. call_analysis reports scope, complete/incomplete/omitted status and endpoint reasons. Completeness applies only to the requested inventory. Explicit endpoints accept commits or trees; commit resolution wins. With neither endpoint, compare the merge base of HEAD and the default branch against the live worktree (origin/HEAD selects that branch, falling back to HEAD). With target alone, compare a commit against its first parent; a tree target requires base. Labels are full commit hashes or tree:<oid>. Immutable endpoint comparisons ignore the live worktree, index and .gitattributes. Snapshot-only objects require host configuration --diff-snapshot-object-dir; the tool accepts no object-store path.",

@@ -687,6 +687,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryPythonRuleFact>,
     },
+    RustMarkerImpl {
+        #[serde(flatten)]
+        value: Box<CodeQueryRustMarkerImpl>,
+    },
     RustPointerFinding {
         #[serde(flatten)]
         value: Box<CodeQueryRustPointerFinding>,

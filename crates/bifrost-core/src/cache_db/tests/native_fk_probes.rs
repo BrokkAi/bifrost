@@ -12,6 +12,7 @@ fn string_column(conn: &Connection, sql: &str, parameter: &str) -> Vec<String> {
         .unwrap()
 }
 
+#[hardwon("#6218: temporal input foreign keys lacked bounded child probes")]
 #[test]
 fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
     let conn = open_in_memory_cache();
@@ -26,7 +27,9 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
     let tables = string_column(
         &conn,
         "SELECT name FROM sqlite_schema WHERE type = 'table'
-         AND (name LIKE 'resolution_%' OR name LIKE 'source_%') AND ?1 = ''",
+         AND (name LIKE 'resolution_%' OR name LIKE 'source_%'
+              OR name LIKE 'python_binding_%' OR name LIKE 'python_member_%'
+              OR name LIKE 'go_context_%' OR name LIKE 'go_package_%') AND ?1 = ''",
         "",
     );
     for state in PlannerStatisticsState::BOTH {
@@ -202,4 +205,66 @@ fn native_and_source_blob_deletion_scales_subquadratically_and_rolls_back() {
         }
         conn.execute_batch("ANALYZE").unwrap();
     }
+}
+
+#[test]
+fn python_reverse_input_migration_preserves_populated_import_events() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;
+        CREATE TABLE blobs(id INTEGER PRIMARY KEY);
+        CREATE TABLE resolution_sites(blob_id INTEGER,site INTEGER,PRIMARY KEY(blob_id,site));
+        CREATE TABLE python_unit_summary_imports(summary_id INTEGER,target_container TEXT,requested_name TEXT,form TEXT,member_ordinal INTEGER,import_site INTEGER);
+        INSERT INTO blobs VALUES(1);
+        INSERT INTO resolution_sites VALUES(1,1),(1,2);").unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0199-temporal-binding-inputs.sql"
+    ))
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO resolution_binding_scopes VALUES(1,0,NULL);
+        INSERT INTO resolution_binding_slots VALUES(1,1,0,'alias',0);
+        INSERT INTO resolution_binding_events VALUES(1,0,1,1,5,1,NULL,0,0,1,0);
+        INSERT INTO python_binding_source VALUES(1,3);
+        INSERT INTO python_binding_imports VALUES(1,2,1,0,1,0);",
+    )
+    .unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0200-python-reverse-inputs.sql"
+    ))
+    .unwrap();
+    let source: Option<i64> = conn
+        .query_row(
+            "SELECT source_reference FROM resolution_binding_events WHERE blob_id=1 AND event=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, None);
+    let event: i64 = conn
+        .query_row(
+            "SELECT binding_event FROM python_binding_imports WHERE blob_id=1 AND import_site=2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event, 0);
+    conn.execute(
+        "UPDATE resolution_binding_events SET source_reference=2 WHERE blob_id=1 AND event=0",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE resolution_binding_events SET source_reference=3 WHERE blob_id=1 AND event=0",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
 }

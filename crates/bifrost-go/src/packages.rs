@@ -706,7 +706,7 @@ pub fn go_module_path_from_source(contents: &str) -> Option<String> {
 
 /// `Some(None)` is a lexically valid go.mod with no module directive. Go
 /// still treats that file as a module boundary, but it has no import path.
-fn parse_go_module_manifest(contents: &str) -> Option<Option<String>> {
+pub(crate) fn parse_go_module_manifest(contents: &str) -> Option<Option<String>> {
     let tokens = go_mod_tokens(contents)?;
     let mut module_path = None;
     let mut cursor = 0;

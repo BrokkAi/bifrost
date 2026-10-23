@@ -3,7 +3,7 @@ pub use brokk_bifrost_core::analyzer::common::{
     language_for_file, language_for_target, languages_may_analyze, workspace_language_for_file,
 };
 pub(crate) use brokk_bifrost_core::analyzer::common::{
-    max_line_length_limit, node_source_text_trimmed, try_node_source_text,
+    max_line_length_limit, try_node_source_text,
 };
 // Each language's identifier sigil moved with the language: Rust's to
 // `brokk-bifrost-rust`, C#'s to `brokk-bifrost-csharp` (its one consumer,
@@ -217,14 +217,16 @@ pub fn visible_local_binding<T, Key: Ord>(
         })
 }
 
-pub(crate) fn non_synthetic_children(children: Vec<CodeUnit>) -> Vec<CodeUnit> {
+#[doc(hidden)]
+pub fn non_synthetic_children(children: Vec<CodeUnit>) -> Vec<CodeUnit> {
     children
         .into_iter()
         .filter(|child| !child.is_synthetic())
         .collect()
 }
 
-pub(crate) fn non_synthetic_summary_projection(
+#[doc(hidden)]
+pub fn non_synthetic_summary_projection(
     projection: Arc<SummaryFileProjection>,
 ) -> Arc<SummaryFileProjection> {
     let mut projection = (*projection).clone();
@@ -636,7 +638,8 @@ enum SkeletonWork {
 /// Iterative rather than recursive: declaration nesting is attacker-controlled
 /// (a generated or hostile source file can nest types thousands deep), so a
 /// recursive walk risks exhausting the native stack.
-pub(crate) fn render_skeleton(
+#[doc(hidden)]
+pub fn render_skeleton(
     analyzer: &dyn crate::analyzer::IAnalyzer,
     code_unit: &CodeUnit,
     header_only: bool,

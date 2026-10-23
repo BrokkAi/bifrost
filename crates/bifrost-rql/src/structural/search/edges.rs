@@ -351,6 +351,7 @@ impl EdgeTraversalCache {
                         continue;
                     }
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::EdgeAxisUnsupported,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -386,6 +387,7 @@ impl EdgeTraversalCache {
                         continue;
                     }
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -426,6 +428,7 @@ impl EdgeTraversalCache {
         }
         if !newly_reported_global.is_empty() {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
                 code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
@@ -445,6 +448,7 @@ impl EdgeTraversalCache {
                 .insert((declaration.clone(), code))
             {
                 diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
                     code,

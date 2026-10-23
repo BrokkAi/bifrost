@@ -27,23 +27,16 @@ use super::facts::FileFacts;
 use super::kinds::NormalizedKind;
 
 use super::occurrence_rows::OccurrenceRow;
-
 use super::occurrence_rows::OccurrenceTarget;
-
 use super::occurrence_rows::occurrences_for_file;
 
 use super::occurrences::Namespace;
-
 use super::occurrences::OccurrenceRole;
 
 use super::routes::CanonicalIdentity;
-
 use super::routes::CuratedExportSurface;
-
 use super::routes::IdentityAxis;
-
 use super::routes::RouteHopKind;
-
 use super::routes::RouteTermination;
 
 use super::spec::StructuralSpec;
@@ -55,11 +48,8 @@ use crate::analyzer::structural_spec_for;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 
 use crate::analyzer::CodeUnit;
-
 use crate::analyzer::IAnalyzer;
-
 use crate::analyzer::ProjectFile;
-
 use crate::analyzer::Range;
 
 use crate::cancellation::CancellationToken;
@@ -951,31 +941,4 @@ pub const IDENTITY_ROUTE_PRODUCER_AXES: &[IdentityAxis] = &[
 pub mod test_support;
 
 #[cfg(test)]
-mod tests {
-    use super::test_support::*;
-
-    use super::*;
-
-    use crate::analyzer::Language;
-
-    #[test]
-    fn same_terminal_different_owner_decoys_compare_unequal() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/a/Map.java", "package a;\npublic class Map {}\n"),
-                ("src/b/Map.java", "package b;\npublic class Map {}\n"),
-            ],
-        );
-        let a_map = fixture.declaration("a.Map");
-        let b_map = fixture.declaration("b.Map");
-        let a_identity = canonical_identity_of(fixture.analyzer(), &a_map);
-        let b_identity = canonical_identity_of(fixture.analyzer(), &b_map);
-        assert_ne!(a_identity, b_identity);
-        assert_eq!(
-            a_identity.segments.last().unwrap().text,
-            b_identity.segments.last().unwrap().text
-        );
-        assert_eq!(a_identity.namespace, Namespace::Type);
-    }
-}
+mod tests {}

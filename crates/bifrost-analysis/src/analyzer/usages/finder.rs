@@ -1,4 +1,4 @@
-use crate::analyzer::languages::{CandidateCtx, candidate_augmentation, language_support};
+use crate::analyzer::languages::{CandidateCtx, candidate_augmentation, language_support_for_hook};
 use crate::analyzer::usages::candidates::find_default_candidates_within;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::model::{FuzzyResult, UsageProofAuthority};
@@ -266,7 +266,7 @@ impl<'a> ReferenceEngine<'a> {
             Err(result) => return *result,
         };
         let target = &overloads[0];
-        let strategy = language_support(language_for_target(target))
+        let strategy = language_support_for_hook(language_for_target(target), "reference_plugin")
             .map(|support| support.reference_plugin().target_strategy());
         let explicit_candidates = explicit_provider
             .and_then(CandidateFileProvider::explicit_candidate_files)
@@ -347,7 +347,7 @@ impl<'a> ReferenceEngine<'a> {
                 return Err(Box::new(cancelled_query_result()));
             }
         }
-        let strategy = language_support(language_for_target(target))
+        let strategy = language_support_for_hook(language_for_target(target), "reference_plugin")
             .map(|support| support.reference_plugin().target_strategy());
         let provider_is_complete_scope =
             explicit_provider.is_some_and(CandidateFileProvider::is_complete_scope);
@@ -473,7 +473,7 @@ impl<'a> ReferenceEngine<'a> {
                     prepared: prepared.as_deref(),
                 })
                 .collect();
-            let outcomes = match language_support(language) {
+            let outcomes = match language_support_for_hook(language, "reference_plugin") {
                 Some(support) => support
                     .reference_plugin()
                     .target_strategy()
@@ -494,7 +494,7 @@ impl<'a> ReferenceEngine<'a> {
             };
             assert_eq!(outcomes.len(), admitted.len());
             for ((target_index, (query, _)), outcome) in admitted.into_iter().zip(outcomes) {
-                let strategy = language_support(language)
+                let strategy = language_support_for_hook(language, "reference_plugin")
                     .map(|support| support.reference_plugin().target_strategy());
                 answers[target_index] = Some(finalize_graph_usage_query(
                     outcome,
@@ -728,7 +728,7 @@ fn graph_find_usages(
     prepared: Option<&dyn PreparedUsageQuery>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
-    match language_support(language) {
+    match language_support_for_hook(language, "reference_plugin") {
         Some(support) => graph_strategy_find_usages(
             support.reference_plugin().target_strategy(),
             analyzer,

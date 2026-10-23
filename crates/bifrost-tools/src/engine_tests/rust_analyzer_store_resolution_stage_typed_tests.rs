@@ -24,8 +24,6 @@ mod rust_departing_root_tests {
 
     use brokk_bifrost_core::analyzer::model::Language;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
-
     use brokk_bifrost_analysis::analyzer::store::resolution_stage::typed::tests::rust_root_test_support::begin_projection as begin_projection;
 
     #[test]
@@ -61,7 +59,7 @@ mod rust_departing_root_tests {
             vec![],
         )
         .with_type_productions(vec![expected.clone()]);
-        let fixture = SelectionFixture::shared_blob(16);
+        let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(16);
         let selection = fixture.open_ready(&[]);
         let connection = begin_projection(&selection);
         assert!(

@@ -8125,6 +8125,7 @@ mod bounded_tests {
         }))
         .expect("serialize Go selector fixture");
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
@@ -8707,6 +8708,8 @@ func use() {
                 max_summary_expansions: 4_096,
                 max_scope_nodes: 100_000,
                 max_resolution_rounds: ReceiverAnalysisBudget::default().max_resolution_rounds,
+                max_hierarchy_order_steps: ReceiverAnalysisBudget::default()
+                    .max_hierarchy_order_steps,
             },
             None,
         );

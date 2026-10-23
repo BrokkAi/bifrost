@@ -250,9 +250,19 @@ impl Default for SemanticModelRuntimeLimits {
     }
 }
 
+/// A request to select a named pack without claiming installed coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ApproximateSemanticModelExpectation {
+    pub language: String,
+    pub ecosystem: String,
+    pub pack_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticModelActivationRequest {
     pub bifrost_version: Version,
+    /// Approximate expectations are never exact workspace evidence.
+    pub approximate_standard_libraries: Vec<ApproximateSemanticModelExpectation>,
     pub evidence: Vec<SemanticModelActivationEvidence>,
     pub controls: Vec<SemanticModelActivationControl>,
     pub limits: SemanticModelRuntimeLimits,
@@ -917,7 +927,10 @@ pub enum EvidenceRank {
 
 #[doc(hidden)]
 pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<String, String> {
-    let evidence = validate_and_canonicalize_request(request)?;
+    let CanonicalActivationEvidence {
+        evidence,
+        approximate_standard_libraries,
+    } = validate_and_canonicalize_request(request)?;
     let mut controls = request
         .controls
         .iter()
@@ -948,7 +961,7 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     controls.sort_unstable();
     controls.dedup();
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.runtime-request.v2\0");
+    hasher.update(b"bifrost.semantic-model.runtime-request.v3\0");
     hash_key_part(&mut hasher, &request.bifrost_version.to_string());
     hasher.update(
         (crate::analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.len() as u64)
@@ -960,6 +973,12 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     }
     for row in &evidence {
         hash_activation_evidence(&mut hasher, row);
+    }
+    hasher.update((approximate_standard_libraries.len() as u64).to_be_bytes());
+    for expectation in &approximate_standard_libraries {
+        hash_key_part(&mut hasher, &expectation.language);
+        hash_key_part(&mut hasher, &expectation.ecosystem);
+        hash_key_part(&mut hasher, &expectation.pack_id);
     }
     for control in controls {
         hasher.update((control.len() as u64).to_be_bytes());
@@ -1021,14 +1040,36 @@ pub fn hash_activation_evidence(hasher: &mut Sha256, evidence: &SemanticModelAct
 }
 
 #[doc(hidden)]
+pub struct CanonicalActivationEvidence {
+    pub evidence: Vec<SemanticModelActivationEvidence>,
+    pub approximate_standard_libraries: Vec<ApproximateSemanticModelExpectation>,
+}
+
+#[doc(hidden)]
 pub fn validate_and_canonicalize_request(
     request: &SemanticModelActivationRequest,
-) -> Result<Vec<SemanticModelActivationEvidence>, String> {
-    if request.evidence.len() > request.limits.max_evidence_rows {
+) -> Result<CanonicalActivationEvidence, String> {
+    if request
+        .evidence
+        .len()
+        .saturating_add(request.approximate_standard_libraries.len())
+        > request.limits.max_evidence_rows
+    {
         return Err("semantic-model activation evidence budget exceeded".to_owned());
     }
     if request.controls.len() > request.limits.max_controls {
         return Err("semantic-model activation control budget exceeded".to_owned());
+    }
+    for expectation in &request.approximate_standard_libraries {
+        if expectation.language.is_empty()
+            || expectation.ecosystem.is_empty()
+            || expectation.pack_id.is_empty()
+        {
+            return Err(
+                "approximate activation expectation must name its language, ecosystem and pack"
+                    .to_owned(),
+            );
+        }
     }
     let mut evidence = request.evidence.clone();
     for row in &evidence {
@@ -1075,7 +1116,13 @@ pub fn validate_and_canonicalize_request(
     }
     evidence.sort();
     evidence.dedup();
-    Ok(evidence)
+    let mut approximate_standard_libraries = request.approximate_standard_libraries.clone();
+    approximate_standard_libraries.sort();
+    approximate_standard_libraries.dedup();
+    Ok(CanonicalActivationEvidence {
+        evidence,
+        approximate_standard_libraries,
+    })
 }
 
 #[doc(hidden)]
@@ -1660,9 +1707,47 @@ mod semantic_diagnostic_runtime_tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#6233: the activation request key ignored approximate stdlib expectations")]
+    fn runtime_request_key_binds_canonical_approximate_expectations() {
+        let mut request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: Version::parse("0.12.0").unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let exact_key = runtime_request_key(&request).unwrap();
+        let expectation = ApproximateSemanticModelExpectation {
+            language: "rust".to_owned(),
+            ecosystem: "cargo".to_owned(),
+            pack_id: "bifrost.rust-stdlib".to_owned(),
+        };
+        request
+            .approximate_standard_libraries
+            .push(expectation.clone());
+        let approximate_key = runtime_request_key(&request).unwrap();
+        assert_ne!(exact_key, approximate_key);
+        request
+            .approximate_standard_libraries
+            .push(expectation.clone());
+        assert_eq!(approximate_key, runtime_request_key(&request).unwrap());
+        let other = ApproximateSemanticModelExpectation {
+            pack_id: "test.other-stdlib".to_owned(),
+            ..expectation.clone()
+        };
+        request.approximate_standard_libraries = vec![expectation.clone(), other.clone()];
+        let multiple_key = runtime_request_key(&request).unwrap();
+        assert_ne!(approximate_key, multiple_key);
+        request.approximate_standard_libraries =
+            vec![other.clone(), expectation.clone(), other, expectation];
+        assert_eq!(multiple_key, runtime_request_key(&request).unwrap());
+    }
+
+    #[test]
     #[hardwon("#3815: cached pack activation ignored the supported schema and engine contract")]
     fn runtime_request_key_binds_engine_and_supported_schema_contract() {
         let request = |bifrost_version| SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version,
             evidence: Vec::new(),
             controls: Vec::new(),

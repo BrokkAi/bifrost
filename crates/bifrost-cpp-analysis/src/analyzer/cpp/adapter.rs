@@ -48,29 +48,6 @@ impl LanguageAdapter for CppAdapter {
         brokk_bifrost_cpp::adapter::is_numeric_initializer_data(node, should_stop)
     }
 
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::cpp::source_publication::SOURCE_STORAGE)
-    }
-
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        true
-    }
-
-    fn produces_canonical_source_facts(&self) -> bool {
-        true
-    }
-
-    fn cpp_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::cpp_facts::CPP_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::Cpp
-    }
-
     /// Relative to `brokk-bifrost-cpp`'s crate root: the `.scm` assets moved
     /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
@@ -92,17 +69,6 @@ impl LanguageAdapter for CppAdapter {
     /// Every other case keeps the default answer: the key is derived from the
     /// FILE's own language (not this adapter's) so the cross-adapter row guard
     /// still discriminates, and an include-claimed file with an extension no
-    /// language owns (#1837) still lands under this adapter's own key.
-    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
-        if LanguageDialect::for_path(Language::Cpp, file.rel_path()) == LanguageDialect::CppC {
-            return CPP_C_STORAGE_LANGUAGE_KEY;
-        }
-        if file.has_unclaimed_extension() {
-            return Language::Cpp.config_label();
-        }
-        brokk_bifrost_core::analyzer::common::language_for_file(file).config_label()
-    }
-
     fn storage_language_keys(&self) -> Vec<(String, tree_sitter::Language)> {
         vec![
             (
@@ -223,14 +189,6 @@ impl LanguageAdapter for CppAdapter {
         Some(&CPP_COGNITIVE_CONFIG)
     }
 
-    /// C++ is the one language that adopts files by include (#1837): `.inc`
-    /// translation-unit fragments (abseil's `absl/.../*.inc`) hold real
-    /// declarations but carry an extension no language owns, so nothing would
-    /// index them otherwise.
-    fn claims_included_files(&self) -> bool {
-        true
-    }
-
     fn infer_claimed_files(
         &self,
         sources: &[(ProjectFile, Vec<ImportInfo>)],
@@ -244,5 +202,42 @@ impl LanguageAdapter for CppAdapter {
         sources: &[(ProjectFile, Vec<ImportInfo>)],
     ) -> HashMap<ProjectFile, BTreeSet<String>> {
         claimable_include_demand(sources)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for CppAdapter {
+    /// C++ is the one language that adopts files by include (#1837): `.inc`
+    /// translation-unit fragments (abseil's `absl/.../*.inc`) hold real
+    /// declarations but carry an extension no language owns, so nothing would
+    /// index them otherwise.
+    fn claims_included_files(&self) -> bool {
+        true
+    }
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::cpp::source_publication::SOURCE_STORAGE)
+    }
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+    fn cpp_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::cpp_facts::CPP_SOURCE_FACTS_VERSION)
+    }
+    fn language(&self) -> Language {
+        Language::Cpp
+    }
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
+        if LanguageDialect::for_path(Language::Cpp, file.rel_path()) == LanguageDialect::CppC {
+            return CPP_C_STORAGE_LANGUAGE_KEY;
+        }
+        if file.has_unclaimed_extension() {
+            return Language::Cpp.config_label();
+        }
+        brokk_bifrost_core::analyzer::common::language_for_file(file).config_label()
     }
 }

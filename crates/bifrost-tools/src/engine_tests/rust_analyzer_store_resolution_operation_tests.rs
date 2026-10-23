@@ -3260,7 +3260,22 @@ pub mod rust_departing_root_tests {
             // and one decoded row; the crate-key open stays at 268/237.
             // #5780 binding-inventory and intermediate-step evidence reads add
             // 57 indexed statements and four decoded rows; opening is unchanged.
-            (268, 237, 393, 212),
+            // #6102 walks an import's spelled route only when its published
+            // routes gave no target, as the point route does. The import already
+            // answered by its routes skips that second walk: -19 statements and
+            // -4 decoded rows from the search; opening is unchanged.
+            // #6242 qualifies import precedence with two batched catalog/cfg
+            // existence probes. This unconditional fixture returns no rows;
+            // opening and decoded-row work remain unchanged.
+            // Operation-wide exact reads remove three empty candidate-gap reads
+            // and one empty context hydration per search. Decoded rows and
+            // selected opening work are unchanged.
+            // #6291: two constant direction-wide emptiness proof rows replace
+            // the later whole-scope gap reads; statement work stays at 372.
+            // Mount guards add six DDL statements and three schema rows on cold open.
+            // #5664 selected Go source view adds one schema statement and row
+            // at store open for every language; Rust search work is unchanged.
+            (275, 241, 372, 210),
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3303,7 +3318,11 @@ pub mod rust_departing_root_tests {
             // the cold search.
             // #5780 binding-inventory and intermediate-step evidence reads add
             // the same 57 statements/four rows to this warm search.
-            (5, 4, 393, 212),
+            // Skipping the spelled-route walk for an import its routes answered
+            // (#6102) removes the same 19 statements/four rows as the cold search.
+            // The same three gap reads and one context hydration as the cold search.
+            // #6291: the same two constant emptiness proof rows as cold.
+            (5, 4, 372, 210),
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3318,7 +3337,11 @@ pub mod rust_departing_root_tests {
             // the same 57 statements/four rows to this warm search. The shared
             // published eager-start reader removes one search statement, as above;
             // open statements and all row counts stay unchanged.
-            (5, 4, 393, 212),
+            // #6102's skipped spelled-route walk removes 19 statements/four rows,
+            // as above.
+            // The same three gap reads and one context hydration as the cold search.
+            // #6291: the same two constant emptiness proof rows as cold.
+            (5, 4, 372, 210),
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);

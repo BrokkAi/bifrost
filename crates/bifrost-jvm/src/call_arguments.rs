@@ -142,14 +142,15 @@ pub(crate) fn publish_jvm_type_union_transfer(
 }
 
 /// Retain ordered function type identities and their runtime projections.
-/// Grammar hooks supply ordered identity slots; shared application consumes
-/// the same type-argument rows for Scala FunctionN and Kotlin FunctionN.
+/// Grammar hooks supply ordered identity slots and a non-binding application
+/// site for their isolated projections. Shared application consumes the same
+/// type-argument rows for Scala FunctionN and Kotlin function/nominal types.
 pub(crate) fn publish_jvm_function_type_arguments(
     facts: &mut FileResolutionFacts,
     owner: ResolutionTypeSlotId,
+    site: ResolutionSiteId,
     arguments: &[ResolutionTypeSlotId],
 ) {
-    let site = facts.type_slots[owner.index()].site;
     for (ordinal, &input) in arguments.iter().enumerate() {
         // Each position owns an identity frontier and its runtime projection.
         // Keeping that identity separate prevents a declaration initializer

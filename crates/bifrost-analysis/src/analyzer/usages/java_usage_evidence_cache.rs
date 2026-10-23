@@ -39,7 +39,8 @@ pub(crate) enum JavaUsageEvidenceDomain {
 /// `active_model_set_hash()` (including the producer identity folded into the
 /// hash by the model runtime); a caller with no publication passes `None`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum JavaUsageEvidenceSemanticModelIdentity {
+#[doc(hidden)]
+pub enum JavaUsageEvidenceSemanticModelIdentity {
     None,
     ActiveModelSet(StableDigest),
 }
@@ -54,19 +55,18 @@ pub(crate) enum JavaUsageEvidenceSemanticModelIdentity {
 /// intentionally required rather than inferred from rendered names: a
 /// rendered spelling is not an exact target identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct JavaUsageEvidenceTargetKey {
+#[doc(hidden)]
+pub struct JavaUsageEvidenceTargetKey {
     target_ids: Box<[DeclarationId]>,
     structured_target_fingerprint: StableDigest,
 }
 
 impl JavaUsageEvidenceTargetKey {
+    #[doc(hidden)]
     /// Build a canonical target key from the exact declarations in a target
     /// group. Duplicate declarations are removed because `TargetSpec` stores
     /// its target group as a set.
-    pub(crate) fn from_targets(
-        targets: &[CodeUnit],
-        structured_target_fingerprint: StableDigest,
-    ) -> Self {
+    pub fn from_targets(targets: &[CodeUnit], structured_target_fingerprint: StableDigest) -> Self {
         Self::from_target_ids(
             targets.iter().map(CodeUnit::declaration_id),
             structured_target_fingerprint,
@@ -115,7 +115,8 @@ impl JavaUsageEvidenceTargetKey {
 /// that can affect Java's answer. If it cannot attest that identity, it must
 /// bypass this cache rather than inventing a weaker key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct JavaUsageEvidenceCacheKey {
+#[doc(hidden)]
+pub struct JavaUsageEvidenceCacheKey {
     representation_version: u32,
     domain: JavaUsageEvidenceDomain,
     language: Language,
@@ -127,7 +128,8 @@ pub(crate) struct JavaUsageEvidenceCacheKey {
 }
 
 impl JavaUsageEvidenceCacheKey {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         workspace_content: WorkspaceContentIdentity,
         file: ProjectFile,
         target: JavaUsageEvidenceTargetKey,
@@ -160,14 +162,19 @@ impl JavaUsageEvidenceCacheKey {
 
 /// Immutable, uncapped semantic evidence for one Java file and target set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JavaFileUsageEvidence {
-    pub(crate) hits: BTreeSet<UsageHit>,
-    pub(crate) unproven_hits: BTreeSet<UsageHit>,
-    pub(crate) raw_match_count: usize,
+#[doc(hidden)]
+pub struct JavaFileUsageEvidence {
+    #[doc(hidden)]
+    pub hits: BTreeSet<UsageHit>,
+    #[doc(hidden)]
+    pub unproven_hits: BTreeSet<UsageHit>,
+    #[doc(hidden)]
+    pub raw_match_count: usize,
 }
 
 impl JavaFileUsageEvidence {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         hits: BTreeSet<UsageHit>,
         unproven_hits: BTreeSet<UsageHit>,
         raw_match_count: usize,
@@ -217,7 +224,8 @@ fn retained_code_unit_bytes(unit: &CodeUnit) -> u64 {
 /// incomplete leader must leave no ready value for followers to mistake for a
 /// complete zero-hit scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum JavaUsageEvidenceOmission {
+#[doc(hidden)]
+pub enum JavaUsageEvidenceOmission {
     SourceRead,
     ParserSetup,
     Parse,
@@ -229,20 +237,23 @@ pub(crate) enum JavaUsageEvidenceOmission {
     Failed,
 }
 
-pub(crate) enum JavaUsageEvidenceBuildOutcome {
+#[doc(hidden)]
+pub enum JavaUsageEvidenceBuildOutcome {
     Complete(JavaFileUsageEvidence),
     Omitted(JavaUsageEvidenceOmission),
     Cancelled,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum JavaUsageEvidenceCacheLifecycle {
+pub enum JavaUsageEvidenceCacheLifecycle {
     Hit,
     Built,
     UncachedOverBudget,
 }
 
-pub(crate) enum JavaUsageEvidenceCacheAcquisition {
+#[doc(hidden)]
+pub enum JavaUsageEvidenceCacheAcquisition {
     Ready {
         evidence: Arc<JavaFileUsageEvidence>,
         lifecycle: JavaUsageEvidenceCacheLifecycle,
@@ -298,8 +309,9 @@ impl AtomicJavaUsageEvidenceCacheStats {
     }
 }
 
+#[doc(hidden)]
 /// Snapshot-owned complete Java evidence with cancellation-aware single-flight.
-pub(crate) struct SnapshotJavaUsageEvidenceCache {
+pub struct SnapshotJavaUsageEvidenceCache {
     max_retained_bytes: u64,
     values: CompleteValueCache<JavaUsageEvidenceCacheKey, JavaFileUsageEvidence>,
     stats: AtomicJavaUsageEvidenceCacheStats,
@@ -319,13 +331,14 @@ impl SnapshotJavaUsageEvidenceCache {
         }
     }
 
+    #[doc(hidden)]
     /// Acquire exact evidence or build it once for all same-key followers.
     ///
     /// `content_is_current` must compare the captured whole-JVM content
     /// identity with the live analyzer immediately before publication. The
     /// closure must return `Complete` only after all semantic work is complete;
     /// omitted and cancelled outcomes are deliberately uncached.
-    pub(crate) fn acquire(
+    pub fn acquire(
         &self,
         key: JavaUsageEvidenceCacheKey,
         cancellation: &CancellationToken,

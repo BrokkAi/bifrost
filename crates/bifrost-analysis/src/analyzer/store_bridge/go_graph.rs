@@ -39,7 +39,7 @@ pub(crate) type GoReferenceEdgeBatchStager<'a> = dyn FnMut(
 
 struct GoGraphStageAdapter<'callback> {
     analyzer: &'callback dyn IAnalyzer,
-    context_id: i64,
+    base_profile: [u8; 32],
     stage: &'callback mut GoReferenceEdgeBatchStager<'callback>,
     unprojected_definitions: Vec<SemanticId>,
 }
@@ -58,8 +58,11 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
         let mut groups = BTreeMap::<GoPackageStageUnit, Vec<ProjectFile>>::new();
         let mut skipped = BTreeMap::new();
         let mut modules = None;
-        let support = crate::analyzer::languages::language_support(Language::Go)
-            .expect("Go stage has a Go analyzer");
+        let support = crate::analyzer::languages::language_support_for_hook(
+            Language::Go,
+            "selected_graph_fallback_active",
+        )
+        .expect("Go stage has a Go analyzer");
         let fallback = support.selected_graph_fallback_active(self.analyzer);
         for file in files {
             if cancellation.is_cancelled() {
@@ -79,9 +82,18 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
                 }
             }
             let path = selected_path_key(file.rel_path());
+            let placement_context = operation.go_context_for_file(&self.base_profile, &path)?;
             let unit = if let Some(mount) = mounts.mount_for_path("go", &path)? {
                 assert_eq!(mount.semantic_language(), Language::Go);
-                operation.go_package_stage_unit_for_path(self.context_id, &path, cancellation)?
+                if let Some(context) = &placement_context {
+                    operation.go_package_stage_unit_for_path(
+                        context.context_id,
+                        &path,
+                        cancellation,
+                    )?
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -110,9 +122,11 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
                         .replace('\\', "/"),
                 }
             } else {
-                operation.go_graph_file_exclusion(
-                    self.context_id,
+                operation.go_graph_file_exclusion_for_domain(
+                    &self.base_profile,
                     &path,
+                    placement_context.as_ref().map(|context| context.context_id),
+                    module.map(|module| module.workspace_dir.as_path()),
                     module.map(|module| module.import_path.as_str()),
                 )?
             };
@@ -282,6 +296,9 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
                     }
                     let definitions = edge_projector.pending_definitions(batch);
                     let selected_lexical = ready.lexical_source();
+                    let projection_facts = selected_lexical.reference_projection_facts(batch, cancellation)?;
+                    if cancellation.is_cancelled() { projection_cancelled = true; return Ok(()); }
+                    edge_projector.catalog_mut().replace_reference_facts(projection_facts);
                     let mut source_definitions = Vec::new();
                     for definition in definitions {
                         if cancellation.is_cancelled() {
@@ -447,7 +464,7 @@ pub trait GoGraphStageExt {
     fn stage_go_graph_reference_edge_batches_in_files(
         &self,
         analyzer: &dyn IAnalyzer,
-        context_id: i64,
+        base_profile: [u8; 32],
         files: &HashSet<ProjectFile>,
         maximum_batch_size: usize,
         cancellation: &CancellationToken,
@@ -508,7 +525,7 @@ impl GoGraphStageExt for SelectedResolutionOperation<'_, '_> {
     fn stage_go_graph_reference_edge_batches_in_files(
         &self,
         analyzer: &dyn IAnalyzer,
-        context_id: i64,
+        base_profile: [u8; 32],
         files: &HashSet<ProjectFile>,
         maximum_batch_size: usize,
         cancellation: &CancellationToken,
@@ -518,7 +535,7 @@ impl GoGraphStageExt for SelectedResolutionOperation<'_, '_> {
         let files = files.iter().cloned().collect::<Vec<_>>();
         let mut adapter = GoGraphStageAdapter {
             analyzer,
-            context_id,
+            base_profile,
             stage,
             unprojected_definitions: Vec::new(),
         };
@@ -659,6 +676,9 @@ impl GoGraphStageExt for SelectedResolutionOperation<'_, '_> {
                     }
                     let definitions = edge_projector.pending_definitions(batch);
                     let selected_lexical = ready.lexical_source();
+                    let projection_facts = selected_lexical.reference_projection_facts(batch, cancellation)?;
+                    if cancellation.is_cancelled() { projection_cancelled = true; return Ok(()); }
+                    edge_projector.catalog_mut().replace_reference_facts(projection_facts);
                     let mut source_definitions = Vec::new();
                     for definition in definitions {
                         if cancellation.is_cancelled() {

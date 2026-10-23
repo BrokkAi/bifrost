@@ -10,13 +10,27 @@ use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::semantic_model::SemanticModelOverlayBuildError;
 use crate::analyzer::semantic_model::SemanticPackCatalog;
 use crate::analyzer::semantic_model::SemanticPackSelectorQuery;
+pub use crate::analyzer::store::active_models::{
+    ActivatedProcedureSummary, ActivatedSemanticModelRecord, ActiveSemanticModelShard,
+    EffectiveProcedureClaims, MatcherIndexes, ProcedureSummaryMatch, ResolvedActiveSemanticModels,
+    ReviewedObligationTarget, SemanticModelActivationExplanation, SemanticModelActivationReport,
+    SemanticModelMatch, absorb_procedure_posting, build_normal_continuation_absence_candidates,
+    empty_procedure_match, indexed_procedure_summary, insert_rule_trigger,
+    procedure_match_proves_normal_continuation_absent, procedure_summary_actual_to_formal,
+    python_artifact_applies_to_target, python_shard_requires_distribution_artifact,
+    resolve_applicable_procedure_postings, resolve_applicable_procedure_postings_where,
+    resolve_applicable_procedure_postings_where_for_counts, resolve_exact_procedure_postings,
+    resolve_posting, resolve_procedure_postings, resolve_procedure_postings_where,
+};
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
 };
 use crate::hash::{HashMap, map_with_capacity};
 use brokk_bifrost_core::util::elapsed_ns;
+
 pub use brokk_bifrost_semantic::analyzer::semantic_model::runtime::*;
 
+use semver::Version;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -97,10 +111,11 @@ impl ActiveSemanticModelSnapshot {
         self.python_runtime.as_ref()
     }
 
+    #[doc(hidden)]
     /// Exact prepared JDK artifact selected by a configured source binding in
     /// this same model publication. A missing home supplies no applicability
     /// proof, even if a model for its release version is globally active.
-    pub(crate) fn jdk_artifact_for_home(
+    pub fn jdk_artifact_for_home(
         &self,
         configured_home: &Path,
     ) -> Option<&SemanticModelActivationEvidence> {
@@ -408,8 +423,11 @@ pub fn resolve_active_semantic_models(
     let mut report = SemanticModelActivationReport::default();
     let activation_sql_start = catalog.sql_statement_count();
     let selection_started = Instant::now();
-    let evidence = match validate_and_canonicalize_request(request) {
-        Ok(evidence) => evidence,
+    let CanonicalActivationEvidence {
+        evidence,
+        approximate_standard_libraries,
+    } = match validate_and_canonicalize_request(request) {
+        Ok(canonical) => canonical,
         Err(reason) => {
             push_request_explanation(&mut report, request.limits, reason);
             return SemanticModelResolutionOutcome::Unavailable(report);
@@ -463,6 +481,12 @@ pub fn resolve_active_semantic_models(
             )
         })
         .collect::<Vec<_>>();
+    language_ecosystems.extend(approximate_standard_libraries.iter().map(|expectation| {
+        (
+            semantic_pack_language(&expectation.language).to_owned(),
+            expectation.ecosystem.clone(),
+        )
+    }));
     language_ecosystems.sort();
     language_ecosystems.dedup();
     for (language, ecosystem) in language_ecosystems {
@@ -516,6 +540,8 @@ pub fn resolve_active_semantic_models(
     report.phase_measurements.selection_nanos = elapsed_ns(selection_started);
 
     let mut selected = Vec::<CandidateSelection>::new();
+    // Bounded by max_catalog_candidates and retained only for this activation.
+    let mut newest_approximate_versions = HashMap::<String, Version>::default();
     let mut incomplete = false;
     let mut decode_hydration_nanos = 0u64;
     for candidate in candidates.into_values() {
@@ -559,17 +585,51 @@ pub fn resolve_active_semantic_models(
             return SemanticModelResolutionOutcome::Unavailable(report);
         }
 
+        let approximate = approximate_standard_libraries.iter().any(|expectation| {
+            expectation.pack_id == loaded.manifest.pack_id
+                && semantic_pack_language(&expectation.language) == loaded.manifest.language
+                && expectation.ecosystem == loaded.manifest.ecosystem
+        });
+        let activation_match = if approximate {
+            // An expectation requests a pack; it does not prove any of that
+            // pack's toolchain coordinates or artifact digests exist locally.
+            // Catalog discovery already checked engine compatibility.
+            let version = Version::parse(&loaded.manifest.version)
+                .expect("validated manifest version is semver");
+            newest_approximate_versions
+                .entry(loaded.manifest.pack_id.clone())
+                .and_modify(|newest| *newest = newest.clone().max(version.clone()))
+                .or_insert(version);
+            let row = SemanticModelActivationEvidence {
+                language: loaded.manifest.language.clone(),
+                ecosystem: loaded.manifest.ecosystem.clone(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            };
+            Some(StrictActivationMatch {
+                evidence_rank: EvidenceRank::Language,
+                matched_evidence: row,
+                matching_evidence: Vec::new(),
+                matched_requirements: Vec::new(),
+            })
+        } else {
+            strict_activation_match(
+                &loaded.manifest,
+                &loaded.shard,
+                &evidence,
+                &request.bifrost_version,
+            )
+        };
         let Some(StrictActivationMatch {
             evidence_rank,
             matched_evidence,
             matching_evidence,
             matched_requirements,
-        }) = strict_activation_match(
-            &loaded.manifest,
-            &loaded.shard,
-            &evidence,
-            &request.bifrost_version,
-        )
+        }) = activation_match
         else {
             let reason =
                 strict_activation_mismatch_reason(&loaded.manifest, &loaded.shard, &evidence);
@@ -641,6 +701,7 @@ pub fn resolve_active_semantic_models(
             matched_requirements,
             source_rank: loaded.source_kind.precedence(),
             active: ActiveSemanticModelShard {
+                approximate,
                 manifest: loaded.manifest,
                 shard: loaded.shard,
                 source_kind: loaded.source_kind,
@@ -653,6 +714,12 @@ pub fn resolve_active_semantic_models(
         });
     }
 
+    selected.retain(|selection| {
+        !selection.active.approximate
+            || newest_approximate_versions
+                .get(&selection.active.manifest.pack_id)
+                .is_some_and(|newest| newest.to_string() == selection.active.manifest.version)
+    });
     selected.sort_by(compare_selection);
     let mut active = Vec::new();
     let mut by_semantic_shard = BTreeMap::<(String, PayloadKind), usize>::new();
@@ -699,7 +766,9 @@ pub fn resolve_active_semantic_models(
         // A review-gated pack reaches this push only through an explicit
         // compatible enable control, so the report retains that user
         // authorization decision rather than merely implying it.
-        let mut reason = if selection.active.manifest.safety.review_required {
+        let mut reason = if selection.active.approximate {
+            "approximate activation: the project's toolchain is unpinned; std facts are approximate"
+        } else if selection.active.manifest.safety.review_required {
             "strict activation evidence and an explicit enable control selected this shard"
         } else {
             "strict activation evidence and controls selected this shard"
@@ -712,7 +781,7 @@ pub fn resolve_active_semantic_models(
         // requirement instead of to an unnamed match (#3465). The pack
         // version is that extraction identity; it is the provenance the
         // requirement no longer carries.
-        if !selection.matched_requirements.is_empty() {
+        if selection.active.approximate || !selection.matched_requirements.is_empty() {
             reason.push_str("; pack version ");
             reason.push_str(&selection.active.manifest.version);
             for matched in &selection.matched_requirements {
@@ -1278,6 +1347,9 @@ pub(crate) fn active_model_set_hash(
     hasher.update(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION.to_be_bytes());
     hasher.update((rows.len() as u64).to_be_bytes());
     for selection in rows {
+        if selection.active.approximate {
+            hasher.update(b"approximate\0");
+        }
         hash_key_part(&mut hasher, &selection.semantic_sha256);
         hasher.update([match selection.payload_kind {
             PayloadKind::DeclarationFacts => 0,
@@ -1565,6 +1637,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         )
         .expect("exact-PyPI fixture decodes");
         ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
@@ -1599,6 +1672,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         )
         .expect("PyPI wildcard fixture decodes");
         ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
@@ -1638,6 +1712,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             artifact_sha256: None,
         };
         ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
@@ -1725,6 +1800,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             artifact_sha256: None,
         };
         let active_shard = ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
@@ -2122,6 +2198,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let first = evidence("21.0.8", "1");
         let second = evidence("21.0.8", "2");
         let active = ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
@@ -2184,6 +2261,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let mut separate = [first.clone(), second.clone()]
             .into_iter()
             .map(|evidence| ActiveSemanticModelShard {
+                approximate: false,
                 manifest: Arc::clone(&active.manifest),
                 shard: active.shard.clone(),
                 source_kind: CatalogPackSourceKind::Embedded,
@@ -2207,6 +2285,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         )
         .expect("ordinary model without an obligation compiles");
         separate.push(ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(bare_compiled.manifest),
             shard: decode_shard(
                 &bare_compiled.shards[0].descriptor,
@@ -2491,6 +2570,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         )
         .expect("same-artifact variadic model compiles");
         let incompatible = ActiveSemanticModelShard {
+            approximate: false,
             manifest: Arc::new(incompatible_compiled.manifest),
             shard: decode_shard(
                 &incompatible_compiled.shards[0].descriptor,
@@ -2833,6 +2913,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             artifact_sha256: None,
         };
         let active_shard = ActiveSemanticModelShard {
+            approximate: false,
             manifest: std::sync::Arc::new(compiled.manifest),
             shard,
             source_kind: CatalogPackSourceKind::Embedded,
@@ -3036,6 +3117,7 @@ pub(crate) mod active_model_set_identity_tests {
             matched_requirements: Vec::new(),
             source_rank: 0,
             active: ActiveSemanticModelShard {
+                approximate: false,
                 manifest: std::sync::Arc::new(compiled.manifest),
                 shard,
                 source_kind: CatalogPackSourceKind::Embedded,
@@ -3165,16 +3247,3 @@ pub(crate) mod active_model_set_identity_tests {
         );
     }
 }
-
-pub use crate::analyzer::store::active_models::{
-    ActivatedProcedureSummary, ActivatedSemanticModelRecord, ActiveSemanticModelShard,
-    EffectiveProcedureClaims, MatcherIndexes, ProcedureSummaryMatch, ResolvedActiveSemanticModels,
-    ReviewedObligationTarget, SemanticModelActivationExplanation, SemanticModelActivationReport,
-    SemanticModelMatch, absorb_procedure_posting, build_normal_continuation_absence_candidates,
-    empty_procedure_match, indexed_procedure_summary, insert_rule_trigger,
-    procedure_match_proves_normal_continuation_absent, procedure_summary_actual_to_formal,
-    python_artifact_applies_to_target, python_shard_requires_distribution_artifact,
-    resolve_applicable_procedure_postings, resolve_applicable_procedure_postings_where,
-    resolve_applicable_procedure_postings_where_for_counts, resolve_exact_procedure_postings,
-    resolve_posting, resolve_procedure_postings, resolve_procedure_postings_where,
-};

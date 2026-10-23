@@ -148,7 +148,46 @@ use std::sync::Arc;
 // #5868: resolved-call lowering consumes reconciled callable ownership. Its
 // semantic artifact key does not include the C++ source epoch; give the combined
 // ownership/receiver correction a fresh lowering identity even for unchanged bytes.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v37";
+// #6318: a declaration whose specifier run holds a `macro_modifier` (including
+// C11 `_Thread_local`) no longer lowers to a closed scalar type, so stored IR for
+// unchanged bytes can still carry the false definite value; rotate it.
+// #6309: a callable whose return type follows a `macro_modifier` or is a
+// `macro_type_specifier` no longer publishes a structured return identity, so
+// its procedure return model changes for unchanged bytes. v38 is reserved for
+// the independently published #6318 macro-modifier scalar-typing change, so
+// the two corrections never share one lowering identity.
+// #6346: a macro-decorated constructor's member initializers no longer publish
+// false member functions, so a call such as `grow_(...)` reaches the real
+// function-pointer field instead of a callable for unchanged bytes. v39 is
+// reserved for the concurrent #6309 return-identity repair, so the two
+// corrections never share one lowering identity.
+// #3298: the constructor and members under an access label a class-scope macro
+// invocation swallowed are now published, with that label's access, so the
+// callables lowered for unchanged bytes change. v40 is reserved for the
+// concurrent #6346 macro-initialized constructor repair.
+// #6325: resolved-call lowering reads guard-based visibility, and a displaced
+// `#else` now places its declarations in the alternative branch. v40 is the
+// published #6346 identity and v41 is reserved for the concurrent #3298
+// access-label repair, so this guard correction takes v42.
+// #6373: a type parameter defaulted to an abstract declarator (`typename U =
+// T*`) is a type parameter again under grammar 0.24.4, so its forward-declared
+// default reaches receiver selection and resolved calls change for unchanged
+// bytes.
+// #2928: a function-like export-macro class head without a base clause again
+// publishes its class and member ownership, so resolved-call lowering changes
+// for unchanged bytes. v42 is the published #6325 guard identity and v43 is
+// reserved for the concurrent #6373 type-parameter repair, so this takes v44.
+// v43 (#6373 alone) and v44 (#2928 alone) are both published standalone
+// identities whose lowerings lack the other repair, so the producer combining
+// them takes v45.
+// #2184: a type spelled after a leading `macro_modifier` again takes the
+// physical same-file alias, so receiver types and resolved calls change for
+// unchanged bytes. v43, v44 and the combined v45 are published identities
+// whose lowerings lack this repair, so the producer adding it takes v46.
+// #3093: parsed namespace Modules carry their source facts again, so bounded
+// visibility reaches their dependency names and resolved calls change for
+// unchanged bytes.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v47";
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their
@@ -1384,7 +1423,12 @@ fn cpp_scalar_type_for_declaration(
         || has_atomic_qualifier(source, declaration, declarator)
         || has_storage_class(source, declaration, "static")
         || has_storage_class(source, declaration, "thread_local")
-        || has_storage_class(source, declaration, "_Thread_local")
+        // The grammar has no C11 `_Thread_local` keyword: it parses that word,
+        // like any unexpanded object-like macro in the specifier run, as a
+        // `macro_modifier`, whose expansion may be a storage class or qualifier.
+        || named_children(declaration)
+            .into_iter()
+            .any(|child| child.kind() == "macro_modifier")
         || cpp_declarator_contains_kind(declarator, "pointer_declarator")
         || cpp_declarator_contains_kind(declarator, "reference_declarator")
         || cpp_declarator_contains_kind(declarator, "array_declarator")

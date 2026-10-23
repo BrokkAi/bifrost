@@ -587,6 +587,7 @@ fn activate_legacy_configured_semantic_models(
     evidence.sort();
     evidence.dedup();
     let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("crate version must be valid semver"),
         evidence,
@@ -2568,6 +2569,7 @@ fn mark_pack_acquisition_pending(
         return;
     };
     result.diagnostics.push(crate::rql::CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: crate::rql::CodeQueryDiagnosticCode::SemanticPackAcquisitionPending,
         impact: crate::rql::CodeQueryDiagnosticImpact::Incomplete,
@@ -3071,6 +3073,21 @@ impl WorkspaceSession {
                 workspace_pack_ecosystems(&self.snapshot, state.config.as_deref())
                     != state.ecosystems
             })
+    }
+
+    fn refresh_updated_contexts(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
+        let uncancelled = CancellationToken::default();
+        self.snapshot
+            .refresh_updated_workspace_contexts(
+                changed_files,
+                &crate::analyzer::semantic_model::DependencyPackLimits::default(),
+                cancellation.unwrap_or(&uncancelled),
+            )
+            .map_err(|error| SearchToolsServiceError::internal(error.to_string()))
     }
 
     /// Re-run the shared activation transaction after dependency inputs or the
@@ -4012,7 +4029,7 @@ impl SearchToolsService {
         // explicitly, activate replaces the whole workspace, and get is cheap.
         match name {
             "refresh" => return self.handle_refresh(arguments),
-            "update_paths" => return self.handle_update_paths(arguments),
+            "update_paths" => return self.handle_update_paths(arguments, cancellation),
             "activate_workspace" => return self.handle_activate_workspace(arguments),
             "get_active_workspace" => return self.handle_get_active_workspace(arguments),
             _ => {}
@@ -4183,7 +4200,7 @@ impl SearchToolsService {
             // (#1199).
             let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
             let named = crate::tool_arguments::tool_named_files(name, &arguments);
-            if self.apply_stale_named_files(&named)? {
+            if self.apply_stale_named_files(&named, cancellation)? {
                 self.snapshot_for_query_with_cancellation(cancellation)?
             } else {
                 snapshot
@@ -4245,6 +4262,22 @@ impl SearchToolsService {
                 render_options,
                 |workspace, params| list_symbols(workspace.analyzer(), params),
             ),
+            "list_function_sources" => {
+                let params = serde_json::from_value::<
+                    brokk_bifrost_tools::function_sources::ListFunctionSourcesParams,
+                >(arguments)
+                .map_err(|err| {
+                    SearchToolsServiceError::invalid_params(format!(
+                        "Invalid tool arguments: {err}"
+                    ))
+                })?;
+                Self::structured_only(
+                    brokk_bifrost_tools::function_sources::list_function_sources(
+                        snapshot.analyzer(),
+                        params,
+                    ),
+                )
+            }
             "classify_test_files" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     classify_test_files(workspace.analyzer(), params)
@@ -5702,7 +5735,11 @@ impl SearchToolsService {
     /// existing analysis for every other file. Unlike `refresh` (which rebuilds the
     /// whole project), this is O(changed files) and is how a caller that knows what
     /// changed (e.g. between two checked-out revisions) drives updates cheaply.
-    fn handle_update_paths(&self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
+    fn handle_update_paths(
+        &self,
+        arguments: Value,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         let paths: Vec<String> = arguments
             .get("paths")
             .and_then(|v| v.as_array())
@@ -5719,24 +5756,13 @@ impl SearchToolsService {
             .iter()
             .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
             .collect();
-        if !changed.is_empty() {
-            let mut refresh_packs = changed_files_invalidate_pack_activation(&changed);
-            // The caller is telling us these paths changed on disk; created or
-            // deleted files must show up in listing-backed tools, so any
-            // cached workspace listing is stale.
-            session
-                .snapshot
-                .analyzer()
-                .project()
-                .invalidate_cached_file_listing();
-            let next = session.snapshot.update(&changed);
-            session.snapshot = Arc::new(next);
-            refresh_packs |= session.pack_activation_scope_changed();
-            if refresh_packs {
-                session.refresh_pack_activation();
-            }
-            session.schedule_index_warm();
-        }
+        // Explicit edits and watcher deltas use the same publication path.
+        session
+            .snapshot
+            .analyzer()
+            .project()
+            .invalidate_cached_file_listing();
+        Self::apply_changed_files(session, changed, cancellation)?;
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
 
@@ -5848,7 +5874,15 @@ impl SearchToolsService {
     /// (an event landing right after `apply_watcher_delta` already missed the
     /// current call). Under `Manual`, the watcher is always `Disabled` and
     /// this path never mutates the snapshot, so a read lock always suffices.
+    #[cfg(test)]
     fn snapshot_for_query(&self) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
+        self.snapshot_after_updates(None)
+    }
+
+    fn snapshot_after_updates(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
         // Manual sessions never mutate the snapshot from this path (no
         // watcher, no implicit updates driven by this call), so a read lock
         // always suffices — never take the write lock at all.
@@ -5877,7 +5911,7 @@ impl SearchToolsService {
         // Only reached for `WatchFiles` sessions with a pending delta.
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        Self::apply_watcher_delta(session);
+        Self::apply_watcher_delta(session, cancellation)?;
         Ok(WorkspaceQueryScope::new(
             Arc::clone(&session.snapshot),
             Arc::clone(&session.document_root),
@@ -5954,7 +5988,7 @@ impl SearchToolsService {
     ) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
         self.ensure_ready_with_cancellation(cancellation)?;
         self.settle_installed_pack_stage(cancellation)?;
-        self.snapshot_for_query()
+        self.snapshot_after_updates(cancellation)
     }
 
     /// Whether `session`'s watcher (if active) currently has a delta that a
@@ -6019,7 +6053,7 @@ impl SearchToolsService {
             } else {
                 let mut guard = self.write_session()?;
                 let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-                Self::apply_watcher_delta(session);
+                Self::apply_watcher_delta(session, cancellation)?;
                 // Re-validate under the write lock: another thread may have
                 // applied a watcher delta between the read-locked peek above
                 // and now, which can make a file the peek considered stale
@@ -6027,7 +6061,7 @@ impl SearchToolsService {
                 // now-current session snapshot rather than trusting the peek.
                 let analyzer = session.snapshot.analyzer();
                 let stale_files = stale_symbol_source_files(analyzer, stale_files)?;
-                Self::apply_changed_files(session, stale_files);
+                Self::apply_changed_files(session, stale_files, cancellation)?;
                 Arc::clone(&session.snapshot)
             };
 
@@ -6099,7 +6133,11 @@ impl SearchToolsService {
     /// comparison with the indexed source each) costs what the request names,
     /// not what the worktree holds. Other files stay as fresh as the watcher
     /// has made them, exactly as before.
-    fn apply_stale_named_files(&self, named: &[String]) -> Result<bool, SearchToolsServiceError> {
+    fn apply_stale_named_files(
+        &self,
+        named: &[String],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<bool, SearchToolsServiceError> {
         if self.update_strategy != UpdateStrategy::WatchFiles || named.is_empty() {
             return Ok(false);
         }
@@ -6121,18 +6159,21 @@ impl SearchToolsService {
         }
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        Self::apply_watcher_delta(session);
+        Self::apply_watcher_delta(session, cancellation)?;
         // Another thread may have applied the change between the peek and the
         // write lock; recompute against the now-current snapshot.
         let stale = stale_symbol_source_files(session.snapshot.analyzer(), stale)?;
-        Self::apply_changed_files(session, stale);
+        Self::apply_changed_files(session, stale, cancellation)?;
         Ok(true)
     }
 
-    fn apply_watcher_delta(session: &mut WorkspaceSession) {
+    fn apply_watcher_delta(
+        session: &mut WorkspaceSession,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
         let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
         let watcher = match &session.watcher {
-            SessionWatcher::Disabled => return,
+            SessionWatcher::Disabled => return Ok(()),
             SessionWatcher::Active(watcher) => watcher,
         };
 
@@ -6154,20 +6195,24 @@ impl SearchToolsService {
             });
             session.refresh_pack_activation();
             session.schedule_index_warm();
-            return;
+            return Ok(());
         }
 
         if delta.files.is_empty() {
-            return;
+            return Ok(());
         }
 
         let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
-        Self::apply_changed_files(session, changed_files);
+        Self::apply_changed_files(session, changed_files, cancellation)
     }
 
-    fn apply_changed_files(session: &mut WorkspaceSession, changed_files: BTreeSet<ProjectFile>) {
+    fn apply_changed_files(
+        session: &mut WorkspaceSession,
+        changed_files: BTreeSet<ProjectFile>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
         if changed_files.is_empty() {
-            return;
+            return Ok(());
         }
         if profiling::enabled() {
             profiling::note(format!("snapshot_changed_files={}", changed_files.len()));
@@ -6179,9 +6224,13 @@ impl SearchToolsService {
         });
         refresh_packs |= session.pack_activation_scope_changed();
         if refresh_packs {
+            // Activation already rediscovers tool contexts for this snapshot.
             session.refresh_pack_activation();
+        } else {
+            session.refresh_updated_contexts(&changed_files, cancellation)?;
         }
         session.schedule_index_warm();
+        Ok(())
     }
 
     fn decode_and_run<P, R>(
@@ -7279,6 +7328,7 @@ fn unbound_test_service(
 mod watcher_startup_tests {
     use super::*;
     use crate::path_normalization::NormalizePath;
+    use brokk_bifrost_test_macros::hardwon;
     use serde_json::json;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8440,6 +8490,304 @@ mod watcher_startup_tests {
             .arg("version")
             .output()
             .is_ok()
+    }
+
+    fn go_live_edit_fixture() -> brokk_bifrost_analysis::inline_project::BuiltInlineTestProject {
+        brokk_bifrost_analysis::inline_project::InlineTestProject::new()
+            .file("go.mod", "module example.test/liveedit\n\ngo 1.22\n")
+            .file(
+                "caller.go",
+                "package liveedit\nfunc Caller() int { return Target() }\n",
+            )
+            .file(
+                "target.go",
+                "package liveedit\nfunc Target() int { return 1 }\n",
+            )
+            .build()
+    }
+
+    #[test]
+    #[hardwon("#6482: a .go edit dropped the selected Go context until go.mod changed")]
+    fn go_live_update_keeps_native_cross_file_definition() {
+        if !go_toolchain_available() {
+            return;
+        }
+        let fixture = go_live_edit_fixture();
+        let service =
+            SearchToolsService::new_manual_persisted(fixture.root().to_path_buf()).unwrap();
+        // Real startup discovery must finish before the first native request.
+        {
+            let guard = service.read_session().unwrap();
+            guard.as_ref().unwrap().semantic_packs.wait();
+        }
+        service.settle_installed_pack_stage(None).unwrap();
+        let arguments = json!({
+            "references": [{"path": "caller.go", "line": 2, "column": 28}]
+        });
+        let resolve = || {
+            let payload = service
+                .call_tool_json("get_definitions_by_location", &arguments.to_string())
+                .unwrap();
+            let value: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+            assert_eq!(
+                value["results"][0]["definitions"][0]["path"], "target.go",
+                "{value}"
+            );
+            let snapshot = service.snapshot_for_query().unwrap();
+            let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                brokk_bifrost_go_analysis::analyzer::GoAnalyzer,
+            >(snapshot.analyzer())
+            .unwrap();
+            let profile = go
+                .context_profile_for_test()
+                .expect("Go-tool context profile selected");
+            assert_ne!(
+                profile,
+                brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile()
+            );
+            (go.selected_snapshot_for_test().unwrap(), profile)
+        };
+        let (initial_snapshot, initial_profile) = resolve();
+        let initial_scope = service.snapshot_for_query().unwrap();
+        let initial_context = initial_scope
+            .store()
+            .unwrap()
+            .selected_go_context(&initial_snapshot, &initial_profile)
+            .unwrap()
+            .unwrap();
+        let initial_digest: Vec<u8> = initial_scope
+            .store()
+            .unwrap()
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT input_digest FROM go_context_publications WHERE context_id=?1",
+                [initial_context.context_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(initial_scope);
+        let edited = [2, 3, 4].map(|value| {
+            fixture
+                .file("target.go")
+                .write(format!(
+                    "package liveedit\nfunc Target() int {{ /* body edit */ return {value} }}\n"
+                ))
+                .unwrap();
+            service
+                .call_tool_json("update_paths", &json!({"paths": ["target.go"]}).to_string())
+                .unwrap();
+            resolve()
+        });
+        let (latest, profile) = &edited[2];
+        let scope = service.snapshot_for_query().unwrap();
+        let conn = scope.store().unwrap().read_conn().unwrap();
+        let (publications, open, context_id, digest): (i64,i64,i64,Vec<u8>) = conn.query_row(
+            "SELECT count(*),sum(p.valid_until IS NULL),max(p.context_id),p.input_digest FROM go_context_selections s JOIN go_context_publications p USING(selection_id) WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2 AND s.profile_digest=?3 AND s.derivation_version=?4",
+            rusqlite::params![latest.workspace_id.as_str(),latest.generation.get(),profile,brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            publications, 1,
+            "body edits retain the placement publication"
+        );
+        assert_eq!(open, 1, "one open publication per domain");
+        assert_eq!(context_id, initial_context.context_id);
+        assert_ne!(
+            digest, initial_digest,
+            "body edits update the reconciliation input digest"
+        );
+    }
+
+    #[test]
+    #[hardwon("#6482: a burst of watched Go edits must publish one context at the latest revision")]
+    fn go_watched_edit_burst_publishes_one_context() {
+        if !go_toolchain_available() {
+            return;
+        }
+        let fixture = go_live_edit_fixture();
+        fixture
+            .file("spare.go")
+            .write("package liveedit\nfunc Spare() int { return 0 }\n")
+            .unwrap();
+        let starter: WatcherStarter = Arc::new(|project, claimed_files| {
+            ProjectChangeWatcher::start_polling_with_claimed_files_for_tests(project, claimed_files)
+        });
+        let config = AnalyzerConfig::default();
+        #[cfg(unix)]
+        let (config, invocation_log) = {
+            let mut config = config;
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let log = directory.path().join("go-list-log");
+            std::fs::write(&log, "").unwrap();
+            let wrapper = directory.path().join("go-wrapper");
+            let go = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|path| path.join("go"))
+                .find(|path| path.is_file())
+                .unwrap();
+            let quote =
+                |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = list ]; then pwd >> {}; fi\nexec {} \"$@\"\n",
+                    quote(&log),
+                    quote(&go)
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            config.go.dependency_discovery.go_executable = Some(wrapper);
+            (config, (directory, log))
+        };
+        let (canonical, listing) = canonical_root_and_listing_cache(
+            fixture.root().to_path_buf(),
+            UpdateStrategy::WatchFiles,
+        )
+        .unwrap();
+        let project = build_project(canonical, listing.clone()).unwrap();
+        let workspace = build_persisted_analyzer(
+            Arc::clone(&project),
+            config,
+            UpdateStrategy::WatchFiles,
+            None,
+        )
+        .unwrap();
+        let root = project.root().to_path_buf();
+        let session = assemble_session(
+            project,
+            workspace,
+            UpdateStrategy::WatchFiles,
+            StartupIndexWarm::OnDemand,
+            &starter,
+        )
+        .unwrap();
+        let service = SearchToolsService::with_session_state(
+            root,
+            Some(session),
+            listing,
+            UpdateStrategy::WatchFiles,
+            starter,
+        );
+        {
+            let guard = service.read_session().unwrap();
+            guard.as_ref().unwrap().semantic_packs.wait();
+        }
+        service.settle_installed_pack_stage(None).unwrap();
+        let arguments = json!({"references": [{"path": "caller.go", "line": 2, "column": 28}]});
+        let payload = service
+            .call_tool_json("get_definitions_by_location", &arguments.to_string())
+            .unwrap();
+        let before_answer: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            before_answer["results"][0]["status"], "resolved",
+            "{before_answer}"
+        );
+        let (before, profile, previous_context) = {
+            let guard = service.read_session().unwrap();
+            let snapshot = &guard.as_ref().unwrap().snapshot;
+            let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                brokk_bifrost_go_analysis::analyzer::GoAnalyzer,
+            >(snapshot.analyzer())
+            .unwrap();
+            let before = go.selected_snapshot_for_test().unwrap();
+            let profile = go.context_profile_for_test().unwrap();
+            let identity = snapshot
+                .store()
+                .unwrap()
+                .selected_go_context(&before, &profile)
+                .unwrap()
+                .unwrap();
+            (before, profile, identity.context_id)
+        };
+        #[cfg(unix)]
+        std::fs::write(&invocation_log.1, "").unwrap();
+        let edits = [
+            (
+                "target.go",
+                "package liveedit\nfunc Target() int { return 2 }\n",
+            ),
+            (
+                "caller.go",
+                "package liveedit\nfunc Caller() int { return Target() } // saved\n",
+            ),
+            (
+                "spare.go",
+                "package liveedit\nfunc Spare() int { return 3 }\n",
+            ),
+        ];
+        for (path, source) in edits {
+            fixture.file(path).write(source).unwrap();
+        }
+        let changed = edits.map(|(path, _)| fixture.file(path));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = {
+                let guard = service.read_session().unwrap();
+                match &guard.as_ref().unwrap().watcher {
+                    SessionWatcher::Active(watcher) => watcher.has_pending_files(&changed),
+                    SessionWatcher::Disabled => panic!("the burst test needs a real watcher"),
+                }
+            };
+            if pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the watcher must deliver all three edits before the request"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // No snapshot/query helper runs between the writes and this one request.
+        let payload = service
+            .call_tool_json("get_definitions_by_location", &arguments.to_string())
+            .unwrap();
+        let answer: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(answer["results"][0]["status"], "resolved", "{answer}");
+        let guard = service.read_session().unwrap();
+        let snapshot = &guard.as_ref().unwrap().snapshot;
+        let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            brokk_bifrost_go_analysis::analyzer::GoAnalyzer,
+        >(snapshot.analyzer())
+        .unwrap();
+        let latest = go.selected_snapshot_for_test().unwrap();
+        assert!(latest.revision > before.revision);
+        let store = snapshot.store().unwrap();
+        assert!(
+            store
+                .selected_go_context(&latest, &profile)
+                .unwrap()
+                .is_some()
+        );
+        let current = store
+            .selected_go_context(&latest, &profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.context_id, previous_context,
+            "body burst reuses placement"
+        );
+        #[cfg(unix)]
+        {
+            let invocations = std::fs::read_to_string(&invocation_log.1).unwrap();
+            let invocations = invocations.lines().collect::<Vec<_>>();
+            assert_eq!(
+                invocations.len(),
+                1,
+                "at most one go list for the changed domain: {invocations:?}"
+            );
+        }
+        for (path, source) in edits {
+            assert_eq!(
+                snapshot
+                    .analyzer()
+                    .indexed_source(&fixture.file(path))
+                    .unwrap(),
+                source
+            );
+        }
     }
 
     #[test]

@@ -19,29 +19,6 @@ use tree_sitter::Tree;
 pub struct RubyAdapter;
 
 impl LanguageAdapter for RubyAdapter {
-    fn source_fact_storage(
-        &self,
-    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
-    {
-        Some(&crate::analyzer::ruby::source_publication::SOURCE_STORAGE)
-    }
-
-    fn requires_source_declaration_metadata_bridges(&self) -> bool {
-        true
-    }
-
-    fn produces_canonical_source_facts(&self) -> bool {
-        true
-    }
-
-    fn ruby_source_facts_version(&self) -> Option<i64> {
-        Some(brokk_bifrost_core::analyzer::ruby_facts::RUBY_SOURCE_FACTS_VERSION)
-    }
-
-    fn language(&self) -> Language {
-        Language::Ruby
-    }
-
     /// Relative to `brokk-bifrost-ruby`'s crate root: the `.scm` assets moved
     /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
@@ -50,10 +27,6 @@ impl LanguageAdapter for RubyAdapter {
 
     fn file_extension(&self) -> &'static str {
         RUBY_FILE_EXTENSION
-    }
-
-    fn persist_content_stable_lookup_keys(&self) -> bool {
-        true
     }
 
     /// Ruby's structured declaration identity renders nested constant owners
@@ -90,5 +63,29 @@ impl LanguageAdapter for RubyAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUBY_COGNITIVE_CONFIG)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for RubyAdapter {
+    fn source_fact_storage(
+        &self,
+    ) -> Option<&'static brokk_bifrost_analysis::analyzer::store::source_facts::SourceFactStorage>
+    {
+        Some(&crate::analyzer::ruby::source_publication::SOURCE_STORAGE)
+    }
+    fn requires_source_declaration_metadata_bridges(&self) -> bool {
+        true
+    }
+    fn produces_canonical_source_facts(&self) -> bool {
+        true
+    }
+    fn ruby_source_facts_version(&self) -> Option<i64> {
+        Some(brokk_bifrost_core::analyzer::ruby_facts::RUBY_SOURCE_FACTS_VERSION)
+    }
+    fn language(&self) -> Language {
+        Language::Ruby
+    }
+    fn persist_content_stable_lookup_keys(&self) -> bool {
+        true
     }
 }

@@ -10,7 +10,8 @@ use super::results::{
     CodeQueryDiagnosticImpact, CodeQueryResultRef, DetailedCodeQueryKey,
 };
 use super::scalar_conditions::{
-    ScalarConditionGap, ScalarConditionOutcome, ScalarConditionVerdict, scalar_condition_outcomes,
+    ScalarConditionDerivation, ScalarConditionGap, ScalarConditionOutcome, ScalarConditionVerdict,
+    scalar_condition_outcomes,
 };
 use super::*;
 use crate::analyzer::semantic::ProcedureHandle;
@@ -29,7 +30,7 @@ const MAX_BRANCH_SOURCE_BYTES: usize = 1024 * 1024;
 pub(super) struct BranchRelationTraversalCache {
     syntax: HashMap<ProjectFile, StructuralSyntaxLimitedOutcome>,
     reference_proofs: HashMap<ProjectFile, BranchReferenceProofs>,
-    scalar: HashMap<ProcedureHandle, Result<Vec<ScalarConditionOutcome>, ScalarConditionGap>>,
+    scalar: HashMap<ProcedureHandle, Result<ScalarConditionDerivation, ScalarConditionGap>>,
     reported: HashSet<(ProjectFile, &'static str, &'static str)>,
 }
 
@@ -154,6 +155,7 @@ fn report(
 ) {
     if cache.reported.insert((seed.file.clone(), relation, cause)) {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -414,9 +416,9 @@ fn qualify_php_repeated_conditions(
                 chain
                     .get(row.earlier_ordinal..=row.later_ordinal)
                     .is_some_and(|conditions| {
-                        conditions
-                            .iter()
-                            .all(|range| php_condition_has_stable_outcome(syntax, *range, outcomes))
+                        conditions.iter().all(|range| {
+                            php_condition_has_stable_outcome(syntax, *range, &outcomes.outcomes)
+                        })
                     })
             }),
             Err(_) => false,
@@ -443,7 +445,7 @@ fn scalar_outcomes_for_procedure(
     procedure: &SemanticProcedureValue,
     syntax: &Arc<PreparedSyntaxTree>,
     cancellation: &CancellationToken,
-) -> Result<Vec<ScalarConditionOutcome>, ScalarConditionGap> {
+) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
     if let Some(outcomes) = cache.scalar.get(&procedure.handle) {
         return outcomes.clone();
     }
@@ -814,7 +816,8 @@ fn scalar_condition_expansions(
             }
             let verdict = match outcome {
                 Err(gap) => Ok(ScalarConditionVerdict::Open(*gap)),
-                Ok(outcomes) => {
+                Ok(derivation) => {
+                    let outcomes = &derivation.outcomes;
                     let exact = |outcome: &&ScalarConditionOutcome| {
                         outcome.condition_start_byte == condition.start_byte()
                             && outcome.condition_end_byte == condition.end_byte()
@@ -876,6 +879,10 @@ fn scalar_condition_expansions(
             (ordinal, range, verdict)
         })
         .collect::<Vec<_>>();
+    let related = match outcome {
+        Ok(derivation) => Some((&derivation.procedure_gaps, &derivation.producer_gaps)),
+        Err(_) => None,
+    };
     verdicts
         .into_iter()
         .map(|(ordinal, range, verdict)| {
@@ -887,17 +894,31 @@ fn scalar_condition_expansions(
                 Err(reason) => ("open", Some(reason), None),
             };
             if let Some(reason) = reason {
-                report(
-                    cache,
-                    seed,
-                    RELATION,
-                    reason,
-                    format!(
-                        "{RELATION} branch relation for {} is incomplete: {reason}",
-                        rel_path_string(&seed.file)
-                    ),
-                    diagnostics,
+                let source = procedure.diagnostic_source();
+                let message = format!(
+                    "{RELATION} branch relation for {} is incomplete: {reason}",
+                    rel_path_string(&seed.file)
                 );
+                if !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete
+                        && diagnostic.source == source
+                        && diagnostic.message == message
+                }) {
+                    let mut diagnostic = super::incomplete_diagnostic(
+                        CodeQueryDiagnosticCode::BranchRelationDerivationIncomplete,
+                        seed.language.config_label(),
+                        message,
+                        Vec::new(),
+                    );
+                    diagnostic.source = source;
+                    diagnostic.related = match (reason, related) {
+                        ("partial_procedure", Some((gaps, _)))
+                        | ("partial_producer", Some((_, gaps))) => gaps.clone(),
+                        _ => Vec::new(),
+                    };
+                    diagnostic.withheld_rows_path = Some(rel_path_string(&seed.file));
+                    diagnostics.push(diagnostic);
+                }
             }
             pipeline_expansion(PipelineValue::BranchRelation(Box::new(make_value(
                 seed,

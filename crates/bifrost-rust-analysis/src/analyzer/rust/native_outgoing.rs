@@ -296,10 +296,10 @@ pub(crate) fn outgoing(
                             continue;
                         }
                     }
-                    if answer.resolution.completion() != &ResolutionCompletion::Complete {
+                    if answer.resolution.call_target_completion() != ResolutionCompletion::Complete {
                         result.diagnostics.push(diagnostic("native_call_resolution_incomplete", format!(
                             "call resolution at {callee_range:?}: {:?}; receiver dispositions: {:?}",
-                            answer.resolution.completion(), answer.resolution.callable_receiver_dispositions(),
+                            answer.resolution.call_target_completion(), answer.resolution.callable_receiver_dispositions(),
                         ), caller));
                     }
                     let cardinality = answer.resolution.binding().targets().len();
@@ -404,6 +404,7 @@ mod tests {
 
     use crate::analyzer::rust::native_outgoing::*;
     use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn fixture() -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
         let fixture = InlineTestProject::with_language(Language::Rust)
@@ -436,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn native_outgoing_preserves_exact_sites_and_async_type_uncertainty() {
+    fn native_outgoing_preserves_exact_sites_despite_async_type_uncertainty() {
         let (fixture, rust) = fixture();
         let caller = rust
             .declarations(&fixture.file("src/lib.rs"))
@@ -482,14 +483,7 @@ mod tests {
             &source[method.arguments[0].range.start_byte..method.arguments[0].range.end_byte],
             "2"
         );
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.reason_kind.as_deref()
-                    == Some("native_call_resolution_incomplete")),
-            "{result:?}"
-        );
+        assert!(result.diagnostics.is_empty(), "{result:?}");
         assert!(
             !result
                 .diagnostics
@@ -497,6 +491,72 @@ mod tests {
                 .any(|diagnostic| diagnostic.reason_kind.as_deref()
                     == Some("native_reference_inventory_incomplete")),
             "unrelated source gaps escaped their fragment: {result:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#6238: an incomplete return-type projection made a unique complete call binding report AnalysisFailed"
+    )]
+    fn native_outgoing_separates_return_projection_from_open_dispatch() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"completion\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                concat!(
+                    "pub fn f(input: &[u8]) { helper() }\n",
+                    "fn helper() {}\n",
+                    "pub trait Action { fn run(&self); }\n",
+                    "impl<T: Clone> Action for T { fn run(&self) {} }\n",
+                    "pub fn dynamic(action: &dyn Action) { action.run(); }\n",
+                ),
+            )
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let declarations = rust.declarations(&fixture.file("src/lib.rs"));
+        let caller = declarations
+            .iter()
+            .find(|unit| unit.identifier() == "f")
+            .unwrap();
+        let result = outgoing(
+            &rust,
+            caller,
+            limits(),
+            ReceiverAnalysisBudget::default(),
+            &CancellationToken::new(),
+        );
+        assert!(!result.cancelled && !result.truncated, "{result:?}");
+        assert!(result.diagnostics.is_empty(), "{result:?}");
+        assert_eq!(result.sites.len(), 1, "{result:?}");
+        assert_eq!(result.sites[0].callee.identifier(), "helper");
+        assert_eq!(result.sites[0].proof, UsageProof::Proven);
+
+        let caller = declarations
+            .iter()
+            .find(|unit| unit.identifier() == "dynamic")
+            .unwrap();
+        let result = outgoing(
+            &rust,
+            caller,
+            limits(),
+            ReceiverAnalysisBudget::default(),
+            &CancellationToken::new(),
+        );
+        assert!(!result.cancelled && !result.truncated, "{result:?}");
+        assert!(
+            !result.sites.is_empty(),
+            "open dispatch still retains its known target: {result:?}"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.reason_kind.as_deref()
+                    == Some("native_call_resolution_incomplete")),
+            "{result:?}"
         );
     }
 

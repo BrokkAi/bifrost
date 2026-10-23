@@ -9,7 +9,8 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_path_chain_root, spelled_generic_arity,
 };
 use brokk_bifrost_core::analyzer::structural::callable::{
-    CallShapeCoverage, CallSiteContext, CallSiteFacts,
+    CallShapeCoverage, CallSiteContext, CallSiteFacts, CalleeProvenance, CalleeProvenanceFact,
+    CalleeSupplier, CalleeTypeShape,
 };
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
@@ -718,7 +719,305 @@ fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
     }
 }
 
+// Provenance depends only on this blob's syntax, unlike dispatch or models.
+// Keep it on the persisted structural node array alongside other call facts:
+// every call-shape read already loads that node, avoiding another join or a
+// query-time reparse. STRUCTURAL_FACTS_VERSION invalidates old array layouts.
+fn rust_callee_provenance<E>(
+    call: Node<'_>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<CalleeProvenanceFact, E> {
+    let mut fact = CalleeProvenanceFact {
+        provenance: CalleeProvenance::Unknown,
+        supplier: None,
+        shape: CalleeTypeShape::Unknown,
+        bounds: Vec::new(),
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return Ok(fact);
+    };
+    let method_receiver = rust_method_call_parts(function);
+    let mut callee = method_receiver.map_or(function, |(receiver, _)| receiver);
+    loop {
+        charge(1)?;
+        let inner = match callee.kind() {
+            "parenthesized_expression" => callee.named_child(0),
+            "reference_expression" => callee.child_by_field_name("value"),
+            "unary_expression"
+                if callee
+                    .child(0)
+                    .is_some_and(|operator| operator.kind() == "*") =>
+            {
+                callee.named_child(0)
+            }
+            _ => None,
+        };
+        let Some(inner) = inner else {
+            break;
+        };
+        callee = inner;
+    }
+    if matches!(callee.kind(), "scoped_identifier" | "generic_function")
+        || (callee.kind() == "field_expression" && method_receiver.is_some())
+    {
+        fact.provenance = CalleeProvenance::Declared;
+        return Ok(fact);
+    }
+    // A callable stored in a field needs value-flow provenance. In a method
+    // call the receiver was selected above, so nominal receivers still carry
+    // their own parameter type evidence.
+    if !matches!(callee.kind(), "identifier" | "self") {
+        return Ok(fact);
+    }
+    let Some(binding) =
+        crate::lexical_scope::rust_value_binding_at_bounded(callee, source, charge)?
+    else {
+        fact.provenance = CalleeProvenance::Declared;
+        return Ok(fact);
+    };
+    if binding.kind() == "let_declaration" {
+        if binding
+            .child_by_field_name("value")
+            .is_some_and(|value| value.kind() == "closure_expression")
+        {
+            fact.provenance = CalleeProvenance::LocalClosure;
+        }
+        return Ok(fact);
+    }
+    let mut ancestor = binding.parent();
+    let mut parameters = None;
+    let mut callable = None;
+    while let Some(node) = ancestor {
+        charge(1)?;
+        if matches!(node.kind(), "parameters" | "closure_parameters") {
+            parameters = Some(node);
+        }
+        if matches!(node.kind(), "function_item" | "closure_expression") {
+            callable = Some(node);
+            break;
+        }
+        ancestor = node.parent();
+    }
+    let Some(parameters) = parameters else {
+        return Ok(fact);
+    };
+    let Some(callable) = callable else {
+        return Ok(fact);
+    };
+    let is_closure = callable.kind() == "closure_expression";
+    let mut ordinal = 0;
+    for index in 0..parameters.named_child_count() {
+        charge(1)?;
+        let parameter =
+            unwrap_attributes(parameters.named_child(index).expect("indexed parameter"));
+        if matches!(
+            parameter.kind(),
+            "line_comment" | "block_comment" | "attribute_item"
+        ) {
+            continue;
+        }
+        if parameter.id() == binding.id() {
+            break;
+        }
+        if parameter.kind() != "self_parameter" {
+            ordinal += 1;
+        }
+    }
+    let supplier = if binding.kind() == "self_parameter" || callee.kind() == "self" {
+        CalleeSupplier::Receiver
+    } else if is_closure {
+        CalleeSupplier::ClosureParameter(ordinal)
+    } else {
+        CalleeSupplier::Parameter(ordinal)
+    };
+    if binding.kind() == "self_parameter" {
+        let mut owner = callable.parent();
+        while let Some(node) = owner {
+            charge(1)?;
+            match node.kind() {
+                "trait_item" => {
+                    fact.provenance = CalleeProvenance::CallerSupplied;
+                    fact.supplier = Some(supplier);
+                    break;
+                }
+                "impl_item" | "source_file" => break,
+                _ => owner = node.parent(),
+            }
+        }
+        return Ok(fact);
+    }
+    let Some(mut ty) = binding.child_by_field_name("type") else {
+        if is_closure {
+            fact.provenance = CalleeProvenance::CallerSupplied;
+            fact.supplier = Some(supplier);
+        }
+        return Ok(fact);
+    };
+    while ty.kind() == "reference_type" {
+        charge(1)?;
+        let Some(inner) = ty.child_by_field_name("type") else {
+            return Ok(fact);
+        };
+        ty = inner;
+    }
+    fact.shape = match ty.kind() {
+        "dynamic_type" => CalleeTypeShape::DynTrait,
+        "abstract_type" => CalleeTypeShape::ImplTrait,
+        "function_type" => CalleeTypeShape::FnPointer,
+        _ => CalleeTypeShape::Nominal,
+    };
+    if matches!(ty.kind(), "dynamic_type" | "abstract_type") {
+        if let Some(bounds) = ty.child_by_field_name("trait") {
+            fact.bounds = rust_callee_bound_paths(bounds, source, charge)?;
+        }
+    } else if ty.kind() == "type_identifier" {
+        let type_name = crate::declarations::rust_node_text(ty, source);
+        let mut bound_nodes = Vec::new();
+        let mut generic = false;
+        if let Some(formals) = callable.child_by_field_name("type_parameters") {
+            let mut cursor = formals.walk();
+            for parameter in formals.named_children(&mut cursor) {
+                charge(1)?;
+                if parameter.kind() == "type_parameter"
+                    && parameter.child_by_field_name("name").is_some_and(|name| {
+                        crate::declarations::rust_node_text(name, source) == type_name
+                    })
+                {
+                    generic = true;
+                    if let Some(bounds) = parameter.child_by_field_name("bounds") {
+                        bound_nodes.push(bounds);
+                    }
+                }
+            }
+        }
+        if generic {
+            let mut cursor = callable.walk();
+            for clause in callable.named_children(&mut cursor) {
+                charge(1)?;
+                if clause.kind() != "where_clause" {
+                    continue;
+                }
+                let mut cursor = clause.walk();
+                for predicate in clause.named_children(&mut cursor) {
+                    charge(1)?;
+                    if predicate.child_by_field_name("left").is_some_and(|left| {
+                        left.kind() == "type_identifier"
+                            && crate::declarations::rust_node_text(left, source) == type_name
+                    }) && let Some(bounds) = predicate.child_by_field_name("bounds")
+                    {
+                        bound_nodes.push(bounds);
+                    }
+                }
+            }
+            for bounds in bound_nodes {
+                fact.bounds
+                    .extend(rust_callee_bound_paths(bounds, source, charge)?);
+            }
+            if !fact.bounds.is_empty() {
+                fact.shape = if fact.bounds.iter().any(|path| {
+                    // Paths are already selected and assembled from AST nodes;
+                    // matching their value is not parsing source syntax.
+                    matches!(path.as_str(), "Fn" | "FnMut" | "FnOnce")
+                        || ["::Fn", "::FnMut", "::FnOnce"]
+                            .iter()
+                            .any(|suffix| path.ends_with(suffix))
+                }) {
+                    CalleeTypeShape::FnBoundGeneric
+                } else {
+                    CalleeTypeShape::TraitBoundGeneric
+                };
+            }
+        }
+    }
+    if is_closure
+        || !matches!(
+            fact.shape,
+            CalleeTypeShape::Nominal | CalleeTypeShape::Unknown
+        )
+    {
+        fact.provenance = CalleeProvenance::CallerSupplied;
+        fact.supplier = Some(supplier);
+    } else {
+        fact.provenance = CalleeProvenance::Declared;
+    }
+    Ok(fact)
+}
+
+fn rust_callee_bound_paths<E>(
+    bounds: Node<'_>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<Vec<String>, E> {
+    let mut result = Vec::new();
+    let mut stack = vec![bounds];
+    while let Some(node) = stack.pop() {
+        charge(1)?;
+        match node.kind() {
+            "function_type" => {
+                if let Some(head) = node.child_by_field_name("trait") {
+                    stack.push(head);
+                }
+            }
+            "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+                if let Some(path) = crate::declarations::rust_nominal_type_path(node, source) {
+                    charge(path.len())?;
+                    result.push(path.join("::"));
+                }
+            }
+            "trait_bounds"
+            | "bounded_type"
+            | "higher_ranked_trait_bound"
+            | "removed_trait_bound" => {
+                for index in (0..node.named_child_count()).rev() {
+                    charge(1)?;
+                    stack.push(node.named_child(index).expect("indexed bound"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 impl StructuralSpec for RustStructuralSpec {
+    fn supports_unsafe_context(&self) -> bool {
+        true
+    }
+
+    fn unsafe_context_value(
+        &self,
+        node: Node<'_>,
+        charge: &mut dyn FnMut(
+            usize,
+        ) -> Result<
+            (),
+            brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+        >,
+    ) -> Result<
+        Option<bool>,
+        brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+    > {
+        crate::ownership::rust_node_is_in_unsafe_context_bounded(node, charge).map(Some)
+    }
+
+    fn callee_provenance(
+        &self,
+        node: Node<'_>,
+        source: &str,
+        charge: &mut dyn FnMut(
+            usize,
+        ) -> Result<
+            (),
+            brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+        >,
+    ) -> Result<
+        Option<CalleeProvenanceFact>,
+        brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+    > {
+        rust_callee_provenance(node, source, charge).map(Some)
+    }
+
     fn embedded_syntax_kinds(&self) -> &'static [&'static str] {
         &["token_tree"]
     }
@@ -1799,4 +2098,35 @@ mod result_use_tests {
             assert_eq!(receivers, expected_receiver.into_iter().collect::<Vec<_>>());
         }
     }
+}
+
+#[test]
+fn callee_provenance_walk_obeys_the_extraction_work_allowance() {
+    let source = "fn run<F: Fn()>(f: F) { f(); }";
+    let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust grammar");
+    let mut stack = vec![tree.root_node()];
+    let call = loop {
+        let node = stack.pop().expect("fixture call");
+        if node.kind() == "call_expression" {
+            break node;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    };
+    let mut work = 0;
+    let fact = rust_callee_provenance(call, source, &mut |amount| {
+        work += amount;
+        Ok::<_, ()>(())
+    })
+    .expect("unlimited classification");
+    assert_eq!(fact.provenance, CalleeProvenance::CallerSupplied);
+    assert!(work > 1);
+    let mut remaining = work - 1;
+    assert!(
+        rust_callee_provenance(call, source, &mut |amount| {
+            remaining = remaining.checked_sub(amount).ok_or(())?;
+            Ok::<_, ()>(())
+        })
+        .is_err()
+    );
 }

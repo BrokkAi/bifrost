@@ -13662,6 +13662,7 @@ fn run(input: String) {
                 .expect("register receiver sanitizer pack");
         }
         let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: env!("CARGO_PKG_VERSION")
                 .parse()
                 .expect("test Bifrost version parses"),
@@ -15217,6 +15218,7 @@ pub fn run(receiver: String) {
             &catalog,
             None,
             &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: env!("CARGO_PKG_VERSION")
                     .parse()
                     .expect("test Bifrost version parses"),

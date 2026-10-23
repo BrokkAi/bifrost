@@ -337,11 +337,11 @@ pub(crate) fn project_rust_rich_call_relation(
                 }
             };
             for answer in answers {
-                if answer.completion() != &ResolutionCompletion::Complete {
+                if answer.call_target_completion() != ResolutionCompletion::Complete {
                     result.diagnostics.push(diagnostic(
                     "native_call_resolution_incomplete",
-                    format!("selected Rust call {reference} has incomplete aggregate evidence: {:?}; receiver dispositions: {:?}",
-                        answer.completion(), answer.callable_receiver_dispositions()),
+                    format!("selected Rust call {reference} has incomplete call-target evidence: {:?}; receiver dispositions: {:?}",
+                        answer.call_target_completion(), answer.callable_receiver_dispositions()),
                     reference.to_string(),
                 ));
                 }
@@ -759,10 +759,10 @@ mod tests {
             &CancellationToken::new(),
         );
         assert!(
-            outgoing.diagnostics.iter().any(|diagnostic| {
-                diagnostic.reason_kind.as_deref() == Some("native_call_resolution_incomplete")
+            outgoing.diagnostics.iter().all(|diagnostic| {
+                diagnostic.reason_kind.as_deref() != Some("native_call_resolution_incomplete")
             }),
-            "the argument-consuming outgoing query must still report the call gap: {outgoing:?}"
+            "outgoing call edges must not inherit return or argument type projections: {outgoing:?}"
         );
     }
 

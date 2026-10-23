@@ -20,7 +20,7 @@ mod js_ts_extraction_tests {
 
     use brokk_bifrost_core::test_support::write_file;
 
-    use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
     use brokk_bifrost_python_analysis::analyzer::python::adapter::PythonAdapter;
 

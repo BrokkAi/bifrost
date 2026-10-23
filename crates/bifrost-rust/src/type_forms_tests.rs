@@ -40,6 +40,43 @@ fn record_kind(
 
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
+    "#6409: BrokkAi/tree-sitter-rust#3: `..=x` parsed as an assignment to a bare range"
+)]
+fn inclusive_prefix_range_is_a_call_argument() {
+    let source = "fn slice(v: Vec<u8>) { v.get(..=4); }";
+    let tree = parse_tree(source);
+    assert!(!tree.root_node().has_error());
+    let call = first_named_kind(&tree, "call_expression");
+    let function = call.child_by_field_name("function").unwrap();
+    assert_eq!(function.kind(), "field_expression");
+    assert_eq!(
+        function.child_by_field_name("value").unwrap().kind(),
+        "identifier"
+    );
+    assert_eq!(
+        function.child_by_field_name("field").unwrap().kind(),
+        "field_identifier"
+    );
+    let arguments = call.child_by_field_name("arguments").unwrap();
+    assert_eq!(arguments.kind(), "arguments");
+    assert_eq!(arguments.named_child_count(), 1);
+    let range = arguments.named_child(0).unwrap();
+    assert_eq!(range.kind(), "range_expression");
+    assert_eq!(&source[range.byte_range()], "..=4");
+    assert_eq!(range.child(0).unwrap().kind(), "..=");
+    assert_eq!(range.named_child_count(), 1);
+    assert_eq!(range.named_child(0).unwrap().kind(), "integer_literal");
+    assert!(
+        brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+            tree.root_node(),
+            "assignment_expression",
+        )
+        .is_none()
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
     "7d6cc2fc20f8: valid Vector Rust syntax was emitted as ERROR nodes by the grammar"
 )]
 fn valid_vector_turbofish_and_tuple_higher_ranked_bound_keep_structured_nodes() {
@@ -89,6 +126,65 @@ fn valid_vector_turbofish_and_tuple_higher_ranked_bound_keep_structured_nodes() 
         .expect("higher-ranked trait type");
     assert_eq!(bound_type.kind(), "generic_type");
     assert_eq!(&tuple_source[bound_type.byte_range()], "LookupSpan<'a>");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#6393: tree-sitter-rust rejected turbofish type paths such as expr as Box::<dyn T>"
+)]
+fn turbofish_type_paths_preserve_generic_type_fields() {
+    for (source, owner_kind, name_kind, argument_kind) in [
+        (
+            "fn cast(value: Box<Logger>) { value as Box::<dyn log::Log>; }",
+            "type_cast_expression",
+            "type_identifier",
+            "dynamic_type",
+        ),
+        (
+            "fn local() { let x: a::b::Box::<T> = value; }",
+            "let_declaration",
+            "scoped_type_identifier",
+            "type_identifier",
+        ),
+        (
+            "struct Holder { value: Box::<T> }",
+            "field_declaration",
+            "type_identifier",
+            "type_identifier",
+        ),
+        (
+            "type Nested = Vec::<Box::<T>>;",
+            "type_item",
+            "type_identifier",
+            "generic_type",
+        ),
+    ] {
+        let tree = parse_tree(source);
+        assert!(!tree.root_node().has_error(), "{source}");
+        let owner = first_named_kind(&tree, owner_kind);
+        let generic = owner.child_by_field_name("type").expect("type field");
+        assert_eq!(generic.kind(), "generic_type", "{source}");
+        let name = generic.child_by_field_name("type").expect("generic name");
+        assert_eq!(name.kind(), name_kind, "{source}");
+        let arguments = generic
+            .child_by_field_name("type_arguments")
+            .expect("generic arguments");
+        assert_eq!(arguments.kind(), "type_arguments", "{source}");
+        let argument = arguments.named_child(0).expect("first type argument");
+        assert_eq!(argument.kind(), argument_kind, "{source}");
+        if argument_kind == "generic_type" {
+            assert_eq!(
+                argument.child_by_field_name("type").unwrap().kind(),
+                "type_identifier"
+            );
+            let inner_arguments = argument.child_by_field_name("type_arguments").unwrap();
+            assert_eq!(inner_arguments.kind(), "type_arguments");
+            assert_eq!(
+                inner_arguments.named_child(0).unwrap().kind(),
+                "type_identifier"
+            );
+        }
+    }
 }
 
 #[test]

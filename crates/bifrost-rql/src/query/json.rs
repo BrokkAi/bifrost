@@ -1067,6 +1067,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallResultContracts
         | QueryStep::CallResultObligations
         | QueryStep::ProcedureReturnProfile
+        | QueryStep::RustMarkerImplsOf
         | QueryStep::RustPointerFindings
         | QueryStep::PythonIteratorReturnProtocol
         | QueryStep::PythonBuiltinIdentity
@@ -1509,6 +1510,9 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     }
     if let Some(value) = pattern.index {
         object.insert("index".to_string(), json!(value));
+    }
+    if let Some(value) = pattern.unsafe_context {
+        object.insert("unsafe_context".to_string(), Value::Bool(value));
     }
     if let Some(value) = pattern.is_async {
         object.insert("async".to_string(), Value::Bool(value));

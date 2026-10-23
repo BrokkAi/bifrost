@@ -337,6 +337,15 @@ impl RustGraphStageExt for SelectedResolutionOperation<'_, '_> {
                             ));
                         }
                         staged_batches += 1;
+                        let projection_facts =
+                            persisted_lexical.reference_projection_facts(batch, cancellation)?;
+                        if cancellation.is_cancelled() {
+                            projection_cancelled = true;
+                            return Ok(());
+                        }
+                        edge_projector
+                            .catalog_mut()
+                            .replace_reference_facts(projection_facts);
                         let definitions = edge_projector.pending_definitions(batch);
                         match project_rust_source_definitions(
                             ready,

@@ -31,7 +31,7 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::languages::graph_authority_digest_of;
 
-    use brokk_bifrost_analysis::analyzer::languages::language_support;
+    use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
     use brokk_bifrost_core::analyzer::common::INCLUDE_CLAIMING_LANGUAGE;
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::{BTreeMap, BTreeSet};
@@ -52,7 +52,8 @@ mod tests {
     ];
 
     fn support_of(language: Language) -> &'static dyn LanguageSupport {
-        language_support(language).unwrap_or_else(|| panic!("{language:?} must be registered"))
+        language_support_for_hook(language, "package_separator")
+            .unwrap_or_else(|| panic!("{language:?} must be registered"))
     }
 
     /// Every observable capability of every registered language, as one reviewed table.

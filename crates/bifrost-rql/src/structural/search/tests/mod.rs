@@ -49,6 +49,7 @@ mod contracts;
 mod details;
 mod execution;
 mod index_access;
+mod js_rule_coverage;
 mod python_call_callee;
 mod python_comparison;
 mod python_imports;

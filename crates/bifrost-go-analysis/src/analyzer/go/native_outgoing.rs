@@ -248,7 +248,9 @@ pub(crate) fn outgoing(
                 },
             ));
         };
-        let Some(profile) = go.native_context_profile() else {
+        let Some(profile) = go.context_profile_for_file(
+            &brokk_bifrost_core::path_utils::rel_path_string(caller.source()),
+        ) else {
             return Ok(SelectedResolutionOperationOutcome::Unavailable(
                 brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionUnavailable::GoContextUnavailable {
                     persisted_relative_path: caller.source().rel_path().to_string_lossy().into_owned(),
@@ -313,6 +315,7 @@ pub(crate) fn outgoing(
                 ));
             }
         };
+        operation.bind_go_context_publication(context.clone());
         let caller_path = brokk_bifrost_core::path_utils::rel_path_string(caller.source());
         let mut selected_imports = operation.go_selected_external_imports(
             context.context_id,
@@ -468,8 +471,7 @@ pub(crate) fn outgoing(
                             continue;
                         }
                         let binding = answer.answer().binding();
-                        let call_completion = answer.answer().call_target_completion();
-                        let completion = answer.answer().completion().combine(&call_completion);
+                        let completion = answer.answer().call_target_completion();
                         work.examined_candidates = work
                             .examined_candidates
                             .checked_add(binding.targets().len())
@@ -596,7 +598,7 @@ pub(crate) fn outgoing(
                             });
                         }
                         let proof = if binding.targets().len() == 1
-                            && call_completion == ResolutionCompletion::Complete
+                            && completion == ResolutionCompletion::Complete
                             && projected_targets.len() == binding.targets().len()
                             && projected_targets.iter().all(Option::is_some)
                             && callees.len() == binding.targets().len()
@@ -1016,6 +1018,14 @@ mod tests {
                     .is_some_and(|kind| kind.contains("incomplete") || kind.contains("unavailable"))
             }),
             "an unsupported Go builtin remains explicitly incomplete: {result:?}"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.reason_kind.as_deref()
+                    != Some("native_call_resolution_incomplete")),
+            "the builtin's return projection must not add a call-target diagnostic: {result:?}"
         );
         let source = go
             .indexed_source(caller.source())

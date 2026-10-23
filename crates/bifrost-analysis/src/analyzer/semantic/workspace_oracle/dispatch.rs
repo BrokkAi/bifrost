@@ -6,7 +6,7 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::oracle::dispatch::UnmaterializedExternalTargetEngineExt;
 
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 
 use crate::analyzer::semantic::completeness_reason_bytes;
 
@@ -15,213 +15,118 @@ use crate::analyzer::semantic::type_flow::DispatchHintProof;
 use crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
 
 use crate::analyzer::semantic::AbstractObjectIdentity;
-
 use crate::analyzer::semantic::ArgumentCallableProvenance;
-
 use crate::analyzer::semantic::CallArgumentEndpoint;
-
 use crate::analyzer::semantic::CallBinding;
-
 use crate::analyzer::semantic::CallSiteHandle;
-
 use crate::analyzer::semantic::CallableTarget;
-
 use crate::analyzer::semantic::CallableTargetResolution;
-
 use crate::analyzer::semantic::CallerReceiverBinding;
-
 use crate::analyzer::semantic::CancellationToken;
-
 use crate::analyzer::semantic::CandidateCoverage;
-
 use crate::analyzer::semantic::DeclarationLocator;
-
 use crate::analyzer::semantic::DeclarationSegment;
-
 use crate::analyzer::semantic::DeclarationSegmentKind;
-
 use crate::analyzer::semantic::DispatchBoundary;
-
 use crate::analyzer::semantic::DispatchBoundaryKind;
-
 use crate::analyzer::semantic::DispatchCandidate;
-
 use crate::analyzer::semantic::DispatchExtensibility;
-
 use crate::analyzer::semantic::DispatchOracle;
-
 use crate::analyzer::semantic::DispatchResult;
-
 use crate::analyzer::semantic::EvidenceCompleteness;
-
 use crate::analyzer::semantic::EvidenceHandle;
-
 use crate::analyzer::semantic::ExactExternalProcedureTarget;
-
 use crate::analyzer::semantic::HeapOracle;
-
 use crate::analyzer::semantic::MemberDeclaration;
-
 use crate::analyzer::semantic::MemoryLocationKind;
-
 use crate::analyzer::semantic::ObjectCardinality;
-
 use crate::analyzer::semantic::ObservationPhase;
-
 use crate::analyzer::semantic::OracleCallContext;
-
 use crate::analyzer::semantic::OracleLimits;
-
 use crate::analyzer::semantic::OracleRelationArena;
-
 use crate::analyzer::semantic::OracleRelationId;
-
 use crate::analyzer::semantic::OracleRelationOwner;
-
 use crate::analyzer::semantic::OracleRelationRecord;
-
 use crate::analyzer::semantic::OracleRelationSubject;
-
 use crate::analyzer::semantic::ProcedureHandle;
-
 use crate::analyzer::semantic::ProcedureKind;
-
 use crate::analyzer::semantic::ProcedurePortKind;
-
 use crate::analyzer::semantic::ProofStatus;
-
 use crate::analyzer::semantic::ReturnedCallableProvenance;
-
 use crate::analyzer::semantic::SemanticArtifact;
-
 use crate::analyzer::semantic::SemanticBudgetExceeded;
-
 use crate::analyzer::semantic::SemanticCallSite;
-
 use crate::analyzer::semantic::SemanticCapability;
-
 use crate::analyzer::semantic::SemanticGap;
-
 use crate::analyzer::semantic::SemanticGapKind;
-
 use crate::analyzer::semantic::SemanticGapSubject;
-
 use crate::analyzer::semantic::SemanticLanguage;
-
 use crate::analyzer::semantic::SemanticLocator;
-
 use crate::analyzer::semantic::SemanticOutcome;
-
 use crate::analyzer::semantic::SemanticProviderError;
-
 use crate::analyzer::semantic::SemanticRequest;
-
 use crate::analyzer::semantic::SemanticRole;
-
 use crate::analyzer::semantic::SemanticWork;
-
 use crate::analyzer::semantic::SourceSiteKind;
-
 use crate::analyzer::semantic::StablePackageValueProvenance;
-
 use crate::analyzer::semantic::UnmaterializedExternalTarget;
-
 use crate::analyzer::semantic::ValueAtPoint;
-
 use crate::analyzer::semantic::ValueFlowOracle;
-
 use crate::analyzer::semantic::WorkspaceMountId;
-
 use crate::analyzer::semantic::WorkspaceRelativePath;
-
 use crate::analyzer::semantic::split_canonical_qualified_callee;
-
 use crate::analyzer::semantic::unmaterialized_external_mount;
-
 use crate::analyzer::semantic::unmaterialized_external_path;
 
 use crate::analyzer::semantic_model::CompiledProcedureSummary;
-
 use crate::analyzer::semantic_model::Completeness;
-
 use crate::analyzer::semantic_model::ProcedureSummaryApplicability;
-
 use crate::analyzer::semantic_model::ProcedureSummaryMatch;
-
 use crate::analyzer::semantic_model::ProcedureSummaryMemberKey;
-
 use crate::analyzer::semantic_model::SemanticModelCompleteness;
-
 use crate::analyzer::semantic_model::SemanticModelMatchDisposition;
-
 use crate::analyzer::semantic_model::SemanticModelSymbolKind;
-
 use crate::analyzer::semantic_model::TypeRef;
-
 use crate::analyzer::semantic_model::compiled_flow_claims_agree;
 
 use crate::analyzer::structural::resolution::BoundaryStatus;
-
 use crate::analyzer::structural::resolution::MethodFamilyRelation;
 
 use crate::analyzer::usages::call_relations::PrefetchedCallFile;
 
 use crate::analyzer::usages::get_definition::BoundedResolution;
-
 use crate::analyzer::usages::get_definition::CallApplicationKind;
-
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
-
 use crate::analyzer::usages::get_definition::DispatchQuality;
-
 use crate::analyzer::usages::get_definition::ExactExternalCallProof;
-
 use crate::analyzer::usages::get_definition::dispatch_quality_for_status;
-
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 
 use crate::analyzer::usages::CallDispatchBoundaryKind;
-
 use crate::analyzer::usages::CallDispatchLookup;
-
 use crate::analyzer::usages::CallDispatchSession;
-
 use crate::analyzer::usages::CallDispatchTarget;
-
 use crate::analyzer::usages::CallRelationService;
-
 use crate::analyzer::usages::ExternalMemberFamilyStatus;
-
 use crate::analyzer::usages::UsageProof;
-
 use crate::analyzer::usages::call_dispatch_equivalence_source;
 
 use crate::analyzer::AnalyzerQueryScope;
-
 use crate::analyzer::QueryScope;
 
 use crate::analyzer::CodeUnit;
-
 use crate::analyzer::CodeUnitType;
-
 use crate::analyzer::IAnalyzer;
-
 use crate::analyzer::Language;
-
 use crate::analyzer::LanguageDialect;
-
 use crate::analyzer::ProjectFile;
-
 use crate::analyzer::Range;
-
 use crate::analyzer::WorkspaceAnalyzer;
 
 use crate::hash::HashMap;
-
 use crate::hash::HashSet;
 
 use brokk_bifrost_jvm::realm::JvmExternalMemberIdentity;
-
 use brokk_bifrost_jvm::realm::JvmReceiverSemantics;
 
 pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::dispatch::*;
@@ -231,7 +136,6 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 
 use std::sync::Arc;
-
 use std::sync::Mutex;
 
 /// Source-scoped callable identity used only while resolving dispatch. The
@@ -360,7 +264,9 @@ impl<'a> PreparedWorkspaceDispatchPool<'a> {
             .collect::<HashSet<_>>();
         let mut answers = HashMap::default();
         for language in languages {
-            let Some(support) = language_support(language) else {
+            let Some(support) =
+                language_support_for_hook(language, "prefetch_reverse_call_targets")
+            else {
                 continue;
             };
             let Some(result) = support.prefetch_reverse_call_targets(
@@ -632,7 +538,7 @@ pub struct PreparedWorkspaceDispatchSession<'a> {
     prefetched: Option<PrefetchedCallFile>,
 }
 
-impl PreparedWorkspaceDispatchSession<'_> {
+impl<'a> PreparedWorkspaceDispatchSession<'a> {
     #[doc(hidden)]
     pub fn retained_bytes(&self) -> usize {
         debug_assert_eq!(
@@ -673,6 +579,17 @@ impl PreparedWorkspaceDispatchSession<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        self.resolve_call_with_definition_session(call, request, None)
+    }
+
+    pub(crate) fn resolve_call_with_definition_session(
+        &mut self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+        mut definition_session: Option<
+            &mut crate::analyzer::usages::get_definition::ScalarCallTargetSession<'a>,
+        >,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
         if let Some(source) = &self.low_level {
             let (_, bytes) = source.source_admission();
             // This session already retained (and parsed) its source. Moving it
@@ -705,11 +622,13 @@ impl PreparedWorkspaceDispatchSession<'_> {
             return Ok(outcome);
         }
         let before_callable_probe = request.budget.used();
-        if let Some(outcome) = self.resolve_returned_local_callable(call, request)? {
+        if let Some(outcome) =
+            self.resolve_returned_local_callable(call, request, definition_session.as_deref_mut())?
+        {
             return Ok(outcome);
         }
         let probe_work = request.budget.used().saturating_sub(before_callable_probe);
-        let mut outcome = self.resolve_call_through_source(call, request)?;
+        let mut outcome = self.resolve_call_through_source(call, request, definition_session)?;
         match &mut outcome {
             SemanticOutcome::Complete { work, .. }
             | SemanticOutcome::Ambiguous { work, .. }
@@ -733,6 +652,9 @@ impl PreparedWorkspaceDispatchSession<'_> {
         &mut self,
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
+        mut definition_session: Option<
+            &mut crate::analyzer::usages::get_definition::ScalarCallTargetSession<'a>,
+        >,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
         let _scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
             self.oracle.workspace.analyzer(),
@@ -785,13 +707,19 @@ impl PreparedWorkspaceDispatchSession<'_> {
             low_level.install_prefetched(prefetched);
         }
         low_level.expect_calls(std::mem::take(&mut self.expected_calls));
-        let lookup = low_level.dispatch_at_bounded(
+        let lookup = low_level.dispatch_at_bounded_with_operation(
             self.oracle.workspace.analyzer(),
             _scope.token(),
             &call_span,
             usize::MAX,
             Some(request.cancellation),
+            definition_session.as_deref_mut(),
         );
+        // Generic target expansion may check out another store reader. An
+        // exclusive reader must leave before that checkout on this thread.
+        if let Some(session) = definition_session {
+            session.release_before_store_read();
+        }
         let parsed_source = lookup.work.scanned_files > 0;
         let outcome =
             self.oracle
@@ -965,6 +893,9 @@ impl PreparedWorkspaceDispatchSession<'_> {
         &mut self,
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
+        definition_session: Option<
+            &mut crate::analyzer::usages::get_definition::ScalarCallTargetSession<'a>,
+        >,
     ) -> Result<Option<SemanticOutcome<DispatchResult>>, SemanticProviderError> {
         let SemanticLanguage::Standard(language) = self.artifact.key().language() else {
             return Ok(None);
@@ -1012,11 +943,12 @@ impl PreparedWorkspaceDispatchSession<'_> {
             call.id(),
             "an invocation cannot consume its own result as its callee"
         );
-        let factory_outcome =
-            match self.resolve_declared_indirect_local_call(&factory_call, request)? {
-                Some(outcome) => outcome,
-                None => self.resolve_call_through_source(&factory_call, request)?,
-            };
+        let factory_outcome = match self
+            .resolve_declared_indirect_local_call(&factory_call, request)?
+        {
+            Some(outcome) => outcome,
+            None => self.resolve_call_through_source(&factory_call, request, definition_session)?,
+        };
         let factory_work = producer_work.conservative_add(factory_outcome.work());
         let factory_result = match factory_outcome {
             SemanticOutcome::Complete { value, .. } => value,
@@ -1300,9 +1232,15 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         {
             let before_materialization = staged_budget.used();
             let mut materialization_request = request.staged(&mut staged_budget);
-            let attempted = language_support(call_language.language())
-                .expect("call language has registered support")
-                .materialize_callable_factory(self, call, proof, &mut materialization_request)?;
+            let attempted =
+                language_support_for_hook(call_language.language(), "materialize_callable_factory")
+                    .expect("call language has registered support")
+                    .materialize_callable_factory(
+                        self,
+                        call,
+                        proof,
+                        &mut materialization_request,
+                    )?;
             if let Some(outcome) = attempted {
                 *request.budget = staged_budget;
                 let mut outcome = outcome;
@@ -1541,7 +1479,11 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     && !request.cancellation.is_cancelled()
                     && call_dispatch_gap.is_none_or(|gap| gap.budget.is_none()))
                 .then(|| {
-                    language_support(Language::Python)?.exact_external_receiver_identities(
+                    language_support_for_hook(
+                        Language::Python,
+                        "exact_external_receiver_identities",
+                    )?
+                    .exact_external_receiver_identities(
                         self.workspace,
                         call.procedure(),
                         semantic_call,
@@ -1569,12 +1511,11 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                             {
                                 return None;
                             }
-                            let declaration = language_support(Language::Python)?
-                                .external_member_declaration(
-                                    &overlay,
-                                    &owner.id,
-                                    identity.member(),
-                                )?;
+                            let declaration = language_support_for_hook(
+                                Language::Python,
+                                "external_member_declaration",
+                            )?
+                            .external_member_declaration(&overlay, &owner.id, identity.member())?;
                             let signature = declaration.structured_signature()?;
                             let formals = python_external_model_formals(signature);
                             let target = UnmaterializedExternalTarget::new_modeled(
@@ -2906,7 +2847,11 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             return Ok(None);
         }
         let (_, source) = snapshot.into_parts();
-        let proof = match language_support(variable.source().language()).and_then(|support| {
+        let proof = match language_support_for_hook(
+            variable.source().language(),
+            "stable_package_function_value_proof",
+        )
+        .and_then(|support| {
             support.stable_package_function_value_proof(
                 self.workspace.analyzer(),
                 variable,
@@ -3193,20 +3138,22 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             else {
                 return Ok((false, work, None));
             };
-            let resolution = language_support(Language::Go)
-                .expect("Go allocation language support")
-                .definition_allocation_selector_method(
-                    analyzer,
-                    scope.token(),
-                    &file,
-                    &source,
-                    tree.root_node(),
-                    allocation_node,
-                    member,
-                    start,
-                    crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
-                    Some(request.cancellation),
-                );
+            let resolution =
+                language_support_for_hook(Language::Go, "definition_allocation_selector_method")
+                    .expect("Go allocation language support")
+                    .definition_allocation_selector_method(
+                        analyzer,
+                        scope.token(),
+                        &file,
+                        &source,
+                        tree.root_node(),
+                        allocation_node,
+                        member,
+                        start,
+                        crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(
+                        ),
+                        Some(request.cancellation),
+                    );
             let resolution_work = resolution.work();
             let charged = SemanticWork {
                 nested_entries: resolution_work
@@ -3754,7 +3701,11 @@ pub fn virtual_dispatch_implementor_targets(
                 )
             })
             .filter(|edge| {
-                language_support(declaration.source().language()).is_none_or(|support| {
+                language_support_for_hook(
+                    declaration.source().language(),
+                    "virtual_dispatch_target_is_applicable",
+                )
+                .is_none_or(|support| {
                     support.virtual_dispatch_target_is_applicable(
                         analyzer,
                         declaration,
@@ -3837,7 +3788,7 @@ pub(crate) fn external_member_workspace_override_proven_absent(
     analyzer: &dyn IAnalyzer,
     target: &UnmaterializedExternalTarget,
 ) -> bool {
-    language_support(target.language().language())
+    language_support_for_hook(target.language().language(), "external_type_is_sealed")
         .and_then(|support| {
             support.external_type_is_sealed(
                 analyzer,
@@ -5081,9 +5032,12 @@ pub(crate) fn external_constant_field_read_discharges_gap(
     workspace: &WorkspaceAnalyzer,
     request: &mut SemanticRequest<'_>,
 ) -> Result<bool, SemanticProviderError> {
-    if language_support(procedure.artifact().key().language().language()).is_some_and(|support| {
-        support.external_field_read_discharges_gap(workspace, procedure, gap)
-    }) {
+    if language_support_for_hook(
+        procedure.artifact().key().language().language(),
+        "external_field_read_discharges_gap",
+    )
+    .is_some_and(|support| support.external_field_read_discharges_gap(workspace, procedure, gap))
+    {
         return Ok(true);
     }
     if gap.capability != SemanticCapability::FieldMemory {
@@ -5095,7 +5049,9 @@ pub(crate) fn external_constant_field_read_discharges_gap(
     let LanguageDialect::Standard(language) = procedure.artifact().key().language() else {
         return Ok(false);
     };
-    let Some(support) = language_support(language) else {
+    let Some(support) =
+        language_support_for_hook(language, "external_compile_time_constant_member")
+    else {
         return Ok(false);
     };
     let Some(location) = procedure.semantics().memory_location(location_id) else {
@@ -5151,7 +5107,8 @@ pub(crate) fn inert_drop_glue_discharges_gap(
     let LanguageDialect::Standard(language) = procedure.artifact().key().language() else {
         return Ok(false);
     };
-    let Some(support) = language_support(language) else {
+    let Some(support) = language_support_for_hook(language, "procedure_drops_run_no_user_code")
+    else {
         return Ok(false);
     };
     let max_source_bytes = request.budget.limits().source_bytes;
@@ -5191,7 +5148,9 @@ pub(crate) fn residual_conversion_discharges_gap(
     let LanguageDialect::Standard(language) = procedure.artifact().key().language() else {
         return Ok(false);
     };
-    let Some(support) = language_support(language) else {
+    let Some(support) =
+        language_support_for_hook(language, "residual_conversion_runs_no_user_code")
+    else {
         return Ok(false);
     };
     let max_source_bytes = request.budget.limits().source_bytes;
@@ -5818,11 +5777,8 @@ pub(crate) fn python_exact_external_receiver_hints(
         {
             return None;
         }
-        let selected = language_support(Language::Python)?.external_member_declaration(
-            &overlay,
-            receiver_class_id,
-            &member.name,
-        )?;
+        let selected = language_support_for_hook(Language::Python, "external_member_declaration")?
+            .external_member_declaration(&overlay, receiver_class_id, &member.name)?;
         if selected.id != member.id {
             return None;
         }
@@ -5877,11 +5833,8 @@ pub(crate) fn python_external_class_result_call(
     let direct_constructor_class = if exact_external_boundary {
         None
     } else {
-        language_support(Language::Python)?.external_class_call_identity(
-            oracle.workspace,
-            procedure,
-            semantic_call,
-        )
+        language_support_for_hook(Language::Python, "external_class_call_identity")?
+            .external_class_call_identity(oracle.workspace, procedure, semantic_call)
     };
     let (owner_fqn, member) = if exact_external_boundary {
         if let Some(identity) = boundary.external_callee_identity.as_ref() {
@@ -5976,8 +5929,9 @@ pub(crate) fn python_external_class_result_call(
     }
     let initializer_target = match direct_class {
         Some(_) => {
-            let initializer_declaration = language_support(Language::Python)?
-                .external_member_declaration(&overlay, &class.id, "__init__");
+            let initializer_declaration =
+                language_support_for_hook(Language::Python, "external_member_declaration")?
+                    .external_member_declaration(&overlay, &class.id, "__init__");
             match initializer_declaration {
                 Some(initializer) => {
                     let signature = initializer.structured_signature()?;
@@ -6185,7 +6139,7 @@ pub fn python_workspace_module_member_mutation_free(
     max_nodes: usize,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<bool> {
-    language_support(Language::Python)?
+    language_support_for_hook(Language::Python, "workspace_module_member_mutation_free")?
         .workspace_module_member_mutation_free(analyzer, module, member, max_nodes, keep_going)
 }
 
@@ -7016,238 +6970,17 @@ pub mod test_support;
 #[path = "dispatch/js_ts_tests_support.rs"]
 pub mod js_ts_tests_support;
 
-#[cfg(test)]
 #[doc(hidden)]
+#[cfg(test)]
 pub mod tests {
-
-    pub(super) use super::test_support::*;
-
-    use std::sync::Arc;
-
-    use brokk_bifrost_analysis::analyzer::usages::get_definition::CallApplicationKind;
-
-    use brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchBoundaryKind;
-
-    use brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLookup;
-
-    use brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchTarget;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallableTarget;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallableTargetResolution;
-
-    use brokk_bifrost_analysis::analyzer::semantic::oracle::relation::CandidateCoverage;
-
-    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
-
-    use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::DispatchBoundary;
-
-    use brokk_bifrost_analysis::analyzer::semantic::oracle::model::DispatchBoundaryKind;
-
-    use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ir::model::EvidenceCompleteness;
-
-    use brokk_bifrost_analysis::analyzer::semantic::oracle::limits::OracleLimits;
-
-    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::PreparedCallDispatch;
-
-    use brokk_bifrost_analysis::analyzer::semantic::ir::model::ProofStatus;
-
-    use brokk_bifrost_core::analyzer::model::LanguageDialect as SemanticLanguage;
-
-    use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticOutcome;
-
-    use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticRequest;
-
-    use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::UnmaterializedExternalTarget;
-
-    use brokk_bifrost_core::analyzer::usages::model::UsageProof;
-
-    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
 
     use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::agreed_external_formal_contract;
 
-    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::dispatch_coverage;
-
-    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::heuristic_external_boundary_without_resolver_authority;
-
-    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::low_level_boundary;
-
     use crate::analyzer::CallableArity;
-
-    use crate::analyzer::Language;
 
     use crate::analyzer::ParameterMetadata;
 
-    use crate::analyzer::ProjectFile;
-
     use crate::analyzer::SignatureMetadata;
-
-    use crate::analyzer::semantic::SemanticBudget;
-
-    use crate::analyzer::semantic::workspace_oracle::dispatch::*;
-
-    use crate::cancellation::CancellationToken;
-
-    use crate::test_support::AnalyzerFixture;
-
-    #[test]
-    fn unresolved_canonical_callee_is_model_bindable_but_stays_open() {
-        let (_fixture, call) = semantic_call_fixture_for_language(
-            Language::Java,
-            "Caller.java",
-            "class Caller { void call() { com.example.Missing.run(); } }\n",
-        );
-        let semantic_call = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .expect("fixture call belongs to its procedure");
-        let named = low_level_boundary(
-            &CallDispatchBoundaryKind::UnresolvedWithTarget {
-                status: DefinitionLookupStatus::NotFound,
-                callee_text: "com.example.Missing.run".into(),
-                normalized_static_owner: Some("com.example.Missing".into()),
-            },
-            SemanticLanguage::Standard(Language::Java),
-            Some(semantic_call),
-            None,
-        );
-
-        let target = named
-            .unmaterialized_external_target()
-            .expect("structured callee and semantic call mint a model key");
-        assert_eq!(target.owner_fqn(), "com.example.Missing");
-        assert_eq!(target.member(), "run");
-        assert!(!target.has_receiver());
-        assert!(matches!(
-            named.kind,
-            DispatchBoundaryKind::External(Some(ref locator)) if locator == target.locator()
-        ));
-        assert!(matches!(named.proof, ProofStatus::Unproven(_)));
-        assert!(matches!(
-            named.completeness,
-            EvidenceCompleteness::Partial(_)
-        ));
-        assert!(
-            !heuristic_external_boundary_without_resolver_authority(&named),
-            "a resolver-normalized static owner is not syntax-only evidence"
-        );
-        assert_eq!(
-            dispatch_coverage(Some(DefinitionLookupStatus::NotFound), &[named]),
-            CandidateCoverage::Open,
-            "a bindable model key must not turn an unresolved lookup exhaustive"
-        );
-
-        let unnamed = low_level_boundary(
-            &CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
-            SemanticLanguage::Standard(Language::Java),
-            Some(semantic_call),
-            None,
-        );
-        assert_eq!(unnamed.kind, DispatchBoundaryKind::Unresolved);
-        assert!(unnamed.target_locator().is_none());
-        assert!(unnamed.unmaterialized_external_target().is_none());
-    }
-
-    #[test]
-    fn kotlin_adapter_proven_local_callback_bypasses_source_rediscovery() {
-        let source = "fun caller() { val callback = { 1 }; callback() }\n";
-        let (fixture, call) =
-            semantic_call_fixture_for_language(Language::Kotlin, "callback.kt", source);
-        let declared_target = match &call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .expect("call belongs to its procedure")
-            .declared_targets
-        {
-            CallableTargetResolution::Proven(CallableTarget::Local(target)) => *target,
-            other => panic!("expected one adapter-proven local callback, got {other:?}"),
-        };
-        let artifact = Arc::clone(call.procedure().artifact());
-        let mut session = fixture
-            .analyzer
-            .semantic_oracle_provider()
-            .prepare_call_dispatch_session(artifact);
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let outcome = session
-            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
-            .expect("adapter-proven Kotlin callback dispatch");
-        let SemanticOutcome::Complete { value, .. } = outcome else {
-            panic!("adapter-proven Kotlin local dispatch must be complete: {outcome:?}");
-        };
-
-        assert_proven_local_dispatch(&value, declared_target);
-        assert!(!value.candidates()[0].provenance().is_empty());
-        assert_eq!(budget.used().source_bytes, source.len());
-        assert!(session.retained_bytes() >= source.len());
-    }
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "0242909d77ed: Java census G09 (2026-10-15): closed super-call evidence must prevent override expansion and close only a materialized target"
-    )]
-    fn java_nonvirtual_receiver_proof_selects_only_the_superclass_body() {
-        let source = "class Base { int value() { return 1; } } class Middle extends Base { int value() { return 2; } } class Leaf extends Middle { int value() { return 3; } int test() { return super.value(); } }";
-        let (fixture, call) =
-            semantic_call_fixture_for_language(Language::Java, "SuperOverride.java", source);
-        let definitions = fixture.analyzer.analyzer().get_definitions("Middle.value");
-        let [definition] = definitions.as_slice() else {
-            panic!("one selected superclass declaration: {definitions:?}");
-        };
-        let oracle = WorkspaceSemanticOracle::with_limits_and_expansion(
-            &fixture.analyzer,
-            OracleLimits::default(),
-            crate::analyzer::DispatchHierarchyExpansion::CONCRETE_OVERRIDES,
-        );
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let outcome = oracle
-            .resolve_prepared_call(
-                &call,
-                PreparedCallDispatch {
-                    // The native-point regression independently verifies this
-                    // source declaration and call-local receiver proof.
-                    lookup: CallDispatchLookup {
-                        status: Some(DefinitionLookupStatus::Resolved),
-                        targets: vec![CallDispatchTarget {
-                            definition: definition.clone(),
-                            proof: UsageProof::Proven,
-                            native_incomplete_source_reason: None,
-                        }],
-                        call_application: CallApplicationKind::BoundReceiver,
-                        dispatch_extensibility: Some(DispatchExtensibility::Closed),
-                        ..CallDispatchLookup::default()
-                    },
-                },
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("nonvirtual source dispatch");
-        let SemanticOutcome::Complete { value, .. } = outcome else {
-            panic!("super invocation must select one complete body: {outcome:?}");
-        };
-        assert_eq!(value.coverage(), CandidateCoverage::Exhaustive, "{value:?}");
-        assert!(value.boundaries().is_empty(), "{value:?}");
-        let [candidate] = value.candidates() else {
-            panic!("one superclass body and no current-class override: {value:?}");
-        };
-        assert_eq!(candidate.proof(), &ProofStatus::Proven);
-        assert_eq!(candidate.completeness(), &EvidenceCompleteness::Complete);
-        assert!(
-            candidate
-                .target()
-                .semantics()
-                .locator()
-                .declaration()
-                .segments()
-                .iter()
-                .any(|segment| segment.name() == Some("Middle")),
-            "{candidate:?}"
-        );
-    }
 
     fn external_signature(
         label: &str,
@@ -7271,6 +7004,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_external_formal_contract_rejects_same_arity_overloads() {
         let contract = agreed_external_formal_contract([
@@ -7281,6 +7015,7 @@ pub mod tests {
         assert!(contract.is_none());
     }
 
+    #[cfg(test)]
     #[test]
     fn exact_external_formal_contract_rejects_missing_discriminators() {
         let contract = agreed_external_formal_contract([
@@ -7289,224 +7024,6 @@ pub mod tests {
         ]);
 
         assert!(contract.is_none());
-    }
-
-    /// #1981: Java type qualifiers are syntactic call objects in the raw IR,
-    /// but they are not semantic receivers. The definition resolver expands
-    /// both the fully-qualified and explicit-import spellings to the same
-    /// canonical owner; instance receivers retain their receiver shape.
-    #[test]
-    fn java_static_type_qualifiers_normalize_without_cross_binding_instances() {
-        let source = r#"import java.net.URLDecoder;
-import java.lang.String;
-class App {
-    static void qualified(String raw) {
-        java.net.URLDecoder.decode(raw);
-    }
-    static void imported(String raw) {
-        URLDecoder.decode(raw, "UTF-8");
-    }
-    static void instance(String raw) {
-        raw.trim();
-    }
-}
-"#;
-        assert_eq!(
-            external_call_identities(Language::Java, "App.java", source),
-            vec![
-                (
-                    "URLDecoder.decode(raw, \"UTF-8\")".to_owned(),
-                    Some((
-                        "java.net.URLDecoder".to_owned(),
-                        "decode".to_owned(),
-                        2,
-                        false,
-                    )),
-                ),
-                (
-                    "java.net.URLDecoder.decode(raw)".to_owned(),
-                    Some((
-                        "java.net.URLDecoder".to_owned(),
-                        "decode".to_owned(),
-                        1,
-                        false,
-                    )),
-                ),
-                (
-                    "raw.trim()".to_owned(),
-                    Some(("java.lang.String".to_owned(), "trim".to_owned(), 0, true)),
-                ),
-            ]
-        );
-    }
-
-    /// A Java type qualifier is structured proof that one receiverless
-    /// external call cannot dispatch dynamically. The absent external body
-    /// remains a boundary, while an instance receiver retains open dispatch.
-    #[test]
-    fn java_resolver_proven_static_external_target_closes_only_the_target_set() {
-        let source = r#"import java.net.URLDecoder;
-import java.lang.String;
-class App {
-    static void qualified(String raw) {
-        java.net.URLDecoder.decode(raw);
-    }
-    static void imported(String raw) {
-        URLDecoder.decode(raw, "UTF-8");
-    }
-    static void instance(String raw) {
-        raw.trim();
-    }
-}
-"#;
-        let fixture = AnalyzerFixture::new_for_language(Language::Java, &[("App.java", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "App.java");
-        let cancellation = CancellationToken::default();
-        let mut materialization_budget = SemanticBudget::default();
-        let artifact = fixture
-            .analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
-            )
-            .expect("Java semantic materialization")
-            .available_value()
-            .cloned()
-            .expect("Java semantic artifact");
-        let oracle = fixture.analyzer.semantic_oracle_provider();
-        let mut observed = Vec::new();
-        for procedure in artifact.procedures() {
-            for call in procedure.call_sites() {
-                let handle = artifact
-                    .procedure_handle(procedure.id())
-                    .and_then(|procedure| procedure.call_site_handle(call.id))
-                    .expect("scoped call handle");
-                let span = procedure
-                    .source_mapping(call.source)
-                    .expect("call source mapping")
-                    .locator
-                    .anchor()
-                    .span();
-                let text = source[span.start_byte() as usize..span.end_byte() as usize].to_owned();
-                let mut budget = SemanticBudget::default();
-                let outcome = oracle
-                    .resolve_call(
-                        &handle,
-                        &mut SemanticRequest::new(&mut budget, &cancellation),
-                    )
-                    .expect("Java external dispatch runs");
-                let complete = matches!(&outcome, SemanticOutcome::Complete { .. });
-                let result = outcome
-                    .available_value()
-                    .expect("Java external dispatch retains a result");
-                let resolver_proven_static = result
-                    .boundaries()
-                    .iter()
-                    .filter_map(DispatchBoundary::unmaterialized_external_target)
-                    .any(UnmaterializedExternalTarget::resolver_proves_static_call);
-                if resolver_proven_static {
-                    assert_eq!(
-                        result.proven_receiver_shape(),
-                        None,
-                        "Java static target-set proof must not become Go receiver-shape authority"
-                    );
-                }
-                observed.push((text, complete, result.coverage(), resolver_proven_static));
-            }
-        }
-        observed.sort_by(|left, right| left.0.cmp(&right.0));
-        assert_eq!(
-            observed,
-            vec![
-                (
-                    "URLDecoder.decode(raw, \"UTF-8\")".to_owned(),
-                    true,
-                    CandidateCoverage::Exhaustive,
-                    true,
-                ),
-                (
-                    "java.net.URLDecoder.decode(raw)".to_owned(),
-                    true,
-                    CandidateCoverage::Exhaustive,
-                    true,
-                ),
-                (
-                    "raw.trim()".to_owned(),
-                    false,
-                    CandidateCoverage::Open,
-                    false,
-                ),
-            ]
-        );
-    }
-
-    /// Type-name expansion must fail closed for lexical and import ambiguity.
-    /// A workspace type with the same simple name is also not an external
-    /// summary owner merely because its requested member is absent.
-    #[test]
-    fn java_external_static_owner_near_misses_publish_no_identity() {
-        let shadowed = r#"import java.net.URLDecoder;
-class App {
-    static void run(Object URLDecoder, String raw) {
-        URLDecoder.decode(raw);
-    }
-}
-"#;
-        assert_eq!(
-            external_call_identities(Language::Java, "App.java", shadowed),
-            vec![("URLDecoder.decode(raw)".to_owned(), None)]
-        );
-
-        let ambiguous = r#"import a.URLDecoder;
-import b.URLDecoder;
-class App {
-    static void run(String raw) {
-        URLDecoder.decode(raw);
-    }
-}
-"#;
-        assert_eq!(
-            external_call_identities(Language::Java, "App.java", ambiguous),
-            vec![("URLDecoder.decode(raw)".to_owned(), None)]
-        );
-
-        let wildcard_ambiguous = r#"import a.*;
-import b.*;
-class App {
-    static void run(String raw) {
-        URLDecoder.decode(raw);
-    }
-}
-"#;
-        assert_eq!(
-            external_call_identities(Language::Java, "App.java", wildcard_ambiguous),
-            vec![("URLDecoder.decode(raw)".to_owned(), None)]
-        );
-
-        let field_shadowed = r#"import java.net.URLDecoder;
-class App {
-    Object URLDecoder;
-    void run(String raw) {
-        URLDecoder.decode(raw);
-    }
-}
-"#;
-        assert_eq!(
-            external_call_identities(Language::Java, "App.java", field_shadowed),
-            vec![("URLDecoder.decode(raw)".to_owned(), None)]
-        );
-
-        let local_owner = r#"class URLDecoder { }
-class App {
-    static void run(String raw) {
-        URLDecoder.decode(raw);
-    }
-}
-"#;
-        assert_eq!(
-            external_call_identities(Language::Java, "App.java", local_owner),
-            vec![("URLDecoder.decode(raw)".to_owned(), None)]
-        );
     }
 }
 

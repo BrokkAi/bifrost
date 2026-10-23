@@ -1478,6 +1478,7 @@ fn report_rule_fact_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -4088,6 +4089,7 @@ fn report_uninitialized_variable_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
         impact: CodeQueryDiagnosticImpact::Incomplete,

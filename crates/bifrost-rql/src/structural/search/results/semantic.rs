@@ -1464,3 +1464,38 @@ impl CodeQuerySemanticCompleteness {
         }
     }
 }
+
+/// One query-local impl parameter and its exact source anchor.
+#[cfg_attr(feature = "query-result-fixtures", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryRustMarkerImpl {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub impl_range: CodeQueryRange,
+    #[serde(rename = "trait")]
+    pub trait_kind: &'static str,
+    pub trait_proof: &'static str,
+    pub self_proof: &'static str,
+    pub impl_coverage: &'static str,
+    pub parameter: Option<String>,
+    pub declaration_parameter_ordinal: Option<u64>,
+    pub mapping_proof: &'static str,
+    pub has_send_bound: bool,
+    pub has_sync_bound: bool,
+    pub bounds: Vec<String>,
+    pub bounds_proof: &'static str,
+    pub stored: bool,
+    pub shared_ref_only: bool,
+    pub shared_access: &'static str,
+    pub uses: Vec<CodeQueryRustMarkerUse>,
+    pub uses_proof: &'static str,
+    pub completeness: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CodeQueryRustMarkerUse {
+    pub field: String,
+    pub wrappers: Vec<String>,
+}

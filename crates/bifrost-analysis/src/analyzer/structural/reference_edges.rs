@@ -167,7 +167,8 @@ pub fn reference_hits_for_target(
     reference_hits_from_fuzzy_result(analyzer, result, std::slice::from_ref(target))
 }
 
-fn reference_hits_from_fuzzy_result(
+#[doc(hidden)]
+pub fn reference_hits_from_fuzzy_result(
     analyzer: &dyn IAnalyzer,
     result: FuzzyResult,
     fallback_targets: &[CodeUnit],
@@ -398,7 +399,8 @@ struct NearestDeclaration {
 #[doc(hidden)]
 pub struct ReferenceSiteClassifier<'analyzer> {
     analyzer: &'analyzer dyn IAnalyzer,
-    facts: Arc<FileFacts>,
+    #[doc(hidden)]
+    pub facts: Arc<FileFacts>,
     named_accesses: ContainingSpanIndex<u32>,
     containing_nodes: ContainingSpanIndex<u32>,
     nearest_declarations: Box<[Option<NearestDeclaration>]>,
@@ -419,7 +421,8 @@ pub struct SelectedReferenceFileState<'analyzer> {
 
 impl<'analyzer> SelectedReferenceFileState<'analyzer> {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn range(&self, start_byte: usize, end_byte: usize) -> Range {
+    #[doc(hidden)]
+    pub fn range(&self, start_byte: usize, end_byte: usize) -> Range {
         assert!(
             start_byte <= end_byte && end_byte <= self.source_len,
             "selected reference range must fit indexed source: {start_byte}..{end_byte} of {}",
@@ -448,13 +451,16 @@ impl<'analyzer> SelectedReferenceFileState<'analyzer> {
 #[doc(hidden)]
 pub struct SelectedReferenceFileProjection<'a> {
     pub(crate) file: ProjectFile,
-    pub(crate) source: String,
-    pub(crate) state: SelectedReferenceFileState<'a>,
+    #[doc(hidden)]
+    pub source: String,
+    #[doc(hidden)]
+    pub state: SelectedReferenceFileState<'a>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl<'a> SelectedReferenceFileProjection<'a> {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         analyzer: &'a dyn IAnalyzer,
         context_analyzer: &'a dyn IAnalyzer,
         file: &ProjectFile,
@@ -650,7 +656,8 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     /// constructors report the allocation expression, while inverse edges
     /// remain anchored to the exact reference token.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn call_range_containing_reference(
+    #[doc(hidden)]
+    pub fn call_range_containing_reference(
         &self,
         start_byte: usize,
         end_byte: usize,
@@ -678,19 +685,6 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     pub fn ast_id(&self, start_byte: usize, end_byte: usize) -> Option<String> {
         self.site_identities.ast_id_for_bytes(start_byte, end_byte)
     }
-
-    /// The identifier token that spans exactly these bytes, read from the
-    /// file's structural facts rather than from the source text.
-    ///
-    /// `None` means no identifier node has that exact span, which is the
-    /// honest answer for a range the parser did not produce an identifier for.
-    /// A caller comparing this against a declaration's `short_name` must
-    /// normalize a Rust raw identifier with
-    /// `symbol_path::strip_raw_identifier_prefix`.
-    pub(crate) fn identifier_at(&self, start_byte: usize, end_byte: usize) -> Option<&str> {
-        let node = *self.site_identities.by_range.get(&(start_byte, end_byte))?;
-        Some(self.facts.node(node).span().text(self.facts.source()))
-    }
 }
 
 pub fn classify_reference_kind(
@@ -704,8 +698,9 @@ pub fn classify_reference_kind(
         .classify_reference_kind(start_byte, end_byte, target)
 }
 
-#[cfg(test)]
-fn classify_reference_kind_scan_oracle(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn classify_reference_kind_scan_oracle(
     analyzer: &dyn IAnalyzer,
     facts: &FileFacts,
     start_byte: usize,
@@ -1656,8 +1651,11 @@ impl SelectedInverseEdgeCache {
         cancellation: Option<&CancellationToken>,
     ) -> Option<EdgeDerivationResult> {
         let language = crate::analyzer::common::language_for_file(declaration.source());
-        let provider = crate::analyzer::languages::language_support(language)?
-            .selected_inverse_reference_provider()?;
+        let provider = crate::analyzer::languages::language_support_for_hook(
+            language,
+            "selected_inverse_reference_provider",
+        )?
+        .selected_inverse_reference_provider()?;
         let state = self.languages.entry(language).or_insert_with(|| {
             match provider.build_selected_inverse_index(analyzer, cancellation) {
                 SelectedInverseIndexOutcome::Ready(index) => SelectedInverseLanguage::Ready(index),
@@ -2006,29 +2004,15 @@ impl crate::analyzer::structural::reference_edges::SelectedInverseReferenceIndex
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::test_support::*;
-    use brokk_bifrost_core::analyzer::usages::model::UsageHitSurface;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod tests {
 
+    #[cfg(test)]
     use super::*;
 
-    use crate::analyzer::java::JavaAnalyzer;
-
-    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
-    use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::Language;
-
-    use crate::inline_project::InlineTestProject;
-
-    use crate::test_support::token_range;
-
-    use brokk_bifrost_test_macros::hardwon;
-
-    use std::collections::BTreeSet;
-
-    const JAVA_REFERENCE_KIND_SITES: &str = r#"package fixture;
+    #[doc(hidden)]
+    pub const JAVA_REFERENCE_KIND_SITES: &str = r#"package fixture;
 
 class Base {
     void ping() {}
@@ -2049,614 +2033,23 @@ class Child extends Base {
 }
 "#;
 
-    /// The reusable index is a semantics-preserving acceleration of the former
-    /// arena scan. Exercise every source classification branch against that
-    /// scan oracle, the public delegating function, and the exact AST-id join.
-    #[test]
-    fn indexed_reference_sites_match_the_scan_oracle_for_every_kind() {
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("src/ReferenceKinds.java", JAVA_REFERENCE_KIND_SITES)
-            .build();
-        let file = project.file("src/ReferenceKinds.java");
-        let analyzer = JavaAnalyzer::new(project.project_dyn());
-        let declaration = |fq_suffix: &str| {
-            analyzer
-                .all_declarations()
-                .find(|unit| unit.fq_name().ends_with(fq_suffix))
-                .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
-        };
-        let classifier =
-            ReferenceSiteClassifier::new(&analyzer, &file).expect("Java must provide facts");
-        let base = declaration("Base");
-        let cases = [
-            (
-                "method call",
-                "        method();",
-                "method",
-                declaration("Child.method"),
-                ReferenceKind::MethodCall,
-            ),
-            (
-                "static call",
-                "        Base.staticPing();",
-                "staticPing",
-                declaration("Base.staticPing"),
-                ReferenceKind::StaticReference,
-            ),
-            (
-                "super call",
-                "        super.ping();",
-                "ping",
-                declaration("Base.ping"),
-                ReferenceKind::SuperCall,
-            ),
-            (
-                "field read",
-                "        int read = this.field;",
-                "field",
-                declaration("Child.field"),
-                ReferenceKind::FieldRead,
-            ),
-            (
-                "field write",
-                "        this.field = read;",
-                "field",
-                declaration("Child.field"),
-                ReferenceKind::FieldWrite,
-            ),
-            (
-                "type reference",
-                "        Base local = other;",
-                "Base",
-                base.clone(),
-                ReferenceKind::TypeReference,
-            ),
-            (
-                "inheritance",
-                "class Child extends Base",
-                "Base",
-                base,
-                ReferenceKind::Inheritance,
-            ),
-        ];
-
-        for (label, marker, token, target, expected) in cases {
-            let (start_byte, end_byte) = token_range(JAVA_REFERENCE_KIND_SITES, marker, token);
-            let indexed = classifier.classify_reference_kind(start_byte, end_byte, &target);
-            let scanned = classify_reference_kind_scan_oracle(
-                &analyzer,
-                &classifier.facts,
-                start_byte,
-                end_byte,
-                &target,
-            );
-            assert_eq!(indexed, scanned, "indexed/scanned disagreement at {label}");
-            assert_eq!(indexed, Some(expected), "wrong kind at {label}");
-            assert_eq!(
-                classify_reference_kind(&analyzer, &file, start_byte, end_byte, &target),
-                indexed,
-                "public delegator disagrees at {label}"
-            );
-            let identifier = classifier
-                .facts
-                .nodes()
-                .iter()
-                .enumerate()
-                .find(|(_, node)| {
-                    node.kind == NormalizedKind::Identifier
-                        && node.range.start_byte == start_byte
-                        && node.range.end_byte == end_byte
-                })
-                .map(|(id, _)| u32::try_from(id).expect("structural fact id must fit u32"))
-                .unwrap_or_else(|| panic!("exact identifier fact missing at {label}"));
-            assert_eq!(
-                classifier.ast_id(start_byte, end_byte),
-                Some(ast_id(classifier.facts.source_identity(), identifier)),
-                "wrong exact identifier AST id at {label}"
-            );
-        }
-    }
-
-    const JAVA_TARGET: &str =
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub const JAVA_TARGET: &str =
         "package fixture;\n\npublic class Registry {\n    public void register() {\n    }\n}\n";
-    const JAVA_CALLER: &str = "package fixture;\n\npublic class Startup {\n    void boot(Registry registry) {\n        registry.register();\n    }\n}\n";
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub const JAVA_CALLER: &str = "package fixture;\n\npublic class Startup {\n    void boot(Registry registry) {\n        registry.register();\n    }\n}\n";
 
-    #[test]
-    #[hardwon(
-        "#4428: retained incomplete and ambiguous resolution candidates must not become proven forward edges"
-    )]
-    fn forward_resolution_status_preserves_proof_and_run_completeness() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/fixture/Registry.java", JAVA_TARGET),
-                ("src/fixture/Startup.java", JAVA_CALLER),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let caller = &fixture.files[1];
-        let target = fixture.declaration("Registry.register");
-        let occurrences = occurrences_for_file(analyzer, caller, &CancellationToken::new())
-            .expect("uncancelled occurrence derivation");
-        let template = occurrences
-            .rows
-            .iter()
-            .find(|row| {
-                matches!(
-                    &row.target,
-                    OccurrenceTarget::Resolved(units)
-                        if units.len() == 1 && units[0] == target
-                )
-            })
-            .cloned()
-            .expect("fixture must contain a resolved singleton reference");
-        assert_eq!(
-            template.resolution_status,
-            Some(DefinitionLookupStatus::Resolved)
-        );
-
-        let derive_rows = |rows: Vec<OccurrenceRow>| {
-            forward_edges_from_occurrences(
-                analyzer,
-                caller,
-                OccurrenceFileResult {
-                    rows,
-                    completeness: OccurrenceCompleteness::Complete,
-                },
-                analyzer.project().analysis_generation(),
-            )
-            .expect("forward edge conversion does not perform cancellable work")
-        };
-        let derive = |target: OccurrenceTarget, status: DefinitionLookupStatus| {
-            let mut row = template.clone();
-            row.target = target;
-            row.resolution_status = Some(status);
-            derive_rows(vec![row])
-        };
-
-        let alternatives = fixture.declaration("Startup.boot");
-        let cases = [
-            (
-                DefinitionLookupStatus::Resolved,
-                1,
-                Some(UsageProof::Proven),
-                None,
-            ),
-            (DefinitionLookupStatus::NoDefinition, 0, None, None),
-            (
-                DefinitionLookupStatus::Incomplete,
-                1,
-                Some(UsageProof::Unproven),
-                Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
-            ),
-            (
-                DefinitionLookupStatus::Ambiguous,
-                2,
-                Some(UsageProof::Unproven),
-                Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
-            ),
-            (
-                DefinitionLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
-                0,
-                None,
-                Some(EdgeIncompleteReason::ForwardResolutionIncomplete),
-            ),
-            (
-                DefinitionLookupStatus::Cancelled,
-                0,
-                None,
-                Some(EdgeIncompleteReason::Cancelled),
-            ),
-        ];
-        for (status, edge_count, proof, reason) in cases {
-            let target = match status {
-                DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Incomplete => {
-                    OccurrenceTarget::Resolved(vec![target.clone()])
-                }
-                DefinitionLookupStatus::Ambiguous => {
-                    OccurrenceTarget::Resolved(vec![target.clone(), alternatives.clone()])
-                }
-                _ => OccurrenceTarget::Unresolved(status),
-            };
-            let result = derive(target, status);
-            assert_eq!(result.edges.len(), edge_count, "status {status:?}");
-            if let Some(proof) = proof {
-                assert!(
-                    result.edges.iter().all(|edge| edge.proof == proof),
-                    "status {status:?} produced the wrong proof: {:?}",
-                    result.edges
-                );
-            }
-            match (reason, result.completeness) {
-                (None, EdgeCompleteness::Complete) => {}
-                (Some(reason), EdgeCompleteness::Incomplete { reasons }) => {
-                    assert!(reasons.contains(&reason), "status {status:?}: {reasons:?}");
-                    if status == DefinitionLookupStatus::Cancelled {
-                        assert!(
-                            !reasons.contains(&EdgeIncompleteReason::ForwardResolutionIncomplete)
-                        );
-                    }
-                }
-                (reason, completeness) => {
-                    panic!("status {status:?} expected reason {reason:?}, got {completeness:?}")
-                }
-            }
-        }
-
-        let mut incomplete = template.clone();
-        incomplete.resolution_status = Some(DefinitionLookupStatus::Incomplete);
-        let mixed = derive_rows(vec![template.clone(), incomplete]);
-        assert_eq!(mixed.edges.len(), 2);
-        assert_eq!(
-            mixed
-                .edges
-                .iter()
-                .filter(|edge| edge.proof == UsageProof::Proven)
-                .count(),
-            1
-        );
-        assert_eq!(
-            mixed
-                .edges
-                .iter()
-                .filter(|edge| edge.proof == UsageProof::Unproven)
-                .count(),
-            1
-        );
-        assert!(matches!(
-            mixed.completeness,
-            EdgeCompleteness::Incomplete { ref reasons }
-                if reasons.contains(&EdgeIncompleteReason::ForwardResolutionIncomplete)
-        ));
-    }
-
-    #[test]
-    fn reference_engine_file_scan_never_expands_its_hard_scope() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Registry.java", JAVA_TARGET),
-                ("src/Startup.java", JAVA_CALLER),
-                (
-                    "src/Other.java",
-                    "package fixture; class Other { void unrelated() {} }",
-                ),
-            ],
-        );
-        let run = ReferenceEngine::new().scan_file_edges(fixture.analyzer(), &fixture.files[1..2]);
-        assert_eq!(run.work.candidate_files, 1);
-        assert_eq!(run.work.scanned_files, 1);
-        assert!(
-            run.edges
-                .iter()
-                .all(|edge| edge.site.file == fixture.files[1])
-        );
-    }
-
-    #[test]
-    fn external_usage_graph_excludes_only_target_definition_overlap() {
-        const SOURCE: &str = r#"package fixture;
-
-class External {}
-
-class Target {
-    Target child() { return this; }
-    External external() { return null; }
-}
-"#;
-        let project = InlineTestProject::with_language(Language::Java)
-            .file("src/Target.java", SOURCE)
-            .build();
-        let file = project.file("src/Target.java");
-        let analyzer = JavaAnalyzer::new(project.project_dyn());
-        let declaration = |fq_suffix: &str| {
-            analyzer
-                .all_declarations()
-                .find(|unit| unit.fq_name().ends_with(fq_suffix))
-                .unwrap_or_else(|| panic!("fixture must declare {fq_suffix}"))
-        };
-        let target = declaration("Target");
-        let external = declaration("External");
-        let child = declaration("Target.child");
-        let external_method = declaration("Target.external");
-        let (self_start, self_end) = token_range(SOURCE, "    Target child()", "Target");
-        let (external_start, external_end) =
-            token_range(SOURCE, "    External external()", "External");
-        let row = |start_byte, end_byte, enclosing, target| ReferenceEdgeRow {
-            site: EdgeSite {
-                file: file.clone(),
-                range: Range {
-                    start_byte,
-                    end_byte,
-                    start_line: 1,
-                    end_line: 1,
-                },
-                ast_id: None,
-                enclosing: Some(enclosing),
-            },
-            target,
-            reference_kind: Some(ReferenceKind::TypeReference),
-            proof: UsageProof::Proven,
-            ambiguous_candidate: false,
-            usage_kind: UsageHitKind::Reference,
-            site_class: SiteClass::UseSite,
-            owner_relation: OwnerRelation::SameOwner,
-            provenance: EdgeProvenance::Forward,
-            generation: analyzer.project().analysis_generation(),
-        };
-        let self_type = row(self_start, self_end, child, target.clone());
-        let external_type = row(
-            external_start,
-            external_end,
-            external_method,
-            external.clone(),
-        );
-
-        assert!(self_type.included_in(UsageHitSurface::ExternalUsages));
-        assert!(external_type.included_in(UsageHitSurface::ExternalUsages));
-        let target_spans = analyzer
-            .ranges(&target)
-            .into_iter()
-            .map(|range| (target.source().clone(), range))
-            .collect::<Vec<_>>();
-        let external_spans = analyzer
-            .ranges(&external)
-            .into_iter()
-            .map(|range| (external.source().clone(), range))
-            .collect::<Vec<_>>();
-        assert!(!self_type.included_in_external_usage_graph(&target_spans));
-        assert!(external_type.included_in_external_usage_graph(&external_spans));
-
-        let mut self_receiver = self_type.clone();
-        self_receiver.usage_kind = UsageHitKind::SelfReceiver;
-        assert!(
-            !self_receiver.included_in(UsageHitSurface::ExternalUsages),
-            "querying definition overlap must not reclassify a self-receiver as external"
-        );
-        assert!(
-            self_receiver.overlaps_target_definition_spans(&target_spans),
-            "definition overlap remains available independently of usage surface"
-        );
-    }
-
-    #[test]
-    fn fuzzy_overload_buckets_keep_their_exact_edge_targets() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[(
-                "src/Overloads.java",
-                "package fixture; class Overloads { void call(int value) {} void call(String value) {} void caller() {} }",
-            )],
-        );
-        let analyzer = fixture.analyzer();
-        let mut overloads = analyzer
-            .all_declarations()
-            .filter(|unit| unit.fq_name().ends_with("Overloads.call"))
-            .collect::<Vec<_>>();
-        overloads.sort_by(|left, right| left.signature().cmp(&right.signature()));
-        assert_eq!(overloads.len(), 2);
-        let enclosing = fixture.declaration("Overloads.caller");
-        let hits_by_overload = overloads
-            .iter()
-            .enumerate()
-            .map(|(index, target)| {
-                (
-                    target.clone(),
-                    BTreeSet::from([UsageHit::new(
-                        fixture.files[0].clone(),
-                        1,
-                        index,
-                        index + 1,
-                        enclosing.clone(),
-                        1.0,
-                        "call",
-                    )]),
-                )
-            })
-            .collect();
-        let (hits, truncated) = reference_hits_from_fuzzy_result(
-            analyzer,
-            FuzzyResult::Success {
-                hits_by_overload,
-                unproven_by_overload: HashMap::default(),
-                unproven_total_by_overload: HashMap::default(),
-            },
-            &overloads,
-        );
-        assert!(!truncated);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(
-            hits.into_iter()
-                .map(|hit| hit.resolved)
-                .collect::<BTreeSet<_>>(),
-            overloads.into_iter().collect::<BTreeSet<_>>()
-        );
-    }
-
-    const JAVA_BASE: &str =
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub const JAVA_BASE: &str =
         "package fixture;\n\npublic class Base {\n    public void ping() {\n    }\n}\n";
-    const JAVA_DERIVED: &str = "package fixture;\n\npublic class Derived extends Base {\n    void run() {\n        helper();\n        run();\n    }\n\n    void helper() {\n    }\n}\n";
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub const JAVA_DERIVED: &str = "package fixture;\n\npublic class Derived extends Base {\n    void run() {\n        helper();\n        run();\n    }\n\n    void helper() {\n    }\n}\n";
 
-    #[test]
-    fn the_owner_classifier_states_each_relation() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Base.java", JAVA_BASE),
-                ("src/Derived.java", JAVA_DERIVED),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let base_ping = fixture.declaration("Base.ping");
-        let derived_run = fixture.declaration("Derived.run");
-        let derived_helper = fixture.declaration("Derived.helper");
-
-        assert_eq!(
-            classify_owner_relation(analyzer, Some(&derived_run), &derived_helper),
-            OwnerRelation::SameOwner
-        );
-        assert_eq!(
-            classify_owner_relation(analyzer, Some(&derived_run), &derived_run),
-            OwnerRelation::SelfReference
-        );
-        assert_eq!(
-            classify_owner_relation(analyzer, Some(&derived_run), &base_ping),
-            OwnerRelation::InheritedOwner
-        );
-        assert_eq!(
-            classify_owner_relation(analyzer, None, &base_ping),
-            OwnerRelation::Unknown
-        );
-    }
-
-    #[test]
-    fn forward_and_inverse_classify_import_binding() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[
-                ("src/Registry.java", JAVA_TARGET),
-                (
-                    "src/client/Startup.java",
-                    "package client;\n\nimport fixture.Registry;\n\nclass Startup {\n    Registry registry;\n}\n",
-                ),
-            ],
-        );
-        let analyzer = fixture.analyzer();
-        let target = fixture.declaration("Registry");
-        let forward =
-            forward_edges_for_file(analyzer, &fixture.files[1], &CancellationToken::new())
-                .expect("not cancelled");
-        let import_edge = forward
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.target == target
-                    && edge.site.range.start_byte
-                        == fixture.files[1]
-                            .read_to_string()
-                            .expect("fixture source")
-                            .find("Registry;")
-                            .expect("import target")
-            })
-            .expect("the import target must appear as a forward edge");
-        assert_eq!(import_edge.usage_kind, UsageHitKind::Import);
-
-        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
-        let inverse_import = inverse
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.site.file == fixture.files[1] && edge.site.range == import_edge.site.range
-            })
-            .expect("the import target must appear as an inverse edge");
-        assert_eq!(inverse_import.usage_kind, UsageHitKind::Import);
-    }
-
-    #[test]
-    fn forward_and_inverse_classify_recursive_self_reference() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[(
-                "src/Registry.java",
-                "package fixture;\n\nclass Registry {\n    void register() {\n        register();\n    }\n}\n",
-            )],
-        );
-        let analyzer = fixture.analyzer();
-        let target = fixture.declaration("Registry.register");
-        let call_start = fixture.files[0]
-            .read_to_string()
-            .expect("fixture source")
-            .rfind("register();")
-            .expect("recursive call");
-        let forward =
-            forward_edges_for_file(analyzer, &fixture.files[0], &CancellationToken::new())
-                .expect("not cancelled");
-        let forward_self = forward
-            .edges
-            .iter()
-            .find(|edge| edge.target == target && edge.site.range.start_byte == call_start)
-            .expect("recursive call must appear as a forward edge");
-        assert_eq!(forward_self.usage_kind, UsageHitKind::SelfReceiver);
-
-        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
-        let inverse_self = inverse
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.site.file == fixture.files[0] && edge.site.range == forward_self.site.range
-            })
-            .expect("recursive call must appear as an inverse edge");
-        assert_eq!(inverse_self.usage_kind, UsageHitKind::SelfReceiver);
-    }
-
-    #[test]
-    fn forward_keeps_same_owner_different_receiver_as_reference() {
-        let fixture = Fixture::new(
-            Language::Java,
-            &[(
-                "src/Registry.java",
-                "package fixture;\n\nclass Registry {\n    void helper() {}\n    void invoke(Registry other) {\n        other.helper();\n    }\n}\n",
-            )],
-        );
-        let analyzer = fixture.analyzer();
-        let target = fixture.declaration("Registry.helper");
-        let call_start = fixture.files[0]
-            .read_to_string()
-            .expect("fixture source")
-            .rfind("helper();")
-            .expect("member call");
-        let forward =
-            forward_edges_for_file(analyzer, &fixture.files[0], &CancellationToken::new())
-                .expect("not cancelled");
-        let forward_call = forward
-            .edges
-            .iter()
-            .find(|edge| edge.target == target && edge.site.range.start_byte == call_start)
-            .expect("the member call must appear as a forward edge");
-        assert_eq!(forward_call.owner_relation, OwnerRelation::SameOwner);
-        assert_eq!(forward_call.usage_kind, UsageHitKind::Reference);
-
-        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
-        let inverse_call = inverse
-            .edges
-            .iter()
-            .find(|edge| {
-                edge.site.file == fixture.files[0] && edge.site.range == forward_call.site.range
-            })
-            .expect("the member call must appear as an inverse edge");
-        assert_eq!(inverse_call.usage_kind, UsageHitKind::Reference);
-    }
-
-    #[test]
-    fn kotlin_forward_support_reports_only_its_uncovered_occurrence_role() {
-        let fixture = Fixture::new(
-            Language::Kotlin,
-            &[(
-                "src/Main.kt",
-                "class Registry {\n    fun register() {\n    }\n}\n",
-            )],
-        );
-        let result = forward_edges_for_file(
-            fixture.analyzer(),
-            &fixture.files[0],
-            &CancellationToken::new(),
-        )
-        .expect("not cancelled");
-        assert!(result.edges.is_empty());
-        assert_eq!(
-            result.completeness,
-            EdgeCompleteness::Incomplete {
-                reasons: vec![EdgeIncompleteReason::OccurrenceRowsIncomplete {
-                    uncovered_roles: vec![OccurrenceRole::PatternPosition]
-                }]
-            }
-        );
-        assert!(!result.covers(EdgeAxis::ForwardProjection));
-        assert!(!result.covers(EdgeAxis::InverseProjection));
-        assert!(result.covers_forward_role(OccurrenceRole::MemberPosition));
-        assert!(!result.covers_forward_role(OccurrenceRole::PatternPosition));
-    }
-
+    #[cfg(test)]
     #[test]
     fn completeness_covers_the_declared_axes_only() {
         let complete = EdgeCompleteness::Complete;

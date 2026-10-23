@@ -523,6 +523,12 @@ pub trait CodeUnitIndex: Send + Sync {
         None
     }
 
+    /// Raw Git blob identity of the bytes indexed for this file generation.
+    /// This must not hash current disk contents or decoded source text.
+    fn indexed_blob_oid(&self, _file: &ProjectFile) -> Option<git2::Oid> {
+        None
+    }
+
     /// Whether the supplied on-disk source still matches this analyzer
     /// generation. Persisted analyzers compare blob identities so freshness
     /// checks do not need to hydrate stale source text.

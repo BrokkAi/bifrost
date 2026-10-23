@@ -1,6 +1,7 @@
 [env]
 # Keep SQLite page-cache reclamation private to each cache to avoid the global LRU mutex.
-LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"
+# Allow derivation readers to map stores larger than SQLite's default 2 GiB cap.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_MAX_MMAP_SIZE=68719476736LL"
 BIFROST_PARALLELISM = { value = "1", force = false }
 RAYON_NUM_THREADS = { value = "1", force = false }
 # Fixture tests and their subprocesses do not need the bulk-import writer cache.

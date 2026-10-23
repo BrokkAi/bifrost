@@ -2569,6 +2569,7 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         })
     {
         result.diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -3368,6 +3369,22 @@ pub(super) fn render_call_shape(
             .map(|range| render_source_range(analyzer, &outcome.file, &range, cache)),
         callee_name: outcome.callee_name.clone(),
         resolved_external_callee: value.resolved_external_callee.clone(),
+        callee_provenance: outcome
+            .callee_provenance
+            .as_ref()
+            .map_or("unsupported", |fact| fact.provenance.label()),
+        callee_supplier: outcome
+            .callee_provenance
+            .as_ref()
+            .and_then(|fact| fact.supplier.map(|supplier| supplier.to_string())),
+        callee_type_shape: outcome
+            .callee_provenance
+            .as_ref()
+            .map_or("unknown", |fact| fact.shape.label()),
+        callee_bounds: outcome
+            .callee_provenance
+            .as_ref()
+            .map_or_else(Vec::new, |fact| fact.bounds.clone()),
         call_kind: outcome.call_kind.label(),
         coverage: outcome.coverage.label(),
         group_count: value.report.groups.len(),
@@ -4442,6 +4459,7 @@ pub(super) fn provider_supports_feature(
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::BooleanLiteralValue => provider.structural_supports_boolean_literal_value(),
         QueryFeature::AsyncCallableValue => provider.structural_supports_async_callable_value(),
+        QueryFeature::UnsafeContext => provider.structural_supports_unsafe_context(),
         QueryFeature::StringLiteralValue => provider.structural_supports_string_literal_value(),
         QueryFeature::AssignmentShape => provider.structural_supports_assignment_shape(),
         QueryFeature::IntegerLiteralValue => provider.structural_supports_integer_literal_value(),
@@ -4598,6 +4616,7 @@ pub(super) fn push_broad_query_diagnostic(
 ) {
     note_budget_work(CodeQueryDiagnosticCode::BroadQuery, budget);
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
         impact: CodeQueryDiagnosticImpact::Advisory,

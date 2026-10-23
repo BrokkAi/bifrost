@@ -1637,6 +1637,7 @@ int caller() { return local_target(1); }
                 .expect("semantic-pack catalog");
             let cancellation = CancellationToken::new();
             let activation = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("crate version"),
                 evidence: Vec::new(),
@@ -1930,7 +1931,7 @@ void caller(ns::Widget& receiver) {
 
         use brokk_bifrost_analysis::analyzer::usages::workspace_graph::cpp_test_support::parity_inventory;
 
-        use brokk_bifrost_analysis::analyzer::usages::workspace_graph::cpp_test_support::persisted_multilanguage_analyzer;
+        use crate::language_test_support::persisted_multilanguage_analyzer;
 
         #[test]
         #[hardwon(

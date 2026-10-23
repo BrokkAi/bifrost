@@ -335,6 +335,7 @@ fn project_rust_graph_in_operation(
     // per candidate instead of discarding the whole pass.
     let mut unresolved_names = std::collections::BTreeSet::new();
     let mut unresolved_names_complete = true;
+    let mut withheld_references = Vec::new();
     let mut reasons = Vec::new();
     let mut reference_count = 0;
     let mut edge_count = 0;
@@ -364,6 +365,17 @@ fn project_rust_graph_in_operation(
                 }
             }
         }
+        for reference in batch.withheld_references() {
+            for unit in reference.site.enclosing.iter().chain(match &reference.callee {
+                brokk_bifrost_analysis::analyzer::resolution::reference_vocabulary::WithheldCallee::Named(_) => None,
+                brokk_bifrost_analysis::analyzer::resolution::reference_vocabulary::WithheldCallee::Declaration(unit) => Some(unit),
+            }) {
+                if is_graph_declaration(unit) && rooted_declarations.insert(unit.clone()) {
+                    declarations.push((unit.clone(), rust.ranges(unit)));
+                }
+            }
+        }
+        withheld_references.extend_from_slice(batch.withheld_references());
         match batch.unresolved_names() {
             Some(names) => {
                 for name in names {
@@ -452,13 +464,17 @@ fn project_rust_graph_in_operation(
     if !accumulator.stage(&rooted_rows, cancellation) {
         return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
     }
+    if !accumulator.note_withheld_references(&withheld_references, cancellation) {
+        return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
+    }
     if !accumulator.note_unresolved_names(
         unresolved_names_complete.then_some(&unresolved_names),
         cancellation,
     ) {
         return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
     }
-    let projection = accumulator.finish(&completeness, &summary, edge_count, cancellation);
+    let mut projection = accumulator.finish(&completeness, &summary, edge_count, cancellation);
+    attach_implicit_callers(rust, &mut projection, cancellation)?;
     if cancellation.is_cancelled() {
         return Ok(RustNativeWorkspaceGraphOutcome::Cancelled);
     }
@@ -484,4 +500,90 @@ fn project_rust_graph_in_operation(
             unreachable!("a reducer has no source authority to mark stale")
         }
     })
+}
+
+/// Attach query-local trait-impl metadata without changing forward resolution.
+fn attach_implicit_callers(
+    rust: &RustAnalyzer,
+    outcome: &mut SelectedWorkspaceUsageGraphProjectionOutcome,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::usages::workspace_graph::ImplicitUsageGraphCallers;
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+    let (SelectedWorkspaceUsageGraphProjectionOutcome::Complete(graph)
+    | SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph)) = outcome
+    else {
+        return Ok(());
+    };
+    let scope = AnalyzerQueryScope::new(rust);
+    let files = graph
+        .nodes
+        .iter()
+        .map(|node| node.primary.source().clone())
+        .collect::<HashSet<_>>();
+    let mut implicit = brokk_bifrost_core::hash::HashMap::default();
+    let mut implemented_members = brokk_bifrost_core::hash::HashMap::default();
+    let mut node_ids = graph
+        .nodes
+        .iter()
+        .map(|node| node.key.id.clone())
+        .collect::<HashSet<_>>();
+    for file in files {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        for callers in brokk_bifrost_rust::hierarchy::rust_implicit_impl_callers_for_file(
+            rust,
+            scope.token(),
+            &file,
+        )
+        .map_err(|error| {
+            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                "reading implicit Rust callers for {file:?}: {error:?}"
+            ))
+        })? {
+            for endpoint in callers.self_type.iter().chain(callers.implements.iter()) {
+                if !node_ids.insert(endpoint.declaration_id()) {
+                    continue;
+                }
+                // Scoped requests retain dispatch and fallback endpoints even
+                // when their declarations are in another file.
+                let range = rust
+                    .ranges(endpoint)
+                    .into_iter()
+                    .min_by_key(|range| (range.start_line, range.start_byte));
+                let Some(catalog) = WorkspaceUsageCatalog::from_declarations(
+                    vec![(endpoint.clone(), range)],
+                    cancellation,
+                ) else {
+                    return Ok(());
+                };
+                assert_eq!(
+                    catalog.nodes.len(),
+                    1,
+                    "one trait dispatch endpoint is one graph node"
+                );
+                graph.nodes.extend(catalog.nodes);
+                graph.raw_proven_inbound.push(0);
+            }
+            if let Some(member) = callers.implements {
+                implemented_members
+                    .insert(callers.method.declaration_id(), member.declaration_id());
+            } else {
+                implicit.insert(
+                    callers.method.declaration_id(),
+                    ImplicitUsageGraphCallers {
+                        trait_name: callers.trait_name,
+                        self_type_id: callers.self_type.map(|unit| unit.declaration_id()),
+                    },
+                );
+            }
+        }
+    }
+    for node in &mut graph.nodes {
+        node.implements = implemented_members.remove(&node.key.id);
+        node.implicit_callers = implicit.remove(&node.key.id);
+    }
+    Ok(())
 }

@@ -76,6 +76,7 @@ pub fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProve
         rule_id: None,
         origin: SemanticModelOriginKind::DependencySource,
         activation: SemanticModelActivationProvenance {
+            approximate: false,
             status: "active".to_string(),
             reason: "test".to_string(),
             source_kind: "test".to_string(),

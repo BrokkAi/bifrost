@@ -3,10 +3,11 @@
 //! The legacy workspace graph remains in the parent module. This module owns
 //! the selected canonical path so its eventual cutover is a module operation.
 
+use crate::analyzer::resolution::reference_vocabulary::WithheldReference;
 use crate::analyzer::store::resolution_operation::graph_stage::{
     GraphBuildSelectionUnavailable, GraphSkippedCallers, certify_graph_callers,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::inverted_edges::MAX_CALLSITES;
 use super::super::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
@@ -233,6 +234,14 @@ pub enum CanonicalWorkspaceUsageGraphBuildOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct CanonicalWorkspaceUsageProjectedEdge {
+    /// Proven self-receiver dependencies, included only by opted-in public graphs.
+    /// These sites do not contribute to external usage or ranking counters.
+    pub same_owner_sites: Vec<(ProjectFile, usize)>,
+    /// Unproven self-receiver sites, drawn only by opted-in public graphs.
+    pub unproven_same_owner_sites: Vec<(ProjectFile, usize)>,
+    /// Possible callers excluded from ranking counts. May overlap `sites` when
+    /// a line contains both proven and unproven references.
+    pub unproven_sites: Vec<(ProjectFile, usize)>,
     #[doc(hidden)]
     pub from: usize,
     #[doc(hidden)]
@@ -252,12 +261,16 @@ pub struct CanonicalWorkspaceUsageGraphProjection {
     pub nodes: Vec<WorkspaceUsageNode>,
     #[doc(hidden)]
     pub edges: Vec<CanonicalWorkspaceUsageProjectedEdge>,
+    /// Dependencies drawn only when the public graph opts into same-owner sites.
+    pub same_owner_edges: Vec<CanonicalWorkspaceUsageProjectedEdge>,
     #[doc(hidden)]
     pub raw_proven_inbound: Vec<usize>,
     #[doc(hidden)]
     pub admitted_callers: HashSet<ProjectFile>,
     #[doc(hidden)]
     pub unresolved_names: Option<BTreeSet<String>>,
+    #[doc(hidden)]
+    pub withheld_references: Vec<WithheldReference>,
     #[doc(hidden)]
     pub forward_completeness: EdgeCompleteness,
     #[doc(hidden)]
@@ -296,7 +309,7 @@ pub fn projected_edges_into_ranking_edges(
         if cancellation.is_cancelled() {
             return None;
         }
-        if nodes[edge.to].truncated_inbound.is_some() {
+        if nodes[edge.to].truncated_inbound.is_some() || edge.sites.is_empty() {
             continue;
         }
         ranking_edges.push(WorkspaceUsageEdge {
@@ -343,10 +356,15 @@ pub struct CanonicalWorkspaceUsageGraphAccumulator {
     proven_callsites: HashSet<(usize, usize, usize)>,
     graph_callsites: HashSet<(usize, usize, usize)>,
     unproven_sites: HashSet<(usize, usize, usize)>,
+    proven_non_graph_sites: HashSet<(usize, usize, usize)>,
     /// The names this build's unresolved forward bindings spell, or `None`
     /// when one of them has no identifier this route could read. Bounded by
     /// the workspace's distinct identifiers and discarded with the graph.
     unresolved_names: Option<BTreeSet<String>>,
+    same_owner_by_line: HashSet<(usize, usize, usize, usize)>,
+    unproven_same_owner_by_line: HashSet<(usize, usize, usize, usize)>,
+    unproven_by_line: HashSet<(usize, usize, usize, usize)>,
+    withheld_references: Vec<WithheldReference>,
     strongest_kind_by_line: HashMap<(usize, usize, usize, usize), UsageReferenceKind>,
     kind_projection_complete: bool,
     admitted_callers: HashSet<ProjectFile>,
@@ -385,7 +403,12 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             proven_callsites: HashSet::default(),
             graph_callsites: HashSet::default(),
             unproven_sites: HashSet::default(),
+            proven_non_graph_sites: HashSet::default(),
             unresolved_names: Some(BTreeSet::new()),
+            same_owner_by_line: HashSet::default(),
+            unproven_same_owner_by_line: HashSet::default(),
+            unproven_by_line: HashSet::default(),
+            withheld_references: Vec::new(),
             strongest_kind_by_line: HashMap::default(),
             kind_projection_complete: true,
         }
@@ -470,7 +493,7 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             {
                 continue;
             }
-            if row.site.enclosing.is_none() || source == Some(target) {
+            if source == Some(target) {
                 continue;
             }
 
@@ -479,12 +502,16 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
                 row.ambiguous_candidate && row.proof == UsageProof::Unproven && external_usage;
             let unproven_self_receiver =
                 row.proof == UsageProof::Unproven && row.usage_kind == UsageHitKind::SelfReceiver;
-            if !external_usage && !unproven_self_receiver {
+            let proven_self_receiver =
+                row.proof == UsageProof::Proven && row.usage_kind == UsageHitKind::SelfReceiver;
+            if !external_usage && !unproven_self_receiver && !proven_self_receiver {
                 continue;
             }
 
             let mut site_file = None;
-            if row.proof == UsageProof::Proven || ambiguous_candidate {
+            if row.site.enclosing.is_some()
+                && ((row.proof == UsageProof::Proven && external_usage) || ambiguous_candidate)
+            {
                 // Preserve the legacy cap boundary: a proven external target
                 // site and each exact ambiguous candidate count before
                 // definition-overlap and caller-node exclusions.
@@ -498,24 +525,52 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             }
 
             let target_definition_spans = &self.declaration_spans_by_node[target];
-            let overlaps_definition = if external_usage {
-                !row.included_in_external_usage_graph(target_definition_spans)
-            } else {
-                row.overlaps_target_definition_spans(target_definition_spans)
-            };
-            if overlaps_definition {
+            // Usage-surface filtering is already complete. Check only overlap:
+            // graph admission also excludes the ownerless sites retained here.
+            if row.overlaps_target_definition_spans(target_definition_spans) {
+                continue;
+            }
+            if proven_self_receiver {
+                if let Some(source) = source
+                    && self.nodes[source].key.ecosystem == self.nodes[target].key.ecosystem
+                {
+                    // Keep opt-in dependency sites apart from ranking's external
+                    // usage counters. Public caps count the requested line sites.
+                    let file = self.site_file_id(&row.site.file);
+                    self.same_owner_by_line.insert((
+                        source,
+                        target,
+                        file,
+                        row.site.range.start_line,
+                    ));
+                }
                 continue;
             }
             if row.proof == UsageProof::Unproven {
                 let file = self.site_file_id(&row.site.file);
                 self.unproven_sites
                     .insert((target, file, row.site.range.start_byte));
+                if let Some(source) = source
+                    && self.nodes[source].key.ecosystem == self.nodes[target].key.ecosystem
+                {
+                    let sites = if unproven_self_receiver {
+                        &mut self.unproven_same_owner_by_line
+                    } else {
+                        &mut self.unproven_by_line
+                    };
+                    sites.insert((source, target, file, row.site.range.start_line));
+                }
                 if !ambiguous_candidate {
                     continue;
                 }
             }
 
             let Some(source) = source else {
+                if row.proof == UsageProof::Proven && external_usage {
+                    let file = self.site_file_id(&row.site.file);
+                    self.proven_non_graph_sites
+                        .insert((target, file, row.site.range.start_byte));
+                }
                 continue;
             };
             if self.nodes[source].key.ecosystem != self.nodes[target].key.ecosystem
@@ -611,6 +666,18 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             }
             graph_inbound[target] = graph_inbound[target].saturating_add(1);
         }
+        for (target, file, _) in self.proven_non_graph_sites {
+            if cancellation.is_cancelled() {
+                return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
+            }
+            let count = self.nodes[target]
+                .proven_non_graph_inbound_by_file
+                .entry(self.site_files[file].clone())
+                .or_default();
+            *count = count
+                .checked_add(1)
+                .expect("non-graph inbound count fits usize");
+        }
         for (target, _, _) in self.unproven_sites {
             if cancellation.is_cancelled() {
                 return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
@@ -638,6 +705,39 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             counts.record(kind);
             sites.insert((self.site_files[file].clone(), line));
         }
+        let mut unproven_by_edge: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (source, target, file, line) in self.unproven_by_line {
+            if cancellation.is_cancelled() {
+                return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
+            }
+            projected_by_edge.entry((source, target)).or_default();
+            unproven_by_edge
+                .entry((source, target))
+                .or_default()
+                .insert((self.site_files[file].clone(), line));
+        }
+        let mut unproven_same_owner_by_edge: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (source, target, file, line) in self.unproven_same_owner_by_line {
+            if cancellation.is_cancelled() {
+                return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
+            }
+            projected_by_edge.entry((source, target)).or_default();
+            unproven_same_owner_by_edge
+                .entry((source, target))
+                .or_default()
+                .insert((self.site_files[file].clone(), line));
+        }
+        let mut same_owner_by_edge: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (source, target, file, line) in self.same_owner_by_line {
+            if cancellation.is_cancelled() {
+                return CanonicalWorkspaceUsageGraphProjectionOutcome::Cancelled;
+            }
+            projected_by_edge.entry((source, target)).or_default();
+            same_owner_by_edge
+                .entry((source, target))
+                .or_default()
+                .insert((self.site_files[file].clone(), line));
+        }
         let mut edges = Vec::with_capacity(projected_by_edge.len());
         for ((from, to), (counts, sites)) in projected_by_edge {
             if cancellation.is_cancelled() {
@@ -655,6 +755,21 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
                 to,
                 counts,
                 sites: ordered_sites,
+                unproven_same_owner_sites: unproven_same_owner_by_edge
+                    .remove(&(from, to))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                same_owner_sites: same_owner_by_edge
+                    .remove(&(from, to))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                unproven_sites: unproven_by_edge
+                    .remove(&(from, to))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
             });
         }
 
@@ -671,12 +786,17 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
             }
             resolved.into_iter().collect()
         };
+        let (same_owner_edges, edges) = edges
+            .into_iter()
+            .partition(|edge| edge.sites.is_empty() && edge.unproven_sites.is_empty());
         let projection = CanonicalWorkspaceUsageGraphProjection {
             nodes: self.nodes,
             edges,
+            same_owner_edges,
             raw_proven_inbound: proven_inbound,
             admitted_callers: self.admitted_callers,
             unresolved_names: self.unresolved_names,
+            withheld_references: self.withheld_references,
             forward_completeness: forward_completeness.clone(),
             kind_projection_complete: self.kind_projection_complete,
             #[cfg(any(test, feature = "test-support"))]
@@ -705,12 +825,20 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
 /// This remains crate-private. The public test-support facade converts it to
 /// the incumbent `brokk_bifrost_tools::searchtools::UsageGraphResult`, while the ranking
 /// adapter consumes the same nodes and edges without the site inventory.
+///
+/// Nodes also retain proven external sites whose caller is not a graph node,
+/// counted per file after deduplication by (file, byte). These counters do not
+/// draw edges or enter the graph callsite cap, truncated_inbound, or
+/// raw_proven_inbound. The legacy cap accounting of sites with an enclosing
+/// non-graph declaration remains unchanged.
 #[doc(hidden)]
 pub struct SelectedWorkspaceUsageGraphProjection {
     #[doc(hidden)]
     pub nodes: Vec<WorkspaceUsageNode>,
     #[doc(hidden)]
     pub edges: Vec<CanonicalWorkspaceUsageProjectedEdge>,
+    /// Dependencies drawn only when the public graph opts into same-owner sites.
+    pub same_owner_edges: Vec<CanonicalWorkspaceUsageProjectedEdge>,
     /// Exact distinct (target, source file, byte offset) counts, including
     /// below-cap totals. Aligned with nodes, never inferred from line sites.
     #[doc(hidden)]
@@ -723,6 +851,9 @@ pub struct SelectedWorkspaceUsageGraphProjection {
     pub skipped_callers: GraphSkippedCallers,
     #[doc(hidden)]
     pub build_selection_unavailable: Option<GraphBuildSelectionUnavailable>,
+    /// Domain failures do not withdraw admitted source-inventory callers.
+    pub domain_discovery_failures:
+        Vec<crate::analyzer::store::resolution_operation::graph_stage::GraphDomainDiscoveryFailure>,
     /// The terminal names of every declaration an inbound edge this build
     /// did not draw may reach, or `None` when one such edge has no name the
     /// route could read. See `FactReferenceEdgeBatch::unresolved_names`.
@@ -733,6 +864,8 @@ pub struct SelectedWorkspaceUsageGraphProjection {
     /// `None` leaves it no attribution, and it abstains on the whole pass.
     #[doc(hidden)]
     pub unresolved_names: Option<BTreeSet<String>>,
+    #[doc(hidden)]
+    pub withheld_references: Vec<WithheldReference>,
     #[doc(hidden)]
     pub forward_completeness: EdgeCompleteness,
     #[doc(hidden)]
@@ -835,6 +968,9 @@ pub struct CanonicalWorkspaceUsageRemappedEdge<'a> {
     pub counts: UsageReferenceCounts,
     #[doc(hidden)]
     pub sites: &'a [(ProjectFile, usize)],
+    pub same_owner_sites: &'a [(ProjectFile, usize)],
+    pub unproven_same_owner_sites: &'a [(ProjectFile, usize)],
+    pub unproven_sites: &'a [(ProjectFile, usize)],
 }
 
 impl CanonicalWorkspaceUsageRemappedProjection<'_> {
@@ -843,11 +979,15 @@ impl CanonicalWorkspaceUsageRemappedProjection<'_> {
         self.projection
             .edges
             .iter()
+            .chain(&self.projection.same_owner_edges)
             .map(|edge| CanonicalWorkspaceUsageRemappedEdge {
                 from: self.node_indices[edge.from],
                 to: self.node_indices[edge.to],
                 counts: edge.counts,
                 sites: &edge.sites,
+                same_owner_sites: &edge.same_owner_sites,
+                unproven_same_owner_sites: &edge.unproven_same_owner_sites,
+                unproven_sites: &edge.unproven_sites,
             })
     }
 }
@@ -978,7 +1118,7 @@ pub fn remap_workspace_usage_projection_nodes<'a>(
             }
             node_indices.push(indices[&node.key.id]);
         }
-        for edge in &projection.edges {
+        for edge in projection.edges.iter().chain(&projection.same_owner_edges) {
             if cancellation.is_cancelled() {
                 return CanonicalWorkspaceUsageNodeRemappingOutcome::Cancelled;
             }
@@ -1039,7 +1179,14 @@ pub fn aggregate_disjoint_workspace_usage_projections(
     let mut overlapping = BTreeSet::new();
     let mut accounted_callers = HashSet::default();
     let mut unresolved_names = Some(BTreeSet::new());
+    let mut withheld_references = Vec::new();
     for projection in projections {
+        for reference in &projection.withheld_references {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+            }
+            withheld_references.push(reference.clone());
+        }
         for file in projection
             .admitted_callers()
             .iter()
@@ -1083,6 +1230,8 @@ pub fn aggregate_disjoint_workspace_usage_projections(
             return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
         }
         nodes.push(WorkspaceUsageNode {
+            implements: None,
+            implicit_callers: None,
             key: declaration.key.clone(),
             primary: declaration.primary.clone(),
             primary_range: declaration.primary_range,
@@ -1090,10 +1239,14 @@ pub fn aggregate_disjoint_workspace_usage_projections(
             declaration_ids: Vec::new(),
             truncated_inbound: None,
             unproven_inbound: 0,
+            proven_non_graph_inbound_by_file: BTreeMap::new(),
         });
     }
     let mut raw_proven_inbound = vec![0_usize; nodes.len()];
     let mut projected_by_edge = CanonicalProjectedEdgesByNodePair::new();
+    let mut unproven_by_edge: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    let mut unproven_same_owner_by_edge: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    let mut same_owner_by_edge: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
     let mut reasons = Vec::new();
     let mut kind_projection_complete = true;
     let mut reference_count = 0_usize;
@@ -1140,10 +1293,25 @@ pub fn aggregate_disjoint_workspace_usage_projections(
                 return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
             }
             let source = &projection.nodes[local];
+            if let Some(member) = &source.implements {
+                nodes[global].implements = Some(member.clone());
+            }
+            if let Some(implicit) = &source.implicit_callers {
+                nodes[global].implicit_callers = Some(implicit.clone());
+            }
             raw_proven_inbound[global] = raw_proven_inbound[global]
                 .checked_add(projection.raw_proven_inbound()[local])
                 .expect("raw inbound count overflow");
             let node = &mut nodes[global];
+            for (file, count) in &source.proven_non_graph_inbound_by_file {
+                let total = node
+                    .proven_non_graph_inbound_by_file
+                    .entry(file.clone())
+                    .or_default();
+                *total = total
+                    .checked_add(*count)
+                    .expect("non-graph inbound count fits usize");
+            }
             node.unproven_inbound = node
                 .unproven_inbound
                 .checked_add(source.unproven_inbound)
@@ -1165,6 +1333,18 @@ pub fn aggregate_disjoint_workspace_usage_projections(
             if cancellation.is_cancelled() {
                 return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
             }
+            unproven_same_owner_by_edge
+                .entry((edge.from, edge.to))
+                .or_default()
+                .extend(edge.unproven_same_owner_sites.iter().cloned());
+            same_owner_by_edge
+                .entry((edge.from, edge.to))
+                .or_default()
+                .extend(edge.same_owner_sites.iter().cloned());
+            unproven_by_edge
+                .entry((edge.from, edge.to))
+                .or_default()
+                .extend(edge.unproven_sites.iter().cloned());
             let (counts, sites) = projected_by_edge.entry((edge.from, edge.to)).or_default();
             counts.calls = counts.calls.saturating_add(edge.counts.calls);
             counts.members = counts.members.saturating_add(edge.counts.members);
@@ -1209,6 +1389,21 @@ pub fn aggregate_disjoint_workspace_usage_projections(
             to,
             counts,
             sites: ordered_sites,
+            unproven_same_owner_sites: unproven_same_owner_by_edge
+                .remove(&(from, to))
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            same_owner_sites: same_owner_by_edge
+                .remove(&(from, to))
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            unproven_sites: unproven_by_edge
+                .remove(&(from, to))
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
         });
     }
     let forward_completeness = if reasons.is_empty() {
@@ -1218,6 +1413,7 @@ pub fn aggregate_disjoint_workspace_usage_projections(
     };
     let complete = !projections.iter().any(|projection| {
         projection.build_selection_unavailable.is_some()
+            || !projection.domain_discovery_failures.is_empty()
             || projection
                 .skipped_callers
                 .values()
@@ -1230,19 +1426,30 @@ pub fn aggregate_disjoint_workspace_usage_projections(
         ]
         .into_iter()
         .all(|axis| forward_completeness.covers(axis));
+    let (same_owner_edges, edges) = edges
+        .into_iter()
+        .partition(|edge| edge.sites.is_empty() && edge.unproven_sites.is_empty());
     let projection = SelectedWorkspaceUsageGraphProjection {
         nodes,
         edges,
+        same_owner_edges,
         raw_proven_inbound,
         admitted_callers,
         build_selection_unavailable: projections
             .iter()
             .find_map(|projection| projection.build_selection_unavailable.clone()),
+        domain_discovery_failures: projections
+            .iter()
+            .flat_map(|projection| projection.domain_discovery_failures.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         skipped_callers: projections
             .iter()
             .flat_map(|projection| projection.skipped_callers.clone())
             .collect(),
         unresolved_names,
+        withheld_references,
         forward_completeness,
         kind_projection_complete,
         generation: expected_generation,
@@ -1323,6 +1530,8 @@ pub fn merge_workspace_usage_graph_projections(
             return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
         nodes.push(WorkspaceUsageNode {
+            implements: None,
+            implicit_callers: None,
             key: declaration.key.clone(),
             primary: declaration.primary.clone(),
             primary_range: declaration.primary_range,
@@ -1330,6 +1539,7 @@ pub fn merge_workspace_usage_graph_projections(
             declaration_ids: Vec::new(),
             truncated_inbound: None,
             unproven_inbound: 0,
+            proven_non_graph_inbound_by_file: BTreeMap::new(),
         });
     }
     let contribution = &remapping.projections[0];
@@ -1343,11 +1553,26 @@ pub fn merge_workspace_usage_graph_projections(
             return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
         let node = &mut nodes[index];
+        if source.implements.is_some() {
+            node.implements = source.implements.clone();
+        }
+        if source.implicit_callers.is_some() {
+            node.implicit_callers = source.implicit_callers.clone();
+        }
         node.declaration_files
             .extend(source.declaration_files.iter().cloned());
         node.declaration_ids
             .extend(source.declaration_ids.iter().cloned());
         node.truncated_inbound = node.truncated_inbound.max(source.truncated_inbound);
+        for (file, count) in &source.proven_non_graph_inbound_by_file {
+            let total = node
+                .proven_non_graph_inbound_by_file
+                .entry(file.clone())
+                .or_default();
+            *total = total
+                .checked_add(*count)
+                .expect("non-graph inbound count fits usize");
+        }
         node.unproven_inbound = node
             .unproven_inbound
             .checked_add(source.unproven_inbound)
@@ -1376,6 +1601,9 @@ pub fn merge_workspace_usage_graph_projections(
     for edge in contribution.edges() {
         if cancellation.is_cancelled() {
             return WorkspaceUsageGraphBuildOutcome::Cancelled;
+        }
+        if edge.sites.is_empty() {
+            continue;
         }
         if nodes[edge.to].truncated_inbound.is_none() {
             edges.push(WorkspaceUsageEdge {
@@ -1473,6 +1701,22 @@ impl NativeWorkspaceUsageGraphAccumulator {
         self.0.stage_rows(rows, cancellation)
     }
 
+    /// Retain the possible caller/callee pairs for this projection's lifetime.
+    #[doc(hidden)]
+    pub fn note_withheld_references(
+        &mut self,
+        references: &[WithheldReference],
+        cancellation: &CancellationToken,
+    ) -> bool {
+        for reference in references {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            self.0.withheld_references.push(reference.clone());
+        }
+        true
+    }
+
     /// Record the names this build's unresolved forward bindings spell.
     /// `None` means one of them had no identifier the route could read, and
     /// the projection then offers no per-declaration attribution at all.
@@ -1524,11 +1768,14 @@ impl NativeWorkspaceUsageGraphAccumulator {
         let projection = SelectedWorkspaceUsageGraphProjection {
             nodes: projection.nodes,
             edges: projection.edges,
+            same_owner_edges: projection.same_owner_edges,
             raw_proven_inbound: projection.raw_proven_inbound,
             admitted_callers: projection.admitted_callers,
             skipped_callers: self.1,
             build_selection_unavailable: None,
+            domain_discovery_failures: Vec::new(),
             unresolved_names: projection.unresolved_names,
+            withheld_references: projection.withheld_references,
             forward_completeness: projection.forward_completeness,
             kind_projection_complete: projection.kind_projection_complete,
             generation,
@@ -1809,9 +2056,11 @@ where
     let CanonicalWorkspaceUsageGraphProjection {
         nodes,
         edges,
+        same_owner_edges,
         raw_proven_inbound,
         admitted_callers,
         unresolved_names,
+        withheld_references,
         forward_completeness,
         kind_projection_complete,
         #[cfg(any(test, feature = "test-support"))]
@@ -1820,11 +2069,14 @@ where
     let projection = SelectedWorkspaceUsageGraphProjection {
         nodes,
         edges,
+        same_owner_edges,
         raw_proven_inbound,
         admitted_callers,
         skipped_callers: Default::default(),
         build_selection_unavailable: None,
+        domain_discovery_failures: Vec::new(),
         unresolved_names,
+        withheld_references,
         forward_completeness,
         kind_projection_complete,
         generation,

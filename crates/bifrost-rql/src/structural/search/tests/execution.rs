@@ -530,6 +530,7 @@ fn java_result_obligation_requires_selected_jdk_source_and_discarded_use() {
             catalog: &catalog,
             persistence: None,
             activation: &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
                 evidence: Vec::new(),
                 controls: Vec::new(),
@@ -2188,6 +2189,114 @@ fn skipped_set_profile_forwards_cancellation_safe_partial_cardinality() {
     assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
 }
 
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#6418: empty language arms reserved pipeline rows from the only populated arm"
+)]
+fn sequential_union_pipeline_budget_ignores_absent_languages() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "main.rs",
+            "fn first() {} fn second() {} fn third() {} fn fourth() {}",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "union": [functions_in("python"), functions_in("rust"), functions_in("ruby")],
+        "limit": 100
+    }))
+    .expect("union query");
+    let detailed = execute_code_query_with_union_strategy(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            // Leave one row for the existing exhausted-budget preflight on
+            // later empty arms; this test isolates the fair divisor.
+            max_pipeline_rows: 5,
+            ..CodeQueryExecutionLimits::default()
+        },
+        UnionExecutionStrategy::Sequential,
+        true,
+    );
+    assert!(
+        !detailed.result.truncated,
+        "{:?}",
+        detailed.result.diagnostics
+    );
+    assert_eq!(detailed.result.results.len(), 4);
+    assert_eq!(detailed.work.pipeline_rows, 4);
+}
+
+#[test]
+fn sequential_union_pipeline_budget_keeps_populated_arms_fair() {
+    let project = InlineTestProject::new()
+        .file(
+            "main.rs",
+            "fn first() {} fn second() {} fn third() {} fn fourth() {}",
+        )
+        .file(
+            "main.py",
+            "def first(): pass\ndef second(): pass\ndef third(): pass\ndef fourth(): pass\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    // A language set with a populated member and an unscoped seed both
+    // keep their share. File scope does not imply language scope, and an
+    // applicable arm keeps its share even when its match returns no rows.
+    for (second, second_rows) in [
+        (
+            json!({ "languages": ["python", "ruby"], "match": { "kind": "function" } }),
+            2,
+        ),
+        (
+            json!({ "where": ["main.py"], "match": { "kind": "function" } }),
+            2,
+        ),
+        (
+            json!({ "languages": ["python"], "match": { "kind": "function", "name": "missing" } }),
+            0,
+        ),
+    ] {
+        let query = CodeQuery::from_json(&json!({
+            "union": [functions_in("rust"), second],
+            "limit": 100
+        }))
+        .expect("union query");
+        let detailed = execute_code_query_with_union_strategy(
+            workspace.analyzer(),
+            &query,
+            CodeQueryExecutionLimits {
+                max_pipeline_rows: 4,
+                ..CodeQueryExecutionLimits::default()
+            },
+            UnionExecutionStrategy::Sequential,
+            true,
+        );
+        assert!(detailed.result.truncated);
+        assert_eq!(
+            detailed.work.pipeline_rows,
+            u64::try_from(2 + second_rows).expect("row count fits u64")
+        );
+        for branch in [0, 1] {
+            assert_eq!(
+                detailed
+                    .result
+                    .results
+                    .iter()
+                    .filter(|row| {
+                        row.provenance
+                            .iter()
+                            .any(|trace| trace.branch.first() == Some(&branch))
+                    })
+                    .count(),
+                if branch == 0 { 2 } else { second_rows },
+                "each applicable arm retains its half share: {:?}",
+                detailed.result
+            );
+        }
+    }
+}
+
 /// Two-language workspace whose volume is concentrated in the first-listed
 /// union branch: the Rust files hold nearly all of the facts, the single
 /// Python file almost none.
@@ -3814,6 +3923,7 @@ fn execute_conditional_result_contract_files_with_operation(
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
                 language: "go".to_owned(),
@@ -5908,6 +6018,7 @@ func earlyUse() string {
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
                 language: "go".to_owned(),
@@ -6841,6 +6952,7 @@ fn activate_type_flow_builtins(workspace: &WorkspaceAnalyzer) {
         &catalog,
         None,
         &SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
             evidence: vec![SemanticModelActivationEvidence {
                 language: "python".to_owned(),
@@ -8084,6 +8196,36 @@ fn contradictory_condition_rows(
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#6415: compound assignment left the target's scalar fact unchanged"
+)]
+fn branch_relation_step_forgets_rust_compound_assignment_scalar_values() {
+    for (source, forbidden) in [
+        (
+            "fn f(mask: u8) { let mut x: u8 = 0; let mut y: u8 = 7; x |= mask; if x == 0 { y = 1; } let _ = y; }",
+            "always_true",
+        ),
+        (
+            "fn f(mask: u8) { let mut x: u8 = 0; let mut y: u8 = 7; x += mask; if x == 0 { y = 1; } let _ = y; }",
+            "always_true",
+        ),
+        (
+            "fn f() { let mut x: u8 = 5; x -= 3; if x == 2 {} }",
+            "always_false",
+        ),
+    ] {
+        let rows = contradictory_condition_rows(Language::Rust, "sample.rs", source);
+        eprintln!("{source}: {rows:?}");
+        assert_eq!(rows.len(), 1, "{source}: {rows:?}");
+        assert_ne!(rows[0].1, Some(forbidden), "{source}: {rows:?}");
+        assert!(
+            rows[0].0 == "open" || rows[0] == ("distinct", None, None),
+            "{source}: {rows:?}"
+        );
+    }
+}
+
+#[test]
 fn branch_relation_step_qualifies_compound_conditions_in_every_pilot_language() {
     let always_false = ("proven", Some("always_false"), None);
     let always_true = ("proven", Some("always_true"), None);
@@ -8841,4 +8983,104 @@ fn program_point_of_reports_an_incomplete_result_without_a_unique_suspend() {
         matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
         "a missing suspend mapping is explicit: {result:#?}"
     );
+}
+
+#[test]
+fn callee_provenance_filters_project_rust_and_state_python_unsupported() {
+    let project = InlineTestProject::new()
+        .file("src/lib.rs", "fn run<F: FnMut()>(mut f: F) { f(); }")
+        .file("src/probe.py", "def run(f):\n    f()\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for (language, provenance, shape, supplier, bounds) in [
+        (
+            "rust",
+            "caller_supplied",
+            "fn_bound_generic",
+            Some("parameter 0"),
+            vec!["FnMut"],
+        ),
+        ("python", "unsupported", "unknown", None, vec![]),
+    ] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(filter :where ((callee_provenance eq {provenance}) (callee_type_shape eq {shape})) (call-shape (language {language} (call))))"
+        )).expect("callee column filter");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(result.results.len(), 1, "{result:#?}");
+        let CodeQueryResultValue::CallShape { value } = &result.results[0].value else {
+            panic!("call shape row");
+        };
+        assert_eq!(value.callee_supplier.as_deref(), supplier);
+        assert_eq!(value.callee_bounds, bounds);
+    }
+}
+
+#[test]
+fn unsafe_context_selects_rust_calls_and_reports_python_unsupported() {
+    let project = InlineTestProject::new()
+        .file("src/lib.rs", "fn helper() {} fn run() { helper(); unsafe { helper(); } } unsafe fn raw() { helper(); }")
+        .file("src/probe.py", "def run():\n    helper()\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for (expected, count) in [(true, 2), (false, 1)] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(language rust (call :unsafe-context {expected}))"
+        ))
+        .expect("Rust unsafe selector");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(result.results.len(), count, "{result:#?}");
+    }
+    let query = CodeQuery::from_sexp("(language python (call :unsafe-context true))")
+        .expect("property parses before capability check");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unsafe-context")),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn dispatch_file_operations_in_memory_multi_file_query_completes() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname='dispatch_memory'\nversion='0.1.0'\nedition='2024'\n")
+        .file("src/lib.rs", "mod other; pub fn first() {} pub fn second() {} pub fn caller() { first(); second(); }\n")
+        .file("src/other.rs", "pub fn caller() { crate::first(); crate::second(); }\n")
+        .build();
+    let project_dyn = project.project_dyn();
+    let store = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test(project_dyn.as_ref()).expect("in-memory store");
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        project_dyn,
+        AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        },
+        store,
+    )
+    .expect("workspace");
+    let query = CodeQuery::from_sexp(
+        "(filter :where ((ordinal ge 0)) (language rust (dispatch-targets (call))))",
+    )
+    .expect("dispatch query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(!result.results.is_empty(), "{}", result.render_text());
 }

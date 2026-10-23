@@ -1,0 +1,9048 @@
+use crate::analyzer::jvm::equivalent_java_type_identity;
+
+use crate::analyzer::jvm::restrict_visibility as restrict_semantic_visibility;
+
+use brokk_bifrost_analysis::analyzer::dependency_support::resolve_dependency_path as resolve_path;
+
+use crate::analyzer::jvm::dependency_discovery::discover_build_tools;
+
+use crate::analyzer::jvm::dependency_discovery::discover_metadata;
+
+use crate::analyzer::jvm::java_artifact::JavaClassSurfaceOutcome;
+
+use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
+
+use crate::analyzer::jvm::java_artifact::ZipDirectoryStatus;
+
+use crate::analyzer::jvm::java_artifact::class_surface;
+
+use crate::analyzer::jvm::java_artifact::source_type_kind;
+
+use crate::analyzer::jvm::java_artifact::zip_directory_status;
+
+use crate::analyzer::jvm::jdk_artifact::JdkSourceArchivePackProducer;
+
+use crate::analyzer::jvm::jdk_artifact::detect_jdk_source_archive_layout;
+
+use crate::analyzer::jvm::jmod_artifact::JdkJmodSetPackProducer;
+
+use crate::analyzer::jvm::kotlin_artifact::KotlinSourceJarPackProducer;
+
+use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
+
+use brokk_bifrost_analysis::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
+use brokk_bifrost_semantic::analyzer::semantic::ids::push_optional_bytes;
+
+pub(crate) use brokk_bifrost_analysis::analyzer::semantic_model::overlay::jvm_external::JvmExternalTypeKind;
+
+pub(crate) use brokk_bifrost_analysis::analyzer::semantic_model::overlay::jvm_external::pack_type_kind;
+
+pub(crate) use brokk_bifrost_analysis::analyzer::semantic_model::overlay::jvm_external::qualified_model_symbols;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::ActivationSelector;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ArtifactProducerLimits;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ArtifactProduction;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ArtifactProductionRequest;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::ArtifactSourceIdentity;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredPayload;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredSemanticModelPack;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredShard;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::BoundedDependencyDiagnostics;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::CatalogCoordinate;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Compatibility;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Completeness;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyArtifactRole;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryProfile;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackAdapter;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackProduction;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::DependencyProvenance;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::ExactDependencyArtifact;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactKind;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::HierarchyFact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Locator;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::MemberFact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::MemberKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::NameSelector;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Producer;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ProducerDiagnostic;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::ProducerDiagnosticSeverity;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Provenance;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependency;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependencyArtifact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Safety;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Signature;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::SuppressedDiagnostics;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeFact;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeKind;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::Visibility;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::normalize_artifact_locator_paths;
+
+use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact_while;
+
+use brokk_bifrost_core::analyzer::model::JVM_SEMANTIC_PACK_LANGUAGES;
+
+use brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig;
+
+use brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryMode;
+
+use brokk_bifrost_core::analyzer::config::JvmExternalArtifact;
+
+use brokk_bifrost_core::analyzer::config::JvmExternalArtifactOrigin;
+
+use brokk_bifrost_core::analyzer::config::JvmExternalDependencies;
+
+use brokk_bifrost_core::analyzer::config::JvmMavenCoordinate;
+
+use brokk_bifrost_core::analyzer::project::Project;
+
+use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_jvm::java::declarations::{
+    class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
+    java_modifier_keywords, node_text, parse_tree,
+};
+use jclassfile::attributes::Attribute;
+use jclassfile::constant_pool::ConstantPool;
+use semver::Version;
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
+
+fn is_public_external_type(external_type: &JvmExternalType) -> bool {
+    external_type.visibility == JvmVisibility::Public
+}
+use tree_sitter::Parser;
+use zip::ZipArchive;
+
+use brokk_bifrost_analysis::analyzer::topology::DependencyScope;
+use brokk_bifrost_core::cancellation::CancellationToken;
+
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_INDEX_ARTIFACTS: usize = 128;
+const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ANALYZER_SOURCE_ENTRY_BYTES: u64 = 1024 * 1024;
+const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_TOTAL_INDEX_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ANALYZER_SOURCE_TYPES: usize = 4_096;
+const MAX_JDK_JMOD_FILES: usize = 512;
+/// The most member declarations one indexed artifact may contribute to the
+/// external member surface (#1900).
+///
+/// The type-level index bounds an artifact by bytes ([`MAX_TOTAL_ARCHIVE_BYTES`]
+/// against the shared [`MAX_TOTAL_INDEX_BYTES`] remainder) and by entries
+/// ([`MAX_ARCHIVE_ENTRIES`]). Members are a second dimension: one class entry
+/// well inside the byte bound can declare thousands of them, so a jar of
+/// generated API classes could otherwise multiply the retained index far past
+/// what its bytes suggest. Charging members separately keeps the retained
+/// surface bounded in the dimension that actually grows.
+///
+/// Reaching the bound is recorded as a production diagnostic, so the artifact
+/// reports as declared-but-not-fully-indexed rather than as a complete surface
+/// that happens to declare fewer members.
+const MAX_ARTIFACT_MEMBERS: usize = 32_768;
+/// The most owner types one member lookup may walk while following an indexed
+/// owner's supertypes.
+///
+/// An indexed hierarchy comes from class files that were compiled separately
+/// and may disagree, so a cycle is possible; the visited set already stops one,
+/// and this bounds the work of a wide but acyclic hierarchy as well.
+const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
+const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v2";
+const JVM_EXTERNAL_INDEX_MEMO_DOMAIN: &[u8] = b"bifrost-jvm-external-index-memo/v1";
+/// Domain of the read-free identity of one JDK's selected JMOD set.
+const JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN: &[u8] = b"bifrost-jvm.jdk-jmod-set-source-identity/v1";
+const JDK_DISCOVERY_HOME_ID_DOMAIN: &[u8] = b"bifrost-jvm.jdk-discovery-home-id/v1";
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JvmExternalDeclarationIndex {
+    inventory_providers: Vec<String>,
+    types_by_fqn: HashMap<String, JvmExternalType>,
+    /// The member surface of every indexed owner whose own artifact entry this
+    /// index read to the end, keyed by the owner's fully-qualified name
+    /// (#1900).
+    ///
+    /// An owner with no entry here has no read member surface at all, which is
+    /// not the same as an owner that declares no members: see
+    /// [`JvmIndexedOwnerSurface`].
+    members_by_owner: HashMap<String, JvmIndexedOwnerSurface>,
+    production_diagnostics: Vec<ProducerDiagnostic>,
+    /// Stable, path-independent identity of the effective declaration surface
+    /// this index exposes to type, member, and hierarchy resolution.
+    dispatch_behavior_identity: OnceLock<StableDigest>,
+}
+
+pub(crate) fn get_or_build_external_declaration_index<'a>(
+    index: &'a OnceLock<Arc<JvmExternalDeclarationIndex>>,
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+    store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
+) -> &'a JvmExternalDeclarationIndex {
+    index
+        .get_or_init(|| {
+            JvmExternalDeclarationIndex::build_for_project_with_inventory(config, project, store)
+                .unwrap_or_else(|error| {
+                    eprintln!("JVM external inventory publication failed: {error}");
+                    JvmExternalDeclarationIndex::build_for_project(config, project)
+                })
+        })
+        .as_ref()
+}
+
+pub(crate) fn java_inventory_providers(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+) -> Vec<String> {
+    brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+        crate::analyzer::java::JavaAnalyzer,
+    >(analyzer)
+    .map(|java| {
+        java.external_declaration_index()
+            .inventory_providers
+            .clone()
+    })
+    .unwrap_or_default()
+}
+
+pub(crate) fn kotlin_inventory_providers(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+) -> Vec<String> {
+    brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+        crate::analyzer::kotlin::KotlinAnalyzer,
+    >(analyzer)
+    .map(|kotlin| {
+        kotlin
+            .external_declaration_index()
+            .inventory_providers
+            .clone()
+    })
+    .unwrap_or_default()
+}
+
+pub(crate) fn scala_inventory_providers(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+) -> Vec<String> {
+    brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+        crate::analyzer::scala::ScalaAnalyzer,
+    >(analyzer)
+    .map(|scala| {
+        scala
+            .external_declaration_index()
+            .inventory_providers
+            .clone()
+    })
+    .unwrap_or_default()
+}
+
+/// Whether the retained external index resolves a name from `access_package`.
+pub(crate) fn jvm_external_qualified_name_exists(
+    index: &JvmExternalDeclarationIndex,
+    fqn: &str,
+    access_package: &str,
+) -> bool {
+    index.resolve_qualified_name(fqn, access_package).is_some()
+}
+
+/// The member surface one indexed artifact type carries (#1900).
+///
+/// A surface exists only for an owner whose own archive entry passed the byte
+/// budget and parsed, which is what makes the absence of a surface mean "not
+/// read" rather than "declares nothing". This is the artifact half of the same
+/// distinction the pack half draws between a pack that ships an empty `members`
+/// array and no activated pack at all: in both halves only a positive
+/// declaration is ever added, and a lookup that finds none leaves the caller's
+/// status exactly where it was.
+#[derive(Debug, Clone, Default)]
+struct JvmIndexedOwnerSurface {
+    /// One entry per written member name. Overloads are one name and not
+    /// ambiguity -- `sort(List)` and `sort(List, Comparator)` are two
+    /// declarations a reference spells identically -- so the first declaration
+    /// read wins, which is the rule the pack half's `members_of` search already
+    /// applies.
+    members: HashMap<String, JvmExternalMember>,
+    /// The fully-qualified supertypes the owner's own artifact entry named, so
+    /// an inherited member is answered where it is declared. This is the
+    /// artifact half of the pack half's `SemanticModelOverlay::owner_surface`
+    /// closure.
+    supertypes: Vec<String>,
+    hierarchy_complete: bool,
+}
+
+/// What one Java artifact's declaration-fact production yielded, indexed the
+/// way the archive walk consumes it (#1900).
+///
+/// The producer emits a flat list of member facts that point at their owner by
+/// declaration id; the archive walk asks for one owner at a time, by
+/// fully-qualified name, as it finishes reading that owner's entry. This does
+/// the join once.
+struct JavaArtifactFacts {
+    types: HashMap<String, TypeFact>,
+    members_by_owner: HashMap<String, Vec<MemberFact>>,
+}
+
+impl JavaArtifactFacts {
+    fn new(types: HashMap<String, TypeFact>, members: Vec<MemberFact>) -> Self {
+        let name_by_id = types
+            .values()
+            .map(|fact| (fact.id.clone(), fact.name.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut members_by_owner: HashMap<String, Vec<MemberFact>> = HashMap::default();
+        for member in members {
+            // A member whose owner the production never emitted has no name to
+            // hang on, so nothing can spell it.
+            let Some(owner) = name_by_id.get(&member.owner) else {
+                continue;
+            };
+            members_by_owner
+                .entry(owner.clone())
+                .or_default()
+                .push(member);
+        }
+        Self {
+            types,
+            members_by_owner,
+        }
+    }
+
+    /// The member surface for one owner whose artifact entry was just read to
+    /// the end, charged against this artifact's member budget.
+    ///
+    /// Taking rather than borrowing keeps one owner's members from being
+    /// charged twice when the same class appears under two entries.
+    fn take_owner_surface(
+        &mut self,
+        owner_fqn: &str,
+        owner_package: &str,
+        budget: &mut MemberBudget,
+    ) -> JvmIndexedOwnerSurface {
+        let supertypes = self
+            .types
+            .get(owner_fqn)
+            .map(|fact| hierarchy_type_names(&fact.hierarchy))
+            .unwrap_or_default();
+        let hierarchy_complete = self
+            .types
+            .get(owner_fqn)
+            .and_then(|fact| fact.jvm_inventory.as_ref())
+            .is_some_and(|inventory| inventory.supertypes_complete);
+        let mut members = HashMap::default();
+        for fact in self.members_by_owner.remove(owner_fqn).unwrap_or_default() {
+            if !budget.take() {
+                break;
+            }
+            let is_static = fact.is_static;
+            let is_constant = fact.member_kind == MemberKind::Constant;
+            let shape = external_call_shape(
+                fact.member_kind,
+                semantic_visibility(fact.visibility),
+                is_static,
+                fact.signature.as_ref(),
+                fact.non_overridable,
+            );
+            let shapes_incomplete = callable_shape_is_incomplete(
+                fact.member_kind,
+                fact.signature.as_ref(),
+                fact.callable_family_complete,
+                shape.is_some(),
+            );
+            retain_external_member(
+                &mut members,
+                owner_fqn,
+                owner_package,
+                RetainedExternalMember {
+                    name: fact.name,
+                    visibility: semantic_visibility(fact.visibility),
+                    returns: fact.signature.and_then(|signature| signature.returns),
+                    is_static,
+                    is_constant,
+                    shape,
+                    shapes_incomplete,
+                },
+            );
+        }
+        if budget.exhausted {
+            mark_call_shapes_incomplete(&mut members);
+        }
+        JvmIndexedOwnerSurface {
+            members,
+            supertypes,
+            hierarchy_complete,
+        }
+    }
+}
+
+/// The per-artifact member-count bound [`MAX_ARTIFACT_MEMBERS`] states,
+/// carried across one artifact's whole archive walk.
+///
+/// Once it is spent the walk keeps indexing types and simply records no further
+/// members, and `exhausted` makes the artifact report as not fully read, so a
+/// member the bound dropped is unknown rather than absent.
+struct MemberBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl MemberBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_ARTIFACT_MEMBERS,
+            exhausted: false,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        match self.remaining.checked_sub(1) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                true
+            }
+            None => {
+                self.exhausted = true;
+                false
+            }
+        }
+    }
+}
+
+/// The fully-qualified supertype names one indexed type's hierarchy facts name.
+///
+/// A hierarchy target the producer could not name -- an erased type variable,
+/// an array -- is not a type a member surface can be read from, so it is
+/// dropped rather than guessed at.
+fn hierarchy_type_names(hierarchy: &[HierarchyFact]) -> Vec<String> {
+    hierarchy
+        .iter()
+        .filter_map(|relation| match &relation.target {
+            TypeRef::Named { name, .. } => (!name.is_empty()).then(|| name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmExternalType {
+    fqn: String,
+    package_name: String,
+    short_name: String,
+    kind: JvmExternalTypeKind,
+    visibility: JvmVisibility,
+    source: JvmExternalDeclarationSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JvmVisibility {
+    Public,
+    Protected,
+    PackagePrivate,
+    Private,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JvmExternalDeclarationSource {
+    SourceJar {
+        artifact_path: PathBuf,
+        source_path: String,
+    },
+    ClassFile {
+        artifact_path: PathBuf,
+        class_entry: String,
+    },
+    /// A declaration-facts record an activated semantic pack publishes
+    /// (#1893). There is no artifact on disk to point at: the pack itself is
+    /// the evidence, so the provenance recorded here is the pack that declared
+    /// the type and the declaration identity inside it.
+    SemanticPack {
+        pack_id: String,
+        declaration_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedJvmArtifact {
+    artifact_path: PathBuf,
+    source_artifact_path: Option<PathBuf>,
+    coordinate: Option<JvmMavenCoordinate>,
+    origin: JvmDependencyOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JvmDependencyOrigin {
+    ExplicitPath,
+    MavenReport,
+    GradleReport,
+    MavenRepository,
+    GradleCache,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JvmDependencyPackAdapter;
+
+impl JvmDependencyPackAdapter {
+    /// Build the exact JDK dependency when no local source archive is available.
+    pub fn jdk_dependency(version: JdkVersion) -> ResolvedDependency {
+        resolved_jdk_dependency(version, None)
+    }
+
+    /// Build the exact JDK source dependency used by the runtime resolver.
+    /// Release tooling uses this constructor so its production key includes
+    /// the same evidence and provenance as a locally discovered JDK.
+    pub fn jdk_source_dependency(
+        version: JdkVersion,
+        source_archive: PathBuf,
+    ) -> ResolvedDependency {
+        resolved_jdk_dependency(version, Some(source_archive))
+    }
+}
+
+pub fn resolve_jvm_semantic_pack_dependencies(
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyDiscoveryOutcome {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_discovery("JVM dependency discovery was cancelled");
+    }
+    let mut dependencies = config.external_dependencies.clone();
+    // What the build files *declare*, kept beside the coordinates themselves:
+    // scope and declaring target are properties of the declaration, and the
+    // merged coordinate list has already lost which file each came from.
+    let mut declarations = brokk_bifrost_core::hash::HashMap::default();
+    if config.dependency_discovery.mode != JvmDependencyDiscoveryMode::Disabled {
+        let discovered = discover_metadata(project);
+        declarations.clone_from(&discovered.declarations);
+        discovered.merge_into(&mut dependencies);
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_discovery("JVM dependency discovery was cancelled");
+    }
+    if config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
+        discover_build_tools(project, &config.dependency_discovery).merge_into(&mut dependencies);
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_discovery("JVM dependency discovery was cancelled");
+    }
+    let mut metadata_inputs_considered = dependencies
+        .artifact_paths
+        .len()
+        .saturating_add(dependencies.coordinates.len());
+    let resolved = resolve_configured_artifacts(&dependencies, project.root());
+    let mut resolved_coordinates = brokk_bifrost_core::hash::HashSet::default();
+    for artifact in &resolved {
+        if let Some(coordinate) = &artifact.coordinate {
+            resolved_coordinates.insert(coordinate.clone());
+        }
+    }
+    let mut diagnostics = Vec::new();
+    for coordinate in &dependencies.coordinates {
+        if !resolved_coordinates.contains(coordinate) {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "jvm.dependency_unresolved".to_owned(),
+                dependency_id: Some(jvm_coordinate_id(coordinate)),
+                location: None,
+                message: format!(
+                    "exact local artifact was not found for {}",
+                    jvm_coordinate_id(coordinate)
+                ),
+            });
+        }
+    }
+    // Dependencies dropped by the dependency limit are not diagnostics.
+    let mut suppressed_diagnostics = SuppressedDiagnostics {
+        warnings: resolved.len().saturating_sub(limits.max_dependencies),
+        errors: 0,
+    };
+    let dependency_limit_hit = suppressed_diagnostics.total() > 0;
+    let mut resolved_artifacts = resolved;
+    resolved_artifacts.truncate(limits.max_dependencies);
+    let mut resolved = Vec::with_capacity(resolved_artifacts.len());
+    for artifact in resolved_artifacts {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_discovery("JVM dependency discovery was cancelled");
+        }
+        let declaration = artifact
+            .coordinate
+            .as_ref()
+            .and_then(|coordinate| declarations.get(coordinate).cloned());
+        let mut dependency = resolved_semantic_pack_dependency_while(artifact, cancellation);
+        // A jar resolved out of a local repository proves the artifact; only a
+        // build file proves the scope, so a dependency with no declaration
+        // keeps `Unknown` rather than inheriting a neighbour's scope.
+        if let Some(declaration) = declaration {
+            dependency.scope = declaration.scope;
+            dependency.declared_by = declaration.declared_by;
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return cancelled_discovery("JVM dependency discovery was cancelled");
+        }
+        if dependency
+            .provenance
+            .iter()
+            .any(|entry| entry.key == "kotlin.classification" && entry.value == "incomplete")
+        {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Warning,
+                code: "kotlin.classification_incomplete".to_owned(),
+                dependency_id: Some(dependency.id.clone()),
+                location: None,
+                message: "bounded Kotlin metadata inspection was incomplete; the artifact was not treated as Java and requires a compatible prebuilt Kotlin pack"
+                    .to_owned(),
+            });
+        }
+        resolved.push(dependency);
+    }
+    let jdk_discovery = discover_jdk_semantic_pack_dependencies(
+        config,
+        project.root(),
+        config
+            .standard_library_discovery
+            .discover_java_home
+            .then(|| std::env::var_os("JAVA_HOME"))
+            .flatten(),
+    );
+    metadata_inputs_considered =
+        metadata_inputs_considered.saturating_add(jdk_discovery.inputs_considered);
+    resolved.extend(jdk_discovery.dependencies);
+    diagnostics.extend(jdk_discovery.diagnostics);
+    if dependency_limit_hit {
+        diagnostics.push(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: "limit.dependencies".to_owned(),
+            dependency_id: None,
+            location: None,
+            message: format!(
+                "JVM dependency discovery exceeded the configured limit {}",
+                limits.max_dependencies
+            ),
+        });
+    }
+    if resolved.len() > limits.max_dependencies {
+        suppressed_diagnostics.warnings = suppressed_diagnostics
+            .warnings
+            .saturating_add(resolved.len() - limits.max_dependencies);
+        resolved.truncate(limits.max_dependencies);
+        if !dependency_limit_hit {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "limit.dependencies".to_owned(),
+                dependency_id: None,
+                location: None,
+                message: format!(
+                    "JVM dependency discovery exceeded the configured limit {}",
+                    limits.max_dependencies
+                ),
+            });
+        }
+    }
+    // JVM discovery mixes warnings (incomplete Kotlin classification) with the
+    // errors that decide the outcome, so bound it through the shared collector
+    // instead of truncating: an error must keep a slot.
+    let mut bounded = BoundedDependencyDiagnostics::new(limits);
+    for diagnostic in diagnostics {
+        bounded.push(diagnostic);
+    }
+    let (diagnostics, bounded_suppressed) = bounded.finish();
+    suppressed_diagnostics += bounded_suppressed;
+    DependencyDiscoveryOutcome {
+        profile: DependencyDiscoveryProfile {
+            metadata_inputs_considered,
+            dependencies_resolved: resolved.len(),
+            informational_evidence: Vec::new(),
+        },
+        dependencies: resolved,
+        complete: !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error)
+            && suppressed_diagnostics.total() == 0,
+        diagnostics,
+        suppressed_diagnostics,
+        cancelled: false,
+    }
+}
+
+fn cancelled_discovery(message: &str) -> DependencyDiscoveryOutcome {
+    DependencyDiscoveryOutcome::cancelled_with_message(message)
+}
+
+fn jvm_coordinate_id(coordinate: &JvmMavenCoordinate) -> String {
+    format!(
+        "{}:{}:{}",
+        coordinate.group_id, coordinate.artifact_id, coordinate.version
+    )
+}
+
+#[derive(Debug, Default)]
+struct JdkDiscovery {
+    dependencies: Vec<ResolvedDependency>,
+    diagnostics: Vec<DependencyPackDiagnostic>,
+    inputs_considered: usize,
+}
+
+fn discover_jdk_semantic_pack_dependencies(
+    config: &JvmAnalyzerConfig,
+    project_root: &Path,
+    java_home: Option<OsString>,
+) -> JdkDiscovery {
+    let mut candidates: Vec<(PathBuf, bool)> = config
+        .standard_library_discovery
+        .jdk_homes
+        .iter()
+        .map(|home| (resolve_path(project_root, home), true))
+        .collect();
+    candidates.extend(
+        config
+            .standard_library_discovery
+            .source_toolchains
+            .iter()
+            .map(|binding| (resolve_path(project_root, binding.jdk_home()), true)),
+    );
+    if let Some(java_home) = java_home.filter(|value| !value.is_empty()) {
+        candidates.push((resolve_path(project_root, Path::new(&java_home)), false));
+    }
+
+    let discovery_requested =
+        !candidates.is_empty() || config.standard_library_discovery.discover_java_home;
+    let mut discovery = JdkDiscovery {
+        inputs_considered: candidates.len(),
+        ..JdkDiscovery::default()
+    };
+    let mut seen_homes = brokk_bifrost_core::hash::HashSet::default();
+    let mut dependency_homes = Vec::new();
+    for (candidate, configured) in candidates {
+        let home = fs::canonicalize(&candidate).unwrap_or(candidate);
+        if !seen_homes.insert(home.clone()) {
+            continue;
+        }
+        let release = match read_jdk_release(&home) {
+            Ok(release) => release,
+            Err(message) => {
+                discovery.diagnostics.push(DependencyPackDiagnostic {
+                    severity: if configured {
+                        DependencyPackDiagnosticSeverity::Error
+                    } else {
+                        DependencyPackDiagnosticSeverity::Warning
+                    },
+                    code: "jdk.home.invalid".to_owned(),
+                    dependency_id: None,
+                    location: Some(home.to_string_lossy().into_owned()),
+                    message,
+                });
+                continue;
+            }
+        };
+        let version = release.version.clone();
+        let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
+            .into_iter()
+            .find(|path| path.is_file());
+        let dependency = if !configured {
+            match discover_jdk_jmods(&home) {
+                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home.clone(), jmods),
+                Ok(None) => resolved_jdk_dependency(version.clone(), source),
+                Err(message) => {
+                    discovery.diagnostics.push(DependencyPackDiagnostic {
+                        severity: DependencyPackDiagnosticSeverity::Warning,
+                        code: "jdk.jmods.invalid".to_owned(),
+                        dependency_id: Some(format!("jdk:{version}")),
+                        location: Some(home.to_string_lossy().into_owned()),
+                        message,
+                    });
+                    resolved_jdk_dependency(version.clone(), source)
+                }
+            }
+        } else if let Some(source) = source {
+            let mut dependency = resolved_jdk_dependency(version.clone(), Some(source));
+            match discover_jdk_jmods(&home) {
+                Ok(Some(jmods)) => dependency
+                    .artifacts
+                    .push(jdk_jmod_set_artifact(&release, &home, &jmods)),
+                Ok(None) => {}
+                Err(message) => discovery.diagnostics.push(DependencyPackDiagnostic {
+                    severity: if configured {
+                        DependencyPackDiagnosticSeverity::Error
+                    } else {
+                        DependencyPackDiagnosticSeverity::Warning
+                    },
+                    code: "jdk.jmods.invalid".to_owned(),
+                    dependency_id: Some(format!("jdk:{version}")),
+                    location: Some(home.to_string_lossy().into_owned()),
+                    message,
+                }),
+            }
+            dependency
+        } else {
+            match discover_jdk_jmods(&home) {
+                Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home.clone(), jmods),
+                Ok(None) => resolved_jdk_dependency(version.clone(), None),
+                Err(message) => {
+                    discovery.diagnostics.push(DependencyPackDiagnostic {
+                        severity: if configured {
+                            DependencyPackDiagnosticSeverity::Error
+                        } else {
+                            DependencyPackDiagnosticSeverity::Warning
+                        },
+                        code: "jdk.jmods.invalid".to_owned(),
+                        dependency_id: Some(format!("jdk:{version}")),
+                        location: Some(home.to_string_lossy().into_owned()),
+                        message,
+                    });
+                    resolved_jdk_dependency(version.clone(), None)
+                }
+            }
+        };
+        // Distinct homes can report the same version while carrying different
+        // source or JMOD artifacts. Preparation supplies the exact digest;
+        // coalescing by release version here would erase one source binding.
+        dependency_homes.push(home);
+        discovery.dependencies.push(dependency);
+    }
+    let mut id_counts = HashMap::default();
+    for dependency in &discovery.dependencies {
+        *id_counts.entry(dependency.id.clone()).or_insert(0usize) += 1;
+    }
+    for (dependency, home) in discovery.dependencies.iter_mut().zip(dependency_homes) {
+        if id_counts[&dependency.id] > 1 {
+            // The ID correlates discovery with preparation in this run; the
+            // prepared input digest, not this path-derived suffix, is the
+            // artifact proof. Single-home IDs keep their existing display.
+            let mut digest = LengthDelimitedDigest::new(JDK_DISCOVERY_HOME_ID_DOMAIN);
+            digest.push(home.as_os_str().as_encoded_bytes());
+            dependency.id = format!("{}@{}", dependency.id, digest.finish());
+        }
+    }
+    if discovery.dependencies.is_empty() && discovery.diagnostics.is_empty() && discovery_requested
+    {
+        discovery.diagnostics.push(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Warning,
+            code: "jdk.home.unavailable".to_owned(),
+            dependency_id: None,
+            location: None,
+            message: "no usable JDK was discovered; JVM standard-library semantic packs are inactive. Set JAVA_HOME to a JDK installation in the language-server process environment and restart Bifrost"
+                .to_owned(),
+        });
+    }
+    discovery
+}
+
+/// The discovered home of one JDK dependency, derived only from the artifact
+/// layout that discovery itself emitted. This identifies the configured input
+/// for host-side correlation; it is never an artifact-content proof.
+pub(crate) fn jdk_home_for_dependency(dependency: &ResolvedDependency) -> Option<&Path> {
+    if dependency.evidence.ecosystem != "jdk" {
+        return None;
+    }
+    let mut selected = None;
+    for artifact in &dependency.artifacts {
+        let home = match artifact.kind {
+            ExternalArtifactKind::JdkJmodSet => artifact.path(),
+            ExternalArtifactKind::JdkSourceZip => {
+                let parent = artifact.path().parent()?;
+                if parent.file_name().is_some_and(|name| name == "lib") {
+                    parent.parent()?
+                } else {
+                    parent
+                }
+            }
+            _ => return None,
+        };
+        match selected {
+            Some(previous) if previous != home => return None,
+            None => selected = Some(home),
+            _ => {}
+        }
+    }
+    selected
+}
+
+/// One selected JMOD archive with the filesystem metadata that stands in for
+/// its bytes in the read-free source identity.
+///
+/// The discovery already inspects every candidate archive to prove it is a
+/// real regular file, so the length and modification time cost no extra read.
+/// `modified` is `None` when the filesystem would not report one, which is the
+/// signal that this archive gets no identity at all rather than an identity
+/// that spells "unknown" the same way a real timestamp would.
+struct JdkJmodFile {
+    relative_path: PathBuf,
+    bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<JdkJmodFile>>, String> {
+    let jmods = home.join("jmods");
+    let metadata = match fs::symlink_metadata(&jmods) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect JDK jmods directory: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("JDK jmods path is not a real directory".to_owned());
+    }
+    let mut paths = Vec::new();
+    let mut entries_seen = 0usize;
+    let entries = fs::read_dir(&jmods)
+        .map_err(|error| format!("could not read JDK jmods directory: {error}"))?;
+    for entry in entries {
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > MAX_JDK_JMOD_FILES {
+            return Err(format!(
+                "JDK jmods directory contains more than {MAX_JDK_JMOD_FILES} bounded entries"
+            ));
+        }
+        let entry = entry.map_err(|error| format!("could not read JDK jmod entry: {error}"))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jmod") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("could not inspect JDK jmod {name}: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        paths.push(JdkJmodFile {
+            relative_path: PathBuf::from("jmods").join(name),
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
+    }
+    paths.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if paths.len() > MAX_JDK_JMOD_FILES {
+        return Err(format!(
+            "JDK jmods directory contains more than {MAX_JDK_JMOD_FILES} bounded archives"
+        ));
+    }
+    Ok((!paths.is_empty()).then_some(paths))
+}
+
+/// A JDK `JAVA_VERSION` exactly as the `release` file spells it: one to four
+/// dotted decimal components (`21`, `21.0.8`, `21.0.12.1`). Temurin patch
+/// releases carry the fourth component, which is not semver, so the raw
+/// spelling is the dependency identity and the semver view exists only for
+/// catalog toolchain comparisons (#2874).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JdkVersion {
+    raw: String,
+    components: Vec<u64>,
+}
+
+impl JdkVersion {
+    /// `feature.interim.update.patch` (JEP 322) is the longest version string
+    /// a JDK `release` file declares.
+    const MAX_COMPONENTS: usize = 4;
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut components = Vec::with_capacity(Self::MAX_COMPONENTS);
+        for component in raw.split('.') {
+            // `u64::from_str` accepts a leading `+`, and a JDK 8 spelling such
+            // as `1.8.0_392` must stay rejected, so the digits are checked
+            // before the conversion.
+            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{component:?} is not a decimal component"));
+            }
+            if components.len() == Self::MAX_COMPONENTS {
+                return Err(format!(
+                    "more than {} dotted components",
+                    Self::MAX_COMPONENTS
+                ));
+            }
+            components.push(u64::from_str(component).map_err(|error| {
+                format!("component {component:?} does not fit in 64 bits: {error}")
+            })?);
+        }
+        debug_assert!(
+            !components.is_empty(),
+            "split('.') yields at least one component, and an empty one is rejected above"
+        );
+        Ok(Self {
+            raw: raw.to_owned(),
+            components,
+        })
+    }
+
+    /// The three-component view the catalog's semver toolchain coordinate
+    /// compares against. A fourth component is a JDK patch release, which is
+    /// below semver's resolution, and missing components are zero.
+    fn semver(&self) -> Version {
+        let component = |index: usize| self.components.get(index).copied().unwrap_or(0);
+        Version::new(component(0), component(1), component(2))
+    }
+}
+
+impl std::fmt::Display for JdkVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.raw)
+    }
+}
+
+/// A JDK home's `release` file: the version it declares, and the exact bytes
+/// that declared it.
+///
+/// Those bytes are the JDK-level half of the read-free JMOD set identity
+/// ([`jdk_jmod_set_source_identity`]). The discovery reads the file anyway to
+/// learn the version, so identity costs no additional read.
+struct JdkRelease {
+    version: JdkVersion,
+    bytes: Vec<u8>,
+}
+
+fn read_jdk_release(home: &Path) -> Result<JdkRelease, String> {
+    const MAX_RELEASE_BYTES: u64 = 64 * 1024;
+
+    let release_path = home.join("release");
+    let metadata = fs::metadata(&release_path)
+        .map_err(|error| format!("JDK home does not contain a readable release file: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_RELEASE_BYTES {
+        return Err("JDK release file is not a bounded regular file".to_owned());
+    }
+    let mut release_bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&release_path)
+        .and_then(|file| {
+            file.take(MAX_RELEASE_BYTES.saturating_add(1))
+                .read_to_end(&mut release_bytes)
+        })
+        .map_err(|error| format!("could not read JDK release file: {error}"))?;
+    if release_bytes.len() as u64 > MAX_RELEASE_BYTES {
+        return Err("JDK release file grew beyond the bounded read limit".to_owned());
+    }
+    let release = std::str::from_utf8(&release_bytes)
+        .map_err(|error| format!("JDK release file is not valid UTF-8 text: {error}"))?;
+    let mut values = release.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "JAVA_VERSION").then_some(value.trim().trim_matches('"'))
+    });
+    let raw = values
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "JDK release file does not declare JAVA_VERSION".to_owned())?;
+    if values.next().is_some() {
+        return Err("JDK release file declares JAVA_VERSION more than once".to_owned());
+    }
+    let version = JdkVersion::parse(raw).map_err(|error| {
+        format!("JDK JAVA_VERSION {raw:?} is not a dotted JDK version: {error}")
+    })?;
+    Ok(JdkRelease {
+        version,
+        bytes: release_bytes,
+    })
+}
+
+fn resolved_jdk_dependency(
+    version: JdkVersion,
+    source_archive: Option<PathBuf>,
+) -> ResolvedDependency {
+    ResolvedDependency {
+        id: format!("jdk:{version}"),
+        evidence: SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(version.semver()),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance: vec![DependencyProvenance {
+            key: "version".to_owned(),
+            value: version.to_string(),
+        }],
+        artifacts: source_archive
+            .map(|path| {
+                let identity = jdk_source_zip_identity(&path);
+                let artifact = ResolvedDependencyArtifact::file(
+                    DependencyArtifactRole::Sources,
+                    ExternalArtifactKind::JdkSourceZip,
+                    path,
+                );
+                match identity {
+                    Some(identity) => artifact.with_source_identity(identity),
+                    None => artifact,
+                }
+            })
+            .into_iter()
+            .collect(),
+        scope: DependencyScope::Unknown,
+        declared_by: None,
+    }
+}
+
+// Include file replacement and metadata change identity, not just length/mtime:
+// an installer may preserve the archive's timestamp. Platforms without a
+// change-time identity retain the exact-read path.
+fn jdk_source_zip_identity(path: &Path) -> Option<ArtifactSourceIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let canonical = path.canonicalize().ok()?;
+        let metadata = fs::metadata(&canonical).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.jdk-source-zip-state.v1");
+        digest.push(canonical.as_os_str().as_encoded_bytes());
+        digest.push(&metadata.dev().to_le_bytes());
+        digest.push(&metadata.ino().to_le_bytes());
+        digest.push(&metadata.len().to_le_bytes());
+        digest.push(&metadata.mtime().to_le_bytes());
+        digest.push(&metadata.mtime_nsec().to_le_bytes());
+        digest.push(&metadata.ctime().to_le_bytes());
+        digest.push(&metadata.ctime_nsec().to_le_bytes());
+        Some(ArtifactSourceIdentity::from_digest(
+            digest.finish().to_string(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn resolved_jdk_jmod_dependency(
+    release: &JdkRelease,
+    home: PathBuf,
+    jmods: Vec<JdkJmodFile>,
+) -> ResolvedDependency {
+    let mut dependency = resolved_jdk_dependency(release.version.clone(), None);
+    dependency.artifacts = vec![jdk_jmod_set_artifact(release, &home, &jmods)];
+    dependency
+}
+
+/// The `JdkJmodSet` artifact of one JDK home, carrying the read-free identity
+/// of the selected archives when the discovery could derive one.
+///
+/// The identity only decides whether a later process looks in the catalog
+/// before reading; a JDK with no derivable identity (an archive without a
+/// modification time) produces exactly the artifact it produced before.
+fn jdk_jmod_set_artifact(
+    release: &JdkRelease,
+    home: &Path,
+    jmods: &[JdkJmodFile],
+) -> ResolvedDependencyArtifact {
+    let artifact = ResolvedDependencyArtifact::source_set(
+        DependencyArtifactRole::Binary,
+        ExternalArtifactKind::JdkJmodSet,
+        home.to_path_buf(),
+        jmods
+            .iter()
+            .map(|jmod| jmod.relative_path.clone())
+            .collect(),
+    );
+    match jdk_jmod_set_source_identity(&release.bytes, jmods) {
+        Some(identity) => artifact.with_source_identity(identity),
+        None => artifact,
+    }
+}
+
+/// Derive the read-free identity of one JDK's selected JMOD set from the
+/// `release` bytes and each archive's relative path, length, and modification
+/// time.
+///
+/// This is the same stand-in for artifact bytes the external declaration index
+/// already uses ([`push_artifact_file_evidence`]): cheap filesystem metadata
+/// that changes whenever the installed JDK changes. It never decides what a
+/// production contains, so a false match would only cost a lookup; the exact
+/// read and its digests remain the authority for the pack's contents.
+fn jdk_jmod_set_source_identity(
+    release_bytes: &[u8],
+    jmods: &[JdkJmodFile],
+) -> Option<ArtifactSourceIdentity> {
+    if jmods.is_empty() {
+        return None;
+    }
+    let mut digest = LengthDelimitedDigest::new(JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN);
+    digest.push(release_bytes);
+    digest.push(&(jmods.len() as u64).to_le_bytes());
+    for jmod in jmods {
+        digest.push(jmod.relative_path.as_os_str().as_encoded_bytes());
+        digest.push(&jmod.bytes.to_le_bytes());
+        let modified = jmod.modified?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        digest.push(&modified.as_secs().to_le_bytes());
+        digest.push(&modified.subsec_nanos().to_le_bytes());
+    }
+    Some(ArtifactSourceIdentity::from_digest(
+        digest.finish().to_string(),
+    ))
+}
+
+impl DependencyPackAdapter for JvmDependencyPackAdapter {
+    fn adapter_name(&self) -> &str {
+        "bifrost-jvm-dependency"
+    }
+
+    fn producer(&self) -> Producer {
+        Producer::for_name("bifrost-jvm-dependency")
+    }
+
+    fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
+        !matches!(dependency.evidence.language.as_str(), "scala" | "kotlin")
+            || dependency.artifacts.iter().any(|artifact| {
+                artifact.kind
+                    == if dependency.evidence.language == "scala" {
+                        ExternalArtifactKind::ScalaSourceJar
+                    } else {
+                        ExternalArtifactKind::KotlinSourceJar
+                    }
+            })
+    }
+
+    fn produce(
+        &self,
+        dependency: &ResolvedDependency,
+        artifacts: &[ExactDependencyArtifact],
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> DependencyPackProduction {
+        let request = jvm_dependency_production_request(dependency);
+        let mut diagnostics = Vec::new();
+        let mut suppressed_diagnostics = SuppressedDiagnostics::default();
+        let mut source_pack = None;
+        let mut binary_pack = None;
+        let mut partial = false;
+        for artifact in artifacts {
+            let mut artifact_request = request.clone();
+            artifact_request.path = artifact.path().to_owned();
+            artifact_request.artifact_kind = artifact.kind();
+            let production = match artifact.kind() {
+                ExternalArtifactKind::ScalaSourceJar => ScalaSourceJarPackProducer
+                    .produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    ),
+                ExternalArtifactKind::KotlinSourceJar => KotlinSourceJarPackProducer
+                    .produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    ),
+                ExternalArtifactKind::JavaSourceJar | ExternalArtifactKind::JavaClassJar => {
+                    JavaJarPackProducer.produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    )
+                }
+                ExternalArtifactKind::JdkSourceZip => {
+                    match detect_jdk_source_archive_layout(artifact.exact()) {
+                        Ok(layout) => JdkSourceArchivePackProducer::new(layout)
+                            .produce_loaded_artifact(
+                                &artifact_request,
+                                limits,
+                                cancellation,
+                                artifact.exact(),
+                            ),
+                        Err(diagnostic) => ArtifactProduction::failed(diagnostic, limits),
+                    }
+                }
+                ExternalArtifactKind::JdkJmodSet => JdkJmodSetPackProducer.produce_loaded_artifact(
+                    &artifact_request,
+                    limits,
+                    cancellation,
+                    artifact.exact(),
+                ),
+                kind => ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        source_entry: None,
+                        code: "artifact.kind".to_owned(),
+                        location: Some(artifact.path().to_string_lossy().into_owned()),
+                        declaration: None,
+                        message: format!("unsupported JVM dependency artifact kind {kind:?}"),
+                    },
+                    limits,
+                ),
+            };
+            debug_assert_eq!(
+                production.artifact_sha256.as_deref(),
+                Some(artifact.sha256())
+            );
+            partial |= production.completeness == Completeness::Partial;
+            diagnostics.extend(production.diagnostics);
+            suppressed_diagnostics += production.suppressed_diagnostics;
+            match (artifact.role(), production.pack) {
+                (DependencyArtifactRole::Sources, Some(pack)) => source_pack = Some(pack),
+                (DependencyArtifactRole::Binary, Some(mut pack)) => {
+                    normalize_artifact_locator_paths(
+                        &mut pack,
+                        &format!("sha256-{}.artifact", artifact.sha256()),
+                    );
+                    binary_pack = Some(pack);
+                }
+                (_, Some(_)) => diagnostics.push(ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    source_entry: None,
+                    code: "artifact.role".to_owned(),
+                    location: Some(artifact.path().to_string_lossy().into_owned()),
+                    declaration: None,
+                    message: "JVM dependency requires binary or sources artifact roles".to_owned(),
+                }),
+                (_, None) => {}
+            }
+        }
+        let pack = merge_java_dependency_packs(
+            source_pack,
+            binary_pack,
+            &mut diagnostics,
+            &mut suppressed_diagnostics,
+            limits,
+        );
+        let mut pack = pack;
+        if let Some(pack) = pack.as_mut() {
+            pack.producer = self.producer();
+            if partial || !diagnostics.is_empty() || suppressed_diagnostics.total() > 0 {
+                pack.completeness = Completeness::Partial;
+            }
+        }
+        DependencyPackProduction {
+            pack,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+}
+
+#[cfg(test)]
+fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedDependency {
+    resolved_semantic_pack_dependency_while(artifact, None)
+}
+
+fn resolved_semantic_pack_dependency_while(
+    artifact: ResolvedJvmArtifact,
+    cancellation: Option<&CancellationToken>,
+) -> ResolvedDependency {
+    let scala_library = artifact
+        .coordinate
+        .as_ref()
+        .is_some_and(is_scala_library_coordinate);
+    let source_path = if is_source_jar(&artifact.artifact_path) {
+        Some(artifact.artifact_path.as_path())
+    } else {
+        artifact.source_artifact_path.as_deref()
+    };
+    let kotlin_source = source_path
+        .map(|path| classify_kotlin_source(path, cancellation))
+        .unwrap_or(KotlinArchiveClassification::Absent);
+    let kotlin_binary = if kotlin_source == KotlinArchiveClassification::Present
+        || is_source_jar(&artifact.artifact_path)
+    {
+        KotlinArchiveClassification::Absent
+    } else {
+        classify_kotlin_metadata(&artifact.artifact_path, cancellation)
+    };
+    let kotlin_stdlib = artifact
+        .coordinate
+        .as_ref()
+        .is_some_and(is_kotlin_stdlib_coordinate);
+    let kotlin = kotlin_source != KotlinArchiveClassification::Absent
+        || kotlin_binary != KotlinArchiveClassification::Absent
+        || kotlin_stdlib;
+    let kotlin_classification_incomplete = !kotlin_stdlib
+        && kotlin_source != KotlinArchiveClassification::Present
+        && kotlin_binary != KotlinArchiveClassification::Present
+        && (kotlin_source == KotlinArchiveClassification::Incomplete
+            || kotlin_binary == KotlinArchiveClassification::Incomplete);
+    let coordinate_id = artifact.coordinate.as_ref().map(|coordinate| {
+        format!(
+            "{}:{}:{}",
+            coordinate.group_id, coordinate.artifact_id, coordinate.version
+        )
+    });
+    let id = coordinate_id.unwrap_or_else(|| {
+        format!(
+            "explicit:{}",
+            artifact
+                .artifact_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        )
+    });
+    let ecosystem = if scala_library || kotlin_stdlib {
+        "maven"
+    } else {
+        match artifact.origin {
+            JvmDependencyOrigin::MavenReport | JvmDependencyOrigin::MavenRepository => "maven",
+            JvmDependencyOrigin::GradleReport | JvmDependencyOrigin::GradleCache => "gradle",
+            JvmDependencyOrigin::ExplicitPath => "jvm",
+        }
+    };
+    let package = artifact
+        .coordinate
+        .as_ref()
+        .map(|coordinate| CatalogCoordinate {
+            name: format!("{}:{}", coordinate.group_id, coordinate.artifact_id),
+            version: Version::parse(&coordinate.version).ok(),
+        });
+    let mut provenance = vec![DependencyProvenance {
+        key: "origin".to_owned(),
+        value: jvm_dependency_origin_name(artifact.origin).to_owned(),
+    }];
+    if let Some(coordinate) = &artifact.coordinate {
+        provenance.extend([
+            DependencyProvenance {
+                key: "group".to_owned(),
+                value: coordinate.group_id.clone(),
+            },
+            DependencyProvenance {
+                key: "artifact".to_owned(),
+                value: coordinate.artifact_id.clone(),
+            },
+            DependencyProvenance {
+                key: "version".to_owned(),
+                value: coordinate.version.clone(),
+            },
+        ]);
+    }
+    if kotlin_classification_incomplete {
+        provenance.push(DependencyProvenance {
+            key: "kotlin.classification".to_owned(),
+            value: "incomplete".to_owned(),
+        });
+    }
+    let source_kind = if scala_library {
+        ExternalArtifactKind::ScalaSourceJar
+    } else if kotlin {
+        ExternalArtifactKind::KotlinSourceJar
+    } else {
+        ExternalArtifactKind::JavaSourceJar
+    };
+    let artifacts = if is_source_jar(&artifact.artifact_path) {
+        vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Sources,
+            source_kind,
+            artifact.artifact_path,
+        )]
+    } else if (scala_library || kotlin) && artifact.source_artifact_path.is_some() {
+        vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Sources,
+            source_kind,
+            artifact
+                .source_artifact_path
+                .expect("source path was checked above"),
+        )]
+    } else {
+        let mut artifacts = vec![ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Binary,
+            ExternalArtifactKind::JavaClassJar,
+            artifact.artifact_path,
+        )];
+        if let Some(source_artifact_path) = artifact.source_artifact_path {
+            artifacts.push(ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Sources,
+                source_kind,
+                source_artifact_path,
+            ));
+        }
+        artifacts
+    };
+    ResolvedDependency {
+        id,
+        evidence: SemanticModelActivationEvidence {
+            language: if scala_library {
+                "scala"
+            } else if kotlin {
+                "kotlin"
+            } else {
+                "java"
+            }
+            .to_owned(),
+            ecosystem: ecosystem.to_owned(),
+            package,
+            module: (artifact.origin == JvmDependencyOrigin::ExplicitPath).then(|| {
+                CatalogCoordinate {
+                    name: "local-jvm-artifact".to_owned(),
+                    version: None,
+                }
+            }),
+            toolchain: (scala_library || kotlin_stdlib).then(|| CatalogCoordinate {
+                name: if scala_library { "scala" } else { "kotlin" }.to_owned(),
+                version: artifact
+                    .coordinate
+                    .as_ref()
+                    .and_then(|coordinate| Version::parse(&coordinate.version).ok()),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance,
+        artifacts,
+        scope: DependencyScope::Unknown,
+        declared_by: None,
+    }
+}
+
+fn is_scala_library_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
+    coordinate.group_id == "org.scala-lang"
+        && matches!(
+            coordinate.artifact_id.as_str(),
+            "scala-library" | "scala3-library_3"
+        )
+}
+
+fn is_kotlin_stdlib_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
+    coordinate.group_id == "org.jetbrains.kotlin"
+        && matches!(
+            coordinate.artifact_id.as_str(),
+            "kotlin-stdlib" | "kotlin-stdlib-common" | "kotlin-stdlib-jdk7" | "kotlin-stdlib-jdk8"
+        )
+}
+
+fn jvm_dependency_origin_name(origin: JvmDependencyOrigin) -> &'static str {
+    match origin {
+        JvmDependencyOrigin::ExplicitPath => "explicit_path",
+        JvmDependencyOrigin::MavenReport => "maven_report",
+        JvmDependencyOrigin::GradleReport => "gradle_report",
+        JvmDependencyOrigin::MavenRepository => "maven_repository",
+        JvmDependencyOrigin::GradleCache => "gradle_cache",
+    }
+}
+
+fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: PathBuf::new(),
+        artifact_kind: ExternalArtifactKind::JavaClassJar,
+        pack_id: format!("bifrost.external.{}", dependency.evidence.language),
+        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ecosystem: dependency.evidence.ecosystem.clone(),
+        compatibility: Compatibility {
+            bifrost: None,
+            toolchains: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(
+                    |coordinate| brokk_bifrost_analysis::analyzer::semantic_model::VersionConstraint {
+                        name: coordinate.name.clone(),
+                        requirement: coordinate
+                            .version
+                            .as_ref()
+                            .map(|version| format!("={version}"))
+                            .unwrap_or_else(|| "*".to_owned()),
+                    },
+                )
+                .into_iter()
+                .collect(),
+        },
+        activation: vec![
+            brokk_bifrost_semantic::analyzer::semantic_model::dependency::activation_selector_for_evidence(&dependency.evidence),
+        ],
+        provenance: Provenance {
+            source: "exact local JVM dependency".to_owned(),
+            revision: None,
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
+fn merge_java_dependency_packs(
+    source: Option<AuthoredSemanticModelPack>,
+    binary: Option<AuthoredSemanticModelPack>,
+    diagnostics: &mut Vec<ProducerDiagnostic>,
+    suppressed_diagnostics: &mut SuppressedDiagnostics,
+    limits: &ArtifactProducerLimits,
+) -> Option<AuthoredSemanticModelPack> {
+    let (mut pack, secondary) = match (source, binary) {
+        (Some(source), binary) => (source, binary),
+        (None, Some(binary)) => (binary, None),
+        (None, None) => return None,
+    };
+    let Some(secondary) = secondary else {
+        return Some(pack);
+    };
+    let mut type_indexes = HashMap::<String, (usize, usize)>::default();
+    let mut member_indexes = HashMap::<String, (usize, usize)>::default();
+    let mut relation_ids = brokk_bifrost_core::hash::HashSet::<String>::default();
+    for (shard_index, shard) in pack.shards.iter().enumerate() {
+        let AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } = &shard.payload
+        else {
+            continue;
+        };
+        type_indexes.extend(
+            types
+                .iter()
+                .enumerate()
+                .map(|(fact_index, fact)| (fact.id.clone(), (shard_index, fact_index))),
+        );
+        member_indexes.extend(
+            members
+                .iter()
+                .enumerate()
+                .map(|(fact_index, fact)| (fact.id.clone(), (shard_index, fact_index))),
+        );
+        relation_ids.extend(relations.iter().map(|fact| fact.id.clone()));
+    }
+    for shard in secondary.shards {
+        let AuthoredShard {
+            id,
+            activation,
+            payload,
+            runtime_values,
+            runtime_contracts,
+            collection_flows,
+            deferred_yields,
+            conditional_type_refinements,
+            callable_values,
+        } = shard;
+        let (secondary_types, secondary_members, secondary_relations) = match payload {
+            AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations,
+            } => (types, members, relations),
+            payload => {
+                if !pack.shards.iter().any(|shard| shard.id == id) {
+                    pack.shards.push(AuthoredShard {
+                        id,
+                        activation,
+                        payload,
+                        runtime_values,
+                        runtime_contracts,
+                        collection_flows,
+                        deferred_yields,
+                        conditional_type_refinements,
+                        callable_values,
+                    });
+                }
+                continue;
+            }
+        };
+        assert!(
+            callable_values.is_none(),
+            "JVM extraction cannot produce callable values"
+        );
+        assert!(
+            runtime_contracts.is_none(),
+            "JVM declaration extraction cannot produce portable runtime contracts"
+        );
+        let target_shard_index = pack
+            .shards
+            .iter()
+            .position(|shard| shard.id == id)
+            .unwrap_or_else(|| {
+                let index = pack.shards.len();
+                pack.shards.push(AuthoredShard {
+                    id,
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types: Vec::new(),
+                        members: Vec::new(),
+                        relations: Vec::new(),
+                    },
+                    runtime_values: None,
+                    runtime_contracts: None,
+                    collection_flows: None,
+                    deferred_yields: None,
+                    conditional_type_refinements: None,
+                    callable_values: None,
+                });
+                index
+            });
+        if let Some(mut refinements) = conditional_type_refinements {
+            pack.shards[target_shard_index]
+                .conditional_type_refinements
+                .get_or_insert_with(|| {
+                    brokk_bifrost_analysis::analyzer::semantic_model::ConditionalTypeRefinementsPayload {
+                        refinements: Vec::new(),
+                    }
+                })
+                .refinements
+                .append(&mut refinements.refinements);
+        }
+        for fact in secondary_types {
+            if let Some((shard_index, fact_index)) = type_indexes.get(&fact.id).copied() {
+                let AuthoredPayload::DeclarationFacts { types, .. } =
+                    &pack.shards[shard_index].payload
+                else {
+                    unreachable!("Java fact indexes name declaration-fact shards")
+                };
+                if !equivalent_java_type_fact(&types[fact_index], &fact) {
+                    push_java_merge_conflict(diagnostics, suppressed_diagnostics, limits, &fact.id);
+                }
+            } else {
+                let AuthoredPayload::DeclarationFacts { types, .. } =
+                    &mut pack.shards[target_shard_index].payload
+                else {
+                    unreachable!("Java merge targets a declaration-fact shard")
+                };
+                type_indexes.insert(fact.id.clone(), (target_shard_index, types.len()));
+                types.push(fact);
+            }
+        }
+        for fact in secondary_members {
+            if let Some((shard_index, fact_index)) = member_indexes.get(&fact.id).copied() {
+                let equivalent = {
+                    let AuthoredPayload::DeclarationFacts { members, .. } =
+                        &pack.shards[shard_index].payload
+                    else {
+                        unreachable!("Java fact indexes name declaration-fact shards")
+                    };
+                    equivalent_java_member_fact(&members[fact_index], &fact)
+                };
+                if !equivalent {
+                    push_java_merge_conflict(diagnostics, suppressed_diagnostics, limits, &fact.id);
+                } else {
+                    let AuthoredPayload::DeclarationFacts { members, .. } =
+                        &mut pack.shards[shard_index].payload
+                    else {
+                        unreachable!("Java fact indexes name declaration-fact shards")
+                    };
+                    members[fact_index].callable_family_complete |= fact.callable_family_complete;
+                }
+            } else {
+                let AuthoredPayload::DeclarationFacts { members, .. } =
+                    &mut pack.shards[target_shard_index].payload
+                else {
+                    unreachable!("Java merge targets a declaration-fact shard")
+                };
+                member_indexes.insert(fact.id.clone(), (target_shard_index, members.len()));
+                members.push(fact);
+            }
+        }
+        for fact in secondary_relations {
+            if relation_ids.insert(fact.id.clone()) {
+                let AuthoredPayload::DeclarationFacts { relations, .. } =
+                    &mut pack.shards[target_shard_index].payload
+                else {
+                    unreachable!("Java merge targets a declaration-fact shard")
+                };
+                relations.push(fact);
+            }
+        }
+    }
+    Some(pack)
+}
+
+fn equivalent_java_type_fact(left: &TypeFact, right: &TypeFact) -> bool {
+    equivalent_java_type_identity(left, right)
+        && !left
+            .hierarchy
+            .iter()
+            .any(|edge| edge.target.contains_unknown())
+        && !right
+            .hierarchy
+            .iter()
+            .any(|edge| edge.target.contains_unknown())
+        && left.hierarchy == right.hierarchy
+        && left.aliases == right.aliases
+        && left.extension_surfaces == right.extension_surfaces
+}
+
+fn equivalent_java_member_fact(left: &MemberFact, right: &MemberFact) -> bool {
+    left.id == right.id
+        && left.owner == right.owner
+        && left.name == right.name
+        && left.member_kind == right.member_kind
+        && left.visibility == right.visibility
+        && left.is_static == right.is_static
+        && left.is_abstract == right.is_abstract
+        && left.is_virtual == right.is_virtual
+        && left.non_overridable == right.non_overridable
+        && equivalent_java_signature(left.signature.as_ref(), right.signature.as_ref())
+        && left.aliases == right.aliases
+}
+
+fn equivalent_java_signature(left: Option<&Signature>, right: Option<&Signature>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            if left.contains_unknown_types() || right.contains_unknown_types() {
+                return false;
+            }
+            left.type_parameters.len() == right.type_parameters.len()
+                && left.returns == right.returns
+                && left.parameters.len() == right.parameters.len()
+                && left
+                    .parameters
+                    .iter()
+                    .zip(&right.parameters)
+                    .all(|(left, right)| {
+                        left.r#type == right.r#type && left.variadic == right.variadic
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn push_java_merge_conflict(
+    diagnostics: &mut Vec<ProducerDiagnostic>,
+    suppressed_diagnostics: &mut SuppressedDiagnostics,
+    limits: &ArtifactProducerLimits,
+    declaration_id: &str,
+) {
+    if diagnostics.len() >= limits.max_diagnostics {
+        suppressed_diagnostics.warnings = suppressed_diagnostics.warnings.saturating_add(1);
+        return;
+    }
+    diagnostics.push(ProducerDiagnostic {
+        severity: ProducerDiagnosticSeverity::Warning,
+        source_entry: None,
+        code: "java.source_binary_conflict".to_owned(),
+        location: Some(declaration_id.to_owned()),
+        declaration: None,
+        message: "source and binary facts disagree; deterministic source facts were kept"
+            .to_owned(),
+    });
+}
+
+/// Process-wide memo of built external declaration indexes, keyed by the
+/// dependency-discovery evidence digest from [`external_index_memo_key`].
+///
+/// Entries are retained for the life of the process. The set of distinct
+/// dependency universes a process observes is small -- it grows only when a
+/// dependency jar set actually changes -- and each retained index is the
+/// bounded product of `build_from_artifacts`, so retention is the same cost a
+/// long-lived server already pays through its analyzers' `OnceLock` cells.
+fn external_index_memo() -> &'static Mutex<HashMap<StableDigest, Arc<JvmExternalDeclarationIndex>>>
+{
+    static MEMO: OnceLock<Mutex<HashMap<StableDigest, Arc<JvmExternalDeclarationIndex>>>> =
+        OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// Digest of everything [`JvmExternalDeclarationIndex::build_for_project`]'s
+/// result is a function of, past the discovery step it always runs.
+///
+/// That is the ordered resolved artifact files -- their paths plus the length
+/// and mtime evidence that the bytes behind each path are unchanged -- and the
+/// discovery diagnostics the built index appends verbatim. Coordinates,
+/// provenance, and scope are deliberately absent: `build_from_artifacts` never
+/// reads them, so two discoveries that resolve the same files must share one
+/// index.
+fn external_index_memo_key(
+    artifacts: &[ResolvedJvmArtifact],
+    diagnostics: &[ProducerDiagnostic],
+) -> StableDigest {
+    let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_INDEX_MEMO_DOMAIN);
+    digest.push(&(artifacts.len() as u64).to_le_bytes());
+    for artifact in artifacts {
+        push_artifact_file_evidence(&mut digest, &artifact.artifact_path);
+        match artifact.source_artifact_path.as_deref() {
+            Some(path) => push_artifact_file_evidence(&mut digest, path),
+            None => digest.push(b"no-sources"),
+        }
+    }
+    digest.push(&(diagnostics.len() as u64).to_le_bytes());
+    for diagnostic in diagnostics {
+        digest.push(match diagnostic.severity {
+            ProducerDiagnosticSeverity::Warning => b"warning",
+            ProducerDiagnosticSeverity::Error => b"error",
+        });
+        digest.push(diagnostic.code.as_bytes());
+        push_optional_bytes(
+            &mut digest,
+            diagnostic.source_entry.as_deref().map(str::as_bytes),
+        );
+        push_optional_bytes(
+            &mut digest,
+            diagnostic.location.as_deref().map(str::as_bytes),
+        );
+        push_optional_bytes(
+            &mut digest,
+            diagnostic.declaration.as_deref().map(str::as_bytes),
+        );
+        digest.push(diagnostic.message.as_bytes());
+    }
+    digest.finish()
+}
+
+/// Push one artifact file's identity: its path and, when the file is
+/// readable, the length and mtime that stand in for its bytes. A missing or
+/// unreadable file is its own evidence -- the index built from it records the
+/// read failure, so it must not collide with a readable file at the same path.
+fn push_artifact_file_evidence(digest: &mut LengthDelimitedDigest, path: &Path) {
+    digest.push(path.as_os_str().as_encoded_bytes());
+    let Ok(metadata) = fs::metadata(path) else {
+        digest.push(b"unreadable");
+        return;
+    };
+    digest.push(&metadata.len().to_le_bytes());
+    match metadata
+        .modified()
+        .map(|mtime| mtime.duration_since(std::time::UNIX_EPOCH))
+    {
+        Ok(Ok(since_epoch)) => {
+            digest.push(b"mtime");
+            digest.push(&since_epoch.as_secs().to_le_bytes());
+            digest.push(&since_epoch.subsec_nanos().to_le_bytes());
+        }
+        Ok(Err(before_epoch)) => {
+            let duration = before_epoch.duration();
+            digest.push(b"mtime-before-epoch");
+            digest.push(&duration.as_secs().to_le_bytes());
+            digest.push(&duration.subsec_nanos().to_le_bytes());
+        }
+        Err(_) => digest.push(b"no-mtime"),
+    }
+}
+
+impl JvmExternalDeclarationIndex {
+    #[cfg(test)]
+    pub(crate) fn build(config: &JvmExternalDependencies, project_root: &Path) -> Self {
+        let artifacts = resolve_configured_artifacts(config, project_root);
+        Self::build_from_artifacts(artifacts)
+    }
+
+    /// Build the jar-backed external declaration surface the discovery
+    /// evidence names, through a process-wide memo.
+    ///
+    /// Discovery itself runs on every call: it reads the project's build
+    /// manifests, which are exactly what changes between workspaces. The
+    /// expensive step -- reading and parsing every resolved dependency jar --
+    /// is a pure function of the resolved artifact files and the discovery
+    /// diagnostics that get appended to the result, so identical evidence
+    /// (same artifact paths with the same length and mtime, same diagnostics)
+    /// reuses the index already built by any analyzer in this process. A
+    /// long-lived server always amortized this through each analyzer's
+    /// `OnceLock`; the memo extends the same amortization to short-lived
+    /// processes that rebuild workspaces over an unchanged dependency
+    /// universe.
+    pub(crate) fn build_for_project(
+        config: &JvmAnalyzerConfig,
+        project: &dyn Project,
+    ) -> Arc<Self> {
+        let discovery = {
+            let _timing = brokk_bifrost_core::profiling::scope("jvm_external_index.discovery");
+            resolve_jvm_semantic_pack_dependencies(
+                config,
+                project,
+                &DependencyPackLimits::default(),
+                None,
+            )
+        };
+        let artifacts: Vec<ResolvedJvmArtifact> = discovery
+            .dependencies
+            .iter()
+            .filter_map(jvm_artifact_from_dependency)
+            .collect();
+        let diagnostics: Vec<ProducerDiagnostic> = discovery
+            .diagnostics
+            .into_iter()
+            .map(discovery_producer_diagnostic)
+            .collect();
+        let key = external_index_memo_key(&artifacts, &diagnostics);
+        let memo = external_index_memo();
+        if let Some(index) = memo.lock().expect("external index memo poisoned").get(&key) {
+            return Arc::clone(index);
+        }
+        let _timing =
+            brokk_bifrost_core::profiling::scope("jvm_external_index.build_from_artifacts");
+        let mut index = Self::build_from_artifacts(artifacts);
+        index.production_diagnostics.extend(diagnostics);
+        let index = Arc::new(index);
+        Arc::clone(
+            memo.lock()
+                .expect("external index memo poisoned")
+                .entry(key)
+                .or_insert(index),
+        )
+    }
+
+    /// Direct artifact indexing publishes the same relational inventory before
+    /// the name-grouped dispatch surface discards overload coordinates. Only
+    /// bounded provider identities survive publication in the existing index.
+    pub(crate) fn build_for_project_with_inventory(
+        config: &JvmAnalyzerConfig,
+        project: &dyn Project,
+        store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Arc<Self>> {
+        let discovery = resolve_jvm_semantic_pack_dependencies(
+            config,
+            project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let limits = ArtifactProducerLimits::default();
+        let mut providers = Vec::new();
+        for artifact in discovery
+            .dependencies
+            .iter()
+            .filter_map(jvm_artifact_from_dependency)
+            .take(MAX_INDEX_ARTIFACTS)
+        {
+            for path in std::iter::once(artifact.artifact_path.as_path())
+                .chain(artifact.source_artifact_path.as_deref())
+            {
+                // Scala source-only indexes do not assert a Java member inventory.
+                let kind = if is_source_jar(path) {
+                    ExternalArtifactKind::JavaSourceJar
+                } else {
+                    ExternalArtifactKind::JavaClassJar
+                };
+                let exact = match brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact(path, &limits) {
+                    Ok(exact) => exact,
+                    Err(_) => continue, // Existing index diagnostics describe unread artifacts.
+                };
+                let provider = exact.sha256().to_owned();
+                let exists: bool = store.read_conn()?.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1)",
+                    [&provider],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    let request = ArtifactProductionRequest {
+                        path: path.to_path_buf(),
+                        artifact_kind: kind,
+                        pack_id: "bifrost.external.java".to_owned(),
+                        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        ecosystem: "maven".to_owned(),
+                        compatibility: Compatibility {
+                            bifrost: None,
+                            toolchains: Vec::new(),
+                        },
+                        activation: Vec::new(),
+                        provenance: Provenance {
+                            source: "local dependency artifact".to_owned(),
+                            revision: None,
+                        },
+                        license: "NOASSERTION".to_owned(),
+                        safety: Safety {
+                            generated_code_only: false,
+                            review_required: false,
+                        },
+                    };
+                    let production = JavaJarPackProducer
+                        .produce_loaded_artifact(&request, &limits, None, &exact);
+                    if let Some(pack) = production.pack {
+                        for shard in pack.shards {
+                            if let AuthoredPayload::DeclarationFacts { types, members, .. } =
+                                shard.payload
+                            {
+                                store.publish_jvm_external_inventory_facts(
+                                    provider.clone(),
+                                    &types,
+                                    &members,
+                                    production.completeness
+                                        == brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Complete,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                providers.push(provider);
+            }
+        }
+        providers.sort_unstable();
+        providers.dedup();
+        let mut index = (*Self::build_for_project(config, project)).clone();
+        index.inventory_providers = providers;
+        let providers = serde_json::to_string(&index.inventory_providers)
+            .expect("string provider identities serialize");
+        let conn = store.read_conn()?;
+        let mut statement = conn.prepare("SELECT provider_id, owner_fqn, ordinal, member_name, is_static, json(parameters_jsonb) FROM jvm_external_owner_members member WHERE provider_id IN (SELECT value FROM json_each(?1)) AND member_kind IN ('method', 'constructor') AND (SELECT count(*) FROM jvm_external_owners owner WHERE owner.owner_fqn=member.owner_fqn AND owner.provider_id IN (SELECT value FROM json_each(?1)))=1 ORDER BY provider_id,owner_fqn,ordinal")?;
+        let mut rows = statement.query([providers])?;
+        while let Some(row) = rows.next()? {
+            let owner: String = row.get(1)?;
+            let member: String = row.get(3)?;
+            let Some(family) = index
+                .members_by_owner
+                .get_mut(&owner)
+                .and_then(|surface| surface.members.get_mut(&member))
+            else {
+                continue;
+            };
+            let parameters: Vec<brokk_bifrost_analysis::analyzer::semantic_model::Parameter> =
+                serde_json::from_str(&row.get::<_, String>(5)?).map_err(|error| {
+                    brokk_bifrost_analysis::analyzer::store::StoreError::new(error.to_string())
+                })?;
+            let is_static: bool = row.get(4)?;
+            for shape in &mut family.call_shapes {
+                if shape.is_static == is_static
+                    && shape.parameters.len() == parameters.len()
+                    && shape
+                        .parameters
+                        .iter()
+                        .zip(&parameters)
+                        .all(|(selected, formal)| *selected == formal.r#type)
+                    && shape.variadic == parameters.iter().any(|formal| formal.variadic)
+                {
+                    let identity = brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity {
+                        owner: brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalOwnerIdentity {
+                            provider_id: std::sync::Arc::from(row.get::<_, String>(0)?),
+                            owner_fqn: std::sync::Arc::from(owner.as_str()),
+                        },
+                        ordinal: row.get(2)?,
+                    };
+                    // Conflicting provider coordinates cannot certify one
+                    // selected member. The existing dispatch shape still works.
+                    if shape
+                        .inventory_identity
+                        .as_ref()
+                        .is_none_or(|old| *old == identity)
+                    {
+                        shape.inventory_identity = Some(identity);
+                    } else {
+                        shape.inventory_identity = None;
+                    }
+                }
+            }
+        }
+        Ok(Arc::new(index))
+    }
+
+    fn build_from_artifacts(artifacts: Vec<ResolvedJvmArtifact>) -> Self {
+        let mut index = Self::default();
+        let mut remaining_index_bytes = MAX_TOTAL_INDEX_BYTES;
+        for artifact in artifacts.into_iter().take(MAX_INDEX_ARTIFACTS) {
+            if remaining_index_bytes == 0 {
+                break;
+            }
+            if is_source_jar(&artifact.artifact_path) {
+                remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                    index.index_source_jar(&artifact.artifact_path, remaining_index_bytes),
+                );
+                continue;
+            }
+            if let Some(source_artifact_path) = artifact.source_artifact_path.as_deref() {
+                remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                    index.index_source_jar(source_artifact_path, remaining_index_bytes),
+                );
+            }
+            if remaining_index_bytes == 0 {
+                break;
+            }
+            remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                index.index_class_jar(&artifact.artifact_path, remaining_index_bytes),
+            );
+        }
+        index.apply_enclosing_visibility();
+        index
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.types_by_fqn.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
+        &self.production_diagnostics
+    }
+
+    /// How many diagnostics the artifact producers raised while this index was
+    /// built.
+    ///
+    /// A non-zero count means the build declared JVM artifacts that the index
+    /// could not read to the end -- an archive past `MAX_ARCHIVE_ENTRIES`, a
+    /// class past `MAX_CLASS_ENTRY_BYTES`, an artifact set past
+    /// `MAX_INDEX_ARTIFACTS`. It is the difference between "this name is not
+    /// declared anywhere" and "this name may well be declared in a dependency
+    /// nothing finished indexing", which is exactly the boundary distinction a
+    /// resolution trace must report. The full diagnostics stay test-only; a
+    /// count is all a boundary classification needs.
+    pub(crate) fn production_diagnostic_count(&self) -> usize {
+        self.production_diagnostics.len()
+    }
+
+    /// Stable identity of every retained fact that can change external JVM
+    /// dispatch behavior.
+    ///
+    /// Artifact paths and archive entry names are intentionally absent. Once
+    /// an artifact has produced this surface, moving identical bytes does not
+    /// change any resolver answer and should continue to reuse cached flow
+    /// results. A single incomplete marker captures the only diagnostic state
+    /// the resolution boundary observes: whether any producer diagnostic made
+    /// a negative lookup uncertain.
+    pub(crate) fn dispatch_behavior_identity(&self) -> StableDigest {
+        *self.dispatch_behavior_identity.get_or_init(|| {
+            let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN);
+            digest.push(if self.production_diagnostics.is_empty() {
+                b"complete"
+            } else {
+                b"incomplete"
+            });
+
+            let mut types = self.types_by_fqn.iter().collect::<Vec<_>>();
+            types.sort_unstable_by_key(|(fqn, _)| *fqn);
+            digest.push(&(types.len() as u64).to_le_bytes());
+            for (lookup_fqn, external_type) in types {
+                digest.push(b"type");
+                digest.push(lookup_fqn.as_bytes());
+                digest.push(external_type.fqn.as_bytes());
+                digest.push(external_type.package_name.as_bytes());
+                digest.push(external_type.short_name.as_bytes());
+                digest.push(match external_type.kind {
+                    JvmExternalTypeKind::Class => b"class",
+                    JvmExternalTypeKind::Interface => b"interface",
+                    JvmExternalTypeKind::Enum => b"enum",
+                    JvmExternalTypeKind::Annotation => b"annotation",
+                    JvmExternalTypeKind::Record => b"record",
+                });
+                digest.push(match external_type.visibility {
+                    JvmVisibility::Public => b"public",
+                    JvmVisibility::Protected => b"protected",
+                    JvmVisibility::PackagePrivate => b"package-private",
+                    JvmVisibility::Private => b"private",
+                });
+            }
+
+            let mut owners = self.members_by_owner.iter().collect::<Vec<_>>();
+            owners.sort_unstable_by_key(|(owner, _)| *owner);
+            digest.push(&(owners.len() as u64).to_le_bytes());
+            for (owner_fqn, surface) in owners {
+                digest.push(b"owner");
+                digest.push(owner_fqn.as_bytes());
+                digest.push(&[u8::from(surface.hierarchy_complete)]);
+                digest.push(&(surface.supertypes.len() as u64).to_le_bytes());
+                for supertype in &surface.supertypes {
+                    digest.push(b"supertype");
+                    digest.push(supertype.as_bytes());
+                }
+
+                let mut members = surface.members.iter().collect::<Vec<_>>();
+                members.sort_unstable_by_key(|(name, _)| *name);
+                digest.push(&(members.len() as u64).to_le_bytes());
+                for (lookup_name, member) in members {
+                    digest.push(b"member");
+                    digest.push(lookup_name.as_bytes());
+                    digest.push(member.fqn.as_bytes());
+                    digest.push(member.declaring_package.as_bytes());
+                    digest.push(match member.visibility {
+                        JvmVisibility::Public => b"public",
+                        JvmVisibility::Protected => b"protected",
+                        JvmVisibility::PackagePrivate => b"package-private",
+                        JvmVisibility::Private => b"private",
+                    });
+                    match member.declared_return_type_fqn() {
+                        Some(return_type) => {
+                            digest.push(b"named-return");
+                            digest.push(return_type.as_bytes());
+                        }
+                        None => digest.push(b"no-named-return"),
+                    }
+                    digest.push(if member.is_static {
+                        b"static"
+                    } else {
+                        b"instance"
+                    });
+                    digest.push(if member.is_constant {
+                        b"constant"
+                    } else {
+                        b"not-constant"
+                    });
+                    digest.push(if member.call_shapes_incomplete {
+                        b"shapes-incomplete"
+                    } else {
+                        b"shapes-complete"
+                    });
+                    digest.push(&(member.call_shapes.len() as u64).to_le_bytes());
+                    for shape in &member.call_shapes {
+                        digest.push(&shape.parameter_count.to_le_bytes());
+                        digest.push(&[u8::from(shape.has_type_parameters)]);
+                        digest.push(&[shape.visibility as u8]);
+                        digest.push(&[u8::from(shape.non_overridable.is_some())]);
+                        digest.push(if shape.is_static {
+                            b"static-shape"
+                        } else {
+                            b"instance-shape"
+                        });
+                        digest.push(if shape.variadic {
+                            b"variadic"
+                        } else {
+                            b"fixed"
+                        });
+                        // Argument conversion consumes the complete return term,
+                        // including arrays and generic arguments. A class-name
+                        // digest would alias distinct conversion behavior.
+                        digest.push(
+                            &serde_json::to_vec(&shape.returns)
+                                .expect("structured return types serialize"),
+                        );
+                    }
+                }
+            }
+            digest.finish()
+        })
+    }
+
+    pub(crate) fn get(&self, fqn: &str) -> Option<&JvmExternalType> {
+        self.types_by_fqn.get(fqn)
+    }
+
+    /// The member `member_name` names on the indexed owner `owner_fqn`,
+    /// searched over the owner's whole read inherited surface (#1900).
+    ///
+    /// The walk starts at the owner and follows the supertypes its own artifact
+    /// entry named, breadth first, because a JVM member is as often inherited
+    /// as declared: a static factory sits on the class the reference wrote
+    /// while an accessor sits on the base class it extends, and a reference
+    /// spells both the same way. The declaration that answers keeps its own
+    /// qualified name and its own declaring package, so the reported target
+    /// names where the member is declared rather than where it was written,
+    /// and package-private accessibility measures against the right package.
+    ///
+    /// An owner with no read surface, and a supertype whose own class file was
+    /// never read, both contribute nothing rather than proving anything: this
+    /// returns `None` for "not declared here" and for "never read" alike, and a
+    /// caller that finds nothing keeps the status it had.
+    fn member(&self, owner_fqn: &str, member_name: &str) -> Option<&JvmExternalMember> {
+        self.walk_owner_surfaces(owner_fqn, |_, surface| surface.members.get(member_name))
+            .0
+    }
+
+    fn walk_owner_surfaces<'a, T>(
+        &'a self,
+        owner_fqn: &str,
+        mut select: impl FnMut(&str, &'a JvmIndexedOwnerSurface) -> Option<T>,
+    ) -> (Option<T>, bool) {
+        let mut visited = brokk_bifrost_core::hash::HashSet::default();
+        let mut queue =
+            std::collections::VecDeque::from([(owner_fqn.to_owned(), Vec::<String>::new())]);
+        let mut complete = true;
+        while let Some((owner, mut path)) = queue.pop_front() {
+            if path.contains(&owner) {
+                complete = false;
+                continue;
+            }
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            if visited.len() > MAX_MEMBER_SURFACE_OWNERS {
+                return (None, false);
+            }
+            let Some(surface) = self.members_by_owner.get(&owner) else {
+                complete = false;
+                continue;
+            };
+            complete &= surface.hierarchy_complete;
+            if let Some(selected) = select(&owner, surface) {
+                return (Some(selected), complete);
+            }
+            path.push(owner);
+            queue.extend(
+                surface
+                    .supertypes
+                    .iter()
+                    .map(|parent| (parent.clone(), path.clone())),
+            );
+        }
+        (None, complete)
+    }
+
+    pub(crate) fn resolve_explicit_import(
+        &self,
+        import_path: &str,
+        access_package: &str,
+    ) -> Option<&JvmExternalType> {
+        self.resolve_qualified_name(import_path, access_package)
+    }
+
+    pub(crate) fn resolve_wildcard_import(
+        &self,
+        package_name: &str,
+        short_name: &str,
+        access_package: &str,
+    ) -> Option<&JvmExternalType> {
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), access_package)
+    }
+
+    pub(crate) fn resolve_same_package(
+        &self,
+        package_name: &str,
+        short_name: &str,
+    ) -> Option<&JvmExternalType> {
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), package_name)
+    }
+
+    pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<&JvmExternalType> {
+        self.get(&qualified_name("java.lang", short_name))
+            .filter(|external_type| is_public_external_type(external_type))
+    }
+
+    pub(crate) fn resolve_qualified_name(
+        &self,
+        fqn: &str,
+        access_package: &str,
+    ) -> Option<&JvmExternalType> {
+        self.get(fqn)
+            .filter(|ty| ty.is_accessible_from_package(access_package))
+    }
+
+    fn insert(&mut self, external_type: JvmExternalType) {
+        match self.types_by_fqn.get(&external_type.fqn) {
+            Some(existing)
+                if matches!(
+                    existing.source,
+                    JvmExternalDeclarationSource::SourceJar { .. }
+                ) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        self.types_by_fqn
+            .insert(external_type.fqn.clone(), external_type);
+    }
+
+    fn apply_enclosing_visibility(&mut self) {
+        let updates: Vec<_> = self
+            .types_by_fqn
+            .values()
+            .filter_map(|external_type| {
+                let mut effective_visibility = external_type.visibility;
+                for owner_fqn in enclosing_type_fqns(external_type) {
+                    let Some(owner) = self.types_by_fqn.get(&owner_fqn) else {
+                        continue;
+                    };
+                    effective_visibility =
+                        restrict_visibility(effective_visibility, owner.visibility);
+                }
+                (effective_visibility != external_type.visibility)
+                    .then(|| (external_type.fqn.clone(), effective_visibility))
+            })
+            .collect();
+
+        for (fqn, visibility) in updates {
+            if let Some(external_type) = self.types_by_fqn.get_mut(&fqn) {
+                external_type.visibility = visibility;
+            }
+        }
+    }
+
+    fn index_source_jar(&mut self, artifact_path: &Path, index_byte_budget: u64) -> u64 {
+        let Some(file) = open_artifact_file(artifact_path) else {
+            return 0;
+        };
+        let Ok(mut archive) = ZipArchive::new(file) else {
+            return 0;
+        };
+        let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
+        let mut total_bytes = 0u64;
+        let mut java_facts = None;
+        let mut scala_indexed = false;
+        let mut skipped_entries = archive.len().saturating_sub(entry_count);
+        let mut member_budget = MemberBudget::new();
+        for index in 0..entry_count {
+            let Ok(entry) = archive.by_index(index) else {
+                skipped_entries = skipped_entries.saturating_add(1);
+                continue;
+            };
+            let name = match entry.name() {
+                Ok(name) => name,
+                Err(_) => {
+                    skipped_entries = skipped_entries.saturating_add(1);
+                    continue;
+                }
+            };
+            let Some(language) = SourceJarLanguage::for_entry(name.as_ref()) else {
+                continue;
+            };
+            let max_entry_bytes = language.max_entry_bytes();
+            if !can_read_entry(
+                entry.size(),
+                max_entry_bytes,
+                MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
+                &mut total_bytes,
+            ) {
+                skipped_entries = skipped_entries.saturating_add(1);
+                continue;
+            }
+            if matches!(language, SourceJarLanguage::Scala) {
+                if !scala_indexed {
+                    let mut facts = self
+                        .produce_scala_type_facts(artifact_path)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    facts.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+                    for fact in facts.into_iter().take(MAX_ANALYZER_SOURCE_TYPES) {
+                        if let Some(external_type) = scala_external_type(artifact_path, fact) {
+                            self.insert(external_type);
+                        }
+                    }
+                    scala_indexed = true;
+                }
+                continue;
+            }
+            let source_path = name.into_owned();
+            let mut source = String::new();
+            if entry
+                .take(max_entry_bytes + 1)
+                .read_to_string(&mut source)
+                .is_err()
+                || source.len() as u64 > max_entry_bytes
+            {
+                skipped_entries = skipped_entries.saturating_add(1);
+                continue;
+            }
+            let external_types = language.source_types(artifact_path, &source_path, &source);
+            if matches!(language, SourceJarLanguage::Java) && java_facts.is_none() {
+                java_facts = Some(
+                    self.produce_java_facts(artifact_path, ExternalArtifactKind::JavaSourceJar),
+                );
+            }
+            for mut external_type in external_types {
+                if let Some(facts) = java_facts.as_mut() {
+                    if let Some(fact) = facts.types.get(&external_type.fqn) {
+                        apply_java_type_fact(&mut external_type, fact);
+                    }
+                    // The entry that declares this type was read to the end, so
+                    // its member surface may answer.
+                    let surface = facts.take_owner_surface(
+                        &external_type.fqn,
+                        &external_type.package_name,
+                        &mut member_budget,
+                    );
+                    self.attach_member_surface(&external_type.fqn, surface);
+                }
+                self.insert(external_type);
+            }
+        }
+        self.note_bounded_artifact(artifact_path, skipped_entries, member_budget);
+        total_bytes
+    }
+
+    fn index_class_jar(&mut self, artifact_path: &Path, index_byte_budget: u64) -> u64 {
+        let Some(file) = open_artifact_file(artifact_path) else {
+            return 0;
+        };
+        let Ok(mut archive) = ZipArchive::new(file) else {
+            return 0;
+        };
+        let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
+        let mut total_bytes = 0u64;
+        let mut skipped_entries = archive.len().saturating_sub(entry_count);
+        let mut member_budget = MemberBudget::new();
+        let producer_limits = ArtifactProducerLimits::default();
+        let mut producer_diagnostics = brokk_bifrost_semantic::analyzer::semantic_model::producer::BoundedProducerDiagnostics::new(&producer_limits);
+        let mut remaining_records = producer_limits.max_records;
+        let mut record_limit_hit = false;
+        for index in 0..entry_count {
+            let Ok(entry) = archive.by_index(index) else {
+                skipped_entries = skipped_entries.saturating_add(1);
+                continue;
+            };
+            let name = match entry.name() {
+                Ok(name) => name,
+                Err(_) => {
+                    skipped_entries = skipped_entries.saturating_add(1);
+                    continue;
+                }
+            };
+            if !name.ends_with(".class") || name.ends_with("module-info.class") {
+                continue;
+            }
+            if !can_read_entry(
+                entry.size(),
+                MAX_CLASS_ENTRY_BYTES,
+                MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
+                &mut total_bytes,
+            ) {
+                skipped_entries = skipped_entries.saturating_add(1);
+                continue;
+            }
+            let class_entry = name.into_owned();
+            let mut bytes = Vec::new();
+            if entry
+                .take(MAX_CLASS_ENTRY_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() as u64 > MAX_CLASS_ENTRY_BYTES
+            {
+                skipped_entries = skipped_entries.saturating_add(1);
+                continue;
+            }
+            let surface = match class_surface(
+                artifact_path.to_string_lossy().as_ref(),
+                &class_entry,
+                &bytes,
+                producer_limits.max_signature_depth,
+                &mut remaining_records,
+                &mut record_limit_hit,
+                &mut producer_diagnostics,
+            ) {
+                JavaClassSurfaceOutcome::Declared(surface) => surface,
+                // A module descriptor and a private class were read
+                // completely; the index publishes neither on purpose, and
+                // neither leaves anything unread.
+                JavaClassSurfaceOutcome::Excluded => continue,
+                // The producer could not parse this class file, so it declares
+                // no type here and, just as importantly, no member surface that
+                // could later answer a member spelling negatively.
+                JavaClassSurfaceOutcome::Invalid => {
+                    producer_diagnostics.warning(
+                        "java.class.invalid",
+                        Some(class_entry.clone()),
+                        "class entry did not contain supported bounded metadata",
+                    );
+                    skipped_entries = skipped_entries.saturating_add(1);
+                    continue;
+                }
+                // The bounded producer record limit was spent. It is reported
+                // below as `limit.records`; do not misclassify an intentional
+                // bound as an unread archive entry.
+                JavaClassSurfaceOutcome::Skipped => continue,
+            };
+
+            let short_name = surface
+                .name
+                .strip_prefix(&format!("{}.", surface.package_name))
+                .unwrap_or(&surface.name)
+                .to_owned();
+            let external_type = JvmExternalType {
+                fqn: surface.name.clone(),
+                package_name: surface.package_name.clone(),
+                short_name,
+                kind: semantic_type_kind(surface.type_kind),
+                visibility: semantic_visibility(surface.visibility),
+                source: JvmExternalDeclarationSource::ClassFile {
+                    artifact_path: artifact_path.to_path_buf(),
+                    class_entry: class_entry.clone(),
+                },
+            };
+            if external_type.visibility == JvmVisibility::Private {
+                continue;
+            }
+            // This entry was read to the end and parsed, so the members the
+            // same class file declares are a surface that may answer (#1900).
+            let mut members = HashMap::default();
+            for member in surface.members {
+                // The durable inventory owns all declarations. Preserve this
+                // legacy public dispatch projection before grouping overloads.
+                if !matches!(
+                    member.visibility,
+                    Visibility::Public | Visibility::Protected
+                ) {
+                    continue;
+                }
+                if !member_budget.take() {
+                    break;
+                }
+                let is_static = member.is_static;
+                let is_constant = member.member_kind == MemberKind::Constant;
+                let shape = external_call_shape(
+                    member.member_kind,
+                    semantic_visibility(member.visibility),
+                    is_static,
+                    member.signature.as_ref(),
+                    member.non_overridable,
+                );
+                let shapes_incomplete = callable_shape_is_incomplete(
+                    member.member_kind,
+                    member.signature.as_ref(),
+                    member.callable_family_complete,
+                    shape.is_some(),
+                );
+                retain_external_member(
+                    &mut members,
+                    &external_type.fqn,
+                    &external_type.package_name,
+                    RetainedExternalMember {
+                        name: member.name,
+                        visibility: semantic_visibility(member.visibility),
+                        // The class file's member table is what types a chained
+                        // receiver (#2454), so this path carries the declared
+                        // return type exactly as `take_owner_surface` does for
+                        // the pack-production path. Dropping it here made the
+                        // same jar answer `response.getWriter()` on one path and
+                        // not on the other, which measurably retired the whole
+                        // chained-receiver census on the OWASP corpus.
+                        returns: member.returns,
+                        // The class file's access flags are what prove a
+                        // `static final` field is a compile-time constant
+                        // (#2538); dropping them here would make the same
+                        // class file answer a `Cipher.ENCRYPT_MODE`-shaped
+                        // read on the pack-production path and not on this
+                        // one, the same asymmetry #2454's comment above
+                        // describes for return types.
+                        is_static,
+                        is_constant,
+                        shape,
+                        shapes_incomplete,
+                    },
+                );
+            }
+            if member_budget.exhausted {
+                mark_call_shapes_incomplete(&mut members);
+            }
+            self.attach_member_surface(
+                &external_type.fqn,
+                JvmIndexedOwnerSurface {
+                    members,
+                    supertypes: hierarchy_type_names(&surface.hierarchy),
+                    hierarchy_complete: surface
+                        .jvm_inventory
+                        .as_ref()
+                        .is_some_and(|inventory| inventory.supertypes_complete),
+                },
+            );
+            self.insert(external_type);
+        }
+        if record_limit_hit {
+            producer_diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    producer_limits.max_records
+                ),
+            );
+        }
+        let (diagnostics, _) = producer_diagnostics.finish();
+        self.production_diagnostics.extend(diagnostics);
+        self.note_bounded_artifact(artifact_path, skipped_entries, member_budget);
+        total_bytes
+    }
+
+    /// Record the member surface an owner's own artifact entry declared.
+    ///
+    /// Only ever called for an owner whose entry was read to the end, which is
+    /// what gives the presence of an entry in `members_by_owner` its meaning.
+    fn attach_member_surface(&mut self, owner_fqn: &str, surface: JvmIndexedOwnerSurface) {
+        match self.members_by_owner.get_mut(owner_fqn) {
+            // One owner can be read twice -- a binary jar beside its own
+            // source jar, or two artifacts shipping the same class. Merging
+            // keeps every positive declaration either read produced, which is
+            // the only direction this surface ever moves.
+            Some(existing) => {
+                existing.hierarchy_complete &= surface.hierarchy_complete;
+                for (name, member) in surface.members {
+                    existing.members.entry(name).or_insert(member);
+                }
+                for supertype in surface.supertypes {
+                    if !existing.supertypes.contains(&supertype) {
+                        existing.supertypes.push(supertype);
+                    }
+                }
+            }
+            None => {
+                self.members_by_owner.insert(owner_fqn.to_owned(), surface);
+            }
+        }
+    }
+
+    /// Record that one artifact was not read to the end.
+    ///
+    /// This is the honest-absence link for the member surface: an entry the
+    /// byte budget refused, an entry that did not parse, and a member set past
+    /// [`MAX_ARTIFACT_MEMBERS`] all leave declarations unread, and every JVM
+    /// boundary already reads [`Self::production_diagnostic_count`] to report
+    /// `external_declared_unindexed` -- "the build declared this and nothing
+    /// finished reading it" -- instead of `external_unknown`. One diagnostic
+    /// per artifact keeps the record bounded no matter how many entries an
+    /// artifact skipped.
+    fn note_bounded_artifact(
+        &mut self,
+        artifact_path: &Path,
+        skipped_entries: usize,
+        member_budget: MemberBudget,
+    ) {
+        if skipped_entries > 0 {
+            self.production_diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: None,
+                code: "jvm.index.unread_entries".to_owned(),
+                location: Some(artifact_path.to_string_lossy().into_owned()),
+                declaration: None,
+                message: format!(
+                    "bounded index read skipped {skipped_entries} archive entries, so this artifact declares types and members the index never read"
+                ),
+            });
+        }
+        if member_budget.exhausted {
+            self.production_diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: None,
+                code: "limit.artifact_members".to_owned(),
+                location: Some(artifact_path.to_string_lossy().into_owned()),
+                declaration: None,
+                message: format!(
+                    "bounded index read stopped after {MAX_ARTIFACT_MEMBERS} member declarations from this artifact"
+                ),
+            });
+        }
+    }
+
+    fn produce_java_facts(
+        &mut self,
+        artifact_path: &Path,
+        artifact_kind: ExternalArtifactKind,
+    ) -> JavaArtifactFacts {
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &local_jvm_artifact_production_request(
+                artifact_path,
+                artifact_kind,
+                "bifrost.external.java",
+            ),
+            &ArtifactProducerLimits::default(),
+        );
+        self.production_diagnostics
+            .extend(production.diagnostics.iter().cloned());
+        let mut types = HashMap::default();
+        let mut members = Vec::new();
+        for shard in production.pack.into_iter().flat_map(|pack| pack.shards) {
+            let AuthoredPayload::DeclarationFacts {
+                types: shard_types,
+                members: shard_members,
+                ..
+            } = shard.payload
+            else {
+                continue;
+            };
+            types.extend(
+                shard_types
+                    .into_iter()
+                    .map(|fact| (fact.name.clone(), fact)),
+            );
+            members.extend(shard_members);
+        }
+        JavaArtifactFacts::new(types, members)
+    }
+
+    fn produce_scala_type_facts(&mut self, artifact_path: &Path) -> HashMap<String, TypeFact> {
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &local_jvm_artifact_production_request(
+                artifact_path,
+                ExternalArtifactKind::ScalaSourceJar,
+                "bifrost.external.scala",
+            ),
+            &ArtifactProducerLimits::default(),
+        );
+        self.production_diagnostics
+            .extend(production.diagnostics.iter().cloned());
+        production
+            .pack
+            .into_iter()
+            .flat_map(|pack| pack.shards)
+            .flat_map(|shard| match shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types,
+                AuthoredPayload::GeneratorRules { .. }
+                | AuthoredPayload::ProcedureSummaries { .. } => Vec::new(),
+            })
+            .map(|fact| (fact.name.clone(), fact))
+            .collect()
+    }
+}
+
+/// Feeds [`JvmExternalDeclarationIndex::build_from_artifacts`]: raw
+/// class-file/`-sources.jar` byte scanning (`index_class_jar`,
+/// `index_source_jar`) over an ordinary Maven/Gradle dependency's resolved
+/// jar(s).
+///
+/// A JDK dependency's own artifact is a `src.zip` or JMOD source set
+/// (`ExternalArtifactKind::JdkSourceZip`/`JdkJmodSet`, built by
+/// [`resolved_jdk_dependency`]
+/// from `JAVA_HOME`/`jdk_homes`), and this function excludes it
+/// unconditionally. This is deliberate, not an oversight, for two independent
+/// reasons:
+///
+/// 1. Structurally, this index could not read it correctly even if let
+///    through: `is_source_jar` only recognizes a `-sources.jar` filename
+///    suffix (false for `src.zip`), and `index_class_jar` expects `.class`
+///    entries (none exist in a source archive), so the raw-byte path silently
+///    produces zero facts for it either way.
+/// 2. Architecturally, a JDK source archive already has its own producer,
+///    `JdkSourceArchivePackProducer` (dispatched from
+///    `JvmDependencyPackAdapter::produce`, above), which turns the same
+///    `src.zip` into a proper declaration-fact semantic pack. That pack
+///    reaches resolution through the pack-activation pipeline
+///    (`prepare_dependency_semantic_packs` / `activate_workspace_packs`, or a
+///    caller's own hand-curated `SemanticModelActivationRequest`, as
+///    `owasp_benchmark.rs` uses), never through this artifact index. Routing
+///    the same `src.zip` through both would double-produce and diverge from
+///    that pack's own completeness/gap accounting (#2401).
+///
+/// Confirmed twice independently: #2538's investigation found this exclusion
+/// by tracing why `java.util.Locale`/
+/// `javax.crypto.Cipher` never resolved through this index, and #2401's own
+/// session (this repository, 2026-08-21) re-confirmed it while evaluating
+/// whether to lift it. Do not lift this exclusion; if a JDK dependency ever
+/// needs to resolve here too, give it a real conversion from the pack's own
+/// `TypeFact`/`MemberFact` shards (`apply_java_type_fact` already exists for
+/// half of that), not a change to this filter.
+fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
+    if dependency.artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.kind,
+            ExternalArtifactKind::JdkSourceZip | ExternalArtifactKind::JdkJmodSet
+        )
+    }) {
+        return None;
+    }
+    let binary = dependency
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == DependencyArtifactRole::Binary);
+    let source = dependency
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == DependencyArtifactRole::Sources);
+    let primary = binary.or(source)?;
+    Some(ResolvedJvmArtifact {
+        artifact_path: primary.path().to_owned(),
+        source_artifact_path: binary.and(source).map(|source| source.path().to_owned()),
+        coordinate: None,
+        origin: JvmDependencyOrigin::ExplicitPath,
+    })
+}
+
+fn discovery_producer_diagnostic(diagnostic: DependencyPackDiagnostic) -> ProducerDiagnostic {
+    ProducerDiagnostic {
+        severity: match diagnostic.severity {
+            DependencyPackDiagnosticSeverity::Warning => ProducerDiagnosticSeverity::Warning,
+            DependencyPackDiagnosticSeverity::Error => ProducerDiagnosticSeverity::Error,
+        },
+        code: diagnostic.code,
+        location: diagnostic.location,
+        source_entry: None,
+        declaration: None,
+        message: diagnostic.message,
+    }
+}
+
+fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
+    external_type.kind = semantic_type_kind(fact.type_kind);
+    external_type.visibility = semantic_visibility(fact.visibility);
+}
+
+fn scala_external_type(artifact_path: &Path, fact: TypeFact) -> Option<JvmExternalType> {
+    let source_path = match fact.locator {
+        Locator::Source { path, .. } => path,
+        Locator::Artifact { .. } | Locator::Interchange { .. } => return None,
+    };
+    let name = fact.name;
+    let (package_name, short_name) = name
+        .rsplit_once('.')
+        .map_or(("", name.as_str()), |(package, short)| (package, short));
+    (!short_name.is_empty()).then(|| JvmExternalType {
+        fqn: name.clone(),
+        package_name: package_name.to_owned(),
+        short_name: short_name.to_owned(),
+        kind: semantic_type_kind(fact.type_kind),
+        visibility: semantic_visibility(fact.visibility),
+        source: JvmExternalDeclarationSource::SourceJar {
+            artifact_path: artifact_path.to_path_buf(),
+            source_path,
+        },
+    })
+}
+
+fn semantic_type_kind(kind: TypeKind) -> JvmExternalTypeKind {
+    match kind {
+        TypeKind::Interface | TypeKind::Trait => JvmExternalTypeKind::Interface,
+        TypeKind::Enum => JvmExternalTypeKind::Enum,
+        TypeKind::Annotation => JvmExternalTypeKind::Annotation,
+        TypeKind::Record => JvmExternalTypeKind::Record,
+        TypeKind::Class
+        | TypeKind::Delegate
+        | TypeKind::Struct
+        | TypeKind::Union
+        | TypeKind::Module
+        | TypeKind::TypeAlias => JvmExternalTypeKind::Class,
+    }
+}
+
+fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
+    match visibility {
+        Visibility::Public => JvmVisibility::Public,
+        Visibility::Protected | Visibility::ProtectedInternal => JvmVisibility::Protected,
+        Visibility::Package => JvmVisibility::PackagePrivate,
+        Visibility::Internal => {
+            unreachable!("Kotlin internal declarations are dropped before JVM publication")
+        }
+        Visibility::Private => JvmVisibility::Private,
+    }
+}
+
+/// The external declaration surface one JVM lookup reads: the artifact-derived
+/// index first, then the declaration facts the activated semantic packs
+/// publish (#1893).
+///
+/// Both halves answer the same question -- does an external declaration spell
+/// this name, and may this package see it -- so they are one lookup with one
+/// precedence, not two indexes with two vocabularies. The artifact half wins a
+/// tie: an artifact on disk is the classpath the build actually resolved, while
+/// a pack is a published claim about one.
+///
+/// The name may be a type's or a member's. Both halves carry member
+/// declarations (#1900): the index reads them out of the member tables of the
+/// class files it indexes, and a pack publishes them as declaration facts, so
+/// `Collections.sort` is answered by whichever half declared the owner.
+///
+/// # Why the pack half is read live
+///
+/// [`JvmExternalDeclarationIndex`] is memoized in an analyzer `OnceLock` that
+/// survives across activation transactions: a host activates, invalidates and
+/// re-activates packs while one analyzer generation stays alive, and only a
+/// changed build manifest drops the cell. Folding pack facts into that cell
+/// would therefore answer from a pack set the host has since replaced or
+/// withdrawn. This surface instead reads the published overlay on every
+/// lookup, so it always reports the currently activated set and cannot go
+/// stale. The read is a published `Arc` clone plus one hash lookup, which is
+/// the same cost the other seven languages already pay for their overlay-backed
+/// boundary evidence.
+pub(crate) struct JvmExternalDeclarations<'a> {
+    artifacts: &'a JvmExternalDeclarationIndex,
+    packs: Option<
+        Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+    >,
+    selected_jdk_artifact_sha256: Option<Box<str>>,
+}
+
+impl<'a> JvmExternalDeclarations<'a> {
+    pub(crate) fn new(
+        artifacts: &'a JvmExternalDeclarationIndex,
+        packs: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+    ) -> Self {
+        Self {
+            artifacts,
+            packs,
+            selected_jdk_artifact_sha256: None,
+        }
+    }
+
+    /// Scope JDK declaration facts to the exact artifact selected for this
+    /// Java source file. Other dependency packs keep their ordinary lookup.
+    pub(crate) fn select_jdk_artifact(mut self, digest: &str) -> Self {
+        self.selected_jdk_artifact_sha256 = Some(Box::<str>::from(digest));
+        self
+    }
+
+    fn admits_pack_symbol(
+        &self,
+        symbol: &brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol,
+    ) -> bool {
+        self.selected_jdk_artifact_sha256
+            .as_deref()
+            .is_none_or(|expected| {
+                let matched = &symbol.provenance.activation.matched_evidence;
+                matched.ecosystem != "jdk" || matched.artifact_sha256.as_deref() == Some(expected)
+            })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_nominal_widening(&self, actual: &TypeRef, formal: &TypeRef) -> Option<bool> {
+        let (source, target) = (
+            java_external_reference_name(actual)?,
+            java_external_reference_name(formal)?,
+        );
+        let source_type = self.get(source)?;
+        match &source_type.source {
+            JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } => {
+                let overlay = self.packs.as_ref()?;
+                let source_symbol = overlay
+                    .symbols_with_id(declaration_id)
+                    .records
+                    .into_iter()
+                    .find(|symbol| self.admits_pack_symbol(symbol))?;
+                let target_type = self.pack_declaration(target)?;
+                let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } =
+                    &target_type.source
+                else {
+                    return None;
+                };
+                let target_symbol = overlay
+                    .symbols_with_id(declaration_id)
+                    .records
+                    .into_iter()
+                    .find(|symbol| self.admits_pack_symbol(symbol))?;
+                let answer = overlay.java_reference_widening(
+                    source_symbol,
+                    target_symbol,
+                    MAX_MEMBER_SURFACE_OWNERS,
+                    None,
+                );
+                if answer.witness.is_some() {
+                    Some(true)
+                } else if answer.incomplete.is_empty() {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let (found, complete) = self
+                    .artifacts
+                    .walk_owner_surfaces(source, |owner, _| (owner == target).then_some(()));
+                if found.is_some() {
+                    Some(true)
+                } else if complete {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Whether no surface can answer anything, so a caller may skip the ladder
+    /// altogether.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.artifacts.is_empty() && self.packs.is_none()
+    }
+
+    pub(crate) fn get(&self, fqn: &str) -> Option<JvmExternalType> {
+        if let Some(external_type) = self.artifacts.get(fqn) {
+            return Some(external_type.clone());
+        }
+        self.pack_declaration(fqn)
+    }
+
+    pub(crate) fn resolve_explicit_import(
+        &self,
+        import_path: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalType> {
+        self.resolve_qualified_name(import_path, access_package)
+    }
+
+    pub(crate) fn resolve_wildcard_import(
+        &self,
+        package_name: &str,
+        short_name: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalType> {
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), access_package)
+    }
+
+    pub(crate) fn resolve_same_package(
+        &self,
+        package_name: &str,
+        short_name: &str,
+    ) -> Option<JvmExternalType> {
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), package_name)
+    }
+
+    pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<JvmExternalType> {
+        self.get(&qualified_name("java.lang", short_name))
+            .filter(is_public_external_type)
+    }
+
+    pub(crate) fn resolve_qualified_name(
+        &self,
+        fqn: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalType> {
+        self.get(fqn)
+            .filter(|external_type| external_type.is_accessible_from_package(access_package))
+    }
+
+    /// The external member a written `Owner.member` spelling names (#1900).
+    ///
+    /// A reference-site spelling that crosses a `.` is one written name whose
+    /// head is a type and whose last segment is a member: `Collections.sort`
+    /// spells the `sort` member of `java.util.Collections`. The head is
+    /// resolved by `resolve_owner`, which is the caller's own type ladder --
+    /// Java's import tiers, Kotlin's name scope, Scala's import tiers -- so a
+    /// member spelling reaches the same owner a type spelling would.
+    ///
+    /// Only a spelling the type ladder has already failed to answer belongs
+    /// here. A nested type is spelled with the same dot, and its declaration is
+    /// a type, so it is decided by the type ladder before this runs.
+    ///
+    /// Both halves answer here, in the same precedence the type half uses: the
+    /// artifact-derived member surface first, then the activated packs'. The
+    /// owner decides which half can even speak, because an owner is resolved
+    /// once and carries where it came from -- an owner the jar index declared
+    /// has an artifact member surface and no pack declaration id, and a
+    /// pack-declared owner the reverse -- so "artifacts win ties" is settled by
+    /// the owner lookup rather than by a second race here.
+    ///
+    /// A miss is never a proof of absence. The surface reports what it
+    /// declares; a caller that finds nothing keeps the status it had, so a type
+    /// whose pack declares no members, and a type whose class file the bounded
+    /// index never read, both leave every member spelling exactly as unknown as
+    /// it was before.
+    pub(crate) fn resolve_member_spelling(
+        &self,
+        spelling: &str,
+        access_package: &str,
+        resolve_owner: impl FnOnce(&str) -> Option<JvmExternalType>,
+    ) -> Option<JvmExternalMember> {
+        let (owner_spelling, member_name) = spelling.trim().rsplit_once('.')?;
+        if owner_spelling.is_empty() || member_name.is_empty() {
+            return None;
+        }
+        let owner = resolve_owner(owner_spelling)?;
+        self.artifact_member(&owner, member_name)
+            .or_else(|| self.pack_member(&owner, member_name))
+            .and_then(|member| member.accessible_from_package(access_package))
+    }
+
+    /// The member the indexed artifacts declare on `owner` (#1900).
+    ///
+    /// Only an artifact-declared owner has an artifact member surface, for the
+    /// same reason [`Self::pack_member`] refuses a non-pack owner: the surface
+    /// is keyed by the identity the half that read it produced. An owner the
+    /// jar index never read has no entry at all, which is why a miss here is
+    /// silence rather than a negative answer.
+    fn artifact_member(
+        &self,
+        owner: &JvmExternalType,
+        member_name: &str,
+    ) -> Option<JvmExternalMember> {
+        match owner.source {
+            JvmExternalDeclarationSource::SourceJar { .. }
+            | JvmExternalDeclarationSource::ClassFile { .. } => {
+                self.artifacts.member(&owner.fqn, member_name).cloned()
+            }
+            JvmExternalDeclarationSource::SemanticPack { .. } => None,
+        }
+    }
+
+    /// The one declaration the activated packs publish for `fqn`, if exactly
+    /// one does.
+    ///
+    /// `symbols_named` also posts every symbol under its simple name, so a bare
+    /// `Collections` would otherwise match `java.util.Collections` and let any
+    /// dependency type that happens to share a short name answer a JVM name.
+    /// The caller has already walked its own import tiers to produce a
+    /// qualified spelling, so only the qualified postings count: the declared
+    /// name, and the aliases, which are qualified too. This is the same rule
+    /// `JvmOverlayModel::qualified_name_disposition` applies on the
+    /// proof-gated diagnostic side, so a trace, a definition and a diagnostic
+    /// read one activated set the same way.
+    fn pack_declaration(&self, fqn: &str) -> Option<JvmExternalType> {
+        let overlay = self.packs.as_ref()?;
+        let mut declarations = qualified_model_symbols(overlay, fqn)
+            .into_iter()
+            .filter(|symbol| self.admits_pack_symbol(symbol))
+            .filter_map(pack_external_type);
+        let declared = declarations.next()?;
+        // Two activated packs claiming one qualified name is ambiguity, not a
+        // declaration: the name exists but which declaration it denotes is not
+        // decided, so no single external type can be reported. Reporting none
+        // understates what is known and never overstates it.
+        declarations.next().is_none().then_some(declared)
+    }
+
+    /// The member an activated pack publishes on `owner`, searched over the
+    /// owner's whole inherited surface.
+    ///
+    /// The surface is the closure `SemanticModelOverlay::owner_surface` builds,
+    /// because a JVM member is as often inherited as declared: `sort` sits on
+    /// `java.util.Collections` while `toString` sits on `java.lang.Object`, and
+    /// a reference spells both the same way. The declaration that answers keeps
+    /// its own qualified name, so the reported target names where the member is
+    /// declared rather than where it was written.
+    ///
+    /// More than one hit is the ordinary shape of an override or an overload --
+    /// a class and the interface it implements both declare the method, and
+    /// `sort(List)` and `sort(List, Comparator)` are two declarations of one
+    /// name -- so it is not ambiguity. Only a declaration an indexed pack itself
+    /// flagged ambiguous is, which is the same rule PHP's external surface
+    /// applies.
+    ///
+    /// Staticness and arity are deliberately not filtered on. The question this
+    /// surface answers is whether an external declaration spells the name, not
+    /// whether the written use of it compiles: the workspace member tier does
+    /// not refuse a static member written through an instance either, and a
+    /// Scala `object` or Kotlin companion member is published without the
+    /// static flag a Java static carries.
+    fn pack_member(&self, owner: &JvmExternalType, member_name: &str) -> Option<JvmExternalMember> {
+        let overlay = self.packs.as_ref()?;
+        // Only a pack-declared owner has a pack member surface: an artifact
+        // owner carries no declaration identity to look members up by.
+        let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } = &owner.source
+        else {
+            return None;
+        };
+        let owner_symbol = overlay
+            .symbols_with_id(declaration_id)
+            .records
+            .into_iter()
+            .find(|symbol| self.admits_pack_symbol(symbol))?;
+        let surface = overlay.owner_surface(owner_symbol);
+        surface
+            .closure
+            .iter()
+            .filter(|declaring| self.admits_pack_symbol(declaring))
+            .find_map(|declaring| {
+                let matched = overlay
+                    .members_of(&declaring.id)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| {
+                        symbol.name == member_name
+                            && self.admits_pack_symbol(symbol)
+                            && !symbol.provenance.ambiguous
+                            && JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                let member = *matched.first()?;
+                let mut call_shapes = Vec::new();
+                let mut call_shapes_incomplete = false;
+                for symbol in &matched {
+                    if !brokk_bifrost_semantic::analyzer::semantic_model::overlay::symbol_kind_is_callable(symbol.kind) {
+                        continue;
+                    }
+                    let Some(signature) = symbol.structured_signature.as_ref() else {
+                        call_shapes_incomplete = true;
+                        continue;
+                    };
+                    if !symbol.callable_family_complete
+                        && !(declaring.jvm_owner_family_enumerated
+                            && symbol.provenance.completeness
+                                == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCompleteness::Complete)
+                    {
+                        call_shapes_incomplete = true;
+                    }
+                    let Some(parameter_count) = u32::try_from(signature.parameters.len()).ok()
+                    else {
+                        call_shapes_incomplete = true;
+                        continue;
+                    };
+                    call_shapes.push(JvmExternalCallShape {
+                        visibility: semantic_visibility(symbol.visibility),
+                        inventory_identity: None,
+                        non_overridable: symbol.non_overridable,
+                        parameter_count,
+                        has_type_parameters: !signature.type_parameters.is_empty(),
+                        parameters: signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| normalize_jvm_model_type_ref(Some(overlay), &parameter.r#type))
+                            .collect(),
+                        is_static: symbol.is_static,
+                        variadic: signature
+                            .parameters
+                            .iter()
+                            .any(|parameter| parameter.variadic),
+                        returns: signature.returns.clone(),
+                    });
+                }
+                Some(JvmExternalMember {
+                    fqn: member.qualified_name.clone(),
+                    // The package split is the one [`pack_external_type`] makes on
+                    // a type's declared name, taken from the declaring type rather
+                    // than from the type the reference wrote.
+                    declaring_package: declaring
+                        .qualified_name
+                        .rsplit_once('.')
+                        .map_or("", |(package, _)| package)
+                        .to_owned(),
+                    visibility: semantic_visibility(member.visibility),
+                    returns: member
+                        .structured_signature
+                        .as_ref()
+                        .and_then(|signature| signature.returns.clone()),
+                    // Carried for parity with the artifact-derived member surface
+                    // (#2538). The doc comment above already warns that a Scala
+                    // `object` or Kotlin companion member is published without
+                    // the static flag a Java `static` carries, so a caller that
+                    // needs a *proof* of compile-time-constant-ness (not merely
+                    // "declared const-shaped") must not rely on this half alone
+                    // for those languages; [`JvmExternalMember::is_compile_time_constant`]
+                    // requires both flags together and fails closed if either is
+                    // under-reported.
+                    is_static: member.is_static,
+                    is_constant: member.kind
+                        == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Constant,
+                    jdk_artifact_sha256: (member.provenance.activation.matched_evidence.ecosystem
+                        == "jdk")
+                        .then(|| {
+                            member
+                                .provenance
+                                .activation
+                                .matched_evidence
+                                .artifact_sha256
+                                .clone()
+                        })
+                        .flatten(),
+                    call_shapes,
+                    call_shapes_incomplete,
+                })
+            })
+    }
+}
+
+/// One member an external declaration surface declares on an external type
+/// (#1900): the `sort` of `Collections.sort`, not the `Collections`.
+///
+/// Both halves produce this same shape -- the jar index reads it out of a
+/// class file's member table, an activated pack reads it out of a declaration
+/// fact -- so one lookup answers a member spelling whichever half declared it.
+///
+/// A member is not a type, so it is not a [`JvmExternalType`]: nothing may
+/// resolve a type name to it, and [`pack_type_kind`] rejects every member kind
+/// precisely so that cannot happen. What a member shares with a type is the
+/// question a boundary asks -- does an external declaration spell this name,
+/// and may this package see it -- so it carries exactly what answers that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmExternalMember {
+    fqn: String,
+    /// The package of the type that *declares* the member, which is what
+    /// `protected` and package-private accessibility are measured against. An
+    /// inherited member is declared in its own supertype's package, not in the
+    /// package of the type the reference wrote.
+    declaring_package: String,
+    visibility: JvmVisibility,
+    /// The type the declaration writes as this member's return type, exactly as
+    /// the declaring half recorded it. `None` means the declaration wrote none
+    /// -- a field, a constructor, a `void` method, or a member surface whose
+    /// signature the producer did not record -- which is not a claim that the
+    /// member returns nothing a caller can name.
+    ///
+    /// Overloads share one entry per written name in the artifact half, so this
+    /// is the return type of the *first* declaration read for that name. That is
+    /// the same "overloads are one name, not ambiguity" rule
+    /// [`JvmIndexedOwnerSurface`] already applies to the member itself.
+    /// A caller that needs the return type of the overload a written call
+    /// *selects*, rather than a name to continue a ladder from, asks
+    /// [`JvmExternalMember::applicable_return_type`] instead (#3522).
+    returns: Option<TypeRef>,
+    /// Whether the declaring half marked this member `static` (#2538).
+    is_static: bool,
+    /// Whether the declaring half classified this member as a compile-time
+    /// constant: for the JVM class-file half, exactly a field whose access
+    /// flags carry both `ACC_STATIC` and `ACC_FINAL`
+    /// (`MemberKind::Constant`, set by `class_field_member`); for an
+    /// activated pack, `SemanticModelSymbolKind::Constant` (#2538).
+    ///
+    /// This is a separate signal from [`Self::is_static`] rather than the
+    /// whole story on its own: a caller that needs "provably a compile-time
+    /// constant" should require both, so a producer that ever set one flag
+    /// without the other fails closed instead of over-claiming.
+    is_constant: bool,
+    /// Exact JDK declaration artifact. The Java source's selected toolchain is
+    /// separate evidence and cannot turn an arbitrary library call into a JDK call.
+    jdk_artifact_sha256: Option<String>,
+    /// Every callable overload of this name the declaring surface recorded.
+    ///
+    /// The collapsed member above answers "does this name exist". These shapes
+    /// answer whether one written receiver and argument count selects a single
+    /// signature. Same-arity overloads stay distinct entries so a call that
+    /// matches two of them is not treated as one proof. Each shape carries its
+    /// own declared return type, so a selected shape can type a chained
+    /// receiver without a name-only reading of some other overload (#3522).
+    call_shapes: Vec<JvmExternalCallShape>,
+    /// A callable with this name was dropped, lacked a signature, or did not
+    /// certify that its overload family is complete. Applicability then stays
+    /// unknown instead of treating the recorded shapes as exhaustive.
+    call_shapes_incomplete: bool,
+}
+
+/// One callable overload retained beside the collapsed member name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JvmExternalCallShape {
+    visibility: JvmVisibility,
+    inventory_identity:
+        Option<brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity>,
+    non_overridable:
+        Option<brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence>,
+    parameter_count: u32,
+    parameters: Vec<TypeRef>,
+    has_type_parameters: bool,
+    is_static: bool,
+    variadic: bool,
+    /// The type this overload's own declaration writes as its return type.
+    ///
+    /// The collapsed [`JvmExternalMember::returns`] holds the first
+    /// declaration's answer for the whole name, which is enough to continue a
+    /// receiver ladder from a written name but is not the *selected*
+    /// overload's answer. Keeping the type beside the shape lets a caller ask
+    /// for the return type of the one signature an argument count and
+    /// receiver shape actually select (#3522).
+    returns: Option<TypeRef>,
+}
+
+impl JvmExternalMember {
+    pub(crate) fn non_overridable_at(
+        &self,
+        value_receiver: bool,
+        arity: usize,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence> {
+        self.applicable_shape(value_receiver, arity)
+            .and_then(|shape| shape.non_overridable)
+    }
+
+    pub(crate) fn jdk_artifact_sha256(&self) -> Option<&str> {
+        self.jdk_artifact_sha256.as_deref()
+    }
+
+    pub(crate) fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    /// The fully-qualified name of the class this member's declaration says it
+    /// returns (#2454).
+    ///
+    /// This is what types a *chained* receiver: `response.getWriter()` has no
+    /// written type anywhere in the reading file, but the declaration surface
+    /// that declares `getWriter` also writes down that it returns
+    /// `java.io.PrintWriter`.
+    ///
+    /// It fails closed, in the same direction as every other tier of the
+    /// receiver ladder. Only a `Named` return type names a class a member
+    /// lookup can continue from; a type variable, a wildcard, an array, a
+    /// pointer and every other structured form name no single declaration, so
+    /// they answer nothing and the call keeps the identity-free boundary it had.
+    /// A primitive return spells a `Named` type no external surface declares, so
+    /// it fails at the next rung rather than here.
+    pub(crate) fn declared_return_type_fqn(&self) -> Option<&str> {
+        named_return_type_fqn(self.returns.as_ref())
+    }
+
+    fn accessible_from_package(mut self, package_name: &str) -> Option<Self> {
+        // Access is a property of each declaration, not the first overload in
+        // a name group. It is independent of the family's enumeration claim.
+        let declaring_package = &self.declaring_package;
+        self.call_shapes.retain(|shape| {
+            is_visible_from_package(shape.visibility, declaring_package, package_name)
+        });
+        if !is_visible_from_package(self.visibility, declaring_package, package_name) {
+            let shape = self.call_shapes.first()?;
+            self.visibility = shape.visibility;
+            self.is_static = shape.is_static;
+            self.returns = shape.returns.clone();
+            self.is_constant = false;
+        }
+        Some(self)
+    }
+
+    /// Whether the declaring half marked this member `static` (#2538).
+    pub(crate) fn is_static(&self) -> bool {
+        self.is_static
+    }
+
+    /// Whether this member is provably a compile-time constant: `static`
+    /// *and* classified `MemberKind::Constant`/`SemanticModelSymbolKind::Constant`
+    /// by whichever half declared it (#2538).
+    ///
+    /// A field the class-file half classifies `MemberKind::Constant` is,
+    /// by construction, a field whose access flags carry both `ACC_STATIC`
+    /// and `ACC_FINAL` -- read straight off the real class file, not
+    /// inferred -- so a caller may treat a read of such a field as carrying
+    /// no attacker-influenced value flow (Java Language Specification
+    /// compile-time-constant semantics for a `static final` field). Requiring
+    /// both flags here, rather than trusting `is_constant` alone, means a
+    /// producer that only ever set one of the two still fails closed.
+    pub(crate) fn is_compile_time_constant(&self) -> bool {
+        self.is_static && self.is_constant
+    }
+
+    /// The parameter count of the one non-variadic overload that accepts
+    /// `arity` arguments with this receiver shape.
+    ///
+    /// `None` when the surface did not record a complete overload family, when
+    /// a variadic overload could also accept the call, or when zero or several
+    /// fixed signatures match. A name-only member is not a signature.
+    pub(crate) fn applicable_parameter_count(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<u32> {
+        self.applicable_shape(instance_receiver, arity)
+            .map(|shape| shape.parameter_count)
+    }
+
+    /// Select one external overload from structured Java argument types.
+    ///
+    /// Arity alone is not Java applicability: a unique `m(String)` does not
+    /// accept `m(1)`. Unknown conversions keep the external call unproved.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn applicable_parameter_count_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Option<u32> {
+        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)
+            .map(|shape| shape.parameter_count)
+    }
+
+    /// A declared member can remain a possible call when discovery or
+    /// conversions are unknown. A complete family that rejects every
+    /// invocation phase does not supply a call candidate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn may_apply_to_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> bool {
+        if self.call_shapes_incomplete {
+            return true;
+        }
+        self.call_shapes.iter().any(|shape| {
+            if shape.is_static == instance_receiver {
+                return false;
+            }
+            let signature = JavaExternalSignature {
+                parameters: &shape.parameters,
+                variadic: shape.variadic,
+                has_type_parameters: shape.has_type_parameters,
+            };
+            [
+                JavaExternalInvocationPhase::Strict,
+                JavaExternalInvocationPhase::Loose,
+                JavaExternalInvocationPhase::Variable,
+            ]
+            .into_iter()
+            .any(|phase| {
+                signature.applicability(actuals, phase, surface)
+                    != JavaExternalApplicability::Inapplicable
+            })
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn non_overridable_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Option<&brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence> {
+        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?
+            .non_overridable
+            .as_ref()
+    }
+
+    /// Reuse the writer's owner-member order for the overload selected by the
+    /// structured argument conversion proof. This borrows the active shard;
+    /// it does not materialize another payload or invent a source locator.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn direct_inventory_identity_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity>
+    {
+        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?
+            .inventory_identity
+            .clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn inventory_identity_for_argument_types(
+        &self,
+        active: &brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity>
+    {
+        use brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity;
+
+        use brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalOwnerIdentity;
+        let shape =
+            self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?;
+        let (owner_fqn, member_name) = self.fqn.rsplit_once('.')?;
+        let mut selected = None;
+        for owner in active.types_named(owner_fqn).records {
+            if !owner.shard.admits_jvm_owner_declaration(owner.record) {
+                continue;
+            }
+            let (_, members, _) = owner.shard.shard.payload().declaration_facts()?;
+            for (ordinal, member) in members
+                .iter()
+                .chain(
+                    owner
+                        .record
+                        .jvm_inventory
+                        .iter()
+                        .flat_map(|inventory| &inventory.additional_members),
+                )
+                .filter(|member| member.owner == owner.record.id && member.guard.is_none())
+                .enumerate()
+            {
+                if member.name != member_name || member.is_static != shape.is_static {
+                    continue;
+                }
+                let Some(signature) = &member.signature else {
+                    continue;
+                };
+                if signature.parameters.len() != shape.parameters.len()
+                    || !signature.parameters.iter().zip(&shape.parameters).all(
+                        |(formal, selected)| {
+                            normalize_jvm_model_type_ref(
+                                surface.and_then(|surface| surface.packs.as_deref()),
+                                &formal.r#type,
+                            ) == *selected
+                        },
+                    )
+                    || signature.parameters.iter().any(|formal| formal.variadic) != shape.variadic
+                {
+                    continue;
+                }
+                let identity = ExternalMemberIdentity {
+                    owner: ExternalOwnerIdentity {
+                        provider_id: std::sync::Arc::from(
+                            owner.shard.manifest.semantic_sha256.as_str(),
+                        ),
+                        owner_fqn: std::sync::Arc::from(owner_fqn),
+                    },
+                    ordinal: u32::try_from(ordinal).expect("bounded provider member ordinal"),
+                };
+                if selected
+                    .as_ref()
+                    .is_some_and(|previous| previous != &identity)
+                {
+                    return None;
+                }
+                selected = Some(identity);
+            }
+        }
+        selected
+    }
+
+    /// Preserve the selected declaration's full return term for conversion.
+    /// Arrays and generic terms must not be reduced to a displayed class name.
+    pub(crate) fn applicable_return_type(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<&TypeRef> {
+        self.applicable_shape(instance_receiver, arity)?
+            .returns
+            .as_ref()
+    }
+
+    /// The one recorded overload this written arity and receiver shape select.
+    ///
+    /// `None` when the surface did not record a complete overload family, when
+    /// a variadic overload could also accept the call, or when zero or several
+    /// fixed signatures match. A name-only member is not a signature.
+    fn applicable_shape(
+        &self,
+        instance_receiver: bool,
+        arity: usize,
+    ) -> Option<&JvmExternalCallShape> {
+        if self.call_shapes_incomplete {
+            return None;
+        }
+        let arity = u32::try_from(arity).ok()?;
+        let wants_static = !instance_receiver;
+        let mut matched = None;
+        for shape in &self.call_shapes {
+            if shape.is_static != wants_static {
+                continue;
+            }
+            if shape.variadic {
+                let minimum = shape.parameter_count.saturating_sub(1);
+                if arity >= minimum {
+                    return None;
+                }
+                continue;
+            }
+            if shape.parameter_count != arity {
+                continue;
+            }
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(shape);
+        }
+        matched
+    }
+
+    /// A fixed nongeneric signature equal to all known static actuals is
+    /// selected independently of family completeness. Receiver proof belongs
+    /// to the caller, and behavior-only summaries supply no call shape.
+    pub(crate) fn exact_return_type_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<&TypeRef> {
+        self.exact_shape_for_argument_types(instance_receiver, actuals)?
+            .returns
+            .as_ref()
+    }
+
+    fn exact_shape_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+    ) -> Option<&JvmExternalCallShape> {
+        let wants_static = !instance_receiver;
+        let mut exact = self
+            .call_shapes
+            .iter()
+            .filter(|shape| shape.is_static == wants_static && shape.java_exact_actuals(actuals));
+        let selected = exact.next()?;
+        // JLS 15.12.2 phase 1: no applicable overload can be strictly more
+        // specific than formals equal to every actual's static type, and
+        // two declarations with identical formals cannot coexist. Missing
+        // family members therefore cannot change this nongeneric, fixed
+        // selection. This says nothing about receiver dispatch or model
+        // provenance completeness.
+        exact.next().is_none().then_some(selected)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn applicable_shape_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> Option<&JvmExternalCallShape> {
+        if let Some(selected) = self.exact_shape_for_argument_types(instance_receiver, actuals) {
+            return Some(selected);
+        }
+        let wants_static = !instance_receiver;
+        if self.call_shapes_incomplete {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        for shape in &self.call_shapes {
+            if shape.is_static != wants_static {
+                continue;
+            }
+            if shape.parameter_count as usize == actuals.len()
+                || (shape.variadic
+                    && actuals.len() >= shape.parameter_count.saturating_sub(1) as usize)
+            {
+                candidates.push(shape);
+            }
+        }
+        let selected = select_java_external_invocation(
+            actuals,
+            &candidates
+                .iter()
+                .map(|shape| JavaExternalSignature {
+                    parameters: &shape.parameters,
+                    variadic: shape.variadic,
+                    has_type_parameters: shape.has_type_parameters,
+                })
+                .collect::<Vec<_>>(),
+            surface,
+        )?;
+        candidates.get(selected.0).copied()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum JavaExternalInvocationPhase {
+    Strict,
+    Loose,
+    Variable,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JavaExternalConversion {
+    Strict,
+    Loose,
+    Inapplicable,
+    Unknown,
+}
+
+/// Select the unique most-specific signature under Java's fixed-arity
+/// invocation phases. `None` preserves uncertainty when one of the structured
+/// parameter types cannot decide applicability or specificity.
+#[cfg(any(test, feature = "test-support"))]
+fn select_java_external_signature(actuals: &[TypeRef], candidates: &[&[TypeRef]]) -> Option<usize> {
+    select_java_external_invocation(
+        actuals,
+        &candidates
+            .iter()
+            .map(|parameters| JavaExternalSignature {
+                parameters,
+                variadic: false,
+                has_type_parameters: false,
+            })
+            .collect::<Vec<_>>(),
+        None,
+    )
+    .map(|(selected, _)| selected)
+}
+
+struct JavaExternalSignature<'a> {
+    parameters: &'a [TypeRef],
+    variadic: bool,
+    has_type_parameters: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaExternalApplicability {
+    Applicable,
+    Inapplicable,
+    Unknown,
+}
+
+impl JavaExternalSignature<'_> {
+    #[cfg(any(test, feature = "test-support"))]
+    fn applicability(
+        &self,
+        actuals: &[TypeRef],
+        phase: JavaExternalInvocationPhase,
+        surface: Option<&JvmExternalDeclarations<'_>>,
+    ) -> JavaExternalApplicability {
+        use crate::analyzer::jvm::external::JavaExternalApplicability::Applicable;
+
+        use crate::analyzer::jvm::external::JavaExternalApplicability::Inapplicable;
+
+        use crate::analyzer::jvm::external::JavaExternalApplicability::Unknown;
+        let expanded = phase == JavaExternalInvocationPhase::Variable;
+        let minimum = self.parameters.len().saturating_sub(1);
+        if expanded {
+            if !self.variadic || self.parameters.is_empty() || actuals.len() < minimum {
+                return Inapplicable;
+            }
+        } else if self.parameters.len() != actuals.len() {
+            return Inapplicable;
+        }
+        let tail = if expanded {
+            match self.parameters.last() {
+                Some(TypeRef::Array { element }) => Some(element.as_ref()),
+                _ => return Unknown,
+            }
+        } else {
+            None
+        };
+        let mut unknown = false;
+        for (ordinal, actual) in actuals.iter().enumerate() {
+            let formal = if expanded && ordinal >= minimum {
+                tail.expect("expanded signature has an element type")
+            } else {
+                &self.parameters[ordinal]
+            };
+            match java_external_conversion_in(actual, formal, surface) {
+                JavaExternalConversion::Strict => {}
+                JavaExternalConversion::Loose if phase != JavaExternalInvocationPhase::Strict => {}
+                JavaExternalConversion::Loose | JavaExternalConversion::Inapplicable => {
+                    return Inapplicable;
+                }
+                JavaExternalConversion::Unknown => unknown = true,
+            }
+        }
+        if unknown { Unknown } else { Applicable }
+    }
+
+    fn exact_actuals(&self, actuals: &[TypeRef]) -> bool {
+        !self.variadic
+            && !self.has_type_parameters
+            && self.parameters.len() == actuals.len()
+            && self
+                .parameters
+                .iter()
+                .zip(actuals)
+                .all(|(formal, actual)| java_external_same_static_type(formal, actual))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn select_java_external_invocation(
+    actuals: &[TypeRef],
+    candidates: &[JavaExternalSignature<'_>],
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> Option<(usize, JavaExternalInvocationPhase)> {
+    use crate::analyzer::jvm::external::JavaExternalInvocationPhase::Loose;
+
+    use crate::analyzer::jvm::external::JavaExternalInvocationPhase::Strict;
+
+    use crate::analyzer::jvm::external::JavaExternalInvocationPhase::Variable;
+    for phase in [Strict, Loose, Variable] {
+        let mut applicable = Vec::new();
+        let mut uncertain = false;
+        for (index, candidate) in candidates.iter().enumerate() {
+            match candidate.applicability(actuals, phase, surface) {
+                JavaExternalApplicability::Applicable => applicable.push(index),
+                JavaExternalApplicability::Inapplicable => {}
+                JavaExternalApplicability::Unknown => uncertain = true,
+            }
+        }
+        // Unknown applicability in an earlier phase can change whether the
+        // later phase is reached; it must not be silently discarded.
+        if uncertain {
+            return None;
+        }
+        if applicable.is_empty() {
+            continue;
+        }
+        let ranking_arity = if phase == Variable {
+            applicable
+                .iter()
+                .map(|&index| candidates[index].parameters.len())
+                .max()
+                .unwrap_or(0)
+                .max(actuals.len())
+        } else {
+            actuals.len()
+        };
+        let expanded_formals = |index: usize| -> Option<Vec<TypeRef>> {
+            let candidate = &candidates[index];
+            if phase != Variable {
+                return Some(candidate.parameters.to_vec());
+            }
+            let (last, prefix) = candidate.parameters.split_last()?;
+            let TypeRef::Array { element } = last else {
+                return None;
+            };
+            Some(
+                prefix
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::repeat_n(
+                        element.as_ref().clone(),
+                        ranking_arity - prefix.len(),
+                    ))
+                    .collect(),
+            )
+        };
+        let mut maximal = Vec::new();
+        for &index in &applicable {
+            let formals = expanded_formals(index)?;
+            let mut dominated = false;
+            for &other in &applicable {
+                if index == other {
+                    continue;
+                }
+                if java_external_more_specific(&expanded_formals(other)?, &formals, surface)? {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                maximal.push(index);
+            }
+        }
+        return match maximal.as_slice() {
+            [selected] => Some((*selected, phase)),
+            _ => None,
+        };
+    }
+    None
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn select_java_external_signature_for_types(
+    actuals: &[TypeRef],
+    candidates: &[Vec<TypeRef>],
+) -> Option<usize> {
+    let candidates = candidates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    select_java_external_signature(actuals, &candidates)
+}
+
+pub(crate) fn java_external_same_static_type(left: &TypeRef, right: &TypeRef) -> bool {
+    let mut pending = vec![(left, right)];
+    while let Some((left, right)) = pending.pop() {
+        let arguments = match (left, right) {
+            (
+                TypeRef::Named {
+                    name: left,
+                    arguments: left_args,
+                    ..
+                },
+                TypeRef::Named {
+                    name: right,
+                    arguments: right_args,
+                    ..
+                },
+            ) if !left.is_empty() && left != "void" && left == right => {
+                Some((left_args, right_args))
+            }
+            (
+                TypeRef::Declared {
+                    id: left,
+                    arguments: left_args,
+                    ..
+                },
+                TypeRef::Declared {
+                    id: right,
+                    arguments: right_args,
+                    ..
+                },
+            ) if !left.is_empty() && left == right => Some((left_args, right_args)),
+            (TypeRef::Array { element: left }, TypeRef::Array { element: right }) => {
+                pending.push((left, right));
+                None
+            }
+            _ => return false,
+        };
+        if let Some((left, right)) = arguments {
+            if left.len() != right.len() {
+                return false;
+            }
+            pending.extend(left.iter().zip(right));
+        }
+    }
+    true
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_known_ground_type(ty: &TypeRef) -> bool {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty {
+            TypeRef::Named {
+                name, arguments, ..
+            } => {
+                if name.is_empty() || name == "void" {
+                    return false;
+                }
+                pending.extend(arguments);
+            }
+            TypeRef::Declared { id, arguments, .. } => {
+                if id.is_empty() {
+                    return false;
+                }
+                pending.extend(arguments);
+            }
+            TypeRef::Array { element } => pending.push(element),
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn java_external_conversion(actual: &TypeRef, formal: &TypeRef) -> JavaExternalConversion {
+    java_external_conversion_in(actual, formal, None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn java_external_conversion_in(
+    actual: &TypeRef,
+    formal: &TypeRef,
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> JavaExternalConversion {
+    if (matches!(actual, TypeRef::Array { .. }) && java_external_primitive(formal).is_some())
+        || (java_external_primitive(actual).is_some() && matches!(formal, TypeRef::Array { .. }))
+    {
+        return JavaExternalConversion::Inapplicable;
+    }
+    if !java_known_ground_type(actual) || !java_known_ground_type(formal) {
+        return JavaExternalConversion::Unknown;
+    }
+    let actual_primitive = java_external_primitive(actual);
+    let formal_primitive = java_external_primitive(formal);
+    match (actual_primitive, formal_primitive) {
+        (Some(actual), Some(formal)) => {
+            return if brokk_bifrost_jvm::java::primitives::primitive_converts(actual, formal) {
+                JavaExternalConversion::Strict
+            } else {
+                JavaExternalConversion::Inapplicable
+            };
+        }
+        (Some(_), None) if matches!(formal, TypeRef::Array { .. }) => {
+            return JavaExternalConversion::Inapplicable;
+        }
+        (Some(actual), None) => {
+            let Some(formal_name) = java_external_reference_name(formal) else {
+                return JavaExternalConversion::Unknown;
+            };
+            return if java_external_wrapper_name(actual) == Some(formal_name)
+                || formal_name == "java.lang.Object"
+            {
+                JavaExternalConversion::Loose
+            } else if formal_name == "java.lang.String" {
+                JavaExternalConversion::Inapplicable
+            } else {
+                let Some(wrapper) = java_external_wrapper_name(actual) else {
+                    return JavaExternalConversion::Unknown;
+                };
+                match java_external_reference_conversion(&TypeRef::named(wrapper), formal, surface)
+                {
+                    JavaExternalConversion::Strict => JavaExternalConversion::Loose,
+                    conversion => conversion,
+                }
+            };
+        }
+        (None, Some(formal)) => {
+            if matches!(actual, TypeRef::Named { name, .. } if name == "<null>") {
+                return JavaExternalConversion::Inapplicable;
+            }
+            let Some(actual_name) = java_external_reference_name(actual) else {
+                return JavaExternalConversion::Unknown;
+            };
+            return if let Some(unboxed) = java_external_wrapper_primitive(actual_name) {
+                if brokk_bifrost_jvm::java::primitives::primitive_converts(unboxed, formal) {
+                    JavaExternalConversion::Loose
+                } else {
+                    JavaExternalConversion::Inapplicable
+                }
+            } else if matches!(actual, TypeRef::Named { .. }) {
+                // Only the eight nominal wrapper types have an unboxing
+                // conversion; arrays and other ground reference types do not.
+                JavaExternalConversion::Inapplicable
+            } else {
+                JavaExternalConversion::Unknown
+            };
+        }
+        (None, None) => {}
+    }
+    java_external_reference_conversion(actual, formal, surface)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_reference_conversion(
+    mut actual: &TypeRef,
+    mut formal: &TypeRef,
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> JavaExternalConversion {
+    loop {
+        if java_external_same_static_type(actual, formal)
+            || matches!(actual, TypeRef::Named { name, .. } if name == "<null>")
+        {
+            return JavaExternalConversion::Strict;
+        }
+        match (actual, formal) {
+            (TypeRef::Array { element: source }, TypeRef::Array { element: target }) => {
+                if java_external_primitive(source).is_some()
+                    || java_external_primitive(target).is_some()
+                {
+                    return if java_external_same_static_type(source, target) {
+                        JavaExternalConversion::Strict
+                    } else {
+                        JavaExternalConversion::Inapplicable
+                    };
+                }
+                actual = source;
+                formal = target;
+            }
+            (TypeRef::Array { .. }, _) => {
+                return if matches!(
+                    java_external_reference_name(formal),
+                    Some("java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable")
+                ) {
+                    JavaExternalConversion::Strict
+                } else {
+                    JavaExternalConversion::Inapplicable
+                };
+            }
+            (_, TypeRef::Array { .. }) => return JavaExternalConversion::Inapplicable,
+            _ => {
+                return if java_external_reference_name(formal) == Some("java.lang.Object")
+                    && java_external_reference_name(actual).is_some()
+                {
+                    JavaExternalConversion::Strict
+                } else {
+                    match surface.and_then(|surface| surface.java_nominal_widening(actual, formal))
+                    {
+                        Some(true) => JavaExternalConversion::Strict,
+                        Some(false) => JavaExternalConversion::Inapplicable,
+                        None => JavaExternalConversion::Unknown,
+                    }
+                };
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_more_specific(
+    left: &[TypeRef],
+    right: &[TypeRef],
+    surface: Option<&JvmExternalDeclarations<'_>>,
+) -> Option<bool> {
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut strict = false;
+    for (left, right) in left.iter().zip(right) {
+        if java_external_same_static_type(left, right) {
+            continue;
+        }
+        match java_external_conversion_in(left, right, surface) {
+            JavaExternalConversion::Strict => strict = true,
+            JavaExternalConversion::Loose | JavaExternalConversion::Inapplicable => {
+                return Some(false);
+            }
+            JavaExternalConversion::Unknown => return None,
+        }
+    }
+    Some(strict)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_primitive(
+    type_ref: &TypeRef,
+) -> Option<brokk_bifrost_jvm::java::primitives::JavaPrimitive> {
+    let TypeRef::Named {
+        name, arguments, ..
+    } = type_ref
+    else {
+        return None;
+    };
+    arguments
+        .is_empty()
+        .then(|| brokk_bifrost_jvm::java::primitives::primitive_for_name(name))
+        .flatten()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_reference_name(type_ref: &TypeRef) -> Option<&str> {
+    match type_ref {
+        TypeRef::Named {
+            name, arguments, ..
+        } if arguments.is_empty() => Some(name),
+        TypeRef::Declared { id, arguments, .. } if arguments.is_empty() => Some(id),
+        _ => None,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_wrapper_name(
+    primitive: brokk_bifrost_jvm::java::primitives::JavaPrimitive,
+) -> Option<&'static str> {
+    use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
+    Some(match primitive {
+        JavaPrimitive::Boolean => "java.lang.Boolean",
+        JavaPrimitive::Byte => "java.lang.Byte",
+        JavaPrimitive::Short => "java.lang.Short",
+        JavaPrimitive::Char => "java.lang.Character",
+        JavaPrimitive::Int => "java.lang.Integer",
+        JavaPrimitive::Long => "java.lang.Long",
+        JavaPrimitive::Float => "java.lang.Float",
+        JavaPrimitive::Double => "java.lang.Double",
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_external_wrapper_primitive(
+    name: &str,
+) -> Option<brokk_bifrost_jvm::java::primitives::JavaPrimitive> {
+    use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
+    Some(match name {
+        "java.lang.Boolean" => JavaPrimitive::Boolean,
+        "java.lang.Byte" => JavaPrimitive::Byte,
+        "java.lang.Short" => JavaPrimitive::Short,
+        "java.lang.Character" => JavaPrimitive::Char,
+        "java.lang.Integer" => JavaPrimitive::Int,
+        "java.lang.Long" => JavaPrimitive::Long,
+        "java.lang.Float" => JavaPrimitive::Float,
+        "java.lang.Double" => JavaPrimitive::Double,
+        _ => return None,
+    })
+}
+
+impl JvmExternalCallShape {
+    fn java_exact_actuals(&self, actuals: &[TypeRef]) -> bool {
+        // Type-use nullability is ignored, while declaration IDs and arguments
+        // must agree; unknown and type-variable terms never establish equality.
+        JavaExternalSignature {
+            parameters: &self.parameters,
+            variadic: self.variadic,
+            has_type_parameters: self.has_type_parameters,
+        }
+        .exact_actuals(actuals)
+    }
+}
+
+/// The class name one recorded declared return type spells, or `None` for a
+/// form that names no single declaration.
+///
+/// Shared by the collapsed member and each retained overload so a chained
+/// receiver reads the same rule from either (#2454, #3522): only a `Named`,
+/// non-empty type names a class the member lookup can continue from.
+fn named_return_type_fqn(returns: Option<&TypeRef>) -> Option<&str> {
+    match returns? {
+        TypeRef::Named { name, .. } if !name.is_empty() => Some(name),
+        _ => None,
+    }
+}
+
+fn callable_member_kind(kind: MemberKind) -> bool {
+    matches!(kind, MemberKind::Method | MemberKind::Constructor)
+}
+
+fn external_call_shape(
+    kind: MemberKind,
+    visibility: JvmVisibility,
+    is_static: bool,
+    signature: Option<&Signature>,
+    non_overridable: Option<
+        brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence,
+    >,
+) -> Option<JvmExternalCallShape> {
+    if !callable_member_kind(kind) {
+        return None;
+    }
+    let signature = signature?;
+    let parameter_count = u32::try_from(signature.parameters.len()).ok()?;
+    Some(JvmExternalCallShape {
+        visibility,
+        inventory_identity: None,
+        non_overridable,
+        parameter_count,
+        has_type_parameters: !signature.type_parameters.is_empty(),
+        parameters: signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.r#type.clone())
+            .collect(),
+        is_static,
+        variadic: signature
+            .parameters
+            .iter()
+            .any(|parameter| parameter.variadic),
+        returns: signature.returns.clone(),
+    })
+}
+
+/// A callable whose signature or overload family is not fully known cannot
+/// support an exact applicability claim. Fields are not callables, so a field
+/// that shares the name does not make the method family incomplete.
+fn callable_shape_is_incomplete(
+    kind: MemberKind,
+    signature: Option<&Signature>,
+    family_complete: bool,
+    shape_recorded: bool,
+) -> bool {
+    callable_member_kind(kind) && (signature.is_none() || !family_complete || !shape_recorded)
+}
+
+/// One overload contribution while a declaration surface is collapsed to a
+/// single member name. Later contributions of the same name only add shapes.
+struct RetainedExternalMember {
+    name: String,
+    visibility: JvmVisibility,
+    returns: Option<TypeRef>,
+    is_static: bool,
+    is_constant: bool,
+    shape: Option<JvmExternalCallShape>,
+    shapes_incomplete: bool,
+}
+
+fn retain_external_member(
+    members: &mut HashMap<String, JvmExternalMember>,
+    owner_fqn: &str,
+    owner_package: &str,
+    retained: RetainedExternalMember,
+) {
+    match members.entry(retained.name) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let name = slot.key().clone();
+            slot.insert(JvmExternalMember {
+                fqn: qualified_name(owner_fqn, &name),
+                declaring_package: owner_package.to_owned(),
+                visibility: retained.visibility,
+                returns: retained.returns,
+                is_static: retained.is_static,
+                is_constant: retained.is_constant,
+                jdk_artifact_sha256: None,
+                call_shapes: retained.shape.into_iter().collect(),
+                call_shapes_incomplete: retained.shapes_incomplete,
+            });
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let existing = slot.get_mut();
+            if let Some(shape) = retained.shape {
+                existing.call_shapes.push(shape);
+            }
+            existing.call_shapes_incomplete |= retained.shapes_incomplete;
+        }
+    }
+}
+
+fn mark_call_shapes_incomplete(members: &mut HashMap<String, JvmExternalMember>) {
+    for member in members.values_mut() {
+        member.call_shapes_incomplete = true;
+    }
+}
+
+/// One activated pack symbol as the JVM realm's external declaration, when the
+/// symbol is a JVM type at all.
+///
+/// The package and short name are split out of the declared qualified name
+/// exactly as the pack-fact producers in this module already do
+/// ([`scala_external_type`]), because a declaration fact carries one dotted
+/// name and no separate package field.
+fn pack_external_type(
+    symbol: &brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol,
+) -> Option<JvmExternalType> {
+    if !JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str()) {
+        return None;
+    }
+    let kind = pack_type_kind(symbol.kind)?;
+    let (package_name, short_name) = symbol
+        .qualified_name
+        .rsplit_once('.')
+        .map_or(("", symbol.qualified_name.as_str()), |(package, short)| {
+            (package, short)
+        });
+    (!short_name.is_empty()).then(|| JvmExternalType {
+        fqn: symbol.qualified_name.clone(),
+        package_name: package_name.to_owned(),
+        short_name: short_name.to_owned(),
+        kind,
+        visibility: semantic_visibility(symbol.visibility),
+        source: JvmExternalDeclarationSource::SemanticPack {
+            pack_id: symbol.provenance.pack_id.clone(),
+            declaration_id: symbol.id.clone(),
+        },
+    })
+}
+
+/// A source language Bifrost can read out of a published `-sources.jar`.
+///
+/// All three compile to the same classpath, so one archive walk feeds one
+/// index. They differ only in how much budget an entry gets and which parser
+/// turns it into declarations.
+#[derive(Clone, Copy)]
+enum SourceJarLanguage {
+    Java,
+    Scala,
+    Kotlin,
+}
+
+impl SourceJarLanguage {
+    fn for_entry(entry_name: &str) -> Option<Self> {
+        if entry_name.ends_with(".java") {
+            Some(Self::Java)
+        } else if entry_name.ends_with(".scala") {
+            Some(Self::Scala)
+        } else if entry_name.ends_with(".kt") {
+            Some(Self::Kotlin)
+        } else {
+            // `.kts` build scripts are packaged into some source jars but
+            // declare no library API, so they are deliberately skipped.
+            None
+        }
+    }
+
+    fn max_entry_bytes(self) -> u64 {
+        match self {
+            Self::Java => MAX_SOURCE_ENTRY_BYTES,
+            // Scala and Kotlin entries run the language's whole declaration
+            // walk rather than Java's targeted class-like scan, so they get a
+            // tighter per-entry budget.
+            Self::Scala | Self::Kotlin => MAX_ANALYZER_SOURCE_ENTRY_BYTES,
+        }
+    }
+
+    fn source_types(
+        self,
+        artifact_path: &Path,
+        source_path: &str,
+        source: &str,
+    ) -> Vec<JvmExternalType> {
+        match self {
+            Self::Java => source_types(artifact_path, source_path, source),
+            Self::Scala => unreachable!("Scala source JARs are indexed from semantic pack facts"),
+            Self::Kotlin => kotlin_source_types(artifact_path, source_path, source),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl JvmExternalType {
+    pub(crate) fn package_name(&self) -> &str {
+        &self.package_name
+    }
+
+    pub(crate) fn short_name(&self) -> &str {
+        &self.short_name
+    }
+
+    pub(crate) fn kind(&self) -> JvmExternalTypeKind {
+        self.kind
+    }
+
+    pub(crate) fn visibility(&self) -> JvmVisibility {
+        self.visibility
+    }
+
+    pub(crate) fn source(&self) -> &JvmExternalDeclarationSource {
+        &self.source
+    }
+
+    pub(crate) fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    fn is_accessible_from_package(&self, package_name: &str) -> bool {
+        is_visible_from_package(self.visibility, &self.package_name, package_name)
+    }
+}
+
+/// Whether a declaration of `visibility` sitting in `declaring_package` is
+/// visible to code compiled in `access_package`.
+///
+/// One rule for types and members, because the JVM applies one: a `protected`
+/// declaration is also visible to a subtype, which this deliberately does not
+/// admit, so the answer understates what is reachable and never overstates it.
+fn is_visible_from_package(
+    visibility: JvmVisibility,
+    declaring_package: &str,
+    access_package: &str,
+) -> bool {
+    visibility == JvmVisibility::Public
+        || (matches!(
+            visibility,
+            JvmVisibility::Protected | JvmVisibility::PackagePrivate
+        ) && declaring_package == access_package)
+}
+
+fn open_artifact_file(path: &Path) -> Option<File> {
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES {
+        return None;
+    }
+    File::open(path).ok()
+}
+
+fn can_read_entry(
+    entry_size: u64,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    total_bytes: &mut u64,
+) -> bool {
+    if entry_size > max_entry_bytes {
+        return false;
+    }
+    let Some(next_total) = total_bytes.checked_add(entry_size) else {
+        return false;
+    };
+    if next_total > max_total_bytes {
+        return false;
+    }
+    *total_bytes = next_total;
+    true
+}
+
+fn resolve_configured_artifacts(
+    config: &JvmExternalDependencies,
+    project_root: &Path,
+) -> Vec<ResolvedJvmArtifact> {
+    let mut artifacts = Vec::new();
+    for artifact in &config.artifact_paths {
+        artifacts.push(resolve_explicit_artifact(artifact, project_root));
+    }
+
+    let repository_roots = repository_roots(config);
+    let gradle_cache_roots = gradle_cache_roots(config);
+    for coordinate in &config.coordinates {
+        let mut resolved = false;
+        for root in &repository_roots {
+            if let Some(artifact) = resolve_coordinate(root, coordinate) {
+                artifacts.push(artifact);
+                resolved = true;
+                break;
+            }
+        }
+        if !resolved {
+            for root in &gradle_cache_roots {
+                let gradle_artifacts = resolve_gradle_coordinate(root, coordinate);
+                if !gradle_artifacts.is_empty() {
+                    artifacts.extend(gradle_artifacts);
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut seen = brokk_bifrost_core::hash::HashSet::default();
+    artifacts.retain(|artifact| {
+        seen.insert((
+            artifact.artifact_path.clone(),
+            artifact.source_artifact_path.clone(),
+        ))
+    });
+    artifacts
+}
+
+fn resolve_explicit_artifact(
+    artifact: &JvmExternalArtifact,
+    project_root: &Path,
+) -> ResolvedJvmArtifact {
+    ResolvedJvmArtifact {
+        artifact_path: resolve_path(project_root, &artifact.artifact_path),
+        source_artifact_path: artifact
+            .source_artifact_path
+            .as_ref()
+            .map(|path| resolve_path(project_root, path)),
+        coordinate: artifact.coordinate.clone(),
+        origin: match artifact.origin {
+            JvmExternalArtifactOrigin::Explicit => JvmDependencyOrigin::ExplicitPath,
+            JvmExternalArtifactOrigin::MavenReport => JvmDependencyOrigin::MavenReport,
+            JvmExternalArtifactOrigin::GradleReport => JvmDependencyOrigin::GradleReport,
+        },
+    }
+}
+
+fn maven_coordinate_jar_names(coordinate: &JvmMavenCoordinate) -> (String, String) {
+    (
+        format!("{}-{}.jar", coordinate.artifact_id, coordinate.version),
+        format!(
+            "{}-{}-sources.jar",
+            coordinate.artifact_id, coordinate.version
+        ),
+    )
+}
+
+fn local_jvm_artifact_production_request(
+    path: &Path,
+    artifact_kind: ExternalArtifactKind,
+    pack_id: &str,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: path.to_path_buf(),
+        artifact_kind,
+        pack_id: pack_id.to_owned(),
+        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+        ecosystem: "maven".to_owned(),
+        compatibility: Compatibility {
+            bifrost: None,
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "jvm".to_owned(),
+                version: None,
+            }),
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "local dependency artifact".to_owned(),
+            revision: None,
+        },
+        license: "NOASSERTION".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    }
+}
+
+fn resolve_coordinate(
+    repository_root: &Path,
+    coordinate: &JvmMavenCoordinate,
+) -> Option<ResolvedJvmArtifact> {
+    if !is_safe_maven_coordinate(coordinate) {
+        return None;
+    }
+
+    let repository_root = repository_root.canonicalize().ok()?;
+    let mut directory = repository_root.clone();
+    for segment in coordinate.group_id.split('.') {
+        directory.push(segment);
+    }
+    directory.push(&coordinate.artifact_id);
+    directory.push(&coordinate.version);
+
+    let (jar_name, sources_name) = maven_coordinate_jar_names(coordinate);
+    let artifact_path = canonical_file_under(&repository_root, &directory.join(jar_name))?;
+    if !artifact_path.is_file() {
+        return None;
+    }
+    let source_artifact_path =
+        canonical_file_under(&repository_root, &directory.join(sources_name));
+    Some(ResolvedJvmArtifact {
+        artifact_path,
+        source_artifact_path,
+        coordinate: Some(coordinate.clone()),
+        origin: JvmDependencyOrigin::MavenRepository,
+    })
+}
+
+fn is_safe_maven_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
+    !coordinate.group_id.is_empty()
+        && coordinate
+            .group_id
+            .split('.')
+            .all(is_safe_maven_path_segment)
+        && is_safe_maven_path_segment(&coordinate.artifact_id)
+        && is_safe_maven_path_segment(&coordinate.version)
+}
+
+fn is_safe_maven_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains('/')
+        && !segment.contains('\\')
+}
+
+fn canonical_file_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.starts_with(root).then_some(canonical)
+}
+
+fn is_source_jar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("-sources.jar"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KotlinArchiveClassification {
+    Present,
+    Absent,
+    Incomplete,
+}
+
+fn classification_archive(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ZipArchive<Cursor<Vec<u8>>>, KotlinArchiveClassification> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(KotlinArchiveClassification::Incomplete);
+    }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(KotlinArchiveClassification::Incomplete),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(KotlinArchiveClassification::Absent);
+        }
+        Err(_) => return Err(KotlinArchiveClassification::Incomplete),
+    }
+    let limits = ArtifactProducerLimits {
+        max_artifact_bytes: MAX_ARTIFACT_BYTES,
+        ..ArtifactProducerLimits::default()
+    };
+    let artifact = read_exact_artifact_while(path, &limits, || {
+        cancellation.is_some_and(CancellationToken::is_cancelled)
+    })
+    .map_err(|_| KotlinArchiveClassification::Incomplete)?;
+    match zip_directory_status(artifact.bytes()) {
+        ZipDirectoryStatus::Valid => {}
+        ZipDirectoryStatus::Invalid | ZipDirectoryStatus::Exceeded => {
+            return Err(KotlinArchiveClassification::Incomplete);
+        }
+    }
+    ZipArchive::new(Cursor::new(artifact.into_bytes()))
+        .map_err(|_| KotlinArchiveClassification::Incomplete)
+}
+
+fn classify_kotlin_source(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> KotlinArchiveClassification {
+    let mut archive = match classification_archive(path, cancellation) {
+        Ok(archive) => archive,
+        Err(classification) => return classification,
+    };
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return KotlinArchiveClassification::Incomplete;
+    }
+    for index in 0..archive.len() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return KotlinArchiveClassification::Incomplete;
+        }
+        let Ok(entry) = archive.by_index(index) else {
+            return KotlinArchiveClassification::Incomplete;
+        };
+        let Ok(name) = entry.name() else {
+            return KotlinArchiveClassification::Incomplete;
+        };
+        if name.ends_with(".kt") {
+            return KotlinArchiveClassification::Present;
+        }
+    }
+    KotlinArchiveClassification::Absent
+}
+
+fn classify_kotlin_metadata(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> KotlinArchiveClassification {
+    const MAX_CLASSIFICATION_CLASSES: usize = 1_024;
+    const MAX_CLASSIFICATION_BYTES: u64 = 32 * 1024 * 1024;
+
+    let mut archive = match classification_archive(path, cancellation) {
+        Ok(archive) => archive,
+        Err(classification) => return classification,
+    };
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return KotlinArchiveClassification::Incomplete;
+    }
+    let mut classes_read = 0usize;
+    let mut bytes_read = 0u64;
+    let mut incomplete = false;
+    for index in 0..archive.len() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return KotlinArchiveClassification::Incomplete;
+        }
+        let Ok(mut entry) = archive.by_index(index) else {
+            incomplete = true;
+            continue;
+        };
+        let name = match entry.name() {
+            Ok(name) => name,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        if !name.ends_with(".class") || name.ends_with("module-info.class") {
+            continue;
+        }
+        if classes_read == MAX_CLASSIFICATION_CLASSES
+            || bytes_read.saturating_add(entry.size()) > MAX_CLASSIFICATION_BYTES
+        {
+            return KotlinArchiveClassification::Incomplete;
+        }
+        if entry.size() > MAX_CLASS_ENTRY_BYTES {
+            incomplete = true;
+            continue;
+        }
+        classes_read += 1;
+        bytes_read = bytes_read.saturating_add(entry.size());
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        if entry
+            .by_ref()
+            .take(MAX_CLASS_ENTRY_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_CLASS_ENTRY_BYTES
+        {
+            incomplete = true;
+            continue;
+        }
+        let Ok(class_file) = jclassfile::class_file::parse(&bytes) else {
+            incomplete = true;
+            continue;
+        };
+        if class_file.attributes().iter().any(|attribute| {
+            let annotations = match attribute {
+                Attribute::RuntimeVisibleAnnotations { annotations, .. }
+                | Attribute::RuntimeInvisibleAnnotations { annotations } => annotations,
+                _ => return false,
+            };
+            annotations.iter().any(|annotation| {
+                matches!(
+                    class_file
+                        .constant_pool()
+                        .get(annotation.type_index() as usize),
+                    Some(ConstantPool::Utf8 { value }) if value == "Lkotlin/Metadata;"
+                )
+            })
+        }) {
+            return KotlinArchiveClassification::Present;
+        }
+    }
+    if incomplete {
+        KotlinArchiveClassification::Incomplete
+    } else {
+        KotlinArchiveClassification::Absent
+    }
+}
+
+fn repository_roots(config: &JvmExternalDependencies) -> Vec<PathBuf> {
+    if !config.repository_roots.is_empty() {
+        return config.repository_roots.clone();
+    }
+
+    home_dir()
+        .map(|home| vec![home.join(".m2").join("repository")])
+        .unwrap_or_default()
+}
+
+fn gradle_cache_roots(config: &JvmExternalDependencies) -> Vec<PathBuf> {
+    if !config.gradle_cache_roots.is_empty() {
+        return config.gradle_cache_roots.clone();
+    }
+
+    std::env::var_os("GRADLE_USER_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|root| root.join("caches").join("modules-2").join("files-2.1"))
+        .or_else(|| {
+            home_dir().map(|home| {
+                home.join(".gradle")
+                    .join("caches")
+                    .join("modules-2")
+                    .join("files-2.1")
+            })
+        })
+        .into_iter()
+        .collect()
+}
+
+fn resolve_gradle_coordinate(
+    cache_root: &Path,
+    coordinate: &JvmMavenCoordinate,
+) -> Vec<ResolvedJvmArtifact> {
+    if !is_safe_maven_coordinate(coordinate) {
+        return Vec::new();
+    }
+    let Ok(cache_root) = cache_root.canonicalize() else {
+        return Vec::new();
+    };
+    let coordinate_directory = cache_root
+        .join(&coordinate.group_id)
+        .join(&coordinate.artifact_id)
+        .join(&coordinate.version);
+    let Ok(hash_directories) = coordinate_directory.read_dir() else {
+        return Vec::new();
+    };
+
+    let mut jars = Vec::new();
+    for hash_directory in hash_directories.filter_map(Result::ok) {
+        let Ok(file_type) = hash_directory.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(entries) = hash_directory.path().read_dir() else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "jar") {
+                continue;
+            }
+            let Some(path) = canonical_file_under(&cache_root, &path) else {
+                continue;
+            };
+            if path.is_file() {
+                jars.push(path);
+            }
+        }
+    }
+    jars.sort();
+    jars.dedup();
+
+    let (expected_binary, expected_sources) = maven_coordinate_jar_names(coordinate);
+    let sources = jars
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == expected_sources.as_str())
+        })
+        .cloned();
+    let exact_binaries: Vec<_> = jars
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == expected_binary.as_str())
+        })
+        .cloned()
+        .collect();
+    let binaries = exact_binaries;
+    if binaries.is_empty() {
+        return sources
+            .into_iter()
+            .map(|artifact_path| ResolvedJvmArtifact {
+                artifact_path,
+                source_artifact_path: None,
+                coordinate: Some(coordinate.clone()),
+                origin: JvmDependencyOrigin::GradleCache,
+            })
+            .collect();
+    }
+    binaries
+        .into_iter()
+        .map(|artifact_path| ResolvedJvmArtifact {
+            artifact_path,
+            source_artifact_path: sources.clone(),
+            coordinate: Some(coordinate.clone()),
+            origin: JvmDependencyOrigin::GradleCache,
+        })
+        .collect()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<JvmExternalType> {
+    let Some(tree) = parse_tree(source) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let package_name = determine_package_name(root, source);
+    let mut result = Vec::new();
+    let mut stack = Vec::new();
+    for index in (0..root.named_child_count()).rev() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if is_class_like_declaration_kind(child.kind()) {
+            stack.push((
+                child,
+                None::<String>,
+                None::<JvmVisibility>,
+                JvmVisibility::PackagePrivate,
+            ));
+        }
+    }
+
+    while let Some((node, parent_short_name, parent_visibility, default_visibility)) = stack.pop() {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
+        };
+        let simple_name = node_text(name_node, source).trim();
+        if simple_name.is_empty() {
+            continue;
+        }
+
+        let short_name = parent_short_name
+            .as_deref()
+            .map(|parent| format!("{parent}.{simple_name}"))
+            .unwrap_or_else(|| simple_name.to_string());
+        let declared_visibility = source_visibility(node, default_visibility);
+        let visibility = parent_visibility
+            .map(|parent| restrict_visibility(declared_visibility, parent))
+            .unwrap_or(declared_visibility);
+        if visibility != JvmVisibility::Private {
+            result.push(JvmExternalType {
+                fqn: qualified_name(&package_name, &short_name),
+                package_name: package_name.clone(),
+                short_name: short_name.clone(),
+                kind: source_kind(node.kind()),
+                visibility,
+                source: JvmExternalDeclarationSource::SourceJar {
+                    artifact_path: artifact_path.to_path_buf(),
+                    source_path: source_path.to_string(),
+                },
+            });
+        }
+
+        let child_default_visibility = if is_interface_like_node(node.kind()) {
+            JvmVisibility::Public
+        } else {
+            JvmVisibility::PackagePrivate
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            continue;
+        };
+        for child in class_like_body_children_rev(body) {
+            if is_class_like_declaration_kind(child.kind()) {
+                stack.push((
+                    child,
+                    Some(short_name.clone()),
+                    Some(visibility),
+                    child_default_visibility,
+                ));
+            }
+        }
+    }
+
+    result
+}
+
+/// Public Kotlin types declared by one `.kt` entry of a source jar.
+///
+/// Kotlin identities are already source-level (issue #1236): no `FooKt` file
+/// facade, no `$` encoding, companions spelled by their declared name. The
+/// declaration walk therefore yields exactly the names a consumer would write,
+/// and no normalization step is needed the way Scala's `$`-suffixed object
+/// identities require one.
+///
+/// A file whose tree contains a parse error is skipped entirely, matching the
+/// Scala path: a source jar is untrusted input, and a partially-recovered tree
+/// can name types the library does not actually export, which would make an
+/// unknown name look resolvable.
+fn kotlin_source_types(
+    artifact_path: &Path,
+    source_path: &str,
+    source: &str,
+) -> Vec<JvmExternalType> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&brokk_bifrost_jvm::kotlin::language::LANGUAGE.into())
+        .expect("tree-sitter Kotlin language must load");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+
+    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.kt");
+    let parsed =
+        brokk_bifrost_jvm::kotlin::declarations::parse_kotlin_file(&synthetic_file, source, &tree);
+    parsed
+        .declarations()
+        .iter()
+        .filter(|declaration| declaration.is_class() && !declaration.is_synthetic())
+        .filter_map(|declaration| {
+            let node = kotlin_source_declaration_node(&tree, &parsed, declaration)?;
+            let visibility = kotlin_external_visibility(node, source)?;
+            let kind = kotlin_external_kind(node)?;
+            let short_name = declaration.short_name().to_string();
+            (!short_name.is_empty()).then(|| JvmExternalType {
+                fqn: declaration.fq_name(),
+                package_name: declaration.package_name().to_string(),
+                short_name,
+                kind,
+                visibility,
+                source: JvmExternalDeclarationSource::SourceJar {
+                    artifact_path: artifact_path.to_path_buf(),
+                    source_path: source_path.to_string(),
+                },
+            })
+        })
+        // Source JARs are untrusted input. The index is deliberately
+        // best-effort, so stopping at a bounded number of public Kotlin types
+        // is preferable to retaining an arbitrarily large declaration set.
+        .take(MAX_ANALYZER_SOURCE_TYPES)
+        .collect()
+}
+
+fn kotlin_source_declaration_node<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    declaration: &brokk_bifrost_core::analyzer::model::CodeUnit,
+) -> Option<tree_sitter::Node<'tree>> {
+    let range = parsed.declaration_ranges(declaration).first()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    loop {
+        if brokk_bifrost_jvm::kotlin::declarations::KOTLIN_CLASS_LIKE_KINDS.contains(&node.kind()) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// The visibility a Kotlin declaration contributes to the shared index, or
+/// `None` when it contributes nothing.
+///
+/// `internal` restricts a declaration to its own compilation module, so from
+/// the perspective of code consuming a published artifact it is exactly as
+/// invisible as `private` — neither belongs in the index at all.
+fn kotlin_external_visibility(node: tree_sitter::Node<'_>, source: &str) -> Option<JvmVisibility> {
+    use brokk_bifrost_jvm::kotlin::declarations::KotlinDeclaredVisibility;
+    match brokk_bifrost_jvm::kotlin::declarations::kotlin_declared_visibility(node, source) {
+        KotlinDeclaredVisibility::Public => Some(JvmVisibility::Public),
+        // Kotlin has no package-private tier; `protected` is modelled with the
+        // index's nearest same-package-only tier so a consumer in another
+        // package cannot resolve it.
+        KotlinDeclaredVisibility::Protected => Some(JvmVisibility::Protected),
+        KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => None,
+    }
+}
+
+fn kotlin_external_kind(node: tree_sitter::Node<'_>) -> Option<JvmExternalTypeKind> {
+    use brokk_bifrost_jvm::kotlin::declarations::KotlinClassLikeKind;
+    Some(
+        match brokk_bifrost_jvm::kotlin::declarations::kotlin_class_like_kind(node)? {
+            KotlinClassLikeKind::Interface => JvmExternalTypeKind::Interface,
+            KotlinClassLikeKind::Enum => JvmExternalTypeKind::Enum,
+            KotlinClassLikeKind::Annotation => JvmExternalTypeKind::Annotation,
+            // An `object` is a class with exactly one instance; the index only
+            // answers "does this type name exist", so the distinction between
+            // an object and a class carries no information here.
+            KotlinClassLikeKind::Class | KotlinClassLikeKind::Object => JvmExternalTypeKind::Class,
+        },
+    )
+}
+
+fn source_visibility(
+    node: tree_sitter::Node<'_>,
+    default_visibility: JvmVisibility,
+) -> JvmVisibility {
+    let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
+    if modifiers.contains(&"public") {
+        JvmVisibility::Public
+    } else if modifiers.contains(&"protected") {
+        JvmVisibility::Protected
+    } else if modifiers.contains(&"private") {
+        JvmVisibility::Private
+    } else {
+        default_visibility
+    }
+}
+
+/// One class to assemble into a test class JAR: its binary name, the binary
+/// name of its superclass, and the members it declares (#1900).
+///
+/// Binary names use the `/` separator the class-file format itself uses, for
+/// example `com/example/probe/Registry`, because that is what the bytes hold.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct TestClassFile<'a> {
+    #[doc(hidden)]
+    pub internal_name: &'a str,
+    #[doc(hidden)]
+    pub super_internal_name: &'a str,
+    #[doc(hidden)]
+    pub methods: &'a [TestClassMethod<'a>],
+    /// Emit the `InnerClasses` attribute a compiler writes for a class nested
+    /// inside another and declared `private`. Real JARs are full of these, and
+    /// the index deliberately publishes none of them, so a fixture needs one to
+    /// show that a deliberate exclusion is not a failed read.
+    #[doc(hidden)]
+    pub private_nested: bool,
+}
+
+/// One public method of a [`TestClassFile`]. `descriptor` is the JVM method
+/// descriptor, for example `(Ljava/lang/String;)V` for a method taking one
+/// `String` and returning nothing.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct TestClassMethod<'a> {
+    #[doc(hidden)]
+    pub name: &'a str,
+    #[doc(hidden)]
+    pub descriptor: &'a str,
+    #[doc(hidden)]
+    pub is_static: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn probe_registry_base_class_files() -> [TestClassFile<'static>; 2] {
+    [
+        TestClassFile {
+            internal_name: "com/example/probe/Registry",
+            super_internal_name: "com/example/probe/BaseRegistry",
+            methods: &[TestClassMethod {
+                name: "register",
+                descriptor: "(Ljava/lang/String;)V",
+                is_static: true,
+            }],
+            private_nested: false,
+        },
+        TestClassFile {
+            internal_name: "com/example/probe/BaseRegistry",
+            super_internal_name: "java/lang/Object",
+            methods: &[TestClassMethod {
+                name: "reset",
+                descriptor: "()V",
+                is_static: true,
+            }],
+            private_nested: false,
+        },
+    ]
+}
+
+/// The bytes of a minimal, valid `.class` file for `class`.
+///
+/// Bifrost's JVM tests normally compile fixtures with `javac`, and skip
+/// themselves when no JDK is installed. A skipped test proves nothing, and the
+/// member surface this file indexes is read out of class files, so the #1900
+/// acceptance needs a class JAR that exists on every machine. Emitting the
+/// bytes directly is the only way to get one without a JDK.
+///
+/// This writes only what the class-file format requires of a declaration: the
+/// magic number, a class-file version, a constant pool holding the two class
+/// names and each method's name and descriptor, the access flags, and one
+/// method table entry per method with no attributes. There is no bytecode,
+/// because nothing here executes; `jclassfile` parses it exactly as it parses a
+/// compiled class, which is what the index reads.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
+    const ACC_PUBLIC_CLASS: u16 = 0x0021; // ACC_PUBLIC | ACC_SUPER
+    const ACC_PUBLIC_METHOD: u16 = 0x0001;
+    const ACC_STATIC_METHOD: u16 = 0x0008;
+    const CONSTANT_UTF8: u8 = 1;
+    const CONSTANT_CLASS: u8 = 7;
+    const CLASS_FILE_MAJOR_VERSION: u16 = 52; // Java 8
+
+    let mut pool = Vec::new();
+    let mut next_index = 1u16;
+    // The constant pool is indexed by a `u16`, so a class declaring thousands
+    // of methods only fits when repeated strings are shared. Interning is also
+    // what a compiler emits, so the bytes stay ordinary.
+    let mut interned: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+    let mut utf8_index = |pool: &mut Vec<u8>, next_index: &mut u16, value: &str| -> u16 {
+        if let Some(index) = interned.get(value) {
+            return *index;
+        }
+        pool.push(CONSTANT_UTF8);
+        pool.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        pool.extend_from_slice(value.as_bytes());
+        let index = *next_index;
+        *next_index += 1;
+        interned.insert(value.to_owned(), index);
+        index
+    };
+    let this_name_index = utf8_index(&mut pool, &mut next_index, class.internal_name);
+    pool.push(CONSTANT_CLASS);
+    pool.extend_from_slice(&this_name_index.to_be_bytes());
+    let this_class_index = next_index;
+    next_index += 1;
+    let super_name_index = utf8_index(&mut pool, &mut next_index, class.super_internal_name);
+    pool.push(CONSTANT_CLASS);
+    pool.extend_from_slice(&super_name_index.to_be_bytes());
+    let super_class_index = next_index;
+    next_index += 1;
+    let mut method_indexes = Vec::with_capacity(class.methods.len());
+    for method in class.methods {
+        let name_index = utf8_index(&mut pool, &mut next_index, method.name);
+        let descriptor_index = utf8_index(&mut pool, &mut next_index, method.descriptor);
+        method_indexes.push((name_index, descriptor_index));
+    }
+    let inner_classes_index = class
+        .private_nested
+        .then(|| utf8_index(&mut pool, &mut next_index, "InnerClasses"));
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&CLASS_FILE_MAJOR_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&next_index.to_be_bytes());
+    bytes.extend_from_slice(&pool);
+    bytes.extend_from_slice(&ACC_PUBLIC_CLASS.to_be_bytes());
+    bytes.extend_from_slice(&this_class_index.to_be_bytes());
+    bytes.extend_from_slice(&super_class_index.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&(class.methods.len() as u16).to_be_bytes());
+    for (method, (name_index, descriptor_index)) in class.methods.iter().zip(method_indexes) {
+        let flags = if method.is_static {
+            ACC_PUBLIC_METHOD | ACC_STATIC_METHOD
+        } else {
+            ACC_PUBLIC_METHOD
+        };
+        bytes.extend_from_slice(&flags.to_be_bytes());
+        bytes.extend_from_slice(&name_index.to_be_bytes());
+        bytes.extend_from_slice(&descriptor_index.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+    match inner_classes_index {
+        // One `InnerClasses` entry naming this very class as a private nested
+        // class: inner class, no outer, no simple name, `ACC_PRIVATE`.
+        Some(name_index) => {
+            const ACC_PRIVATE_NESTED: u16 = 0x0002;
+
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&name_index.to_be_bytes());
+            bytes.extend_from_slice(&10u32.to_be_bytes());
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&this_class_index.to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            bytes.extend_from_slice(&ACC_PRIVATE_NESTED.to_be_bytes());
+        }
+        None => bytes.extend_from_slice(&0u16.to_be_bytes()),
+    }
+    bytes
+}
+
+/// Write `classes` into a class JAR at `path`, one entry per class named after
+/// its binary name, exactly as `jar cf` would lay them out.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn write_test_class_jar(path: &Path, classes: &[TestClassFile<'_>]) {
+    use std::io::Write;
+
+    let file = File::create(path).expect("create the fixture class jar");
+    let mut jar = zip::ZipWriter::new(file);
+    for class in classes {
+        jar.start_file(
+            format!("{}.class", class.internal_name),
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("start a fixture class entry");
+        jar.write_all(&test_class_file_bytes(class))
+            .expect("write a fixture class entry");
+    }
+    jar.finish().expect("finish the fixture class jar");
+}
+
+fn restrict_visibility(declared: JvmVisibility, enclosing: JvmVisibility) -> JvmVisibility {
+    let to_visibility = |visibility| match visibility {
+        JvmVisibility::Public => Visibility::Public,
+        JvmVisibility::Protected => Visibility::Protected,
+        JvmVisibility::PackagePrivate => Visibility::Package,
+        JvmVisibility::Private => Visibility::Private,
+    };
+    semantic_visibility(restrict_semantic_visibility(
+        to_visibility(declared),
+        to_visibility(enclosing),
+    ))
+}
+
+fn is_interface_like_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "interface_declaration" | "annotation_type_declaration"
+    )
+}
+
+fn source_kind(kind: &str) -> JvmExternalTypeKind {
+    source_type_kind(kind)
+        .map(semantic_type_kind)
+        .unwrap_or(JvmExternalTypeKind::Class)
+}
+
+fn qualified_name(package_name: &str, short_name: &str) -> String {
+    brokk_bifrost_core::analyzer::common::qualify_dotted_name(package_name, short_name)
+}
+
+fn enclosing_type_fqns(external_type: &JvmExternalType) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = external_type.short_name.as_str();
+    while let Some((owner, _)) = current.rsplit_once('.') {
+        result.push(qualified_name(&external_type.package_name, owner));
+        current = owner;
+    }
+    result
+}
+
+/// Model declaration IDs and source declaration IDs occupy distinct domains.
+/// Canonicalize model type declarations before comparing them with scope-proven
+/// nominal actuals; an unresolved or ambiguous model ID remains unknown.
+pub(crate) fn normalize_jvm_model_type_ref(
+    overlay: Option<
+        &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    >,
+    reference: &TypeRef,
+) -> TypeRef {
+    let mut result = reference.clone();
+    let mut pending = vec![&mut result];
+    while let Some(term) = pending.pop() {
+        if let TypeRef::Declared {
+            id,
+            arguments,
+            nullable,
+        } = term
+        {
+            let selected = overlay.and_then(|overlay| {
+                let matched = overlay.symbols_with_id(id);
+                let [symbol] = matched.records.as_slice() else {
+                    return None;
+                };
+                (symbol.kind.is_type_declaration() && !symbol.provenance.ambiguous)
+                    .then(|| symbol.qualified_name.clone())
+            });
+            *term = match selected {
+                Some(name) => TypeRef::Named {
+                    name,
+                    arguments: std::mem::take(arguments),
+                    nullable: *nullable,
+                },
+                None => TypeRef::Unknown,
+            };
+        }
+        match term {
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments)
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => {
+                pending.push(key);
+                pending.push(value);
+            }
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref_mut()),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter_mut().map(|parameter| &mut parameter.r#type));
+                pending.extend(result.as_deref_mut());
+            }
+            TypeRef::Projection { .. } | TypeRef::Unknown | TypeRef::TypeParameter { .. } => {}
+        }
+    }
+    result
+}
+
+/// Reuse the invocation phases for both member selection and conversion rows.
+/// The expanded layout names one formal term per written positional actual.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn select_java_external_model_invocation(
+    actuals: &[TypeRef],
+    signatures: &[brokk_bifrost_analysis::analyzer::semantic_model::Signature],
+    surface: &JvmExternalDeclarations<'_>,
+) -> Option<(usize, Vec<TypeRef>)> {
+    let parameters = signatures
+        .iter()
+        .map(|signature| {
+            signature
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    normalize_jvm_model_type_ref(surface.packs.as_deref(), &parameter.r#type)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let shapes = signatures
+        .iter()
+        .zip(&parameters)
+        .map(|(signature, parameters)| JavaExternalSignature {
+            parameters,
+            has_type_parameters: !signature.type_parameters.is_empty(),
+            variadic: signature
+                .parameters
+                .iter()
+                .any(|parameter| parameter.variadic),
+        })
+        .collect::<Vec<_>>();
+    let mut exact = shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, shape)| shape.exact_actuals(actuals));
+    if let Some((selected, _)) = exact.next() {
+        return exact
+            .next()
+            .is_none()
+            .then(|| (selected, parameters[selected].clone()));
+    }
+    // Method inference is not a ground-formal conversion. Keep its candidate
+    // visible rather than erasing method type parameters from applicability.
+    if signatures
+        .iter()
+        .any(|signature| !signature.type_parameters.is_empty())
+    {
+        return None;
+    }
+    let (selected, phase) = select_java_external_invocation(actuals, &shapes, Some(surface))?;
+    let formals = &parameters[selected];
+    let layout = if phase == JavaExternalInvocationPhase::Variable {
+        let (TypeRef::Array { element }, prefix) = formals.split_last()? else {
+            return None;
+        };
+        prefix
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat_n(
+                element.as_ref().clone(),
+                actuals.len() - prefix.len(),
+            ))
+            .collect()
+    } else {
+        formals.clone()
+    };
+    Some((selected, layout))
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::analyzer::jvm::external::python_test_support::*;
+
+    use crate::analyzer::jvm::external::*;
+
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+
+    use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+
+    use crate::analyzer::JavaAnalyzer;
+
+    use brokk_bifrost_core::analyzer::config::JvmExternalArtifact;
+
+    use brokk_bifrost_core::analyzer::config::JvmExternalDependencies;
+
+    use brokk_bifrost_core::analyzer::config::JvmMavenCoordinate;
+
+    use brokk_bifrost_core::analyzer::model::Language;
+
+    use brokk_bifrost_core::analyzer::project::Project;
+
+    use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+
+    use brokk_bifrost_core::analyzer::project::TestProject;
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    use std::sync::Arc;
+    use zip::write::SimpleFileOptions;
+
+    use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon("ad9166babf21: exact external selection admitted an inaccessible private overload")]
+    fn java_external_exact_selection_rejects_inaccessible_overloads() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogCoordinate;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::CompilerOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationRequest;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelResolutionOutcome;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelRuntimeLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::SessionPackSource;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::SessionPackSourceKind;
+
+        use brokk_bifrost_semantic::analyzer::semantic_model::source::SourceFormat;
+
+        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_source;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::runtime::resolve_active_semantic_models;
+        let method = |id: &str, visibility: &str, formal: &str| {
+            serde_json::json!({
+                "id": id, "owner": "type.overloads", "name": "pick", "member_kind": "method",
+                "visibility": visibility, "is_static": true, "is_abstract": false, "is_virtual": false,
+                "signature": {"type_parameters": [], "parameters": [{
+                    "name": "value", "type": TypeRef::named(formal), "optional": false, "variadic": false
+                }], "returns": TypeRef::named("void")},
+                "aliases": [], "locator": {"kind": "artifact", "path": "example/Overloads.class",
+                    "symbol": format!("example.Overloads.pick({formal})")}
+            })
+        };
+        let document = serde_json::json!({
+            "schema_version": 2, "pack_id": "test.jvm-private-overload", "version": "1.0.0",
+            "producer": {"name": "bifrost-test", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jdk",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0", "toolchains": [{
+                "name": "jdk", "requirement": ">=17.0.0"
+            }]},
+            "provenance": {"source": "test:inline", "revision": "ad9166babf21"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "decls", "activation": [{
+                "toolchain": {"name": "jdk", "version": ">=17.0.0"},
+                "targets": ["jvm"], "configurations": []
+            }], "payload": {"kind": "declaration_facts", "types": [{
+                "id": "type.overloads", "name": "example.Overloads", "type_kind": "class",
+                "visibility": "public", "is_abstract": false, "is_sealed": false,
+                "has_explicit_type_terms": false, "type_parameters": [], "type_parameter_constraints": [],
+                "embedded_types": [], "hierarchy": [], "aliases": [], "extension_surfaces": [],
+                "locator": {"kind": "artifact", "path": "example/Overloads.class", "symbol": "example.Overloads"}
+            }], "members": [method("member.a-public", "public", "int"),
+                method("member.z-private", "private", "java.lang.String")], "relations": []}}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&document).expect("fixture JSON"),
+            &CompilerOptions::default(),
+        )
+        .expect("compile test-only declarations");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("fixture catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:private-overload".into(),
+                },
+            )
+            .expect("register declarations");
+        let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "jdk".into(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "jdk".into(),
+                    version: Some(semver::Version::new(21, 0, 0)),
+                }),
+                target: Some("jvm".into()),
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cancellation = CancellationToken::default();
+        let active = match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+            SemanticModelResolutionOutcome::Ready(active) => active,
+            other => panic!("fixture activation must be ready: {other:#?}"),
+        };
+        let root = tempfile::tempdir().expect("isolated Java project");
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root.path(), Language::Java));
+        let overlay = Arc::new(
+            SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 << 20)
+                .expect("fixture overlay"),
+        );
+        let artifacts = JvmExternalDeclarationIndex::default();
+        let surface = JvmExternalDeclarations::new(&artifacts, Some(overlay));
+        let member = surface
+            .resolve_member_spelling("example.Overloads.pick", "client", |name| surface.get(name))
+            .expect("the public overload remains visible");
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[TypeRef::named("int")],
+                Some(&surface)
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[TypeRef::named("java.lang.String")],
+                Some(&surface)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G16 (2026-10-15): variable arity discarded witnessed external overloads"
+    )]
+    fn java_external_varargs_selects_expanded_and_fixed_array_invocations() {
+        let signature: Signature = serde_json::from_value(serde_json::json!({
+            "parameters": [{"name": "values", "type": {"kind": "array", "element": TypeRef::named("java.lang.String")}, "variadic": true}]
+        })).expect("variadic declaration");
+        let mut member = JvmExternalMember {
+            fqn: "example.Api.accept".into(),
+            declaring_package: "example".into(),
+            visibility: JvmVisibility::Public,
+            returns: None,
+            is_static: true,
+            is_constant: false,
+            jdk_artifact_sha256: None,
+            call_shapes: vec![
+                external_call_shape(
+                    MemberKind::Method,
+                    JvmVisibility::Public,
+                    true,
+                    Some(&signature),
+                    None,
+                )
+                .expect("call shape"),
+            ],
+            call_shapes_incomplete: false,
+        };
+        for actuals in [
+            vec![],
+            vec![
+                TypeRef::named("java.lang.String"),
+                TypeRef::named("java.lang.String"),
+            ],
+            vec![TypeRef::Array {
+                element: Box::new(TypeRef::named("java.lang.String")),
+            }],
+        ] {
+            assert_eq!(
+                member.applicable_parameter_count_for_argument_types(false, &actuals, None),
+                Some(1),
+                "{actuals:?}"
+            );
+        }
+        member.call_shapes_incomplete = true;
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[TypeRef::named("java.lang.String")],
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            member.call_shapes.len(),
+            1,
+            "incomplete discovery retains its witnessed declaration"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G25 (2026-10-15): reference array widening was treated as unknown"
+    )]
+    fn java_external_array_covariance_preserves_primitive_array_invariance() {
+        let array = |name| TypeRef::Array {
+            element: Box::new(TypeRef::named(name)),
+        };
+        let actuals = [array("java.lang.String")];
+        let formals = [vec![array("java.lang.Object")]];
+        assert_eq!(
+            select_java_external_signature_for_types(&actuals, &formals),
+            Some(0)
+        );
+        assert_eq!(
+            java_external_conversion(&array("int"), &array("long")),
+            JavaExternalConversion::Inapplicable
+        );
+        assert_eq!(
+            java_external_conversion(&array("int"), &TypeRef::named("int")),
+            JavaExternalConversion::Inapplicable
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "0242909d77ed: Java census G15b (2026-10-15): partial families discarded exact ground overloads"
+    )]
+    fn partial_java_family_selects_exact_ground_formals_without_admitting_conversions() {
+        let named = |name| TypeRef::named(name);
+        let signatures =
+            ["java.lang.String", "java.lang.Integer", "example.Base"].map(|name| Signature {
+                type_parameters: Vec::new(),
+                parameters: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "name": "value", "type": named(name)
+                    }))
+                    .expect("test formal"),
+                ],
+                returns: Some(named("void")),
+            });
+        let member = JvmExternalMember {
+            fqn: "example.Api.accept".to_owned(),
+            declaring_package: "example".to_owned(),
+            visibility: JvmVisibility::Public,
+            returns: Some(named("void")),
+            is_static: true,
+            is_constant: false,
+            jdk_artifact_sha256: None,
+            call_shapes: signatures
+                .iter()
+                .map(|signature| {
+                    external_call_shape(
+                        MemberKind::Method,
+                        JvmVisibility::Public,
+                        true,
+                        Some(signature),
+                        None,
+                    )
+                    .expect("test method signature")
+                })
+                .collect(),
+            call_shapes_incomplete: true,
+        };
+        assert_eq!(
+            member.applicable_parameter_count_for_argument_types(
+                false,
+                &[named("java.lang.String")],
+                None
+            ),
+            Some(1),
+            "an exact static type decides phase 1 without family closure"
+        );
+        for actual in [named("int"), named("example.Child"), TypeRef::Unknown] {
+            assert_eq!(
+                member.applicable_parameter_count_for_argument_types(
+                    false,
+                    std::slice::from_ref(&actual),
+                    None
+                ),
+                None,
+                "boxing, subtyping and unknown actuals stay unproved: {actual:?}"
+            );
+        }
+        assert_eq!(
+            member.non_overridable_for_argument_types(false, &[named("java.lang.String")], None),
+            None,
+            "selection must not fabricate independent finality evidence"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#3699: Regression ensures array shape is preserved only for one complete matching overload, not ambiguous/incomplete calls"
+    )]
+    fn selected_external_return_preserves_array_shape_and_overload_uncertainty() {
+        let returned = TypeRef::Array {
+            element: Box::new(TypeRef::Named {
+                name: "java.lang.String".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            }),
+        };
+        let mut member = JvmExternalMember {
+            fqn: "example.Factory.values".to_owned(),
+            declaring_package: "example".to_owned(),
+            visibility: JvmVisibility::Public,
+            returns: Some(returned.clone()),
+            is_static: true,
+            is_constant: false,
+            jdk_artifact_sha256: None,
+            call_shapes: vec![JvmExternalCallShape {
+                visibility: JvmVisibility::Public,
+                inventory_identity: None,
+                non_overridable: None,
+                parameter_count: 0,
+                parameters: Vec::new(),
+                has_type_parameters: false,
+                is_static: true,
+                variadic: false,
+                returns: Some(returned.clone()),
+            }],
+            call_shapes_incomplete: false,
+        };
+        assert_eq!(member.applicable_return_type(false, 0), Some(&returned));
+        assert_eq!(
+            named_return_type_fqn(member.applicable_return_type(false, 0)),
+            None
+        );
+        assert_eq!(member.applicable_return_type(true, 0), None);
+        assert_eq!(member.applicable_return_type(false, 1), None);
+        member.call_shapes_incomplete = true;
+        assert_eq!(member.applicable_return_type(false, 0), None);
+        member.call_shapes_incomplete = false;
+        member.call_shapes.push(member.call_shapes[0].clone());
+        assert_eq!(member.applicable_return_type(false, 0), None);
+    }
+
+    #[test]
+    #[hardwon(
+        "#3693: Builds actual class jars and verifies changing an array element type changes dispatch behavior identity"
+    )]
+    fn external_return_array_element_changes_behavior_identity() {
+        let root = tempfile::tempdir().expect("temporary class jar directory");
+        let mut identities = Vec::new();
+        for (name, descriptor) in [
+            ("strings.jar", "()[Ljava/lang/String;"),
+            ("integers.jar", "()[Ljava/lang/Integer;"),
+        ] {
+            let jar = root.path().join(name);
+            write_test_class_jar(
+                &jar,
+                &[TestClassFile {
+                    internal_name: "example/Factory",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "values",
+                        descriptor,
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                }],
+            );
+            let index = probe_index(&jar);
+            assert!(
+                index.production_diagnostics().is_empty(),
+                "{:?}",
+                index.production_diagnostics()
+            );
+            identities.push(index.dispatch_behavior_identity());
+        }
+        assert_ne!(identities[0], identities[1]);
+    }
+
+    #[test]
+    #[hardwon(
+        "#3422: Checks missing toolchain diagnostics include actionable configuration guidance"
+    )]
+    fn missing_jdk_discovery_explains_how_to_activate_stdlib_packs() {
+        let config = JvmAnalyzerConfig::default();
+        let root = tempfile::tempdir().expect("temp root");
+        let discovery = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+
+        let diagnostic = discovery
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "jdk.home.unavailable")
+            .expect("missing JDK must produce actionable discovery guidance");
+        assert!(diagnostic.message.contains("JAVA_HOME"));
+        assert!(diagnostic.message.contains("restart Bifrost"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The artifact half of the JVM external member surface (#1900).
+    // -----------------------------------------------------------------------
+
+    /// A class JAR declaring `com.example.probe.Registry`, which extends
+    /// `com.example.probe.BaseRegistry`. `register` is declared on the subclass
+    /// and `reset` is inherited from the base, so one fixture covers both
+    /// shapes a written `Owner.member` can take.
+    ///
+    /// The third entry is a private nested class, which every real JAR carries
+    /// and this index deliberately publishes for nobody. It is here so the
+    /// fixture proves a *deliberate exclusion* does not make the artifact
+    /// report as not fully read.
+    fn probe_class_jar(path: &Path) {
+        let mut classes = probe_registry_base_class_files()
+            .into_iter()
+            .collect::<Vec<_>>();
+        classes.push(TestClassFile {
+            internal_name: "com/example/probe/Registry$Hidden",
+            super_internal_name: "java/lang/Object",
+            methods: &[TestClassMethod {
+                name: "secret",
+                descriptor: "()V",
+                is_static: true,
+            }],
+            private_nested: true,
+        });
+        write_test_class_jar(path, &classes);
+    }
+
+    fn probe_index(jar: &Path) -> JvmExternalDeclarationIndex {
+        JvmExternalDeclarationIndex::build_from_artifacts(vec![ResolvedJvmArtifact {
+            artifact_path: jar.to_path_buf(),
+            source_artifact_path: None,
+            coordinate: None,
+            origin: JvmDependencyOrigin::ExplicitPath,
+        }])
+    }
+
+    #[test]
+    #[hardwon(
+        "#1900: A JAR member declaration must resolve where class metadata had previously discarded it"
+    )]
+    fn a_class_jar_member_answers_a_written_member_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("probe.jar");
+        probe_class_jar(&jar);
+        let store =
+            brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: jar.clone(),
+                    source_artifact_path: None,
+                    coordinate: None,
+                    origin: JvmExternalArtifactOrigin::Explicit,
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let project = TestProject::new(root.path(), Language::Java);
+        let stored = JvmExternalDeclarationIndex::build_for_project_with_inventory(
+            &config, &project, &store,
+        )
+        .unwrap();
+        let provider = stored
+            .inventory_providers
+            .first()
+            .expect("indexed artifact content identity");
+        let conn = store.read_conn().unwrap();
+        let coverage: (bool, bool, bool, bool) = conn.query_row(
+            "SELECT callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn='com.example.probe.Registry'",
+            [provider], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(coverage, (true, true, true, true));
+        let declared = JvmExternalDeclarations::new(&stored, None)
+            .resolve_member_spelling("com.example.probe.Registry.register", "app", |owner| {
+                stored.get(owner).cloned()
+            })
+            .unwrap();
+        let identity = declared
+            .direct_inventory_identity_for_argument_types(
+                false,
+                &[TypeRef::named("java.lang.String")],
+                None,
+            )
+            .expect("direct overload has its durable member coordinate");
+        assert_eq!(identity.owner.provider_id.as_ref(), provider);
+        let persisted: String = conn.query_row("SELECT member_name FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3", rusqlite::params![identity.owner.provider_id.as_ref(),identity.owner.owner_fqn.as_ref(),identity.ordinal], |row| row.get(0)).unwrap();
+        assert_eq!(persisted, "register");
+        drop(conn);
+        let index = probe_index(&jar);
+        let surface = JvmExternalDeclarations::new(&index, None);
+
+        assert!(
+            index.get("com.example.probe.Registry").is_some(),
+            "the type half still indexes the owner"
+        );
+        let owner = |spelling: &str| surface.resolve_qualified_name(spelling, "app");
+        let member = surface
+            .resolve_member_spelling("com.example.probe.Registry.register", "app", owner)
+            .expect("the class jar declares the member");
+        assert_eq!(member.fqn(), "com.example.probe.Registry.register");
+
+        // Inherited: `reset` is declared on the base class in the same jar, and
+        // a reference spells it through the subclass exactly as it spells a
+        // declared member.
+        let inherited = surface
+            .resolve_member_spelling("com.example.probe.Registry.reset", "app", owner)
+            .expect("the base class in the same jar declares the member");
+        assert_eq!(inherited.fqn(), "com.example.probe.BaseRegistry.reset");
+
+        // A member no class file declares is not upgraded: the owner is
+        // decided, and the spelling stays exactly as unknown as before.
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Registry.absent", "app", owner)
+                .is_none()
+        );
+        // An owner nothing indexed answers nothing at all.
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Missing.register", "app", owner)
+                .is_none()
+        );
+        // A class the index deliberately publishes for nobody -- the private
+        // nested `Registry$Hidden` -- was read completely and is not a gap.
+        // Counting it as unread would make every ordinary JAR report as
+        // declared-but-not-indexed, which would turn every honest miss in the
+        // whole workspace into "may be there".
+        assert!(
+            index.get("com.example.probe.Registry.Hidden").is_none(),
+            "a private nested class is not published"
+        );
+        assert_eq!(
+            index.production_diagnostic_count(),
+            0,
+            "the whole fixture jar was read: {:?}",
+            index.production_diagnostics()
+        );
+    }
+
+    #[test]
+    fn a_class_entry_the_byte_budget_refused_declares_no_member_surface() {
+        // Honest absence for the artifact half: an owner whose class entry the
+        // bounded read never finished has no member surface, so its members are
+        // unknown rather than absent -- and the index says so, which is what
+        // makes every JVM boundary report `external_declared_unindexed` instead
+        // of `external_unknown`.
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("probe.jar");
+        probe_class_jar(&jar);
+
+        let mut index = JvmExternalDeclarationIndex::default();
+        // One byte of budget refuses every entry in the archive.
+        index.index_class_jar(&jar, 1);
+        let surface = JvmExternalDeclarations::new(&index, None);
+        assert!(
+            index.get("com.example.probe.Registry").is_none(),
+            "a refused entry declares no type either"
+        );
+        assert!(
+            index
+                .member("com.example.probe.Registry", "register")
+                .is_none(),
+            "a refused entry declares no member surface"
+        );
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Registry.register", "app", |spelling| {
+                    surface.resolve_qualified_name(spelling, "app")
+                })
+                .is_none()
+        );
+        let diagnostics = index.production_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "jvm.index.unread_entries"),
+            "a refused read must be recorded, not silently look complete: {diagnostics:?}"
+        );
+        assert!(index.production_diagnostic_count() > 0);
+    }
+
+    /// A class JAR whose first entry alone spends the whole per-artifact member
+    /// budget, so `Registry`'s own members are read *after* the charge is gone.
+    /// Everything stays well inside the byte and entry bounds, which is the
+    /// point: members are a bound of their own.
+    fn member_saturated_class_jar(path: &Path) {
+        let names: Vec<String> = (0..MAX_ARTIFACT_MEMBERS)
+            .map(|ordinal| format!("filler{ordinal}"))
+            .collect();
+        let filler_methods: Vec<TestClassMethod<'_>> = names
+            .iter()
+            .map(|name| TestClassMethod {
+                name,
+                descriptor: "()V",
+                is_static: true,
+            })
+            .collect();
+        write_test_class_jar(
+            path,
+            &[
+                TestClassFile {
+                    internal_name: "com/example/probe/Filler",
+                    super_internal_name: "java/lang/Object",
+                    methods: &filler_methods,
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "com/example/probe/Registry",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "register",
+                        descriptor: "(Ljava/lang/String;)V",
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn the_per_artifact_member_bound_drops_members_and_says_so() {
+        // The second bounded dimension #1900 requires beside
+        // `MAX_TOTAL_INDEX_BYTES`: one artifact well inside the byte budget can
+        // declare any number of members, so members are charged per artifact.
+        // What must not happen is a silent short surface -- the owner type is
+        // still indexed, so a member spelling on it would otherwise look
+        // decidable -- which is why exhausting the charge is recorded.
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("probe.jar");
+        member_saturated_class_jar(&jar);
+        let index = probe_index(&jar);
+        let surface = JvmExternalDeclarations::new(&index, None);
+
+        assert!(
+            index.get("com.example.probe.Registry").is_some(),
+            "the type half still indexes the owner; only members were bounded"
+        );
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Registry.register", "app", |spelling| {
+                    surface.resolve_qualified_name(spelling, "app")
+                })
+                .is_none(),
+            "the member fell past the per-artifact bound"
+        );
+        let diagnostics = index.production_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.artifact_members"),
+            "a bounded member read must be recorded, not look complete: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn source_bound_jdk_home_discovers_and_generates_exact_source_pack() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        use brokk_bifrost_core::analyzer::config::JvmSourceToolchainBinding;
+
+        use brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig;
+
+        let root = tempfile::tempdir().unwrap();
+        let relative_home = PathBuf::from("toolchains").join("jdk-21");
+        let home = root.path().join(&relative_home);
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let source_archive = home.join("lib").join("src.zip");
+        write_zip_entries(
+            &source_archive,
+            &[
+                (
+                    "java.base/module-info.java",
+                    b"module java.base { exports java.lang; }" as &[u8],
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    b"package java.lang; public class Object { public final String echo(String value) { return value; } public final String echo(int value) { return null; } public String echo(String value, int count) { return value; } }",
+                ),
+            ],
+        );
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                source_toolchains: vec![JvmSourceToolchainBinding::new(
+                    PathBuf::from("src"),
+                    relative_home,
+                )],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21.0.8");
+        assert_eq!(discovered.dependencies[0].evidence.ecosystem, "jdk");
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(source_archive).unwrap()
+        );
+
+        let catalog_root = root.path().join("catalog");
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert!(prepared.packs[0].evidence.artifact_sha256.is_some());
+        drop(catalog);
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let again = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let reused = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &again.dependencies,
+            &limits,
+            None,
+        );
+        assert!(reused.complete, "{:#?}", reused.diagnostics);
+        assert_eq!(reused.profile.generated_packs, 0);
+        assert_eq!(reused.profile.reused_packs, 1);
+        #[cfg(unix)]
+        assert_eq!(reused.profile.artifacts_read, 0);
+        assert_eq!(reused.packs[0].evidence, prepared.packs[0].evidence);
+
+        // Cross the generated source-archive, compiler, activation, and SQLite
+        // inventory boundary, including overloads and repeat publication.
+        let request =
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                evidence: vec![reused.packs[0].evidence.clone()],
+                controls: Vec::new(),
+                limits: Default::default(),
+            };
+        let brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelResolutionOutcome::Ready(active) =
+            brokk_bifrost_analysis::analyzer::semantic_model::runtime::resolve_active_semantic_models(
+                &catalog,
+                &request,
+                &CancellationToken::default(),
+            )
+        else {
+            panic!("exact generated source inventory activates");
+        };
+        let store =
+            brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        for shard in active.shards() {
+            store.publish_jvm_external_owner_inventory(shard).unwrap();
+            store.publish_jvm_external_owner_inventory(shard).unwrap();
+        }
+        let conn = store.read_conn().unwrap();
+        let complete: bool = conn
+            .query_row(
+                "SELECT callables_complete FROM jvm_external_owners WHERE owner_fqn='java.lang.Object'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !complete,
+            "source API inventory makes no whole-namespace absence claim"
+        );
+        let shapes = conn
+            .prepare(
+                "SELECT json_array_length(parameters_jsonb), non_overridable,
+                    json_extract(return_type_jsonb, '$.name')
+             FROM jvm_external_owner_members WHERE member_name='echo'
+             ORDER BY json_array_length(parameters_jsonb)",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            shapes,
+            vec![
+                (
+                    1,
+                    Some("java_final_method".to_owned()),
+                    "java.lang.String".to_owned()
+                ),
+                (
+                    1,
+                    Some("java_final_method".to_owned()),
+                    "java.lang.String".to_owned()
+                ),
+                (2, None, "java.lang.String".to_owned()),
+            ]
+        );
+        let analyzer = JavaAnalyzer::from_project(project);
+        let overlay = Arc::new(
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &CancellationToken::default(),
+                128 * 1024 * 1024,
+            )
+            .unwrap(),
+        );
+        let index = JvmExternalDeclarationIndex::default();
+        let declarations = JvmExternalDeclarations::new(&index, Some(overlay));
+        let member = declarations
+            .resolve_member_spelling("java.lang.Object.echo", "app", |owner| {
+                declarations.resolve_qualified_name(owner, "app")
+            })
+            .unwrap();
+        let string = TypeRef::Named {
+            name: "java.lang.String".into(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let integer = TypeRef::Named {
+            name: "int".into(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let string_identity = member
+            .inventory_identity_for_argument_types(&active, true, &[string], None)
+            .unwrap();
+        let integer_identity = member
+            .inventory_identity_for_argument_types(&active, true, &[integer], None)
+            .unwrap();
+        assert_eq!(string_identity.owner, integer_identity.owner);
+        assert_ne!(
+            string_identity.ordinal, integer_identity.ordinal,
+            "same-arity overloads have separate inventory identities"
+        );
+        for (identity, parameter) in [
+            (string_identity, "java.lang.String"),
+            (integer_identity, "int"),
+        ] {
+            let stored: String = conn.query_row(
+                "SELECT json_extract(parameters_jsonb,'$[0].type.name') FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3",
+                rusqlite::params![identity.owner.provider_id.as_ref(), identity.owner.owner_fqn.as_ref(), identity.ordinal],
+                |row| row.get(0)).unwrap();
+            assert_eq!(stored, parameter);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_zip_identity_detects_replacement_with_preserved_length_and_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("src.zip");
+        fs::write(&path, b"first archive").unwrap();
+        let before = jdk_source_zip_identity(&path).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = root.path().join("replacement.zip");
+        fs::write(&replacement, b"other archive").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert_ne!(jdk_source_zip_identity(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn same_version_source_bound_jdk_homes_retain_distinct_artifact_evidence() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        use brokk_bifrost_core::analyzer::config::JvmSourceToolchainBinding;
+
+        use brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig;
+
+        let root = tempfile::tempdir().unwrap();
+        let home_a = PathBuf::from("toolchains/jdk-a");
+        let home_b = PathBuf::from("toolchains/jdk-b");
+        for (home, source) in [
+            (
+                &home_a,
+                b"package java.lang; public final class String { public String trim() { return this; } }"
+                    .as_slice(),
+            ),
+            (
+                &home_b,
+                b"package java.lang; public final class String { public String strip() { return this; } }"
+                    .as_slice(),
+            ),
+        ] {
+            let absolute = root.path().join(home);
+            fs::create_dir_all(absolute.join("lib")).unwrap();
+            fs::write(absolute.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+            write_zip_entries(
+                &absolute.join("lib/src.zip"),
+                &[
+                    (
+                        "java.base/module-info.java",
+                        b"module java.base { exports java.lang; }",
+                    ),
+                    ("java.base/java/lang/String.java", source),
+                ],
+            );
+        }
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                source_toolchains: vec![
+                    JvmSourceToolchainBinding::new(PathBuf::from("module-a"), home_a),
+                    JvmSourceToolchainBinding::new(PathBuf::from("module-b"), home_b),
+                    JvmSourceToolchainBinding::new(
+                        PathBuf::from("module-conflict"),
+                        PathBuf::from("toolchains/jdk-a"),
+                    ),
+                    JvmSourceToolchainBinding::new(
+                        PathBuf::from("module-conflict"),
+                        PathBuf::from("toolchains/jdk-b"),
+                    ),
+                ],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 2);
+        assert_ne!(
+            discovered.dependencies[0].id, discovered.dependencies[1].id,
+            "equal release versions must still correlate to separate preparations"
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 2);
+        for (discovered, prepared) in discovered.dependencies.iter().zip(&prepared.packs) {
+            assert_eq!(discovered.id, prepared.dependency_id);
+        }
+        let digests = prepared
+            .packs
+            .iter()
+            .map(|pack| pack.evidence.artifact_sha256.as_deref().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            digests.len(),
+            2,
+            "each selected JDK needs its own exact artifact"
+        );
+        let mapping = brokk_bifrost_analysis::analyzer::workspace::prepared_jdk_artifacts_for_source_bindings(
+            &brokk_bifrost_core::analyzer::config::AnalyzerConfig {
+                jvm: config.clone(),
+                ..Default::default()
+            },
+            root.path(),
+            &[brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystemOutcome {
+                ecosystem: brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem::Jvm,
+                discovery: discovered,
+                preparation: Some(prepared),
+            }],
+        )
+        .expect("the JVM ecosystem was prepared");
+        assert_eq!(mapping.len(), 2);
+        for binding in &config.standard_library_discovery.source_toolchains {
+            let evidence = mapping
+                .get(binding.jdk_home())
+                .expect("each configured home has exact prepared evidence");
+            assert_eq!(evidence.ecosystem, "jdk");
+            assert!(evidence.artifact_sha256.is_some());
+        }
+        assert_ne!(
+            mapping[config.standard_library_discovery.source_toolchains[0].jdk_home()]
+                .artifact_sha256,
+            mapping[config.standard_library_discovery.source_toolchains[1].jdk_home()]
+                .artifact_sha256,
+        );
+        for (module, source) in [
+            (
+                "module-a",
+                "class App { void run(String value) { value.trim(); value.strip(); } }",
+            ),
+            (
+                "module-b",
+                "class App { void run(String value) { value.strip(); value.trim(); } }",
+            ),
+            (
+                "module-conflict",
+                "class App { void run(String value) { value.trim(); } }",
+            ),
+            (
+                "module-unbound",
+                "class App { void run(String value) { value.trim(); } }",
+            ),
+        ] {
+            let source_dir = root.path().join(module).join("src");
+            fs::create_dir_all(&source_dir).unwrap();
+            fs::write(source_dir.join("App.java"), source).unwrap();
+        }
+        let workspace = brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(TestProject::new(root.path(), Language::Java)),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig {
+                jvm: config.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("two-module Java workspace builds");
+        let live = CancellationToken::default();
+        let activation =
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                evidence: Vec::new(),
+                controls: Vec::new(),
+                limits: Default::default(),
+            };
+        let outcome = workspace.activate_dependency_packs(
+            &brokk_bifrost_core::analyzer::config::AnalyzerConfig {
+                jvm: config.clone(),
+                ..Default::default()
+            },
+            &[brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem::Jvm],
+            brokk_bifrost_analysis::analyzer::workspace::DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &activation,
+                limits,
+                cancellation: &live,
+            },
+        );
+        let brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelRuntimeOutcome::Ready {
+            snapshot, ..
+        } = outcome.runtime.as_ref().expect("JDK activation runs")
+        else {
+            panic!("both prepared JDKs must publish: {outcome:#?}");
+        };
+        for binding in &config.standard_library_discovery.source_toolchains {
+            assert_eq!(
+                snapshot.jdk_artifact_for_home(binding.jdk_home()),
+                mapping.get(binding.jdk_home()),
+                "publication must keep the selected home and its exact artifact together"
+            );
+        }
+        let check = |module: &str, member: &str| {
+            let file = ProjectFile::new(root.path(), format!("{module}/src/App.java"));
+            let source = fs::read_to_string(file.abs_path()).unwrap();
+            let start = source.find(&format!("{member}()")).unwrap();
+            let scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let outcomes =
+                brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_call_target_batch_with_source(
+                    workspace.analyzer(),
+                    scope.token(),
+                    vec![
+                        brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
+                            file: file.clone(),
+                            line: None,
+                            column: None,
+                            start_byte: Some(start),
+                            end_byte: Some(start + member.len()),
+                        },
+                    ],
+                    file.clone(),
+                    Arc::<str>::from(source.as_str()),
+                    None,
+                );
+            outcomes.into_iter().next().expect("one call request")
+        };
+        for (module, accepted, rejected) in
+            [("module-a", "trim", "strip"), ("module-b", "strip", "trim")]
+        {
+            let positive = check(module, accepted);
+            let proof = positive
+                .exact_external_call
+                .as_ref()
+                .unwrap_or_else(|| panic!("{module} must bind its own JDK member: {positive:#?}"));
+            let home = config
+                .standard_library_discovery
+                .source_toolchains
+                .iter()
+                .find(|binding| binding.source_root() == Path::new(module))
+                .unwrap()
+                .jdk_home();
+            assert_eq!(
+                proof.source_jdk_artifact(),
+                mapping.get(home),
+                "the resolver must carry this module's prepared artifact"
+            );
+            let near_miss = check(module, rejected);
+            assert!(
+                near_miss.exact_external_call.is_none(),
+                "a member declared only by the other JDK must not bind here: {near_miss:#?}"
+            );
+        }
+        for module in ["module-conflict", "module-unbound"] {
+            let unresolved = check(module, "trim");
+            assert!(
+                unresolved.exact_external_call.is_none(),
+                "{module} has no unique selected JDK artifact: {unresolved:#?}"
+            );
+        }
+        let oracle = workspace.semantic_oracle_provider();
+        for (module, selected_member) in [("module-a", "trim"), ("module-b", "strip")] {
+            let file = ProjectFile::new(root.path(), format!("{module}/src/App.java"));
+            let mut budget = brokk_bifrost_analysis::analyzer::semantic::SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest::new(
+                        &mut budget,
+                        &live,
+                    ),
+                )
+                .expect("Java semantic materialization")
+                .available_value()
+                .cloned()
+                .expect("Java semantic artifact");
+            let mut targets = Vec::new();
+            for procedure in artifact.procedures() {
+                for call in procedure.call_sites() {
+                    let handle = artifact
+                        .procedure_handle(procedure.id())
+                        .and_then(|procedure| procedure.call_site_handle(call.id))
+                        .expect("scoped call handle");
+                    let mut budget =
+                        brokk_bifrost_analysis::analyzer::semantic::SemanticBudget::default();
+                    let outcome =
+                        brokk_bifrost_analysis::analyzer::semantic::DispatchOracle::resolve_call(
+                            &oracle,
+                            &handle,
+                            &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest::new(
+                                &mut budget,
+                                &live,
+                            ),
+                        )
+                        .expect("Java external dispatch");
+                    let result = outcome
+                        .available_value()
+                        .expect("dispatch retains a result");
+                    targets.extend(
+                        result
+                            .boundaries()
+                            .iter()
+                            .filter_map(|boundary| boundary.unmaterialized_external_target())
+                            .filter(|target| matches!(target.member(), "trim" | "strip"))
+                            .cloned(),
+                    );
+                }
+            }
+            let exact = targets
+                .iter()
+                .filter(|target| target.has_resolver_owned_call_shape())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exact.len(),
+                1,
+                "{module} has one exact JDK call: {targets:#?}"
+            );
+            assert_eq!(exact[0].member(), selected_member);
+            assert!(
+                targets
+                    .iter()
+                    .filter(|target| !target.has_resolver_owned_call_shape())
+                    .all(|target| target.selected_jdk_artifact().is_none()),
+                "syntax-only targets cannot inherit JDK applicability"
+            );
+            let home = config
+                .standard_library_discovery
+                .source_toolchains
+                .iter()
+                .find(|binding| binding.source_root() == Path::new(module))
+                .unwrap()
+                .jdk_home();
+            assert_eq!(
+                exact[0].selected_jdk_artifact(),
+                mapping.get(home),
+                "semantic dispatch preserves the full resolver-proven JDK row"
+            );
+        }
+    }
+
+    #[test]
+    fn jdk_home_prefers_sources_and_falls_back_to_one_exact_jmod_source_set() {
+        use brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let root = tempfile::tempdir().unwrap();
+        let relative_home = PathBuf::from("toolchains").join("jdk-21");
+        let home = root.path().join(&relative_home);
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let class = test_class_file_bytes(&TestClassFile {
+            internal_name: "java/lang/Object",
+            super_internal_name: "java/lang/Object",
+            methods: &[],
+            private_nested: false,
+        });
+        write_zip_entries(
+            &home.join("jmods/java.base.jmod"),
+            &[
+                (
+                    "classes/module-info.class",
+                    &crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes(
+                        &["java/lang"],
+                        &[],
+                    ),
+                ),
+                ("classes/java/lang/Object.class", &class),
+            ],
+        );
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![relative_home],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(&home).unwrap()
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+
+        // Adding a source archive retains it for formal names and also retains
+        // the exact JMOD set that certifies callable-family completeness.
+        fs::create_dir_all(home.join("lib")).unwrap();
+        write_zip_entries(
+            &home.join("lib/src.zip"),
+            &[
+                (
+                    "java.base/module-info.java",
+                    b"module java.base { exports java.lang; }",
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    b"package java.lang; public class Object {}",
+                ),
+            ],
+        );
+        let source_discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+        assert_eq!(source_discovered.dependencies[0].artifacts.len(), 2);
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkSourceZip
+        );
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(home.join("lib/src.zip")).unwrap()
+        );
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[1].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[1].path(),
+            fs::canonicalize(&home).unwrap()
+        );
+    }
+
+    /// A second production over the same installed JDK must answer from the
+    /// catalog instead of reading the JMOD set again (#3429).
+    ///
+    /// Reading every JMOD of a real JDK is the whole cost of a
+    /// zero-configuration JDK pack, and the pack is identified by the release
+    /// digest plus each selected archive's path, length, and modification time.
+    /// The catalog is reopened between the two preparations, so only what the
+    /// first process wrote to disk can serve the second.
+    #[hardwon("#3006: jdk jmod set source identity serves a second production without reading")]
+    #[test]
+    fn jdk_jmod_set_source_identity_serves_a_second_production_without_reading() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+
+        let catalog_root = root.path().join("catalog");
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(first.complete, "{:#?}", first.diagnostics);
+        assert_eq!(first.profile.artifacts_read, 1);
+        assert_eq!(first.profile.generated_packs, 1);
+        assert_eq!(
+            first.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        drop(catalog);
+
+        // A second process: the same JDK, a freshly opened catalog handle, and
+        // no in-memory memory of the first production.
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(second.complete, "{:#?}", second.diagnostics);
+        assert_eq!(second.profile.artifacts_read, 0);
+        assert_eq!(second.profile.artifact_bytes_read, 0);
+        assert_eq!(second.profile.reused_packs, 1);
+        assert_eq!(second.profile.generated_packs, 0);
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
+        assert_eq!(first.evidence, second.evidence);
+    }
+
+    /// A JDK whose selected JMOD set changed is a different JDK: its packs are
+    /// read and produced, never served from the identity the old set was
+    /// learned under (#3429).
+    #[hardwon("#3006: changed jdk jmod set identity is not served from the catalog")]
+    #[test]
+    fn changed_jdk_jmod_set_identity_is_not_served_from_the_catalog() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let catalog_root = root.path().join("catalog");
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(first.complete, "{:#?}", first.diagnostics);
+        assert_eq!(first.profile.generated_packs, 1);
+        drop(catalog);
+
+        // A module is added to the installed JDK. The listing, a length, and a
+        // modification time all change, so the recorded identity no longer
+        // describes this JDK.
+        write_test_jdk_jmods(&home, &["java.logging.jmod", "java.sql.jmod"]);
+        let catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert_eq!(discovered.dependencies.len(), 1);
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert_eq!(second.profile.artifacts_read, 1);
+        assert_eq!(second.profile.reused_packs, 0);
+        assert_eq!(second.profile.generated_packs, 1);
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_ne!(
+            first.packs[0].production.key.input_digest(),
+            second.packs[0].production.key.input_digest()
+        );
+    }
+
+    fn test_jdk_config(home: &Path) -> JvmAnalyzerConfig {
+        let mut config = brokk_bifrost_analysis::test_support::hermetic_jvm_config();
+        config.jvm.standard_library_discovery.jdk_homes = vec![home.to_path_buf()];
+        config.jvm
+    }
+
+    /// An installed JDK fixture with one class-bearing `java.base` module and
+    /// one empty module for every name in `additional`.
+    fn write_test_jdk_jmods(home: &Path, additional: &[&str]) {
+        use crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes;
+
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let class = test_class_file_bytes(&TestClassFile {
+            internal_name: "java/lang/Object",
+            super_internal_name: "java/lang/Object",
+            methods: &[],
+            private_nested: false,
+        });
+        write_zip_entries(
+            &home.join("jmods/java.base.jmod"),
+            &[
+                (
+                    "classes/module-info.class",
+                    &test_module_info_class_bytes(&["java/lang"], &[]),
+                ),
+                ("classes/java/lang/Object.class", &class),
+            ],
+        );
+        for name in additional {
+            let module = name.strip_suffix(".jmod").unwrap();
+            let package = module.replace('.', "/");
+            write_zip_entries(
+                &home.join("jmods").join(name),
+                &[(
+                    "classes/module-info.class",
+                    &test_module_info_class_bytes(&[package.as_str()], &[]),
+                )],
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_java_home_with_only_jmods_produces_exact_binary_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("portable-jdk-home");
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"exact binary input").unwrap();
+        let config = JvmAnalyzerConfig::default();
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &config,
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.diagnostics.is_empty());
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(&home).unwrap()
+        );
+        assert_eq!(
+            discovered.dependencies[0]
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.8").unwrap())
+        );
+    }
+
+    #[test]
+    fn automatic_java_home_prefers_bounded_jmod_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("portable-jdk-home");
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("lib/src.zip"), b"candidate source names").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"exact binary input").unwrap();
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.diagnostics.is_empty());
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#2874: Checks an invalid environment-selected JDK is a warning with no guessed dependency"
+    )]
+    fn invalid_environment_jdk_home_is_a_warning_without_guessed_version() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-a-jdk");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(missing.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.dependencies.is_empty());
+        assert_eq!(discovered.diagnostics.len(), 1);
+        assert_eq!(
+            discovered.diagnostics[0].severity,
+            DependencyPackDiagnosticSeverity::Warning
+        );
+        assert_eq!(discovered.diagnostics[0].code, "jdk.home.invalid");
+    }
+
+    /// Writes the smallest JDK home automatic discovery accepts: a `release`
+    /// file that declares one `JAVA_VERSION`.
+    fn write_jdk_release(root: &Path, java_version: &str) -> PathBuf {
+        brokk_bifrost_analysis::test_support::write_jdk_release(&root.join("jdk"), java_version)
+    }
+
+    #[test]
+    #[hardwon("#2874: Checks four-component JDK version remains exact in identity and provenance")]
+    fn four_part_temurin_version_keeps_its_exact_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        let home = write_jdk_release(root.path(), "21.0.12.1");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "{:#?}",
+            discovered.diagnostics
+        );
+        assert_eq!(discovered.dependencies.len(), 1);
+        let dependency = &discovered.dependencies[0];
+        // The fourth component names a distinct source archive, so it must
+        // stay in the dependency identity and the provenance (#2874).
+        assert_eq!(dependency.id, "jdk:21.0.12.1");
+        assert_eq!(
+            dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.12").unwrap())
+        );
+        assert_eq!(
+            dependency.provenance,
+            vec![DependencyProvenance {
+                key: "version".to_owned(),
+                value: "21.0.12.1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#2874: Checks an explicitly configured JDK home accepts a four-part release version"
+    )]
+    fn configured_jdk_home_accepts_a_four_part_version() {
+        use brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = write_jdk_release(root.path(), "21.0.12.1");
+        let config = JvmAnalyzerConfig {
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+
+        let discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "{:#?}",
+            discovered.diagnostics
+        );
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21.0.12.1");
+    }
+
+    #[test]
+    #[hardwon(
+        "#2874: Checks feature-only version maps to a complete semantic-version coordinate without guessing a different feature"
+    )]
+    fn feature_only_jdk_version_fills_the_missing_semver_components() {
+        let root = tempfile::tempdir().unwrap();
+        let home = write_jdk_release(root.path(), "21");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(
+            discovered.diagnostics.is_empty(),
+            "{:#?}",
+            discovered.diagnostics
+        );
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21");
+        assert_eq!(
+            discovered.dependencies[0]
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.0").unwrap())
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#2874: Keeps legacy underscore and overlong version forms out of exact JDK evidence"
+    )]
+    fn undotted_and_overlong_jdk_versions_stay_invalid() {
+        for java_version in ["1.8.0_392", "21.0.12.1.7"] {
+            let root = tempfile::tempdir().unwrap();
+            let home = write_jdk_release(root.path(), java_version);
+
+            let discovered = discover_jdk_semantic_pack_dependencies(
+                &JvmAnalyzerConfig::default(),
+                root.path(),
+                Some(home.as_os_str().to_owned()),
+            );
+
+            assert!(
+                discovered.dependencies.is_empty(),
+                "{java_version}: {:#?}",
+                discovered.dependencies
+            );
+            assert_eq!(discovered.diagnostics.len(), 1, "{java_version}");
+            assert_eq!(
+                discovered.diagnostics[0].code, "jdk.home.invalid",
+                "{java_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_external_declaration_indexes_coordinate_and_prefers_source_jar() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let config = fixture.coordinate_config();
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
+        assert!(
+            index.production_diagnostics().is_empty(),
+            "{:?}",
+            index.production_diagnostics()
+        );
+
+        let service = index.get("com.example.dep.ExternalService").unwrap();
+        assert_eq!("com.example.dep", service.package_name());
+        assert_eq!("ExternalService", service.short_name());
+        assert_eq!(JvmExternalTypeKind::Class, service.kind());
+        assert_eq!(JvmVisibility::Public, service.visibility());
+        assert!(
+            matches!(
+                service.source(),
+                JvmExternalDeclarationSource::SourceJar { source_path, .. }
+                    if source_path == "com/example/dep/ExternalService.java"
+            ),
+            "{service:#?}"
+        );
+
+        assert!(
+            index
+                .get("com.example.dep.ExternalService.Nested")
+                .is_some()
+        );
+        assert!(
+            matches!(
+                index
+                    .get("com.example.dep.ExternalService.Nested")
+                    .map(JvmExternalType::source),
+                Some(JvmExternalDeclarationSource::SourceJar { .. })
+            ),
+            "nested source declarations should retain source-JAR provenance"
+        );
+        assert_eq!(
+            Some(JvmVisibility::Protected),
+            index
+                .get("com.example.dep.ExternalService.ProtectedNested")
+                .map(JvmExternalType::visibility)
+        );
+        assert!(
+            index
+                .get("com.example.dep.ExternalService.Hidden")
+                .is_none(),
+            "private nested classes should not be indexed as externally visible"
+        );
+        assert!(
+            index
+                .get("com.example.dep.ExternalService.Hidden.Leaks")
+                .is_none(),
+            "nested classes under a private parent should not be indexed as externally visible"
+        );
+        assert_eq!(
+            Some(JvmVisibility::PackagePrivate),
+            index
+                .get("com.example.dep.PackageHelper")
+                .map(JvmExternalType::visibility)
+        );
+        assert_eq!(
+            Some(JvmVisibility::PackagePrivate),
+            index
+                .get("com.example.dep.PackageOuter.Nested")
+                .map(JvmExternalType::visibility)
+        );
+        assert_eq!(
+            Some(JvmVisibility::Public),
+            index
+                .get("com.example.dep.PublicApi.Callback")
+                .map(JvmExternalType::visibility)
+        );
+        assert!(
+            index
+                .resolve_wildcard_import("com.example.dep", "ExternalService", "app")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[hardwon("#4271: Annotation text containing public hid a protected source-JAR member type")]
+    fn java_source_jar_visibility_ignores_annotation_values() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let index = JvmExternalDeclarationIndex::build(
+            &fixture.coordinate_config(),
+            fixture.project_root(),
+        );
+        let nested = index
+            .get("com.example.dep.ExternalService.AnnotatedProtectedNested")
+            .expect("annotated protected nested type is indexed");
+
+        assert_eq!(JvmVisibility::Protected, nested.visibility());
+        assert!(matches!(
+            nested.source(),
+            JvmExternalDeclarationSource::SourceJar { .. }
+        ));
+    }
+
+    #[test]
+    fn java_dependency_pack_retains_coordinate_and_reuses_merged_artifacts() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyArtifactRole;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::ExactDependencyArtifact;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact;
+
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let project = TestProject::new(fixture.project_root(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            external_dependencies: fixture.coordinate_config(),
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig::default()
+                },
+            standard_library_discovery:
+                brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+        };
+        let dependencies = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id, "com.example:external-lib:1.2.3");
+        assert_eq!(
+            dependencies[0]
+                .evidence
+                .package
+                .as_ref()
+                .map(|coordinate| coordinate.name.as_str()),
+            Some("com.example:external-lib")
+        );
+        assert!(
+            dependencies[0]
+                .provenance
+                .iter()
+                .any(|entry| { entry.key == "origin" && entry.value == "maven_repository" })
+        );
+        assert_eq!(
+            dependencies[0]
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.role)
+                .collect::<Vec<_>>(),
+            vec![
+                DependencyArtifactRole::Binary,
+                DependencyArtifactRole::Sources
+            ]
+        );
+
+        let producer_limits = ArtifactProducerLimits::default();
+        let exact_artifacts = [
+            ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Binary,
+                ExternalArtifactKind::JavaClassJar,
+                None,
+                read_exact_artifact(&fixture.binary_jar_path(), &producer_limits).unwrap(),
+            ),
+            ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Sources,
+                ExternalArtifactKind::JavaSourceJar,
+                None,
+                read_exact_artifact(&fixture.source_jar_path(), &producer_limits).unwrap(),
+            ),
+        ];
+        let merged = JvmDependencyPackAdapter.produce(
+            &dependencies[0],
+            &exact_artifacts,
+            &producer_limits,
+            None,
+        );
+        assert!(merged.diagnostics.is_empty(), "{:#?}", merged.diagnostics);
+        let merged_pack = merged.pack.expect("source and binary packs merge");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            &merged_pack.shards[0].payload
+        else {
+            panic!("Java dependency producer must emit declaration facts")
+        };
+        let owner = types
+            .iter()
+            .find(|fact| fact.name == "com.example.dep.ExternalService")
+            .expect("merged service declaration");
+        let echo = members
+            .iter()
+            .find(|fact| fact.owner == owner.id && fact.name == "echo")
+            .expect("merged echo declaration");
+        assert_eq!(
+            echo.signature
+                .as_ref()
+                .and_then(|signature| signature.parameters[0].name.as_deref()),
+            Some("name"),
+            "source formal names remain authoritative"
+        );
+        assert!(
+            echo.callable_family_complete,
+            "an equivalent exact binary table contributes scoped completeness"
+        );
+
+        let produce_java_pack = |path: &Path, kind: ExternalArtifactKind| {
+            let mut request = jvm_dependency_production_request(&dependencies[0]);
+            request.path = path.to_path_buf();
+            request.artifact_kind = kind;
+            let artifact = read_exact_artifact(path, &producer_limits).unwrap();
+            JavaJarPackProducer
+                .produce_loaded_artifact(&request, &producer_limits, None, &artifact)
+                .pack
+                .expect("standalone Java declaration pack")
+        };
+        let mut source_pack = produce_java_pack(
+            &fixture.source_jar_path(),
+            ExternalArtifactKind::JavaSourceJar,
+        );
+        let mut binary_pack = produce_java_pack(
+            &fixture.binary_jar_path(),
+            ExternalArtifactKind::JavaClassJar,
+        );
+        for pack in [&mut source_pack, &mut binary_pack] {
+            let activation = pack.shards[0].activation.clone();
+            pack.shards[0].id = "declarations.second".to_owned();
+            pack.shards.insert(
+                0,
+                AuthoredShard {
+                    id: "declarations.first".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types: Vec::new(),
+                        members: Vec::new(),
+                        relations: Vec::new(),
+                    },
+                    runtime_values: None,
+                    runtime_contracts: None,
+                    collection_flows: None,
+                    deferred_yields: None,
+                    conditional_type_refinements: None,
+                    callable_values: None,
+                },
+            );
+        }
+        let mut multi_shard_diagnostics = Vec::new();
+        let mut multi_shard_suppressed = SuppressedDiagnostics::default();
+        let multi_shard = merge_java_dependency_packs(
+            Some(source_pack),
+            Some(binary_pack),
+            &mut multi_shard_diagnostics,
+            &mut multi_shard_suppressed,
+            &producer_limits,
+        )
+        .expect("multi-shard Java packs merge");
+        assert!(multi_shard_diagnostics.is_empty());
+        assert_eq!(multi_shard_suppressed.total(), 0);
+        let AuthoredPayload::DeclarationFacts { types, members, .. } =
+            &multi_shard.shards[1].payload
+        else {
+            panic!("the corresponding declaration shard remains typed")
+        };
+        let owner = types
+            .iter()
+            .find(|fact| fact.name == "com.example.dep.ExternalService")
+            .expect("multi-shard service declaration");
+        assert!(
+            members.iter().any(|fact| {
+                fact.owner == owner.id && fact.name == "echo" && fact.callable_family_complete
+            }),
+            "binary proof must merge into the matching source shard"
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert_eq!(first.packs.len(), 1, "{:#?}", first.diagnostics);
+        assert_eq!(second.packs.len(), 1, "{:#?}", second.diagnostics);
+        assert_eq!(
+            first.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
+    }
+
+    #[test]
+    fn scala_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("scala-library-2.13.16-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "scala/example/LibraryApi.scala",
+            b"package scala.example\ntrait LibraryApi { def value: String }\n",
+        );
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: temp.path().join("scala-library-2.13.16.jar"),
+            source_artifact_path: Some(source_jar),
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.scala-lang",
+                "scala-library",
+                "2.13.16",
+            )),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+
+        assert_eq!(dependency.evidence.language, "scala");
+        assert_eq!(
+            dependency.evidence.toolchain,
+            Some(CatalogCoordinate {
+                name: "scala".to_owned(),
+                version: Some(Version::parse("2.13.16").unwrap()),
+            })
+        );
+        assert_eq!(dependency.artifacts.len(), 1);
+        assert_eq!(
+            dependency.artifacts[0].kind,
+            ExternalArtifactKind::ScalaSourceJar
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.artifacts_read, 1);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.language, "scala");
+    }
+
+    #[test]
+    #[hardwon(
+        "#2756: A refused dependency with no compatible pack must receive specific and generic accounting diagnostics"
+    )]
+    fn scala_library_without_sources_waits_for_compatible_prebuilt_pack() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: PathBuf::from("scala-library-2.13.16.jar"),
+            source_artifact_path: None,
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.scala-lang",
+                "scala-library",
+                "2.13.16",
+            )),
+            origin: JvmDependencyOrigin::GradleCache,
+        });
+        assert_eq!(dependency.evidence.ecosystem, "maven");
+        assert!(!JvmDependencyPackAdapter.can_produce(&dependency));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!prepared.complete);
+        assert_eq!(prepared.profile.artifacts_read, 0);
+        // The dependency is unaccounted (no pack, no installed pack), so
+        // preparation names both the specific reason and the generic
+        // catch-all (#2756).
+        assert_eq!(prepared.diagnostics.len(), 2, "{:#?}", prepared.diagnostics);
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency.pack_unavailable")
+        );
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "preparation.unaccounted-dependency")
+        );
+    }
+
+    #[test]
+    fn kotlin_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("kotlin-stdlib-2.2.0-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/LibraryApi.kt",
+            b"package kotlin.example\ninterface LibraryApi {\n    fun value(): String\n}\n",
+        );
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: temp.path().join("kotlin-stdlib-2.2.0.jar"),
+            source_artifact_path: Some(source_jar),
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.jetbrains.kotlin",
+                "kotlin-stdlib",
+                "2.2.0",
+            )),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+
+        assert_eq!(dependency.evidence.language, "kotlin");
+        assert_eq!(
+            dependency.evidence.toolchain,
+            Some(CatalogCoordinate {
+                name: "kotlin".to_owned(),
+                version: Some(Version::parse("2.2.0").unwrap()),
+            })
+        );
+        assert_eq!(dependency.artifacts.len(), 1);
+        assert_eq!(
+            dependency.artifacts[0].kind,
+            ExternalArtifactKind::KotlinSourceJar
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.artifacts_read, 1);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.language, "kotlin");
+    }
+
+    #[test]
+    #[hardwon(
+        "#2756: A refused dependency with no compatible pack must receive specific and generic accounting diagnostics"
+    )]
+    fn kotlin_library_without_sources_waits_for_compatible_prebuilt_pack() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: PathBuf::from("kotlin-stdlib-2.2.0.jar"),
+            source_artifact_path: None,
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.jetbrains.kotlin",
+                "kotlin-stdlib",
+                "2.2.0",
+            )),
+            origin: JvmDependencyOrigin::GradleCache,
+        });
+        assert_eq!(dependency.evidence.language, "kotlin");
+        assert_eq!(dependency.evidence.ecosystem, "maven");
+        assert!(!JvmDependencyPackAdapter.can_produce(&dependency));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!prepared.complete);
+        assert_eq!(prepared.profile.artifacts_read, 0);
+        // The dependency is unaccounted (no pack, no installed pack), so
+        // preparation names both the specific reason and the generic
+        // catch-all (#2756).
+        assert_eq!(prepared.diagnostics.len(), 2, "{:#?}", prepared.diagnostics);
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency.pack_unavailable")
+        );
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "preparation.unaccounted-dependency")
+        );
+    }
+
+    #[test]
+    fn renamed_identical_jars_reuse_one_path_independent_manifest() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::assert_path_independent_pack_reuse;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let copies = tempfile::tempdir().unwrap();
+        let first_binary = copies.path().join("first.jar");
+        let second_binary = copies.path().join("renamed.jar");
+        fs::copy(fixture.binary_jar_path(), &first_binary).unwrap();
+        fs::copy(fixture.binary_jar_path(), &second_binary).unwrap();
+        let project = TestProject::new(copies.path(), Language::Java);
+        let config = |binary| JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: binary,
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery:
+                brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+        };
+        let limits = DependencyPackLimits::default();
+        let first_dependencies =
+            resolve_jvm_semantic_pack_dependencies(&config(first_binary), &project, &limits, None);
+        let second_dependencies =
+            resolve_jvm_semantic_pack_dependencies(&config(second_binary), &project, &limits, None);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &first_dependencies,
+            &limits,
+            None,
+        );
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &second_dependencies,
+            &limits,
+            None,
+        );
+
+        assert_path_independent_pack_reuse(&first, &second);
+    }
+
+    #[test]
+    fn java_external_declaration_uses_classfile_when_source_jar_is_missing() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let config = fixture.coordinate_config();
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
+
+        let service = index.get("com.example.dep.ExternalService").unwrap();
+        assert!(
+            matches!(
+                service.source(),
+                JvmExternalDeclarationSource::ClassFile { class_entry, .. }
+                    if class_entry == "com/example/dep/ExternalService.class"
+            ),
+            "{service:#?}"
+        );
+        assert_eq!(
+            Some(JvmVisibility::Protected),
+            index
+                .get("com.example.dep.ExternalService.ProtectedNested")
+                .map(JvmExternalType::visibility)
+        );
+        assert_eq!(
+            Some(JvmVisibility::PackagePrivate),
+            index
+                .get("com.example.dep.PackageHelper")
+                .map(JvmExternalType::visibility)
+        );
+        let package_nested = index
+            .get("com.example.dep.ExternalService.PackageNested")
+            .unwrap();
+        assert_eq!("com.example.dep", package_nested.package_name());
+        assert_eq!("ExternalService.PackageNested", package_nested.short_name());
+        assert_eq!(JvmVisibility::PackagePrivate, package_nested.visibility());
+        assert_eq!(
+            Some(JvmVisibility::PackagePrivate),
+            index
+                .get("com.example.dep.PackageOuter.Nested")
+                .map(JvmExternalType::visibility)
+        );
+        assert!(
+            index
+                .get("com.example.dep.ExternalService.Hidden")
+                .is_none(),
+            "classfile fallback should respect InnerClasses private visibility"
+        );
+    }
+
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn java_external_declaration_indexes_explicit_source_artifact_path() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![JvmExternalArtifact {
+                artifact_path: fixture.source_jar_path(),
+                source_artifact_path: None,
+                ..JvmExternalArtifact::default()
+            }],
+            ..JvmExternalDependencies::default()
+        };
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
+
+        let service = index.get("com.example.dep.ExternalService").unwrap();
+        assert!(
+            matches!(
+                service.source(),
+                JvmExternalDeclarationSource::SourceJar { source_path, .. }
+                    if source_path == "com/example/dep/ExternalService.java"
+            ),
+            "{service:#?}"
+        );
+    }
+
+    #[test]
+    fn jvm_external_declaration_indexes_scala_source_jar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source_jar = root.join("scala-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "scala/example/Dependency.scala",
+            b"package scala.example\nclass Dependency\ntrait Contract\nobject Defaults\nprivate class Hidden\n",
+        );
+
+        let index = JvmExternalDeclarationIndex::build(
+            &JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: source_jar,
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            &root,
+        );
+
+        for name in [
+            "scala.example.Dependency",
+            "scala.example.Contract",
+            "scala.example.Defaults",
+        ] {
+            assert!(matches!(
+                index.get(name).map(JvmExternalType::source),
+                Some(JvmExternalDeclarationSource::SourceJar { source_path, .. })
+                    if source_path == "scala/example/Dependency.scala"
+            ));
+        }
+        assert!(index.get("scala.example.Hidden").is_none());
+    }
+
+    const KOTLIN_DEPENDENCY_SOURCE: &str = "package kotlin.example\n\
+         \n\
+         class Dependency {\n\
+             class Nested\n\
+             private class Hidden\n\
+             companion object Factory\n\
+         }\n\
+         \n\
+         interface Contract\n\
+         \n\
+         object Defaults\n\
+         \n\
+         enum class Mode { FAST, SLOW }\n\
+         \n\
+         annotation class Marked\n\
+         \n\
+         internal class ModulePrivate\n\
+         \n\
+         private class FilePrivate\n\
+         \n\
+         fun topLevelHelper(): Int = 1\n";
+
+    fn kotlin_source_jar_index(root: &Path) -> JvmExternalDeclarationIndex {
+        let source_jar = root.join("kotlin-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/Dependency.kt",
+            KOTLIN_DEPENDENCY_SOURCE.as_bytes(),
+        );
+        JvmExternalDeclarationIndex::build(
+            &JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: source_jar,
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            root,
+        )
+    }
+
+    #[test]
+    fn jvm_external_declaration_indexes_kotlin_source_jar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let index = kotlin_source_jar_index(&root);
+
+        for name in [
+            "kotlin.example.Dependency",
+            "kotlin.example.Dependency.Nested",
+            "kotlin.example.Dependency.Factory",
+            "kotlin.example.Contract",
+            "kotlin.example.Defaults",
+            "kotlin.example.Mode",
+            "kotlin.example.Marked",
+        ] {
+            assert!(
+                matches!(
+                    index.get(name).map(JvmExternalType::source),
+                    Some(JvmExternalDeclarationSource::SourceJar { source_path, .. })
+                        if source_path == "kotlin/example/Dependency.kt"
+                ),
+                "expected {name} to be indexed from the Kotlin source jar"
+            );
+        }
+
+        assert_eq!(
+            Some(JvmExternalTypeKind::Interface),
+            index
+                .get("kotlin.example.Contract")
+                .map(JvmExternalType::kind)
+        );
+        assert_eq!(
+            Some(JvmExternalTypeKind::Enum),
+            index.get("kotlin.example.Mode").map(JvmExternalType::kind)
+        );
+        assert_eq!(
+            Some(JvmExternalTypeKind::Annotation),
+            index
+                .get("kotlin.example.Marked")
+                .map(JvmExternalType::kind)
+        );
+    }
+
+    #[test]
+    fn java_external_declaration_ignores_missing_and_malformed_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let malformed = root.join("bad.jar");
+        fs::write(&malformed, b"not a zip").unwrap();
+
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![
+                JvmExternalArtifact {
+                    artifact_path: malformed,
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                },
+                JvmExternalArtifact {
+                    artifact_path: root.join("missing.jar"),
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                },
+            ],
+            ..JvmExternalDependencies::default()
+        };
+
+        let index = JvmExternalDeclarationIndex::build(&config, &root);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn java_external_declaration_rejects_unsafe_coordinates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let unsafe_coordinates = [
+            JvmMavenCoordinate::new("..", "external-lib", "1.2.3"),
+            JvmMavenCoordinate::new("com.example", "../external-lib", "1.2.3"),
+            JvmMavenCoordinate::new("com.example", "external-lib", "../1.2.3"),
+            JvmMavenCoordinate::new("com..example", "external-lib", "1.2.3"),
+        ];
+
+        for coordinate in unsafe_coordinates {
+            assert!(
+                resolve_coordinate(&root, &coordinate).is_none(),
+                "unsafe coordinate should not resolve: {coordinate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_external_declaration_skips_oversized_source_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let oversized_source_jar = root.join("oversized-sources.jar");
+        write_zip_entry(
+            &oversized_source_jar,
+            "com/example/dep/Oversized.java",
+            &vec![b' '; MAX_SOURCE_ENTRY_BYTES as usize + 1],
+        );
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![JvmExternalArtifact {
+                artifact_path: oversized_source_jar,
+                source_artifact_path: None,
+                ..JvmExternalArtifact::default()
+            }],
+            ..JvmExternalDependencies::default()
+        };
+
+        let index = JvmExternalDeclarationIndex::build(&config, &root);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn java_external_declaration_skips_oversized_artifacts_before_zip_parse() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let oversized_jar = root.join("oversized.jar");
+        File::create(&oversized_jar)
+            .unwrap()
+            .set_len(MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![JvmExternalArtifact {
+                artifact_path: oversized_jar,
+                source_artifact_path: None,
+                ..JvmExternalArtifact::default()
+            }],
+            ..JvmExternalDependencies::default()
+        };
+
+        let index = JvmExternalDeclarationIndex::build(&config, &root);
+        assert!(index.is_empty());
+    }
+
+    /// Two workspaces over one unchanged dependency universe share one built
+    /// index through the process-wide memo; changing a resolved artifact's
+    /// bytes changes the evidence and rebuilds.
+    #[test]
+    fn build_for_project_memoizes_on_dependency_discovery_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo_dir = root.join("m2").join(GROUP_PATH);
+        fs::create_dir_all(&repo_dir).unwrap();
+        for workspace in ["workspace-a", "workspace-b"] {
+            fs::create_dir_all(root.join(workspace)).unwrap();
+        }
+        probe_class_jar(&repo_dir.join(BINARY_JAR));
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
+                    "com.example",
+                    "external-lib",
+                    "1.2.3",
+                )],
+                repository_roots: vec![root.join("m2")],
+                ..JvmExternalDependencies::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let first = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-a"), Language::Java),
+        );
+        let second = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-b"), Language::Java),
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical dependency-discovery evidence must share one built index"
+        );
+
+        write_test_class_jar(
+            &repo_dir.join(BINARY_JAR),
+            &[TestClassFile {
+                internal_name: "com/example/probe/Replaced",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+        let third = JvmExternalDeclarationIndex::build_for_project(
+            &config,
+            &TestProject::new(root.join("workspace-a"), Language::Java),
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a changed resolved artifact must rebuild the index"
+        );
+        assert!(
+            third
+                .resolve_qualified_name("com.example.probe.Replaced", "")
+                .is_some(),
+            "the rebuilt index must read the replaced artifact"
+        );
+    }
+
+    fn write_zip_entry(path: &Path, entry_name: &str, bytes: &[u8]) {
+        brokk_bifrost_analysis::test_support::zip_helpers::write_zip_unwrap(
+            path,
+            &[(entry_name, bytes)],
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+        );
+    }
+
+    fn write_zip_entries(path: &Path, entries: &[(&str, &[u8])]) {
+        brokk_bifrost_analysis::test_support::zip_helpers::write_zip_unwrap(
+            path,
+            entries,
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_JDK_HOME pointing to a pinned JDK installation"]
+    fn pinned_jdk_home_preparation_is_cached() {
+        use brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackPreparationStatus;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let home =
+            PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("set BIFROST_JDK_HOME"));
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{discovered:#?}");
+        assert_eq!(discovered.dependencies.len(), 1, "{discovered:#?}");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        // Partial declaration coverage is expected, but the artifact must
+        // still install and leave exact activation evidence and a cache entry.
+        assert_eq!(prepared.packs.len(), 1, "{prepared:#?}");
+        assert_eq!(prepared.evidence.len(), 1, "{prepared:#?}");
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        let reused = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert_eq!(reused.packs.len(), 1, "{reused:#?}");
+        assert_eq!(reused.profile.generated_packs, 0, "{reused:#?}");
+        assert_eq!(reused.evidence, prepared.evidence);
+    }
+
+    #[test]
+    fn missing_jmod_after_discovery_is_an_honest_preparation_failure() {
+        use brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk");
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"not a jmod").unwrap();
+        let config = JvmAnalyzerConfig {
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home.clone()],
+                discover_java_home: false,
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert_eq!(discovered.dependencies.len(), 1);
+        fs::remove_file(home.join("jmods/java.base.jmod")).unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(prepared.packs.is_empty());
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "artifact.metadata" })
+        );
+    }
+
+    #[test]
+    fn incomplete_kotlin_classification_never_falls_through_to_java() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("unknown-sources.jar");
+        File::create(&source_jar)
+            .unwrap()
+            .set_len(MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let invalid_jar = temp.path().join("invalid-sources.jar");
+        fs::write(&invalid_jar, b"not a ZIP archive").unwrap();
+        for path in [source_jar, invalid_jar] {
+            let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+                artifact_path: temp.path().join("unknown.jar"),
+                source_artifact_path: Some(path),
+                coordinate: Some(JvmMavenCoordinate::new("example", "unknown", "1.0.0")),
+                origin: JvmDependencyOrigin::ExplicitPath,
+            });
+
+            assert_eq!(dependency.evidence.language, "kotlin");
+            assert_eq!(
+                dependency.artifacts[0].kind,
+                ExternalArtifactKind::KotlinSourceJar
+            );
+            assert!(dependency.provenance.iter().any(|entry| {
+                entry.key == "kotlin.classification" && entry.value == "incomplete"
+            }));
+        }
+    }
+
+    #[test]
+    fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
+
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_discovered_dependency_semantic_packs;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate {
+                    group_id: "com.example".to_owned(),
+                    artifact_id: "missing".to_owned(),
+                    version: "1.0.0".to_owned(),
+                }],
+                repository_roots: vec![root.path().join("repository")],
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig::default()
+                },
+            standard_library_discovery:
+                brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+        };
+        let limits = DependencyPackLimits::default();
+        let discovery = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert!(!discovery.complete);
+        assert!(discovery.dependencies.is_empty());
+        assert_eq!(discovery.diagnostics[0].code, "jvm.dependency_unresolved");
+        let catalog = brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog::open_ephemeral(
+            Default::default(),
+        )
+        .unwrap();
+        let prepared = prepare_discovered_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            discovery,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(
+            prepared
+                .compose_activation_request(
+                    brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationRequest {
+                        approximate_standard_libraries: Vec::new(),
+                        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                        evidence: Vec::new(),
+                        controls: Vec::new(),
+                        limits: Default::default(),
+                    }
+                )
+                .is_none()
+        );
+    }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn java_dependency_discovery_indexes_exact_maven_pom_coordinate() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
+            .write(
+                "<project><groupId>app</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
+            )
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_indexes_only_locked_gradle_coordinate_directory() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let locked_dir = gradle_cache.join("com.example/external-lib/1.2.3/binary-hash");
+        let source_dir = gradle_cache.join("com.example/external-lib/1.2.3/source-hash");
+        let unrelated_dir = gradle_cache.join("unrelated/example/9.9.9/hash");
+        fs::create_dir_all(&locked_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&unrelated_dir).unwrap();
+        fs::copy(fixture.binary_jar_path(), locked_dir.join(BINARY_JAR)).unwrap();
+        fs::copy(fixture.source_jar_path(), source_dir.join(SOURCE_JAR)).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            unrelated_dir.join("example-9.9.9.jar"),
+        )
+        .unwrap();
+
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "gradle.lockfile")
+            .write("com.example:external-lib:1.2.3=compileClasspath\n")
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.root.join("empty-maven")],
+                    gradle_cache_roots: vec![gradle_cache],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let resolution = analyzer
+            .resolve_type_name_with_external(token, None, &app, "ExternalService")
+            .unwrap();
+        let crate::analyzer::java::imports::JavaTypeResolution::External(external) = resolution
+        else {
+            panic!("dependency should resolve externally");
+        };
+        assert!(matches!(
+            external.source(),
+            JvmExternalDeclarationSource::SourceJar { .. }
+        ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_skips_classifier_only_gradle_cache_entries() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let classifier_dir = gradle_cache.join("com.example/external-lib/1.2.3/classifier-hash");
+        fs::create_dir_all(&classifier_dir).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            classifier_dir.join("external-lib-1.2.3-tests.jar"),
+        )
+        .unwrap();
+
+        let config = JvmExternalDependencies {
+            coordinates: vec![JvmMavenCoordinate::new(
+                "com.example",
+                "external-lib",
+                "1.2.3",
+            )],
+            gradle_cache_roots: vec![gradle_cache],
+            ..JvmExternalDependencies::default()
+        };
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
+        assert!(index.is_empty());
+    }
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
+    #[test]
+    fn java_dependency_discovery_disabled_keeps_metadata_out_of_index() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
+            .write(
+                "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
+            )
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                dependency_discovery: brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryMode::Disabled,
+                    ..brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig::default()
+                },
+                standard_library_discovery: brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_invalidates_only_for_build_inputs() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId></dependency></dependencies></project>")
+            .unwrap();
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+        let initial_index = analyzer.external_index.clone();
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
+        assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
+        assert!(updated.is_known_type_name_in_file(token, None, &app, "ExternalService"));
+
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
+        )
+        .unwrap();
+        let java_only = updated.update(&BTreeSet::from([app]));
+        assert!(Arc::ptr_eq(
+            &updated.external_index,
+            &java_only.external_index
+        ));
+        let refreshed = java_only.update_all();
+        assert!(!Arc::ptr_eq(
+            &java_only.external_index,
+            &refreshed.external_index
+        ));
+    }
+
+    #[test]
+    fn jvm_external_declaration_omits_kotlin_types_a_consumer_cannot_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let index = kotlin_source_jar_index(&root);
+
+        // `internal` is module-scoped and `private` is file-scoped, so neither
+        // is nameable from a different artifact.
+        assert!(index.get("kotlin.example.ModulePrivate").is_none());
+        assert!(index.get("kotlin.example.FilePrivate").is_none());
+        assert!(index.get("kotlin.example.Dependency.Hidden").is_none());
+
+        // The index answers "does this *type* exist"; top-level callables are
+        // not types, and the JVM facade Kotlin generates for them
+        // (`DependencyKt`) is a compiler artifact that never appears in a
+        // Kotlin identity.
+        assert!(index.get("kotlin.example.topLevelHelper").is_none());
+        assert!(index.get("kotlin.example.DependencyKt").is_none());
+    }
+
+    #[test]
+    fn kotlin_analyzer_shares_the_jvm_dependency_realm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let source_jar = root.join("kotlin-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/Dependency.kt",
+            KOTLIN_DEPENDENCY_SOURCE.as_bytes(),
+        );
+
+        ProjectFile::new(workspace_root.clone(), "src/App.kt")
+            .write("package app\n\nimport kotlin.example.Dependency\n\nclass App\n")
+            .unwrap();
+
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    artifact_paths: vec![JvmExternalArtifact {
+                        artifact_path: source_jar,
+                        source_artifact_path: None,
+                        ..JvmExternalArtifact::default()
+                    }],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = crate::analyzer::KotlinAnalyzer::new_with_config(
+            Arc::new(TestProject::new(workspace_root, Language::Kotlin)),
+            config,
+        );
+
+        let index = analyzer.external_declaration_index();
+        assert!(
+            index
+                .resolve_explicit_import("kotlin.example.Dependency", "app")
+                .is_some(),
+            "the Kotlin analyzer must read the same jar-backed index Java and Scala use"
+        );
+        assert!(
+            index
+                .resolve_explicit_import("kotlin.example.ModulePrivate", "app")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_external_declaration_resolver_distinguishes_source_and_external_types() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let config = AnalyzerConfig {
+            jvm: brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig {
+                external_dependencies: fixture.coordinate_config(),
+                ..brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app;\n\
+             import com.example.dep.ExternalService;\n\
+             import com.example.dep.ExternalHelper;\n\
+             import com.example.dep.PublicApi;\n\
+             import com.example.dep.*;\n\
+             import com.example.other.*;\n\
+             public class App { ExternalService one; ExternalService.Nested two; ExternalHelper helper; ExternalService.ProtectedNested blocked; PublicApi.Callback callback; Foo ambiguous; PackageOuter.Nested hidden; }\n",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "src/LocalType.java")
+            .write("package app; public class LocalType {}")
+            .unwrap();
+        let same_package_app = ProjectFile::new(
+            fixture.project_root().to_path_buf(),
+            "src/com/example/dep/App.java",
+        );
+        same_package_app
+            .write("package com.example.dep; public class App { PackageHelper helper; }\n")
+            .unwrap();
+
+        let project = TestProject::new(fixture.project_root().to_path_buf(), Language::Java);
+        let analyzer = JavaAnalyzer::from_project_with_config(project.clone(), config);
+
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(token, None, &app, "LocalType"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::Source(
+                _
+            ))
+        ));
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(token, None, &app, "ExternalService"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(token, None, &app, "ExternalService.Nested"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(
+            analyzer
+                .resolve_type_name_with_external(
+                    token,
+                    None,
+                    &app,
+                    "ExternalService.ProtectedNested"
+                )
+                .is_none(),
+            "protected nested dependency types should not resolve from unrelated packages"
+        );
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(token, None, &app, "PublicApi.Callback"),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(
+            analyzer
+                .resolve_type_name_with_external(token, None, &app, "Foo")
+                .is_none(),
+            "ambiguous wildcard external types should not resolve arbitrarily"
+        );
+        assert!(
+            analyzer
+                .resolve_type_name_with_external(token, None, &app, "PackageOuter.Nested")
+                .is_none(),
+            "public nested types under package-private outers should not resolve from other packages"
+        );
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(
+                token,
+                None,
+                &same_package_app,
+                "PackageHelper"
+            ),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(matches!(
+            analyzer.resolve_type_name_with_external(
+                token,
+                None,
+                &same_package_app,
+                "ExternalService.PackageNested"
+            ),
+            Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
+        ));
+        assert!(
+            analyzer
+                .resolve_type_name_in_file(token, &app, "ExternalService")
+                .is_none(),
+            "source-only resolution should not fabricate CodeUnits for dependency types"
+        );
+        assert!(
+            project
+                .all_files()
+                .unwrap()
+                .iter()
+                .all(|file| !file.rel_path().to_string_lossy().contains(".jar"))
+        );
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod python_test_support;

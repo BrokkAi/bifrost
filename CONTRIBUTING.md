@@ -501,7 +501,7 @@ the dependency graph: `brokk-bifrost-core`, then the language crates
 `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
 run in parallel), then `brokk-bifrost-semantic`, then `brokk-bifrost-store`,
 then `brokk-bifrost-analysis`,
-then `brokk-bifrost-go-analysis`, `brokk-bifrost-cpp-analysis`, `brokk-bifrost-csharp-analysis`, `brokk-bifrost-php-analysis`, `brokk-bifrost-python-analysis`, `brokk-bifrost-ruby-analysis`, `brokk-bifrost-rust-analysis`, `brokk-bifrost-js-ts-analysis` and `brokk-bifrost-flow` in parallel, then
+then `brokk-bifrost-jvm-analysis`, `brokk-bifrost-go-analysis`, `brokk-bifrost-cpp-analysis`, `brokk-bifrost-csharp-analysis`, `brokk-bifrost-php-analysis`, `brokk-bifrost-python-analysis`, `brokk-bifrost-ruby-analysis`, `brokk-bifrost-rust-analysis`, `brokk-bifrost-js-ts-analysis` and `brokk-bifrost-flow` in parallel, then
 `brokk-bifrost-tools` and `brokk-bifrost-semantic-packs` in parallel, then
 `brokk-bifrost-rql`, then `brokk-bifrost-policy`, then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
@@ -525,24 +525,25 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-ruby` | `crates/bifrost-ruby/Cargo.toml` | 2 |
 | `brokk-bifrost-rust` | `crates/bifrost-rust/Cargo.toml` | 2 |
 | `brokk-bifrost-semantic` | `crates/bifrost-semantic/Cargo.toml` | 3 |
-| `brokk-bifrost-store` | `crates/bifrost-store/Cargo.toml` | 1 |
-| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 4 |
-| `brokk-bifrost-go-analysis` | `crates/bifrost-go-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-csharp-analysis` | `crates/bifrost-csharp-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-php-analysis` | `crates/bifrost-php-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-cpp-analysis` | `crates/bifrost-cpp-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-python-analysis` | `crates/bifrost-python-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-ruby-analysis` | `crates/bifrost-ruby-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-js-ts-analysis` | `crates/bifrost-js-ts-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-rust-analysis` | `crates/bifrost-rust-analysis/Cargo.toml` | 5 |
-| `brokk-bifrost-tools` | `crates/bifrost-tools/Cargo.toml` | 6 |
-| `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 5 |
-| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 7 |
-| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 7 |
-| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 8 |
-| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 9 |
-| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 10 |
-| `brokk-bifrost` | `Cargo.toml` | 11 |
+| `brokk-bifrost-store` | `crates/bifrost-store/Cargo.toml` | 4 |
+| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 5 |
+| `brokk-bifrost-go-analysis` | `crates/bifrost-go-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-csharp-analysis` | `crates/bifrost-csharp-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-jvm-analysis` | `crates/bifrost-jvm-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-php-analysis` | `crates/bifrost-php-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-cpp-analysis` | `crates/bifrost-cpp-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-python-analysis` | `crates/bifrost-python-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-ruby-analysis` | `crates/bifrost-ruby-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-js-ts-analysis` | `crates/bifrost-js-ts-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-rust-analysis` | `crates/bifrost-rust-analysis/Cargo.toml` | 6 |
+| `brokk-bifrost-tools` | `crates/bifrost-tools/Cargo.toml` | 7 |
+| `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 6 |
+| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 8 |
+| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 8 |
+| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 9 |
+| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 10 |
+| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 11 |
+| `brokk-bifrost` | `Cargo.toml` | 12 |
 
 Before each release, compare this table with the root workspace members and
 package names. Confirm these items for each package:

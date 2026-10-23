@@ -1875,6 +1875,16 @@ fn python_ancestry_type_refs(
     std::iter::from_fn(move || {
         let reference = pending.pop()?;
         match reference {
+            TypeRef::Projection {
+                owner,
+                trait_type,
+                arguments,
+                ..
+            } => {
+                pending.push(owner);
+                pending.extend(trait_type.as_deref());
+                pending.extend(arguments);
+            }
             TypeRef::Unknown | TypeRef::TypeParameter { .. } => {}
             TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
                 pending.extend(arguments)
@@ -1972,6 +1982,20 @@ fn python_ancestry_retained_bytes(basis: &PythonAncestryBasis) -> usize {
     // unsupported authored shapes retained by an incomplete provider answer.
     for reference in python_ancestry_type_refs(basis) {
         match reference {
+            TypeRef::Projection {
+                trait_type,
+                name,
+                arguments,
+                ..
+            } => {
+                bytes = bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(arguments.capacity().saturating_mul(size_of::<TypeRef>()))
+                    .saturating_add(size_of::<TypeRef>());
+                if trait_type.is_some() {
+                    bytes = bytes.saturating_add(size_of::<TypeRef>());
+                }
+            }
             TypeRef::Unknown => {}
             TypeRef::Named {
                 name, arguments, ..
@@ -2122,7 +2146,9 @@ fn validate_python_ancestry_basis(basis: &PythonAncestryBasis) -> Result<(), Rep
     }
     for reference in python_ancestry_type_refs(basis) {
         match reference {
-            TypeRef::Named { name, .. } | TypeRef::TypeParameter { name } => required_text(name)?,
+            TypeRef::Projection { name, .. }
+            | TypeRef::Named { name, .. }
+            | TypeRef::TypeParameter { name } => required_text(name)?,
             TypeRef::Declared { id, .. } => required_text(id)?,
             TypeRef::FixedArray { length, .. } => required_text(length)?,
             TypeRef::Function { parameters, .. } => {
@@ -3233,6 +3259,8 @@ pub struct RelatedPolicyLocation {
     relationship: PolicyLocationRelationship,
     location: PolicySourceLocation,
     evidence_refs: Vec<EvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 impl RelatedPolicyLocation {
@@ -3251,6 +3279,7 @@ impl RelatedPolicyLocation {
         evidence_refs.dedup();
         tighten_vec(&mut evidence_refs);
         let related = Self {
+            label: None,
             relationship,
             location,
             evidence_refs,
@@ -3262,6 +3291,17 @@ impl RelatedPolicyLocation {
             });
         }
         Ok(related)
+    }
+
+    /// Attribute analyzer evidence without introducing another location type.
+    pub fn with_label(mut self, label: String) -> Result<Self, ReportValueError> {
+        validate_report_prose(&label)?;
+        self.label = Some(label);
+        Ok(self)
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 
     pub const fn relationship(&self) -> PolicyLocationRelationship {
@@ -3282,6 +3322,7 @@ impl RetainedSize for RelatedPolicyLocation {
         size_of::<Self>()
             .saturating_add(retained_extra(&self.location))
             .saturating_add(retained_extra(&self.evidence_refs))
+            .saturating_add(self.label.as_ref().map_or(0, String::capacity))
     }
 }
 
@@ -6482,11 +6523,17 @@ impl<'de> Deserialize<'de> for RelatedPolicyLocation {
             relationship: PolicyLocationRelationship,
             location: PolicySourceLocation,
             evidence_refs: Vec<EvidenceRef>,
+            #[serde(default)]
+            label: Option<String>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::try_new(wire.relationship, wire.location, wire.evidence_refs)
-            .map_err(de::Error::custom)
+        let related = Self::try_new(wire.relationship, wire.location, wire.evidence_refs)
+            .map_err(de::Error::custom)?;
+        match wire.label {
+            Some(label) => related.with_label(label).map_err(de::Error::custom),
+            None => Ok(related),
+        }
     }
 }
 

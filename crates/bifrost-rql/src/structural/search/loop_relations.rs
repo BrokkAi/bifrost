@@ -184,6 +184,7 @@ pub(super) fn loop_relation_expansions(
     };
     flow_state_cache.report_completeness(
         &procedure.wire_id(),
+        Some(procedure),
         procedure.handle.artifact().key().language().language(),
         &derivation.completeness,
         LOOP_AXES,
@@ -258,6 +259,17 @@ pub(super) fn loop_relation_expansions(
                 ),
                 LoopRepeatAnswer::Open { reasons } => {
                     report_open(procedure, &reasons, diagnostics);
+                    let flow_reasons = reasons
+                        .iter()
+                        .filter_map(|reason| match reason {
+                            LoopRepeatIncompleteReason::Flow(reason) => Some(reason.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    diagnostics
+                        .last_mut()
+                        .expect("report_open emits a diagnostic")
+                        .related = procedure.related_flow_reasons(&flow_reasons);
                     let reasons = reasons
                         .into_iter()
                         .map(|reason| match reason {

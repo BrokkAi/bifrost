@@ -172,7 +172,7 @@ pub(crate) fn build_language_delegate(
     // delegates share the store and generation identities.
     store_context.live_paths =
         Arc::new(crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation());
-    crate::analyzer::languages::language_support(language)
+    crate::analyzer::languages::language_support_for_hook(language, "build_analyzer")
         .expect("Language::None is filtered before delegate build")
         .build_analyzer(project, config, store_context, progress)
 }
@@ -505,7 +505,7 @@ impl WorkspaceBuildContext {
 /// language's delegate, and the MCP file watcher watches every directory that
 /// holds one, so both sides must agree on this one predicate.
 pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -> bool {
-    crate::analyzer::languages::language_support(language)
+    crate::analyzer::languages::language_support_for_hook(language, "is_configuration_input")
         .is_some_and(|support| support.is_configuration_input(file))
 }
 
@@ -793,8 +793,11 @@ impl MultiAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         let delegate = self.delegate_for_file(file)?;
-        crate::analyzer::languages::language_support(language_for_file(file))?
-            .prepared_syntax_for_test(delegate, file)
+        crate::analyzer::languages::language_support_for_hook(
+            language_for_file(file),
+            "prepared_syntax_for_test",
+        )?
+        .prepared_syntax_for_test(delegate, file)
     }
 
     fn delegate_for_procedure(
@@ -934,8 +937,11 @@ impl ImportAnalysisProvider for MultiAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        if let Some(imports) = crate::analyzer::languages::language_support(language_for_file(file))
-            .and_then(|support| support.workspace_imported_code_units(self, token, file))
+        if let Some(imports) = crate::analyzer::languages::language_support_for_hook(
+            language_for_file(file),
+            "workspace_imported_code_units",
+        )
+        .and_then(|support| support.workspace_imported_code_units(self, token, file))
         {
             return imports;
         }
@@ -1217,9 +1223,11 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        if let Some(ancestors) =
-            crate::analyzer::languages::language_support(language_for_file(code_unit.source()))
-                .and_then(|support| support.workspace_direct_ancestors(self, token, code_unit))
+        if let Some(ancestors) = crate::analyzer::languages::language_support_for_hook(
+            language_for_file(code_unit.source()),
+            "workspace_direct_ancestors",
+        )
+        .and_then(|support| support.workspace_direct_ancestors(self, token, code_unit))
         {
             return ancestors;
         }
@@ -1242,12 +1250,13 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     ) -> Option<Vec<CodeUnit>> {
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        if let Some(ancestors) =
-            crate::analyzer::languages::language_support(language_for_file(code_unit.source()))
-                .and_then(|support| {
-                    support.workspace_direct_ancestors_within(self, token, code_unit, scope)
-                })
-        {
+        if let Some(ancestors) = crate::analyzer::languages::language_support_for_hook(
+            language_for_file(code_unit.source()),
+            "workspace_direct_ancestors_within",
+        )
+        .and_then(|support| {
+            support.workspace_direct_ancestors_within(self, token, code_unit, scope)
+        }) {
             return ancestors;
         }
         match self
@@ -1274,8 +1283,11 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             None => HashSet::default(),
         };
         for language in self.languages() {
-            let support = crate::analyzer::languages::language_support(language)
-                .expect("registered delegate has language support");
+            let support = crate::analyzer::languages::language_support_for_hook(
+                language,
+                "workspace_additional_direct_descendants",
+            )
+            .expect("registered delegate has language support");
             descendants.extend(
                 support.workspace_additional_direct_descendants(self, token, code_unit, scope)?,
             );
@@ -1319,13 +1331,18 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         &self,
         member: &CodeUnit,
     ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
-        crate::analyzer::languages::language_support(language_for_file(member.source()))
-            .map(|support| support.workspace_member_family_capability(self, member))
-            .unwrap_or_else(|| {
-                self.member_family_provider_for_code_unit(member)
-                    .map(|provider| provider.member_family_capability(member))
-                    .unwrap_or(crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported)
-            })
+        crate::analyzer::languages::language_support_for_hook(
+            language_for_file(member.source()),
+            "workspace_member_family_capability",
+        )
+        .map(|support| support.workspace_member_family_capability(self, member))
+        .unwrap_or_else(|| {
+            self.member_family_provider_for_code_unit(member)
+                .map(|provider| provider.member_family_capability(member))
+                .unwrap_or(
+                    crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported,
+                )
+        })
     }
 
     fn member_family(
@@ -1333,13 +1350,16 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         member: &CodeUnit,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        crate::analyzer::languages::language_support(language_for_file(member.source()))
-            .map(|support| support.workspace_member_family(self, member, cancellation))
-            .unwrap_or_else(|| {
-                self.member_family_provider_for_code_unit(member)
-                    .map(|provider| provider.member_family(member, cancellation))
-                    .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer)
-            })
+        crate::analyzer::languages::language_support_for_hook(
+            language_for_file(member.source()),
+            "workspace_member_family",
+        )
+        .map(|support| support.workspace_member_family(self, member, cancellation))
+        .unwrap_or_else(|| {
+            self.member_family_provider_for_code_unit(member)
+                .map(|provider| provider.member_family(member, cancellation))
+                .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer)
+        })
     }
 
     fn external_member_family(
@@ -1355,11 +1375,14 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         // declarations, a Kotlin class can extend a Java class (and the
         // reverse), and a Scala class can extend either, so no arm may prove
         // the boundary from one analyzer's tree alone (#3452, #3453, #3454).
-        crate::analyzer::languages::language_support(identity.language())
-            .map(|support| {
-                support.workspace_external_member_family(self, identity, max_visits, cancellation)
-            })
-            .unwrap_or_else(crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported)
+        crate::analyzer::languages::language_support_for_hook(
+            identity.language(),
+            "workspace_external_member_family",
+        )
+        .map(|support| {
+            support.workspace_external_member_family(self, identity, max_visits, cancellation)
+        })
+        .unwrap_or_else(crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported)
     }
 }
 
@@ -1466,6 +1489,11 @@ impl CodeUnitIndex for MultiAnalyzer {
         self.delegate_for_code_unit(code_unit)
             .map(|delegate| delegate.analyzer().location_ranges(code_unit))
             .unwrap_or_default()
+    }
+
+    fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<git2::Oid> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().indexed_blob_oid(file))
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
@@ -2416,8 +2444,11 @@ impl IAnalyzer for MultiAnalyzer {
         let token = query_scope.token();
         let language = language_for_file(file);
         if self.delegates.contains_key(&language) {
-            let support = crate::analyzer::languages::language_support(language)
-                .expect("registered delegate has language support");
+            let support = crate::analyzer::languages::language_support_for_hook(
+                language,
+                "workspace_semantic_diagnostics",
+            )
+            .expect("registered delegate has language support");
             if let Some(report) = support.workspace_semantic_diagnostics(self, token, file, source)
             {
                 return report;

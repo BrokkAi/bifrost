@@ -389,6 +389,7 @@ pub(super) fn binding_identity_for_range(
         .any(|target_identity| target_identity == identity);
     if reassigned {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -540,6 +541,7 @@ pub(super) fn binding_uses_expansions(
                 && diagnostic.message == message
         }) {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -786,6 +788,7 @@ pub(super) fn state_event_expansions(
                 file: file.clone(),
                 procedure_id: Arc::clone(&procedure_id),
                 procedure: procedure.handle.clone(),
+                diagnostic_procedure: procedure.clone(),
                 selected_property_origin: None,
             },
         ))));
@@ -816,7 +819,7 @@ pub(super) fn flow_relation_expansions(
         &file_state,
         procedure_index,
         &procedure_id,
-        &procedure.handle,
+        procedure,
         &file,
         filter,
         None,
@@ -839,6 +842,7 @@ pub(super) fn selected_property_relation_expansions(
     let public_point = point.public();
     if let Some(reason) = point.exact_selection_incomplete_reason() {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -856,6 +860,7 @@ pub(super) fn selected_property_relation_expansions(
     }
     let Some(outcome) = semantic.materialized_outcome(file) else {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -872,6 +877,7 @@ pub(super) fn selected_property_relation_expansions(
         return Vec::new();
     };
 
+    let diagnostic_procedure = point.procedure_value();
     let procedure = point.handle.procedure().clone();
     let aggregate = flow_state_cache.for_materialized_procedure(
         workspace,
@@ -888,7 +894,12 @@ pub(super) fn selected_property_relation_expansions(
         point.handle.id(),
         cancellation,
     );
-    report_selected_property_completeness(file, &public_point.id, &scoped, diagnostics);
+    report_selected_property_completeness(
+        &diagnostic_procedure,
+        &public_point.id,
+        &scoped,
+        diagnostics,
+    );
 
     let Some(procedure_index) = aggregate
         .procedures
@@ -922,6 +933,7 @@ pub(super) fn selected_property_relation_expansions(
                 file: file.clone(),
                 procedure_id: Arc::clone(&procedure_id),
                 procedure: procedure.clone(),
+                diagnostic_procedure: diagnostic_procedure.clone(),
                 selected_property: Some(Arc::clone(&proof)),
             })))
         })
@@ -929,7 +941,7 @@ pub(super) fn selected_property_relation_expansions(
 }
 
 fn report_selected_property_completeness(
-    file: &ProjectFile,
+    procedure: &SemanticProcedureValue,
     point_id: &str,
     scoped: &super::super::flow_state::FileFlowState,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -941,20 +953,22 @@ fn report_selected_property_completeness(
         .filter(|reason| {
             reason.blocks(super::super::flow_state::FlowStateAxis::PropertyReachingRelation)
         })
+        .cloned()
         .collect::<Vec<_>>();
     if reasons.is_empty() {
         return;
     }
 
     diagnostics.push(CodeQueryDiagnostic {
-        source: None,
+        related: procedure.related_flow_reasons(&reasons),
+        source: procedure.diagnostic_source(),
         code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: "workspace",
         message: format!(
             "{} selected property-reaching relations for program point {point_id} are incomplete in generation {}: reasons={reasons:?}",
-            rel_path_string(file),
+            rel_path_string(procedure.file()),
             scoped.generation
         ),
         exhausted_roots: Vec::new(),
@@ -976,6 +990,7 @@ pub(super) fn flow_relations_of_event(
         let language = crate::analyzer::common::language_for_file(&value.file);
         flow_state_cache.report_completeness(
             &subject,
+            Some(&value.diagnostic_procedure),
             language,
             &value.file_state.completeness,
             flow_state::FLOW_RELATION_AXES,
@@ -984,6 +999,7 @@ pub(super) fn flow_relations_of_event(
         );
         flow_state_cache.report_completeness(
             &subject,
+            Some(&value.diagnostic_procedure),
             language,
             &value.derivation().completeness,
             flow_state::FLOW_RELATION_AXES,
@@ -995,7 +1011,7 @@ pub(super) fn flow_relations_of_event(
         &value.file_state,
         value.procedure_index,
         &value.procedure_id,
-        &value.procedure,
+        &value.diagnostic_procedure,
         &value.file,
         filter,
         Some(value.event),
@@ -1006,7 +1022,7 @@ fn relation_expansions(
     file_state: &Arc<super::super::flow_state::FileFlowState>,
     procedure_index: usize,
     procedure_id: &Arc<str>,
-    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    procedure: &SemanticProcedureValue,
     file: &ProjectFile,
     filter: &FlowRelationFilter,
     incident_to: Option<usize>,
@@ -1031,7 +1047,8 @@ fn relation_expansions(
                 relation,
                 file: file.clone(),
                 procedure_id: Arc::clone(procedure_id),
-                procedure: procedure.clone(),
+                procedure: procedure.handle.clone(),
+                diagnostic_procedure: procedure.clone(),
                 selected_property: None,
             },
         ))));
@@ -1336,6 +1353,7 @@ fn binding_initializer_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1368,6 +1386,7 @@ pub(super) fn seed_derivation(
     let file_state = flow_state_cache.for_file(workspace, &file, cancellation);
     flow_state_cache.report_completeness(
         &rel_path_string(&file),
+        Some(procedure),
         language,
         &file_state.completeness,
         axes,
@@ -1381,6 +1400,7 @@ pub(super) fn seed_derivation(
         .position(|derivation| derivation.procedure == wanted)?;
     flow_state_cache.report_completeness(
         &rel_path_string(&file),
+        Some(procedure),
         language,
         &file_state.procedures[procedure_index].completeness,
         axes,
@@ -1600,6 +1620,7 @@ pub(super) fn edge_row_expansions(
     if omitted > 0 {
         let language = omitted_language.expect("an omitted edge names its language");
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
             impact: CodeQueryDiagnosticImpact::Incomplete,

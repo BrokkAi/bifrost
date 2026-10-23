@@ -7,6 +7,7 @@ use crate::analyzer::resolution::{
     FactProjectedTypeNodeForm, FactProjectedTypeShape, FactResolutionAnswer, ResolutionCompletion,
     ResolutionIncompleteReason, ResolutionSlotValue,
 };
+
 use crate::analyzer::resolution::{SelectedResolutionContextSet, SelectedSemanticLocator};
 use crate::analyzer::store::WorkspaceSnapshots;
 use crate::analyzer::store::resolution_operation::{
@@ -14,10 +15,12 @@ use crate::analyzer::store::resolution_operation::{
     SelectedNativeNamedArgument, SelectedNativeReferenceTypes, SelectedNativeReferenceUnits,
     SelectedNativeTypes, SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
 };
+
 use crate::analyzer::store::resolution_operation::{
     SelectedResolutionContextMetrics, SelectedResolutionLocated, SelectedResolutionOperation,
     SelectedResolutionOperationOutcome,
 };
+
 use crate::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 use crate::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 use crate::analyzer::structural::resolution::RejectionReason;
@@ -26,13 +29,16 @@ use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::get_definition::trace::{
     self, CallableApplicabilityRecord, TraceCandidate, TraceCandidateRef,
 };
+
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
     PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND, ResolvedReferenceSite,
 };
+
 use crate::analyzer::usages::get_type::{
     TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, TypeLookupType,
 };
+
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::path_utils::rel_path_string;
 use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
@@ -42,7 +48,8 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWor
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 
-pub(crate) enum NativePointContext {
+#[doc(hidden)]
+pub enum NativePointContext {
     Ready {
         context: Box<SelectedResolutionContextSet>,
         selected_import_model: Option<Box<SelectedNativeImportModel>>,
@@ -52,10 +59,14 @@ pub(crate) enum NativePointContext {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SelectedNativeImportModel {
-    pub(crate) symbol: crate::analyzer::semantic_model::SemanticModelSymbol,
-    pub(crate) source_token: crate::analyzer::resolution::SemanticId,
-    pub(crate) gap_reason: crate::analyzer::resolution::SemanticId,
+#[doc(hidden)]
+pub struct SelectedNativeImportModel {
+    #[doc(hidden)]
+    pub symbol: crate::analyzer::semantic_model::SemanticModelSymbol,
+    #[doc(hidden)]
+    pub source_token: crate::analyzer::resolution::SemanticId,
+    #[doc(hidden)]
+    pub gap_reason: crate::analyzer::resolution::SemanticId,
 }
 
 struct NativePointReference<'a> {
@@ -64,7 +75,8 @@ struct NativePointReference<'a> {
     call_argument_ordinal: Option<u32>,
 }
 
-pub(crate) fn native_point_operation_inputs<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn native_point_operation_inputs<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
 ) -> Result<
     (
@@ -174,7 +186,8 @@ pub fn open_native_point_operation<'a, A: LanguageAdapter>(
         .open_selected_resolution_operation(input, cancellation)
 }
 
-pub(crate) fn resolve_native_definition_bounded<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn resolve_native_definition_bounded<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
     reference_namespace: Option<ResolutionNamespace>,
@@ -340,6 +353,7 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
                 }
                 SelectedResolutionOverlayInputsOutcome::Cancelled => return Ok(cancelled()),
             };
+        let services = crate::analyzer::selected_services::AnalyzerSelectedServices(query.analyzer);
         let input = SelectedResolutionOperationInput::new(
             inner.project(),
             inner.workspace_id(),
@@ -348,7 +362,7 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
             &masks,
         )
         .with_content_mounts(content_mounts)
-        .with_analyzer(query.analyzer);
+        .with_analyzer(&services);
         let operation = match inner
             .analyzer_store()
             .open_selected_resolution_operation(input, &cancellation)?
@@ -792,9 +806,12 @@ fn adapt_definition_answer_with_import_model(
         });
     }
     if status == DefinitionLookupStatus::NoDefinition
-        && let Some(kind) = crate::analyzer::languages::language_support(language)
-            .and_then(|support| support.call_applicability_adapter())
-            .and_then(|adapter| adapter.no_applicable_call_diagnostic())
+        && let Some(kind) = crate::analyzer::store::store_language_support_for_hook(
+            language,
+            "call_applicability_adapter",
+        )
+        .and_then(|support| support.call_applicability_adapter())
+        .and_then(|adapter| adapter.no_applicable_call_diagnostic())
     {
         let rejected = answer
             .answer
@@ -902,7 +919,7 @@ fn native_scala_type_ambiguity(answer: &FactResolutionAnswer) -> bool {
                 let values = frontier.possible_values();
                 !values.is_empty()
                     && values.iter().all(|value| {
-                        matches!(value, ResolutionSlotValue::TypeObject(ty) if ty.indirection() == 0)
+                        matches!(value, ResolutionSlotValue::TypeObject(ty, _) if ty.indirection() == 0)
                     })
             })
     })
@@ -973,8 +990,11 @@ fn native_member_attribution(
         dispatch_tier,
         relation,
         precedence_tier,
-    } = crate::analyzer::languages::language_support(language)?
-        .native_member_attribution(context, outcome)?;
+    } = crate::analyzer::languages::language_support_for_hook(
+        language,
+        "native_member_attribution",
+    )?
+    .native_member_attribution(context, outcome)?;
     let enrichment = trace::MemberEnrichment {
         owner: owner.clone(),
         hierarchy_depth: depth,
@@ -1041,7 +1061,8 @@ fn record_native_callable_applicability(
     trace::stage_callable_context(selected_context);
 }
 
-pub(crate) fn resolve_native_type_bounded<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn resolve_native_type_bounded<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
     prepare_context: impl FnOnce(
@@ -1084,13 +1105,17 @@ pub(crate) fn resolve_native_type_bounded<A: LanguageAdapter>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct NativeExpressionValueTypeLookup {
-    pub(crate) static_type: Option<crate::analyzer::semantic_model::TypeRef>,
-    pub(crate) value_types: TypeLookupOutcome,
+#[doc(hidden)]
+pub struct NativeExpressionValueTypeLookup {
+    #[doc(hidden)]
+    pub static_type: Option<crate::analyzer::semantic_model::TypeRef>,
+    #[doc(hidden)]
+    pub value_types: TypeLookupOutcome,
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn resolve_native_expression_value_type_bounded<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn resolve_native_expression_value_type_bounded<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
     prepare_context: impl FnOnce(
@@ -1113,7 +1138,8 @@ pub(crate) fn resolve_native_expression_value_type_bounded<A: LanguageAdapter>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn resolve_native_call_argument_type_bounded<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn resolve_native_call_argument_type_bounded<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
     argument_ordinal: u32,
@@ -1479,7 +1505,7 @@ fn adapt_type_answer_with_spelling(
                     && frontier
                         .possible_values()
                         .iter()
-                        .all(|value| matches!(value, ResolutionSlotValue::TypeObject(_)))
+                        .all(|value| matches!(value, ResolutionSlotValue::TypeObject(_, _)))
             })
         {
             target_kind = TypeLookupTargetKind::TypeReference;
@@ -1795,7 +1821,10 @@ pub fn adapt_assignment_value_probe(
     answer: crate::analyzer::store::resolution_operation::SelectedNativeAssignmentValue,
 ) -> NativeAssignmentValueProbe {
     let observed_frontier_complete = answer.observed_frontier_complete;
-    let support = crate::analyzer::languages::language_support(language);
+    let support = crate::analyzer::languages::language_support_for_hook(
+        language,
+        "assignment_value_type_spelling",
+    );
     let mut outcome = match support.and_then(|support| support.assignment_value_type_spelling()) {
         Some(render) => adapt_type_answer_with_spelling(site, language, answer.types, render),
         None => adapt_type_answer(site, language, answer.types),
@@ -1855,7 +1884,8 @@ pub fn map_bounded<T, U>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn probe_jvm_assignment_value<A: LanguageAdapter>(
+#[doc(hidden)]
+pub fn probe_jvm_assignment_value<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     query: BoundedReceiverQuery<'_>,
 ) -> BoundedResolution<NativeAssignmentValueProbe> {
@@ -1939,7 +1969,10 @@ pub fn probe_native_assignment_value(
         budget,
         cancellation: Some(cancellation),
     };
-    let answer = match crate::analyzer::languages::language_support(language) {
+    let answer = match crate::analyzer::languages::language_support_for_hook(
+        language,
+        "probe_assignment_value",
+    ) {
         Some(support) => support.probe_assignment_value(query, request, cancellation)?,
         None => None,
     };
@@ -1959,7 +1992,8 @@ fn with_native_probe<T>(
     ) -> T,
 ) -> Result<T, String> {
     let language = crate::analyzer::common::language_for_file(&request.file);
-    let support = crate::analyzer::languages::language_support(language);
+    let support =
+        crate::analyzer::languages::language_support_for_hook(language, "native_rollout_points");
     let Some(points) = support
         .and_then(|support| support.native_rollout_points())
         .or_else(|| {
@@ -2073,58 +2107,4 @@ pub fn probe_native_type(
 }
 
 #[cfg(test)]
-mod assignment_value_tests {
-    use super::*;
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-    use brokk_bifrost_test_macros::hardwon;
-
-    #[test]
-    #[hardwon("#5015: Scala term-family binding made constructor write values incomplete")]
-    fn scala_constructor_write_keeps_its_observed_frontier_complete() {
-        let source = r#"package app
-class Base
-class Child extends Base
-object Use {
-  def value(): Base = {
-    var current: Base = new Base
-    current = new Child
-    current
-  }
-}
-"#;
-        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
-            .file("Use.scala", source)
-            .build();
-        let workspace = crate::WorkspaceAnalyzer::build_persisted(
-            fixture.project_dyn(),
-            crate::AnalyzerConfig::default(),
-        )
-        .expect("build constructor-write workspace");
-        let request = brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest {
-            file: fixture.file("Use.scala"),
-            line: Some(8),
-            column: Some(5),
-            start_byte: None,
-            end_byte: None,
-        };
-        let answer = probe_native_assignment_value(
-            workspace.analyzer(),
-            &request,
-            source,
-            ReceiverAnalysisBudget::default(),
-            &CancellationToken::new(),
-        )
-        .expect("query constructed write value");
-        let BoundedResolution::Complete { value, .. } = answer else {
-            panic!("constructor-write query must finish: {answer:?}");
-        };
-        let mut types = value
-            .types
-            .iter()
-            .map(|ty| ty.fqn.as_str())
-            .collect::<Vec<_>>();
-        types.sort_unstable();
-        assert_eq!(types, ["app.Base", "app.Child"], "{value:?}");
-        assert!(value.observed_frontier_complete, "{value:?}");
-    }
-}
+mod assignment_value_tests {}

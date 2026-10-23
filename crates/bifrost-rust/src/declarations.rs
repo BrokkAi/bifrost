@@ -1698,7 +1698,6 @@ struct RustPrimaryParseState<'source, 'parsed, 'tree> {
     item_sources: RustItemSourceCollector,
     primary_macros: RustPrimaryMacroState,
     native_enabled: bool,
-    claimed_units: HashSet<CodeUnit>,
     structural: StructuralFactCollector<'source, 'tree>,
     structural_parents: Vec<Option<u32>>,
     structural_active: Vec<bool>,
@@ -1747,7 +1746,6 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             item_sources: RustItemSourceCollector::new(),
             primary_macros: RustPrimaryMacroState::default(),
             native_enabled,
-            claimed_units: HashSet::default(),
             structural: StructuralFactCollector::new(
                 &crate::structural::RUST_STRUCTURAL_SPEC,
                 source,
@@ -2039,10 +2037,8 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         }
         if let Some(declaration) = self.native.declaration_site_for_node(node.id()) {
             if let Some(unit) = code_unit {
-                if self.claimed_units.insert(unit.clone()) {
-                    self.native
-                        .add_definition_unit(ResolutionDefinitionUnitFact { declaration, unit });
-                }
+                self.native
+                    .add_definition_unit(ResolutionDefinitionUnitFact { declaration, unit });
             } else if node.kind() == "field_declaration" {
                 // Fields of block-local types retain native member and type
                 // facts, but their owner has no parser CodeUnit. Publish the
@@ -3982,10 +3978,15 @@ fn rust_macro_rule_declares_no_item(rule: Node<'_>, source: &str) -> bool {
 /// A rule is proven when its transcriber's top-level tokens are a sequence of
 /// `impl` items (optional outer attributes and `unsafe`, the `impl` keyword,
 /// a header, and a `{ .. }` body), possibly inside `$( .. )` repetitions of
-/// the same shape, and every metavariable it splices is bound as `ty`, `expr`,
-/// `path` or `lifetime`, none of which can bring an item or a keyword of its
-/// own. tract's `impl_datum_type!` (`($ty:ty, $c:expr) => { impl Datum for
-/// $ty { .. } }`) is the shape; a `tt` or `ident` fragment is not proven.
+/// the same shape, and every metavariable it splices into an attribute or a
+/// header is bound as `ty`, `expr`, `path` or `lifetime`, none of which can
+/// bring an item, a keyword or a delimiter of its own. A body may splice any
+/// fragment: `macro_rules!` keeps delimiters balanced, so whatever lands
+/// inside the body's braces stays an associated item of that impl. tract's
+/// `impl_datum_type!` (`($ty:ty, $c:expr) => { impl Datum for $ty { .. } }`)
+/// is the shape, and so is `impl From<$ty> for Key { .. Self::$variant(..) }`
+/// with an `ident` in the body. A `tt` or `ident` in a header is not proven:
+/// a `tt` can be the `{ .. }` that ends the impl early.
 pub(crate) fn rust_macro_definition_writes_only_impls(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
     let rules = node
@@ -4014,34 +4015,43 @@ pub(crate) fn rust_macro_definition_writes_only_impls(node: Node<'_>, source: &s
                 let mut cursor = current.walk();
                 pending.extend(current.named_children(&mut cursor));
             }
-            let mut pending = vec![expansion];
-            while let Some(current) = pending.pop() {
-                if current.kind() == "metavariable" {
-                    let name = rust_node_text(current, source).trim();
-                    let spliced = name == "$crate"
-                        || splicing_fragments.get(name).is_some_and(|fragment| {
-                            matches!(*fragment, "ty" | "expr" | "path" | "lifetime")
-                        });
-                    if !spliced {
-                        return false;
-                    }
-                }
-                let mut cursor = current.walk();
-                pending.extend(current.named_children(&mut cursor));
-            }
             let mut cursor = expansion.walk();
             let children = expansion.children(&mut cursor).collect::<Vec<_>>();
             let [_open, interior @ .., _close] = children.as_slice() else {
                 return false;
             };
-            rust_tokens_are_impl_items(interior)
+            // Attributes and headers may splice only fragments that cannot
+            // carry an item keyword or a delimiter; bodies are not checked.
+            let splices_safely = |token: Node<'_>| {
+                let mut pending = vec![token];
+                while let Some(current) = pending.pop() {
+                    if current.kind() == "metavariable" {
+                        let name = rust_node_text(current, source).trim();
+                        let spliced = name == "$crate"
+                            || splicing_fragments.get(name).is_some_and(|fragment| {
+                                matches!(*fragment, "ty" | "expr" | "path" | "lifetime")
+                            });
+                        if !spliced {
+                            return false;
+                        }
+                    }
+                    let mut cursor = current.walk();
+                    pending.extend(current.named_children(&mut cursor));
+                }
+                true
+            };
+            rust_tokens_are_impl_items(interior, splices_safely)
         })
 }
 
 /// Whether `tokens`, one level of a transcriber, are a nonempty sequence of
-/// `impl` items or `$( .. )` repetitions of them. See
+/// `impl` items or `$( .. )` repetitions of them, and `splices_safely` accepts
+/// every attribute and header token. See
 /// [`rust_macro_definition_writes_only_impls`].
-fn rust_tokens_are_impl_items(tokens: &[Node<'_>]) -> bool {
+fn rust_tokens_are_impl_items<'tree>(
+    tokens: &[Node<'tree>],
+    splices_safely: impl Fn(Node<'tree>) -> bool,
+) -> bool {
     let mut pending = vec![tokens.to_vec()];
     let mut items = 0usize;
     while let Some(sequence) = pending.pop() {
@@ -4055,7 +4065,7 @@ fn rust_tokens_are_impl_items(tokens: &[Node<'_>]) -> bool {
                 if opens_body {
                     in_header = false;
                     items += 1;
-                } else if token.kind() == ";" {
+                } else if token.kind() == ";" || !splices_safely(token) {
                     return false;
                 }
                 index += 1;
@@ -4066,6 +4076,7 @@ fn rust_tokens_are_impl_items(tokens: &[Node<'_>]) -> bool {
                     let attribute = sequence.get(index + 1).is_some_and(|next| {
                         next.kind() == "token_tree"
                             && next.child(0).is_some_and(|open| open.kind() == "[")
+                            && splices_safely(*next)
                     });
                     if !attribute {
                         return false;

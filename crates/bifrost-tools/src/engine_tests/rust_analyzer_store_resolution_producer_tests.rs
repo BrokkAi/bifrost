@@ -36,9 +36,9 @@ mod rust_departing_root_tests {
 
     use brokk_bifrost_analysis::analyzer::store::js_ts_resolution_producer_support::persist_alias_fixture;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::rust_root_test_support::MEMBER_ISOLATING_HOLDER as MEMBER_ISOLATING_HOLDER;
+    use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::producer_test_support::MEMBER_ISOLATING_HOLDER;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::rust_root_test_support::ROUTE_ISOLATING_HOLDER as ROUTE_ISOLATING_HOLDER;
+    use brokk_bifrost_analysis::analyzer::store::resolution_producer_tests::producer_test_support::ROUTE_ISOLATING_HOLDER;
 
     #[test]
     fn rust_attribute_macro_argument_keeps_its_primary_source_provenance() {
@@ -206,6 +206,114 @@ fn bench() {}
                 .is_err()
             }),
             "sealed canonical source rows must be immutable"
+        );
+    }
+
+    /// Parser/publication/SQLite agreement, including replacement and withdrawal.
+    #[test]
+    fn python_member_operation_publication_reopens_replaces_and_withdraws() {
+        use brokk_bifrost_analysis::analyzer::{Project, ProjectFile, TestProject};
+        use brokk_bifrost_analysis::native_resolution_test_support::{
+            PythonSummaryAuthority, PythonSummaryObservation, PythonSummaryProfile,
+        };
+        use brokk_bifrost_python_analysis::analyzer::python::native_environment::PythonNativeEnvironment;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("members.db");
+        // Public store-boundary fixture; the comprehensive private golden stays
+        // in its owning test tree and is not embedded in this public crate.
+        let source = "class Owner: pass\nowner = Owner()\ngetattr(owner, 'known', None)\nowner.__dict__.update({})\n";
+        let file = ProjectFile::new(directory.path(), "app.py");
+        std::fs::write(file.abs_path(), source).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(
+            directory.path().to_path_buf(),
+            Language::Python,
+        ));
+        let profile = PythonSummaryProfile {
+            authority: PythonSummaryAuthority::SuppliedAnalysis,
+            observation: PythonSummaryObservation::Runtime,
+            roots: vec![std::path::PathBuf::new()],
+            ordered: true,
+            target_digest: [0; 32],
+            python_version: None,
+        };
+        let expected = crate::native_resolution_test_support::parse_python_source(&file, source)
+            .resolution_facts
+            .python_member_operations
+            .len();
+        let snapshot = |conn: &rusqlite::Connection| {
+            conn.prepare("SELECT operation.site,operation.form,operation.effect,operation.name_kind,names.ordinal,names.spelling FROM python_member_operations operation LEFT JOIN python_member_operation_names names ON names.operation=operation.id ORDER BY operation.blob_id,operation.site,operation.form,names.ordinal").unwrap()
+                .query_map([],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<i64>>(4)?,row.get::<_,Option<String>>(5)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let before;
+        {
+            let environment = PythonNativeEnvironment::open(&path, profile.clone()).unwrap();
+            environment.begin(1).unwrap();
+            environment
+                .stage_source(project.clone(), &file, source, 1)
+                .unwrap();
+            assert!(
+                environment
+                    .reconcile(1, &CancellationToken::default())
+                    .unwrap()
+                    .failed
+                    .is_empty()
+            );
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM python_member_operations", [], |r| {
+                    r.get::<_, usize>(0)
+                })
+                .unwrap(),
+                expected
+            );
+            assert!(expected > 0);
+            assert_eq!(conn.query_row("SELECT count(*) FROM python_member_operations WHERE form=4 AND name_kind=0 AND NOT EXISTS(SELECT 1 FROM python_member_operation_names names WHERE names.operation=python_member_operations.id)",[],|r|r.get::<_,usize>(0)).unwrap(),1);
+            before = snapshot(&conn);
+        }
+        let environment = PythonNativeEnvironment::open(&path, profile).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            snapshot(&conn),
+            before,
+            "reopen must retain complete operation/name rows"
+        );
+        let replacement = "getattr(owner, 'replacement')\n";
+        environment.begin(2).unwrap();
+        std::fs::write(file.abs_path(), replacement).unwrap();
+        environment
+            .stage_source(project, &file, replacement, 2)
+            .unwrap();
+        assert!(
+            environment
+                .reconcile(2, &CancellationToken::default())
+                .unwrap()
+                .failed
+                .is_empty()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_member_operation_names WHERE spelling='replacement'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute_batch("PRAGMA foreign_keys=ON; DELETE FROM blobs WHERE lang='python'")
+            .unwrap();
+        for table in ["python_member_operations", "python_member_operation_names"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, usize>(0))
+                    .unwrap(),
+                0,
+                "blob withdrawal left {table}"
+            );
+        }
+        let families:Vec<String>=conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'python_member_operation%' ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(
+            families,
+            vec!["python_member_operation_names", "python_member_operations"]
         );
     }
 

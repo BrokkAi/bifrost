@@ -14,7 +14,8 @@ pub struct Fixture {
     _temp: TempDir,
     #[doc(hidden)]
     pub workspace: WorkspaceAnalyzer,
-    pub(super) file: ProjectFile,
+    #[doc(hidden)]
+    pub file: ProjectFile,
     source: String,
 }
 impl Fixture {

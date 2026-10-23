@@ -2,7 +2,7 @@ use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
-use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 

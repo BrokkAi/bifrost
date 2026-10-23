@@ -16,6 +16,40 @@ pub mod dependency_evidence;
 pub(crate) mod diagnostics;
 pub(crate) mod external;
 pub(crate) mod providers;
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for JavascriptSupport {
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
+    }
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        dependency_evidence::is_js_ts_dependency_input(path)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for TypescriptSupport {
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
+    }
+    fn is_configuration_input_path(&self, path: &Path) -> bool {
+        dependency_evidence::is_js_ts_dependency_input(path)
+    }
+}
+
 #[cfg(test)]
 mod receiver_analysis_tests;
 pub(crate) mod receiver_facts;
@@ -712,18 +746,6 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 }
 
 impl LanguageSupport for JavascriptSupport {
-    fn selected_dependency_file_evidence(
-        &self,
-        _root: &std::path::Path,
-        selected: &[(
-            ProjectFile,
-            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
-        )],
-        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
-    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
-        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
-    }
-
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -771,10 +793,6 @@ impl LanguageSupport for JavascriptSupport {
 
     fn is_configuration_input(&self, file: &ProjectFile) -> bool {
         is_js_ts_config_file(file)
-    }
-
-    fn is_configuration_input_path(&self, path: &Path) -> bool {
-        dependency_evidence::is_js_ts_dependency_input(path)
     }
 
     fn procedure_syntax_roles(
@@ -981,18 +999,6 @@ impl LanguageSupport for JavascriptSupport {
 pub struct TypescriptSupport;
 
 impl LanguageSupport for TypescriptSupport {
-    fn selected_dependency_file_evidence(
-        &self,
-        _root: &std::path::Path,
-        selected: &[(
-            ProjectFile,
-            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
-        )],
-        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
-    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
-        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
-    }
-
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -1040,10 +1046,6 @@ impl LanguageSupport for TypescriptSupport {
 
     fn is_configuration_input(&self, file: &ProjectFile) -> bool {
         is_js_ts_config_file(file)
-    }
-
-    fn is_configuration_input_path(&self, path: &Path) -> bool {
-        dependency_evidence::is_js_ts_dependency_input(path)
     }
 
     fn procedure_syntax_roles(

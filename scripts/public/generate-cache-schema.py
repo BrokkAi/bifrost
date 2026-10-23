@@ -45,11 +45,13 @@ from pathlib import Path
 from typing import NamedTuple, Sequence
 
 
-CURRENT_MIGRATION_VERSION = 196
 BASELINE_MIGRATION_VERSION = 125
-MIGRATION_VERSIONS = tuple(
-    range(BASELINE_MIGRATION_VERSION, CURRENT_MIGRATION_VERSION + 1)
-)
+# The Rust registry is authoritative, including provisional lane migration numbers.
+_REGISTRY = (Path(__file__).resolve().parents[2] / "crates/bifrost-core/src/cache_db.rs").read_text()
+MIGRATION_VERSIONS = (BASELINE_MIGRATION_VERSION, *(
+    int(version) for version in re.findall(r"version: ([0-9]+),\n        sql: include_str!", _REGISTRY)
+))
+CURRENT_MIGRATION_VERSION = MIGRATION_VERSIONS[-1]
 MIGRATION_FILE_RE = re.compile(r"(?P<version>[0-9]{4})-[^/]+\.sql\Z")
 SCHEMA_OBJECT_TYPES = ("table", "index", "view", "trigger")
 BASELINE_HEADER = (

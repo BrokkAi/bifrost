@@ -59,7 +59,7 @@ fn measured_cold_refresh_matches_producers_and_warm_refresh_does_not_reparse() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().unwrap());
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     write_line(
         &mut stdin,
@@ -216,7 +216,7 @@ fn measured_tasks_preserve_original_request_and_task_identity() {
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().unwrap();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().unwrap());
     discover_tasks_server(&mut stdin, &mut reader, &mut stderr);
     let mut request = malformed_run_policy_request(1);
     request["params"]["_meta"] = common::mcp_server::stateless_tasks_meta();
@@ -279,7 +279,7 @@ fn a_cancelled_readiness_observer_stops_while_the_shared_build_remains_pending()
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().unwrap();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().unwrap());
     initialize_session(&mut stdin, &mut reader, &mut stderr);
     write_line(
         &mut stdin,

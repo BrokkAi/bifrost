@@ -1885,6 +1885,10 @@ detailed_row_domains! {
                     CodeQueryRowField::required("site_ast_id", Scalar::StableId),
                     CodeQueryRowField::optional("callee_name", Scalar::String),
                     CodeQueryRowField::optional("resolved_external_callee", Scalar::String),
+                    CodeQueryRowField::required_enum("callee_provenance", &["caller_supplied", "local_closure", "declared", "unknown", "unsupported"]),
+                    CodeQueryRowField::optional("callee_supplier", Scalar::String),
+                    CodeQueryRowField::required_enum("callee_type_shape", brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape::LABELS),
+                    CodeQueryRowField::required("callee_bounds", Scalar::StringList),
                     CodeQueryRowField::required_enum("call_kind", value_domain::CALL_KIND),
                     CodeQueryRowField::required_enum("coverage", value_domain::CALL_SHAPE_COVERAGE),
                     CodeQueryRowField::required("group_count", Scalar::Integer),
@@ -3280,6 +3284,31 @@ detailed_row_domains! {
             CodeQueryRowField::optional("nested_loop_has_outer_use", Scalar::Boolean),
         ],
     },
+    RustMarkerImpl => "rust_marker_impl" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+            CodeQueryRowField::required("id", Scalar::StableId),
+            CodeQueryRowField::required("path", Scalar::String),
+            CodeQueryRowField::required("language", Scalar::String),
+            CodeQueryRowField::required("trait", Scalar::String),
+            CodeQueryRowField::required("trait_proof", Scalar::String),
+            CodeQueryRowField::required("self_proof", Scalar::String),
+            CodeQueryRowField::required("impl_coverage", Scalar::String),
+            CodeQueryRowField::required("mapping_proof", Scalar::String),
+            CodeQueryRowField::required("has_send_bound", Scalar::Boolean),
+            CodeQueryRowField::required("has_sync_bound", Scalar::Boolean),
+            CodeQueryRowField::required("bounds", Scalar::StringList),
+            CodeQueryRowField::required("bounds_proof", Scalar::String),
+            CodeQueryRowField::required("stored", Scalar::Boolean),
+            CodeQueryRowField::required("shared_ref_only", Scalar::Boolean),
+            CodeQueryRowField::required("shared_access", Scalar::String),
+            CodeQueryRowField::required("uses_proof", Scalar::String),
+            CodeQueryRowField::required("completeness", Scalar::String),
+            CodeQueryRowField::optional("parameter", Scalar::String),
+            CodeQueryRowField::optional("declaration_parameter_ordinal", Scalar::Integer),
+        ],
+    },
     RustPointerFinding => "rust_pointer_finding" {
         display_range: |value| Some(value.range),
         identities: Primary,
@@ -4152,6 +4181,18 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallShape { value }, "site_ast_id") => {
             Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallShape { value }, "callee_provenance") => {
+            Some(Scalar::ConstrainedEnum(value.callee_provenance))
+        }
+        (CodeQueryResultValue::CallShape { value }, "callee_supplier") => {
+            value.callee_supplier.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallShape { value }, "callee_type_shape") => {
+            Some(Scalar::ConstrainedEnum(value.callee_type_shape))
+        }
+        (CodeQueryResultValue::CallShape { value }, "callee_bounds") => {
+            Some(Scalar::StringList(&value.callee_bounds))
         }
         (CodeQueryResultValue::CallShape { value }, "call_kind") => {
             Some(Scalar::ConstrainedEnum(value.call_kind))
@@ -6378,6 +6419,61 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::PythonRuleFact { value }, "reason") => {
             value.reason.as_deref().map(Scalar::String)
         }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::RustMarkerImpl { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "language") => {
+            Some(Scalar::String(value.language))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "trait") => {
+            Some(Scalar::String(value.trait_kind))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "trait_proof") => {
+            Some(Scalar::String(value.trait_proof))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "self_proof") => {
+            Some(Scalar::String(value.self_proof))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "impl_coverage") => {
+            Some(Scalar::String(value.impl_coverage))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "mapping_proof") => {
+            Some(Scalar::String(value.mapping_proof))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "has_send_bound") => {
+            Some(Scalar::Boolean(value.has_send_bound))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "has_sync_bound") => {
+            Some(Scalar::Boolean(value.has_sync_bound))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "bounds") => {
+            Some(Scalar::StringList(&value.bounds))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "bounds_proof") => {
+            Some(Scalar::String(value.bounds_proof))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "stored") => {
+            Some(Scalar::Boolean(value.stored))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "shared_access") => {
+            Some(Scalar::String(value.shared_access))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "shared_ref_only") => {
+            Some(Scalar::Boolean(value.shared_ref_only))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "uses_proof") => {
+            Some(Scalar::String(value.uses_proof))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "completeness") => {
+            Some(Scalar::String(value.completeness))
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "parameter") => {
+            value.parameter.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RustMarkerImpl { value }, "declaration_parameter_ordinal") => {
+            value.declaration_parameter_ordinal.map(Scalar::Integer)
+        }
         (CodeQueryResultValue::RustPointerFinding { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -7252,6 +7348,9 @@ pub enum DetailedCodeQueryKey {
         id: String,
         relation: String,
     },
+    RustMarkerImpl {
+        id: String,
+    },
     RustPointerFinding {
         id: String,
     },
@@ -7595,6 +7694,12 @@ fn detailed_semantic_identity(
                 relation: value.relation.to_string(),
             },
         )),
+        CodeQueryResultValue::RustMarkerImpl { value } => Some((
+            DetailedCodeQueryDomain::RustMarkerImpl,
+            DetailedCodeQueryKey::RustMarkerImpl {
+                id: value.id.clone(),
+            },
+        )),
         CodeQueryResultValue::RustPointerFinding { value } => Some((
             DetailedCodeQueryDomain::RustPointerFinding,
             DetailedCodeQueryKey::RustPointerFinding {
@@ -7798,6 +7903,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::FlowWitness { id, .. }
         | DetailedCodeQueryKey::AbsentMemberWitness { id, .. }
         | DetailedCodeQueryKey::TaintFinding { id }
+        | DetailedCodeQueryKey::RustMarkerImpl { id }
         | DetailedCodeQueryKey::RustPointerFinding { id } => Some(id),
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }

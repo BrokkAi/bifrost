@@ -20,6 +20,7 @@ schemas/semantic-model-pack-v2.schema.json text eol=lf
 schemas/semantic-model-pack-v3.schema.json text eol=lf
 schemas/semantic-model-pack-v4.schema.json text eol=lf
 schemas/semantic-model-pack-v5.schema.json text eol=lf
+schemas/semantic-model-pack-v18.schema.json text eol=lf
 tests/fixtures/semantic-model-packs/*.json text eol=lf
 tests/fixtures/semantic-model-packs/*.yaml text eol=lf
 tests/fixtures/semantic-model-packs/*.deflate binary
@@ -100,6 +101,10 @@ tests/fixtures/golden/**/*.yml text eol=lf
 # over its Rust fixtures, so a CRLF checkout shifts every span after the first
 # line. Keep the committed LF contract on Windows.
 tests/fixtures/rust-codeql-parity/**/*.rs text eol=lf
+
+# The generated JVM intrinsic inventory is hashed into the JVM language epochs
+# with include_str!, so a CRLF checkout must not change its bytes.
+crates/bifrost-jvm/src/intrinsic_inventory_data.rs text eol=lf
 
 # Tutorial Markdown contains executable source snippets whose bytes appear in
 # documented analyzer ranges and output identities.

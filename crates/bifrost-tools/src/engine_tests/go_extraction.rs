@@ -1,11 +1,20 @@
 #[cfg(test)]
 #[doc(hidden)]
 pub mod go_extraction_tests {
+    /// Whether the host Go toolchain can run. macOS runners do not put `go` on
+    /// PATH (#4953).
+    fn go_toolchain_available() -> bool {
+        std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_ok()
+    }
+
     mod go_move_0 {
 
         use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
 
-        use brokk_bifrost_analysis::analyzer::java::adapter::JavaAdapter;
+        use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
 
         use crate::inline_project::InlineTestProject;
         use brokk_bifrost_core::analyzer::model::Language;
@@ -244,6 +253,7 @@ pub mod go_extraction_tests {
             config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
             config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
             let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: vec![SemanticModelActivationEvidence {
                     language: "go".to_owned(),
@@ -305,6 +315,7 @@ pub mod go_extraction_tests {
             let workspace = project.workspace_analyzer(config.clone());
             let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
             let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: Vec::new(),
                 controls: Vec::new(),
@@ -1636,6 +1647,7 @@ func caller() {
             }))
             .expect("serialize Go declaration fixture");
             let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
                     .expect("crate version"),
                 evidence: vec![SemanticModelActivationEvidence {
@@ -2744,6 +2756,8 @@ func caller() { _, _ = os.Open("book.xlsx") }
 
     mod go_move_8 {
 
+        use super::go_toolchain_available;
+
         use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
 
         use brokk_bifrost_go_analysis::analyzer::go::native_points::GoNativePointRequest;
@@ -2870,6 +2884,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
         fn activate_go_context_with(workspace: &WorkspaceAnalyzer, config: &AnalyzerConfig) {
             let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
             let activation = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
                 bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 evidence: Vec::new(),
                 controls: Vec::new(),
@@ -2889,12 +2904,6 @@ func caller() { _, _ = os.Open("book.xlsx") }
             );
             let discovery = format!("{discovery:#?}");
             assert!(!discovery.contains("go.unit_summary_failed"), "{discovery}");
-        }
-        fn go_toolchain_available() -> bool {
-            std::process::Command::new("go")
-                .arg("version")
-                .output()
-                .is_ok()
         }
         /// Build a Go workspace and publish its tool context. `None` when the host
         /// lacks the Go toolchain needed for this publication.
@@ -2976,13 +2985,13 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 .selected_snapshot_for_test()
                 .expect("a selected Go snapshot");
             let cancellation = CancellationToken::new();
-            let GoNativePointRequestOpen::Ready(request) =
+            let GoNativePointRequestOpen::Ready(mut request) =
                 GoNativePointRequest::open(go, None, &cancellation)
                     .expect("open the Go point request")
             else {
                 panic!("the Go point request is unavailable");
             };
-            let (operation, context_id) = request.oracle_for_test();
+            let (operation, context_id) = request.oracle_for_test("util/util.go");
             let connection = operation.ready.inventory.connection();
             let names = operation.ready.shared_names();
             let producer_epoch: String = connection
@@ -3012,7 +3021,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
             {
                 let mut statement = connection
             .prepare(
-                "SELECT file_version_id, source_role, rel_path FROM main.go_context_source_files
+                "SELECT file_version_id, source_role, rel_path FROM temp.selected_go_context_source_files
                  WHERE context_id = ?1 AND source_role <> 'ignored' ORDER BY rel_path, source_role",
             )
             .unwrap();
@@ -3045,7 +3054,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 } else {
                     let listed_under_variant: bool = connection
                         .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM main.go_context_source_files
+                            "SELECT EXISTS(SELECT 1 FROM temp.selected_go_context_source_files
                      WHERE context_id = ?1 AND file_version_id = ?2 AND source_role <> ?3)",
                             rusqlite::params![context_id, file_version_id, role],
                             |row| row.get(0),
@@ -3515,7 +3524,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
         )
         .unwrap();
             let go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()).unwrap();
-            let profile = go.native_context_profile().unwrap();
+            let profile = go.context_profile_for_test().unwrap();
             let mut rows = statement.query([profile.as_slice()]).unwrap();
             let mut units = std::collections::BTreeMap::new();
             while let Some(row) = rows.next().unwrap() {
@@ -3707,7 +3716,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
             let connection = workspace.store().unwrap().read_conn().unwrap();
             let profile = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
                 .unwrap()
-                .native_context_profile()
+                .context_profile_for_test()
                 .unwrap();
             let summary_id: i64 = connection
                 .query_row(
@@ -3890,12 +3899,12 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 let go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()).unwrap();
                 let snapshot = go.selected_snapshot_for_test().unwrap();
                 let cancellation = CancellationToken::new();
-                let GoNativePointRequestOpen::Ready(request) =
+                let GoNativePointRequestOpen::Ready(mut request) =
                     GoNativePointRequest::open(go, None, &cancellation).unwrap()
                 else {
                     panic!("the Go point request is unavailable");
                 };
-                let (operation, inventory_context_id) = request.oracle_for_test();
+                let (operation, inventory_context_id) = request.oracle_for_test("util/util.go");
                 let connection = operation.ready.inventory.connection();
                 brokk_bifrost_analysis::analyzer::store::go_unit_summaries::register_go_summary_sql_functions(
                     connection,
@@ -3910,7 +3919,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     .unwrap();
                 // The unit with the most dependents and exports in the fixture is the
                 // util package, so its rows are the realistic bindings.
-                let profile = go.native_context_profile().unwrap().to_vec();
+                let profile = go.context_profile_for_test().unwrap().to_vec();
                 let (summary_id, unit_key): (i64, Vec<u8>) = connection
             .query_row(
                 "SELECT versions.summary_id, versions.unit_key
@@ -3988,7 +3997,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                                          WHERE tests.package_id=package.package_id
                                            AND tests.source_role='xtest') THEN 'xtest'
                              ELSE 'test' END
-                 FROM main.go_context_source_files AS source
+                 FROM temp.selected_go_context_source_files AS source
                  JOIN temp.selected_resolution_mounts AS mount
                    ON mount.file_version_id=source.file_version_id
                  JOIN main.go_package_instances AS package
@@ -4486,7 +4495,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 let conn = store.read_conn().unwrap();
                 let profile = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
                     .unwrap()
-                    .native_context_profile()
+                    .context_profile_for_test()
                     .unwrap();
                 let mut lines = Vec::new();
                 let mut statement = conn
@@ -4668,7 +4677,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 project = project.file(*path, *source);
             }
             let fixture = project.build();
-            let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+            let mut config = AnalyzerConfig::default();
+            config.go.dependency_discovery.mode =
+                brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::Disabled;
+            let workspace = fixture.workspace_analyzer(config);
             let counts = assert_summaries_match_incumbent_readers(&workspace);
             // plain units: api, util, other, blank, cmd; test unit and external-test unit of api.
             assert_eq!(counts.units, 7, "{counts:?}");
@@ -4806,7 +4818,7 @@ func main() { api.Public() }
                 .unwrap()
                 .clone();
             let snapshot = retained.selected_snapshot_for_test().unwrap();
-            let profile = retained.native_context_profile().unwrap();
+            let profile = retained.context_profile_for_test().unwrap();
             assert_eq!(profile, source_inventory_profile());
             let store = workspace.store().unwrap();
             let conn = store.read_conn().unwrap();
@@ -4825,7 +4837,7 @@ func main() { api.Public() }
             activate_go_context(&workspace);
             let tool_profile = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
                 .unwrap()
-                .native_context_profile()
+                .context_profile_for_test()
                 .unwrap();
             assert_ne!(
                 tool_profile, profile,
@@ -4843,7 +4855,7 @@ func main() { api.Public() }
                 .is_some()
             );
             assert_eq!(retained.selected_snapshot_for_test().unwrap(), snapshot);
-            assert_eq!(retained.native_context_profile(), Some(profile));
+            assert_eq!(retained.context_profile_for_test(), Some(profile));
             let conn = store.read_conn().unwrap();
             assert_eq!(
                 go_live_summary(&conn, &snapshot, &epoch, &key, &profile).unwrap(),
@@ -4951,7 +4963,7 @@ func main() { api.Public() }
             let tool_go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
                 .unwrap()
                 .clone();
-            let tool = tool_go.native_context_profile().unwrap();
+            let tool = tool_go.context_profile_for_test().unwrap();
             assert_ne!(inventory, tool);
             let tool_first = read(store, &snapshot, &tool).unwrap();
             assert_ne!(inventory_first.0, tool_first.0);
@@ -5012,8 +5024,8 @@ func main() { api.Public() }
             activate_go_context(&updated);
             let tool_next = read(store, &next, &tool).unwrap();
             assert_ne!(tool_next.0, tool_first.0);
-            assert_eq!(inventory_go.native_context_profile(), Some(inventory));
-            assert_eq!(tool_go.native_context_profile(), Some(tool));
+            assert_eq!(inventory_go.context_profile_for_test(), Some(inventory));
+            assert_eq!(tool_go.context_profile_for_test(), Some(tool));
             assert_eq!(
                 read(store, &snapshot, &inventory),
                 Some(inventory_first.clone())
@@ -5120,9 +5132,9 @@ func main() { api.Public() }
 
         use brokk_bifrost_analysis::analyzer::store::WorkspaceFileRow;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: parsed_operation_source_state ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: parsed_operation_source_state ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: semantic_at ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: semantic_at ;
         const SPELLING_SOURCE: &str = r#"package consumer
  type Outer struct{ Member int }
  var X Outer
@@ -5392,6 +5404,7 @@ func main() { api.Public() }
                 ResolutionDeclarationVisibilityFact, ResolutionSiteKind,
                 ResolutionVisibilityEligibilityFact,
             };
+
             use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
             let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
@@ -5504,7 +5517,7 @@ func main() { api.Public() }
     pub mod go_move_11 {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
 
-        use brokk_bifrost_analysis::analyzer::store::resolution_operation::resolution_operation_tests_go_support::go_extraction_support_11::assert_empty_context_metrics;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::resolution_operation_tests_go_support::operation_fixture_support::assert_empty_context_metrics;
 
         use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -5570,7 +5583,7 @@ func main() { api.Public() }
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::LocatedSemantic;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: MutableGenerationProject ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: MutableGenerationProject ;
 
         use brokk_bifrost_analysis::analyzer::resolution::model::PartialPath;
 
@@ -5602,9 +5615,9 @@ func main() { api.Public() }
 
         use brokk_bifrost_analysis::analyzer::store::resolution_lexical::UnconditionalCandidateCache;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: assert_store_error_contains ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: assert_store_error_contains ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: content_mount_request ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: content_mount_request ;
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_context;
 
@@ -5612,25 +5625,25 @@ func main() { api.Public() }
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_same_package;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: mount_lookup ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: mount_lookup ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: open_ready_operation ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: open_ready_operation ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: parsed_operation_state ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: parsed_operation_state ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: persist_test_workspace_snapshot ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: persist_test_workspace_snapshot ;
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::reset_selected_resolution_boundary_snapshot_for_test;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: selected_operation_input ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: selected_operation_input ;
 
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_resolution_boundary_snapshot_for_test;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: semantic_at ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: semantic_at ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: site_for_identifier ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: site_for_identifier ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: with_operation_lexical ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: with_operation_lexical ;
 
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
 
@@ -5666,9 +5679,11 @@ func main() { api.Public() }
             FileResolutionFacts, ResolutionGapKind, ResolutionIdentifierRole, ResolutionNamespace,
             ResolutionRootImportAnchor,
         };
+
         use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
             ReceiverAnalysisBudget, ReceiverAnalysisWork,
         };
+
         use brokk_bifrost_core::analyzer::usages::resolution_session::{
             BoundedResolution, ResolutionSession,
         };
@@ -6236,13 +6251,12 @@ type Item struct{ Decoy bool }
             let snapshot = fixture.snapshots["go"].clone();
             fixture.store.conn.execute(move |conn| {
         let tx = conn.transaction().unwrap();
-        tx.execute("INSERT INTO go_context_selections(workspace_id,lang,generation,revision,profile_digest,derivation_version)
-            VALUES(?1,'go',?2,?3,zeroblob(32),?4)", rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION]).unwrap();
+        tx.execute("INSERT INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_version)
+            VALUES(?1,'go',?2,zeroblob(32),'','',zeroblob(32),?4)", rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION]).unwrap();
         let selection = tx.last_insert_rowid();
-        tx.execute("INSERT INTO go_context_publications(selection_id,publication_digest,complete,gaps)
-            VALUES(?1,zeroblob(32),0,jsonb('[]'))", [selection]).unwrap();
+        tx.execute("INSERT INTO go_context_publications(selection_id,workspace_id,lang,generation,valid_from,input_digest,publication_digest,complete,gaps)
+            VALUES(?1,?2,'go',?3,?4,zeroblob(32),zeroblob(32),0,jsonb('[]'))", rusqlite::params![selection,snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision]).unwrap();
         let context = tx.last_insert_rowid();
-        tx.execute("INSERT INTO go_context_heads(selection_id,context_id) VALUES(?1,?2)", rusqlite::params![selection,context]).unwrap();
         let mut packages = Vec::new();
         for (path, import_path, name) in [
             (GO_ROOT_CONSUMER_PATH,"example.test/root/consumer","consumer"),
@@ -6254,8 +6268,8 @@ type Item struct{ Decoy bool }
                 VALUES(?1,?2,?3,'','',zeroblob(32),0,jsonb('[]'),?4)",rusqlite::params![context,import_path,name,unit_key.as_slice()]).unwrap();
             let package = tx.last_insert_rowid();
             packages.push(package);
-            tx.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role)
-                SELECT ?1,file_version_id,'go' FROM workspace_file_versions
+            tx.execute("INSERT INTO go_package_files(package_id,rel_path,source_role)
+                SELECT ?1,rel_path,'go' FROM workspace_file_versions
                 WHERE workspace_id=?2 AND lang='go' AND generation=?3 AND rel_path=?4 AND valid_from<=?5
                 AND (valid_until IS NULL OR ?5<valid_until)",rusqlite::params![package,snapshot.workspace_id.as_str(),snapshot.generation.get(),path,snapshot.revision]).unwrap();
         }
@@ -6372,11 +6386,23 @@ type Item struct{ Decoy bool }
                 // more scope steps.
                 // #6020: shared Go publication registration reads exporting-source
                 // roles, adding six search statements and two decoded rows per point.
+                // #6291: selected path memoization removes eight cold and six
+                // warm mount reads; scoped gap selection removes one cold row.
+                // Indexed emptiness proof removes one further cold statement,
+                // with two cold/one warm constant proof rows instead of gap rows.
+                // Selected Go source view adds one cold DDL/schema row.
+                // Mount guards add three DROP and three CREATE statements on cold
+                // selection setup, plus three decoded SQLite schema rows.
+                // Retaining the typed interior certificate removes one COUNT
+                // statement and aggregate row from warm Definition searches.
+                // #6527 issues module-definition classification only for languages
+                // with a provider; Go has none, so both query kinds lose two cold
+                // and two warm search statements that returned no rows.
                 let (cold_open, cold_search, warm_open, warm_search) = match kind {
                     ProductionGoPointKind::Definition => {
-                        ((268, 237), (194, 163), (5, 4), (151, 102))
+                        ((275, 241), (183, 156), (5, 4), (142, 96))
                     }
-                    ProductionGoPointKind::Type => ((268, 237), (213, 159), (5, 4), (170, 98)),
+                    ProductionGoPointKind::Type => ((275, 241), (202, 152), (5, 4), (162, 93)),
                 };
                 let production_schema = cold
                     .open
@@ -7024,7 +7050,7 @@ type Item struct{ Decoy bool }
             };
             fixture.store.conn.execute(move |conn| {
                 conn.execute(
-                    "DELETE FROM go_context_heads WHERE context_id=?1",
+                    "UPDATE go_context_publications SET valid_until=valid_from WHERE context_id=?1",
                     [context_id],
                 )
                 .unwrap();
@@ -7503,8 +7529,8 @@ type Item struct{ Decoy bool }
         transaction.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key)
             VALUES(?1,'example.test/root/consumer [example.test/root/consumer.test]','consumer','example.test/root/consumer','',zeroblob(32),0,jsonb('[]'),?2)", rusqlite::params![context_id, unit_key.as_slice()]).unwrap();
         let variant = transaction.last_insert_rowid();
-        transaction.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role)
-            SELECT ?2,files.file_version_id,'go' FROM go_context_source_files files
+        transaction.execute("INSERT INTO go_package_files(package_id,rel_path,source_role)
+            SELECT ?2,files.rel_path,'go' FROM go_context_source_files files
             JOIN go_package_instances package ON package.package_id=files.package_id
             WHERE files.context_id=?1 AND package.tool_import_path='example.test/root/consumer'", rusqlite::params![context_id,variant]).unwrap();
         transaction.execute("INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps)
@@ -7577,6 +7603,9 @@ type Item struct{ Decoy bool }
                     |row| row.get(0),
                 )
                 .unwrap();
+            brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(connection);
+            connection.execute("DELETE FROM temp.selected_workspace_revisions", []).unwrap();
+            connection.execute("INSERT INTO temp.selected_workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'go',?2,?3)",rusqlite::params![workspace_id,generation,revision]).unwrap();
             connection
                 .query_row(
                     brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL,
@@ -8191,7 +8220,7 @@ func use() { provider.Rewrites.ReadFile() }
             let unit_key = go_unit_key(&path, &path, "test");
             transaction.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(?1,?2,'provider',?2,'',zeroblob(32),0,jsonb('[]'),?3)", rusqlite::params![context, path, unit_key.as_slice()]).unwrap();
             let package = transaction.last_insert_rowid();
-            transaction.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role) VALUES(?1,?2,'go')", rusqlite::params![package,version]).unwrap();
+            transaction.execute("INSERT INTO go_package_files(package_id,rel_path,source_role) SELECT ?1,rel_path,'go' FROM workspace_file_versions WHERE file_version_id=?2", rusqlite::params![package,version]).unwrap();
         }
         transaction.commit().unwrap();
     });
@@ -8275,22 +8304,22 @@ func use() { provider.Rewrites.ReadFile() }
                     (
                         "go_named_import_target_mounts",
                         vec![Integer(context), Integer(target)],
-                        "members",
+                        "path_members",
                     ),
                     (
                         "go_caller_source_role",
                         vec![Integer(context), Integer(version)],
-                        "members",
+                        "path_members",
                     ),
                     (
                         "go_caller_package",
                         vec![Integer(context), Integer(version), Text("go".into())],
-                        "members",
+                        "path_members",
                     ),
                     (
                         "go_package_peer_mounts",
                         vec![Integer(context), Integer(caller), Text("go".into())],
-                        "members",
+                        "path_members",
                     ),
                 ] {
                     let mut pin = pinned(label);
@@ -8391,14 +8420,12 @@ func use() { provider.Rewrites.ReadFile() }
 
             use brokk_bifrost_analysis::analyzer::resolution::model::StackPattern;
 
-            use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture as SelectionFixture;
-
             use brokk_bifrost_analysis::analyzer::store::resolution_stage::SelectedResolutionStage;
 
-            let fixture = SelectionFixture::new(1);
+            let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
             let selection = fixture.open_ready(&[]);
             let live = CancellationToken::new();
-            let cache = std::rc::Rc::new(UnconditionalCandidateCache::for_go_operation());
+            let cache = std::rc::Rc::new(UnconditionalCandidateCache::for_operation());
             let source = SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
                 &selection,
                 std::rc::Rc::clone(&cache),
@@ -8931,6 +8958,8 @@ func use() { provider.Rewrites.ReadFile() }
     }
 
     mod go_move_13 {
+        use super::go_toolchain_available;
+
         use rusqlite::params;
 
         use std::collections::BTreeSet;
@@ -8939,7 +8968,7 @@ func use() { provider.Rewrites.ReadFile() }
 
         use brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION;
 
-        use brokk_bifrost_analysis::analyzer::store::go_package_context::go_extraction_support_13::Fixture;
+        use crate::store_test_support::go_extraction_support_13::Fixture;
 
         use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextHeadStatus;
 
@@ -9023,7 +9052,8 @@ func use() { provider.Rewrites.ReadFile() }
                 .prepare(
                     "SELECT f.rel_path,p.provider_provenance,p.complete,json(p.gaps),pf.source_role
              FROM go_package_instances p JOIN go_package_files pf USING(package_id)
-             JOIN workspace_file_versions f USING(file_version_id)
+             JOIN go_context_publications publication ON publication.context_id=p.context_id
+             JOIN workspace_file_versions f ON f.workspace_id=publication.workspace_id AND f.lang=publication.lang AND f.generation=publication.generation AND f.input_kind='source' AND f.rel_path=pf.rel_path AND f.valid_from<=publication.valid_from AND (f.valid_until IS NULL OR publication.valid_from<f.valid_until)
              WHERE p.context_id=?1 ORDER BY f.rel_path",
                 )
                 .unwrap()
@@ -9237,10 +9267,17 @@ func use() { provider.Rewrites.ReadFile() }
                         &CancellationToken::new()
                     )
                     .unwrap(),
-                GoContextPublicationOutcome::InputsChanged
+                GoContextPublicationOutcome::Published(_)
             ));
             let third = fixture.publish(fixture.discovery(), Some(second));
-            assert_eq!(first, third, "A/B/A reuses immutable A publication");
+            assert_ne!(
+                first.context_id, third.context_id,
+                "A/B/A keeps superseded intervals"
+            );
+            assert_eq!(
+                first.publication_digest, third.publication_digest,
+                "A/B/A retains output identity"
+            );
             let cancelled = CancellationToken::new();
             cancelled.cancel();
             assert!(matches!(
@@ -9368,7 +9405,10 @@ func use() { provider.Rewrites.ReadFile() }
                 .unwrap();
             assert!(next.revision > fixture.snapshot.revision);
             let second = store.selected_go_context(&next, &profile).unwrap().unwrap();
-            assert_ne!(first.publication_digest, second.publication_digest);
+            assert_eq!(
+                first.publication_digest, second.publication_digest,
+                "member text changes preserve placement"
+            );
             assert_eq!(
                 store
                     .go_context_head_status(&first, &CancellationToken::new())
@@ -9523,9 +9563,11 @@ func use() { provider.Rewrites.ReadFile() }
             .unwrap();
             let conn = workspace.store().unwrap().read_conn().unwrap();
             let context: i64 = conn
-                .query_row("SELECT context_id FROM go_context_heads", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT context_id FROM go_context_publications WHERE valid_until IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap();
             let (complete, gaps): (bool, String) = conn
                 .query_row(
@@ -9576,7 +9618,14 @@ func use() { provider.Rewrites.ReadFile() }
                 brokk_bifrost_go_analysis::GoAnalyzer,
             >(updated.analyzer())
             .unwrap();
-            assert_eq!(go.native_context_profile(), Some(profile));
+            let active_profile = go.context_profile_for_test();
+            // The edit reruns Go discovery. Without host Go that discovery fails,
+            // and a failed discovery must not keep the previous tool profile.
+            if !go_toolchain_available() {
+                assert_eq!(active_profile, Some(source_inventory_profile()));
+                return;
+            }
+            assert!(active_profile.is_some_and(|active| active != source_inventory_profile()));
             let store = updated.store().unwrap();
             let mut next = fixture.snapshot.clone();
             next.revision = store
@@ -9589,12 +9638,18 @@ func use() { provider.Rewrites.ReadFile() }
                 )
                 .unwrap();
             assert!(next.revision > fixture.snapshot.revision);
-            assert_eq!(store.selected_go_context(&next, &profile).unwrap(), None);
-            assert_eq!(
+            assert!(
+                store
+                    .selected_go_context(&next, &profile)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
                 store
                     .selected_go_context(&next, &source_inventory_profile())
-                    .unwrap(),
-                None
+                    .unwrap()
+                    .is_some(),
+                "inactive inventory intervals remain retained without becoming active"
             );
             assert_eq!(
                 store
@@ -9605,7 +9660,7 @@ func use() { provider.Rewrites.ReadFile() }
             assert!(
                 !go.activate_native_context_profile(&fixture.snapshot, source_inventory_profile())
             );
-            assert_eq!(go.native_context_profile(), Some(profile));
+            assert_eq!(go.context_profile_for_test(), active_profile);
         }
         #[test]
         fn go_context_profile_is_explicit_and_clone_local() {
@@ -9622,25 +9677,25 @@ func use() { provider.Rewrites.ReadFile() }
             >(fixture.workspace.analyzer())
             .unwrap();
             assert_eq!(
-                go.native_context_profile(),
+                go.context_profile_for_test(),
                 Some(source_inventory_profile())
             );
             assert!(go.activate_native_context_profile(&fixture.snapshot, first_profile));
             let cloned = go.clone();
             assert!(cloned.activate_native_context_profile(&fixture.snapshot, second_profile));
-            assert_eq!(go.native_context_profile(), Some(first_profile));
-            assert_eq!(cloned.native_context_profile(), Some(second_profile));
+            assert_eq!(go.context_profile_for_test(), Some(first_profile));
+            assert_eq!(cloned.context_profile_for_test(), Some(second_profile));
             assert_eq!(
                 fixture
                     .store()
-                    .selected_go_context(&fixture.snapshot, &go.native_context_profile().unwrap())
+                    .selected_go_context(&fixture.snapshot, &go.context_profile_for_test().unwrap())
                     .unwrap(),
                 Some(first)
             );
             let mut wrong = fixture.snapshot.clone();
             wrong.revision += 1;
             assert!(!go.activate_native_context_profile(&wrong, second_profile));
-            assert_eq!(go.native_context_profile(), Some(first_profile));
+            assert_eq!(go.context_profile_for_test(), Some(first_profile));
         }
         #[test]
         fn go_context_source_membership_view_excludes_wrong_selection_domains() {
@@ -9708,12 +9763,12 @@ func use() { provider.Rewrites.ReadFile() }
             {
                 conn.execute("INSERT OR IGNORE INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,?2,?3,?4)",rusqlite::params![workspace,lang,generation,from]).unwrap();
                 conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,projection_digest,valid_from,valid_until) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",rusqlite::params![workspace,lang,generation,format!("invalid{index}.go"),oid,kind,(kind=="source").then_some(&projection),from,until]).unwrap();
-                conn.execute("INSERT INTO go_package_files(package_id,file_version_id,source_role) VALUES(?1,?2,'go')",rusqlite::params![package,conn.last_insert_rowid()]).unwrap();
+                conn.execute("INSERT INTO go_package_files(package_id,rel_path,source_role) SELECT ?1,rel_path,'go' FROM workspace_file_versions WHERE file_version_id=?2",rusqlite::params![package,conn.last_insert_rowid()]).unwrap();
             }
             let visible: i64 = conn
                 .query_row(
-                    "SELECT count(*) FROM go_context_source_files WHERE context_id=?1",
-                    [identity.context_id],
+                    "SELECT count(*) FROM go_context_source_files WHERE context_id=?1 AND valid_from<=?2 AND (valid_until IS NULL OR ?2<valid_until) AND publication_valid_from<=?2 AND (publication_valid_until IS NULL OR ?2<publication_valid_until)",
+                    rusqlite::params![identity.context_id,selected_revision],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -9725,12 +9780,8 @@ func use() { provider.Rewrites.ReadFile() }
             conn.execute("UPDATE workspace_file_versions SET valid_until=?1 WHERE rel_path='provider/item.go' AND workspace_id=?2",rusqlite::params![selected_revision+1,selected_workspace]).unwrap();
             let shifted = selected_revision + 1;
             conn.execute("INSERT OR IGNORE INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'go',?2,?3)",rusqlite::params![selected_workspace,selected_generation,shifted]).unwrap();
-            conn.execute(
-                "UPDATE go_context_selections SET revision=?1 WHERE selection_id=?2",
-                rusqlite::params![shifted, identity.selection_id],
-            )
-            .unwrap();
-            let ended: i64 = conn.query_row("SELECT count(*) FROM go_context_source_files WHERE context_id=?1 AND rel_path='provider/item.go'",[identity.context_id],|row|row.get(0)).unwrap();
+
+            let ended: i64 = conn.query_row("SELECT count(*) FROM go_context_source_files WHERE context_id=?1 AND rel_path='provider/item.go' AND valid_from<=?2 AND (valid_until IS NULL OR ?2<valid_until)",rusqlite::params![identity.context_id,shifted],|row|row.get(0)).unwrap();
             assert_eq!(ended, 0);
         }
         #[test]
@@ -9762,6 +9813,7 @@ func use() { provider.Rewrites.ReadFile() }
                 Value::Integer(identity.selection_id),
                 Value::Integer(identity.context_id),
                 Value::Blob(identity.publication_digest.to_vec()),
+                Value::Integer(fixture.snapshot.revision),
             ];
             let mut inputs = pinned("go_native_observed_inputs");
             inputs.params = selection.params[..3].to_vec();
@@ -10057,9 +10109,9 @@ func use() { provider.Rewrites.ReadFile() }
 
         use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: semantic_at ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: semantic_at ;
 
-        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: go_extraction_support_11 :: site_for_identifier ;
+        use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: resolution_operation_tests_go_support :: operation_fixture_support :: site_for_identifier ;
 
         use crate::engine_tests::go_extraction::go_extraction_tests::go_move_11::GO_ROOT_CONSUMER_PATH;
         use crate::engine_tests::go_extraction::go_extraction_tests::go_move_11::GoRootResolutionOperationFixture;
@@ -10563,7 +10615,7 @@ func use() { provider.Rewrites.ReadFile() }
         fn go_modeled_package_identity_uses_exact_declared_name_and_pack_provenance() {
             use brokk_bifrost_analysis::analyzer::languages::ModeledExternalPackageIdentity;
 
-            use brokk_bifrost_analysis::analyzer::languages::language_support;
+            use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 
             let mut package = class("example.com/acme/codec", "go");
             package.kind = SemanticModelSymbolKind::Module;
@@ -10573,7 +10625,9 @@ func use() { provider.Rewrites.ReadFile() }
             package.provenance.record_id = "package:codec".to_owned();
             let symbol_id = package.id.clone();
             let selected_overlay = overlay(vec![package.clone()], Vec::new());
-            let go_support = language_support(Language::Go).expect("Go support is registered");
+            let go_support =
+                language_support_for_hook(Language::Go, "modeled_external_package_identity")
+                    .expect("Go support is registered");
             let rejects = |package| {
                 go_support
                     .modeled_external_package_identity(
@@ -11065,6 +11119,7 @@ func use() { provider.Rewrites.ReadFile() }
             let active = match resolve_active_semantic_models(
                 &catalog,
                 &SemanticModelActivationRequest {
+                    approximate_standard_libraries: Vec::new(),
                     bifrost_version: semver::Version::new(0, 12, 0),
                     evidence: vec![SemanticModelActivationEvidence {
                         language: "go".to_owned(),
@@ -12041,8 +12096,6 @@ func use() { provider.Rewrites.ReadFile() }
 
         use brokk_bifrost_core::analyzer::model::Language;
 
-        use brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::SelectionFixture;
-
         use brokk_bifrost_analysis::analyzer::resolution::model::BindingFragmentId;
 
         use brokk_bifrost_core::cancellation::CancellationToken;
@@ -12256,7 +12309,8 @@ func use() { provider.Rewrites.ReadFile() }
                         ),
                     ),
                 ]);
-                let fixture = SelectionFixture::shared_blob(16);
+                let fixture =
+                    crate::selection_fixture_support::JvmSelectionFixture::shared_blob(16);
                 let selection = fixture.open_ready(&[]);
                 let connection = begin_projection(&selection);
                 assert!(

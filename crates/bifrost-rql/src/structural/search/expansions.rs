@@ -47,6 +47,7 @@ fn finish_call_declaration_expansions(
     }
     diagnostics.extend(traversal_diagnostics);
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::CallRelationCandidatesOmitted,
         impact: if declared_non_exhaustive {
@@ -390,6 +391,7 @@ pub(super) fn inbound_reference_expansions(
         if report && query.source_bytes_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -406,6 +408,7 @@ pub(super) fn inbound_reference_expansions(
         } else if report && query.candidate_files_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::ReferenceCandidateFilesTruncated,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -427,6 +430,7 @@ pub(super) fn inbound_reference_expansions(
             && report
         {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
                 code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
@@ -480,6 +484,7 @@ pub(super) fn inbound_reference_expansions(
                         );
                     if omitted > 0 {
                         diagnostics.push(CodeQueryDiagnostic {
+                            related: Vec::new(),
                             source: None,
                             code: CodeQueryDiagnosticCode::ReferenceCandidatesOmitted,
                             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -511,6 +516,7 @@ pub(super) fn inbound_reference_expansions(
                 }));
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
                         impact: CodeQueryDiagnosticImpact::Advisory,
@@ -543,6 +549,7 @@ pub(super) fn inbound_reference_expansions(
                 exhausted = true;
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::ReferenceCallsiteLimit,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -563,6 +570,7 @@ pub(super) fn inbound_reference_expansions(
             FuzzyResult::Failure { reason, .. } => {
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        related: Vec::new(),
                         source: None,
                         code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
                         impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -620,6 +628,7 @@ pub(super) fn inbound_reference_expansions(
             diagnostic.code != CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         });
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::ReferenceCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -752,6 +761,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
 ) {
     if ambiguous_sites > 0 && ambiguous_candidates_complete {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
             impact: CodeQueryDiagnosticImpact::Advisory,
@@ -768,6 +778,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
     }
     if omitted > 0 {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -799,6 +810,7 @@ pub(super) fn scan_outbound_reference_hits(
     let language = crate::analyzer::common::language_for_file(file);
     let Some(source) = analyzer.indexed_source(file) else {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -825,6 +837,7 @@ pub(super) fn scan_outbound_reference_hits(
     let source = Arc::<str>::from(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesParserUnsupported,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -874,6 +887,7 @@ pub(super) fn scan_outbound_reference_hits(
             push_budget_diagnostic(diagnostics, budget);
         } else {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidateLimit,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -891,6 +905,7 @@ pub(super) fn scan_outbound_reference_hits(
     if candidate_limit == 0 {
         exhausted = true;
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::UsesCandidateLimit,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -963,6 +978,7 @@ pub(super) fn scan_outbound_reference_hits(
         } = &result.result
         {
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 exhausted_roots: Vec::new(),
                 code: CodeQueryDiagnosticCode::ReferenceAnalysisFailed,
@@ -981,6 +997,7 @@ pub(super) fn scan_outbound_reference_hits(
         if target_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::UsesCandidateLimit,
                 impact: CodeQueryDiagnosticImpact::Incomplete,

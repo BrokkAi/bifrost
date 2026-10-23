@@ -141,7 +141,7 @@ pub fn rewrite_paths_for_file(
     let token = scope.token();
     let generation = analyzer.project().analysis_generation();
     let language = crate::analyzer::common::language_for_file(file);
-    match crate::analyzer::languages::language_support(language) {
+    match crate::analyzer::languages::language_support_for_hook(language, "rewrite_paths") {
         Some(support) => support.rewrite_paths(analyzer, token, file, generation, request),
         None => FileRewritePaths::complete(Vec::new(), generation),
     }

@@ -126,7 +126,7 @@ fn discovery_instructions(effective_toolsets: &HashSet<String>) -> String {
             }
             "workspace" => " Workspace tools refresh indexed state and manage workspace selection.",
             "diff" => {
-                " Diff tools explain semantic patch effects, suggest test scopes, compare cyclomatic complexity, and find changed functions without a complete structured call path from tests."
+                " Diff tools inventory indexed function sources, explain semantic patch effects, suggest test scopes, compare cyclomatic complexity, and find changed functions without a complete structured call path from tests."
             }
             "extended" => {
                 " Structural tools run CodeQuery and RQL, inspect symbol locations and ancestors, rank related files, inspect Git history, and evaluate repository policies."

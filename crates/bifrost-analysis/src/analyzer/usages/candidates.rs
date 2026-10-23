@@ -1,8 +1,9 @@
 use crate::analyzer::common::source_identifier_for_target;
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::language_support_for_hook;
 use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
+
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
@@ -10,6 +11,7 @@ use crate::analyzer::{
     CodeUnit, DescendantIndexScope, IAnalyzer, ImportAnalysisProvider, ImportReachability,
     Language, ProjectFile,
 };
+
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -196,14 +198,15 @@ fn find_import_graph_candidates(
     // reachable file cannot spell the target returns the narrowed set, which is what
     // keeps a very common member name on a widely included owner inside the file budget
     // instead of admitting the whole include closure (#3093).
-    let language_importers_own_candidates = language_support(target_language)
-        .and_then(|support| {
-            support.referencing_candidate_files(analyzer, target, &source_files, cancellation)
-        })
-        .is_some_and(|importers| {
-            candidates.extend(importers);
-            true
-        });
+    let language_importers_own_candidates =
+        language_support_for_hook(target_language, "referencing_candidate_files")
+            .and_then(|support| {
+                support.referencing_candidate_files(analyzer, target, &source_files, cancellation)
+            })
+            .is_some_and(|importers| {
+                candidates.extend(importers);
+                true
+            });
     if target_language != Language::Python
         && !rust_prepared_query_owns_importers
         && !language_importers_own_candidates
@@ -319,7 +322,11 @@ fn cpp_related_callable_source_files(
             {
                 continue;
             }
-            if language_support(Language::Cpp).is_some_and(|support| {
+            if language_support_for_hook(
+                Language::Cpp,
+                "callable_definitions_share_identity_evidence",
+            )
+            .is_some_and(|support| {
                 support.callable_definitions_share_identity_evidence(
                     analyzer, token, target, &candidate,
                 )
@@ -900,18 +907,26 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
     brokk_bifrost_core::cancellation::optional_is_cancelled(cancellation)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[cfg(test)]
     use super::*;
-    use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::KotlinAnalyzer;
+
+    #[cfg(test)]
+    use crate::analyzer::CodeUnitType;
+    #[cfg(test)]
     use crate::analyzer::workspace::EmptyAnalyzer;
-    use crate::analyzer::{CodeUnitType, ImportInfo, Language};
-    use crate::test_support::AnalyzerFixture;
+
+    #[cfg(test)]
+    use crate::analyzer::{ImportInfo, Language};
+
+    #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
+    #[cfg(test)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(test)]
     /// The importer walks take a `QueryToken`, and these tests drive them with
     /// hand-written providers rather than a real analyzer. The scope is opened
     /// over an analyzer that owns nothing: the token is proof that a request
@@ -923,22 +938,26 @@ pub mod tests {
         )))
     }
 
+    #[cfg(test)]
     struct CancellingImportProvider {
         cancellation: CancellationToken,
         calls: Arc<AtomicUsize>,
         imported: CodeUnit,
     }
 
+    #[cfg(test)]
     struct BatchedImportProvider {
         calls: Arc<AtomicUsize>,
         imported: CodeUnit,
     }
 
+    #[cfg(test)]
     struct FileEdgeProvider {
         edges: HashMap<ProjectFile, HashSet<ProjectFile>>,
         edge_lookups: Arc<AtomicUsize>,
     }
 
+    #[cfg(test)]
     impl ImportAnalysisProvider for FileEdgeProvider {
         fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             Arc::new(HashSet::default())
@@ -958,6 +977,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     impl ImportAnalysisProvider for BatchedImportProvider {
         fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             panic!("batched importer discovery must not hydrate individual import states");
@@ -994,6 +1014,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     impl ImportAnalysisProvider for CancellingImportProvider {
         fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -1006,6 +1027,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "#1748: Scala compiler encodings such as `$plus` must not be confused with source operators; no parser-backed usage test can generate these synthetic names as written callees"
@@ -1033,6 +1055,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     #[test]
     fn cancellable_importer_scan_uses_batched_import_facts_when_available() {
         let root = std::env::temp_dir();
@@ -1059,12 +1082,14 @@ pub mod tests {
         assert_eq!(importers, [importer].into_iter().collect());
     }
 
+    #[cfg(test)]
     struct PrefetchingImportProvider {
         prefetched_files: Arc<Mutex<Vec<usize>>>,
         per_candidate_calls: Arc<AtomicUsize>,
         prefetches_before_first_candidate: Arc<AtomicUsize>,
     }
 
+    #[cfg(test)]
     impl ImportAnalysisProvider for PrefetchingImportProvider {
         fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             Arc::new(HashSet::default())
@@ -1105,6 +1130,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     /// #1748: the walk asks the provider the same shape of question once per
     /// workspace file, so a provider whose answer needs a shared lookup must
     /// get one chance to resolve the whole set first. Fails with zero
@@ -1158,6 +1184,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon(
         "#689: Checks transitive importer discovery follows the file graph without revisiting shared edges"
@@ -1196,6 +1223,7 @@ pub mod tests {
         assert_eq!(3, edge_lookups.load(Ordering::Acquire));
     }
 
+    #[cfg(test)]
     #[test]
     fn cancellable_importer_scan_stops_after_current_file_without_recording_partial_work() {
         let root = std::env::temp_dir();
@@ -1224,6 +1252,7 @@ pub mod tests {
         assert!(importers.is_empty());
     }
 
+    #[cfg(test)]
     #[test]
     fn cancellable_importer_scan_stops_early_without_recording_partial_work_under_concurrency() {
         let root = std::env::temp_dir();
@@ -1268,6 +1297,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(test)]
     #[test]
     #[hardwon("#1748: cancellation failed to skip importer prefetch and candidate walking")]
     fn cancelled_importer_scan_skips_the_prefetch_and_the_walk() {
@@ -1302,52 +1332,6 @@ pub mod tests {
                 .expect("prefetch record poisoned")
                 .is_empty(),
             "a pre-cancelled scan must not spend the batch either"
-        );
-    }
-    /// Constructors do not participate in polymorphic dispatch. Before this
-    /// gate, asking for one constructor's usages built Kotlin's complete
-    /// descendant index and resolved every unrelated class hierarchy in the
-    /// workspace (#1748).
-    #[test]
-    #[hardwon(
-        "#2602: Kotlin constructor candidate lookup avoids scanning workspace descendants when the constructor has a direct type identity"
-    )]
-    fn kotlin_constructor_candidates_skip_workspace_descendant_resolution() {
-        let unrelated_hierarchy = (0..64)
-            .map(|index| format!("open class Base{index}\nclass Child{index} : Base{index}()\n"))
-            .collect::<String>();
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Kotlin,
-            &[
-                (
-                    "DuplicateColumnException.kt",
-                    "package api\nclass DuplicateColumnException(message: String) : Exception(message)\n",
-                ),
-                ("Unrelated.kt", &unrelated_hierarchy),
-            ],
-        );
-        let analyzer = KotlinAnalyzer::new(Arc::new(fixture.test_project().clone()));
-        let constructor = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.fq_name() == "api.DuplicateColumnException.DuplicateColumnException")
-            .expect("fixture declares the DuplicateColumnException constructor");
-        assert!(is_constructor_target(&constructor, &analyzer));
-
-        let cancellation = CancellationToken::default();
-        let scope = DescendantIndexScope::whole_workspace(&cancellation);
-        analyzer
-            .test_hooks()
-            .reset_definition_candidates_query_count_for_test();
-        let candidates = find_default_candidates_within(&constructor, &analyzer, &scope);
-        let definition_queries = analyzer
-            .test_hooks()
-            .definition_candidates_query_count_for_test();
-
-        assert!(candidates.contains(constructor.source()));
-        assert!(
-            definition_queries < 8,
-            "constructor discovery must not resolve the unrelated workspace hierarchy; got {definition_queries} definition queries"
         );
     }
 }

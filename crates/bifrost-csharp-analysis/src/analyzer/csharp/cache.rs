@@ -23,7 +23,7 @@ use std::mem::size_of;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 
-use crate::analyzer::csharp::compilation::CSharpCompilationIndex;
+use brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest;
 
 use brokk_bifrost_analysis::analyzer::cache_weight::estimate_code_unit;
 
@@ -190,9 +190,9 @@ pub(crate) struct CSharpMemoCaches {
     /// hierarchy facts before coarse graph construction enters its parallel
     /// edge-resolution pass.
     pub(crate) hierarchy_test_files: PoolSafeMemo<HashSet<ProjectFile>>,
-    /// Build-declared C# source-to-compilation membership and its configuration
-    /// identity. Shared by file-graph edges and snapshot cache identity.
-    pub(crate) compilation_index: PoolSafeMemo<CSharpCompilationIndex>,
+    /// One fixed-size digest of the generation's build configuration, for
+    /// snapshot cache identity. Published only when the identity is known.
+    pub(crate) compilation_config_digest: PoolSafeMemo<StableDigest>,
     /// Real source files that declare at least one `global using` directive.
     /// The coarse graph factors workspace-global visibility through these
     /// configuration files instead of expanding every directive in every file.
@@ -251,7 +251,7 @@ impl CSharpMemoCaches {
             implicit_reference_index: PoolSafeMemo::new(),
             file_dependencies_by_namespace: PoolSafeMemo::new(),
             hierarchy_test_files: PoolSafeMemo::new(),
-            compilation_index: PoolSafeMemo::new(),
+            compilation_config_digest: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),
             sorted_global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),

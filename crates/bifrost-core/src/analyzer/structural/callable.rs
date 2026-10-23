@@ -233,6 +233,80 @@ labelled_enum! {
     }
 }
 
+labelled_enum! {
+    /// Where the code invoked by a Rust call is supplied.
+    CalleeProvenance, ALL_CALLEE_PROVENANCES {
+        CallerSupplied => "caller_supplied",
+        LocalClosure => "local_closure",
+        Declared => "declared",
+        Unknown => "unknown",
+    }
+}
+
+labelled_enum! {
+    /// The written type shape that establishes callee provenance.
+    CalleeTypeShape, ALL_CALLEE_TYPE_SHAPES {
+        FnBoundGeneric => "fn_bound_generic",
+        TraitBoundGeneric => "trait_bound_generic",
+        DynTrait => "dyn_trait",
+        ImplTrait => "impl_trait",
+        FnPointer => "fn_pointer",
+        Nominal => "nominal",
+        Unknown => "unknown",
+    }
+}
+
+/// The formal that supplies a callee. Ordinals exclude the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalleeSupplier {
+    Parameter(u32),
+    ClosureParameter(u32),
+    Receiver,
+}
+
+impl CalleeSupplier {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Parameter(_) => 0,
+            Self::ClosureParameter(_) => 1,
+            Self::Receiver => 2,
+        }
+    }
+    pub const fn ordinal(self) -> Option<u32> {
+        match self {
+            Self::Parameter(n) | Self::ClosureParameter(n) => Some(n),
+            Self::Receiver => None,
+        }
+    }
+    pub const fn from_parts(kind: u8, ordinal: Option<u32>) -> Option<Self> {
+        match (kind, ordinal) {
+            (0, Some(n)) => Some(Self::Parameter(n)),
+            (1, Some(n)) => Some(Self::ClosureParameter(n)),
+            (2, None) => Some(Self::Receiver),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CalleeSupplier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parameter(n) => write!(f, "parameter {n}"),
+            Self::ClosureParameter(n) => write!(f, "closure_parameter {n}"),
+            Self::Receiver => f.write_str("receiver"),
+        }
+    }
+}
+
+/// Blob-local syntax evidence. No resolution or active model participates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalleeProvenanceFact {
+    pub provenance: CalleeProvenance,
+    pub supplier: Option<CalleeSupplier>,
+    pub shape: CalleeTypeShape,
+    pub bounds: Vec<String>,
+}
+
 /// What one language's structural lowering says about a call site beyond the
 /// receiver and argument roles the shared fact arena already records.
 ///
@@ -248,8 +322,9 @@ labelled_enum! {
 /// missing structure. A language that says nothing keeps the baseline: kind
 /// from receiver presence, [`CallShapeCoverage::Exact`] coverage, and one
 /// call site per call node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSiteFacts {
+    pub callee_provenance: Option<CalleeProvenanceFact>,
     /// The refined call kind. `None` keeps the receiver-derived baseline.
     pub call_kind: Option<CallKind>,
     /// How much of this site's argument structure the lowering could read.
@@ -275,6 +350,7 @@ impl CallSiteFacts {
             call_kind: Some(call_kind),
             coverage: CallShapeCoverage::Exact,
             continues_callee_groups: false,
+            callee_provenance: None,
         }
     }
 
@@ -285,6 +361,7 @@ impl CallSiteFacts {
             call_kind: None,
             coverage,
             continues_callee_groups: false,
+            callee_provenance: None,
         }
     }
 
@@ -344,6 +421,8 @@ impl CallSiteContext {
 #[test]
 fn callable_vocabularies_are_unique_and_round_trip() {
     super::assert_vocabulary_round_trip!(ALL_CALL_KINDS, CallKind);
+    super::assert_vocabulary_round_trip!(ALL_CALLEE_PROVENANCES, CalleeProvenance);
+    super::assert_vocabulary_round_trip!(ALL_CALLEE_TYPE_SHAPES, CalleeTypeShape);
     super::assert_vocabulary_round_trip!(ALL_ARGUMENT_LIST_KINDS, ArgumentListKind);
     super::assert_vocabulary_round_trip!(ALL_CALL_SHAPE_COVERAGES, CallShapeCoverage);
     super::assert_vocabulary_round_trip!(ALL_APPLICABILITY_VERDICTS, ApplicabilityVerdict);

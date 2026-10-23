@@ -84,6 +84,7 @@ pub fn code_query_result_fixtures_json() -> Value {
                     rule_id: None,
                     origin: SemanticModelOriginKind::DeclarativeModel,
                     activation: SemanticModelActivationProvenance {
+                        approximate: false,
                         status: "active".to_owned(),
                         reason: "explicit test-only wire fixture".to_owned(),
                         source_kind: "ephemeral_workspace".to_owned(),
@@ -389,6 +390,9 @@ pub fn code_query_result_fixtures_json() -> Value {
         CodeQueryResultValue::PythonRuleFact {
             value: Default::default(),
         },
+        CodeQueryResultValue::RustMarkerImpl {
+            value: Default::default(),
+        },
         CodeQueryResultValue::RustPointerFinding {
             value: Default::default(),
         },
@@ -444,6 +448,7 @@ pub fn code_query_result_fixtures_json() -> Value {
         truncated: false,
         session_subset: None,
         diagnostics: vec![CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::InvalidPlan,
             impact: CodeQueryDiagnosticImpact::Invalid,

@@ -5,7 +5,7 @@ mod rust_indirect_table_tests {
     use brokk_bifrost_core::cache_gc::planner_statistics_row_count;
     use rusqlite::Connection;
 
-    use brokk_bifrost_analysis::analyzer::store::test_adapters::fixtures::two_revision_collection_fixture;
+    use crate::store_test_support::collection_fixtures::two_revision_collection_fixture;
 
     /// `BIFROST_STORE_STATISTICS=off` leaves the store with no statistics at
     /// all, which is how a statistics-free plan is reproduced.

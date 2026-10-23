@@ -58,7 +58,7 @@ mod js_ts_selection_tests {
                             )
                             .expect("persist selected-resolution fixture blob");
                     } else {
-                        support::write_fixture_blob(
+                        crate::selection_fixture_support::write_fixture_blob(
                             store,
                             oid,
                             storage_language,

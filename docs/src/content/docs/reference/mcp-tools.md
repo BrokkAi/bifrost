@@ -443,7 +443,7 @@ lists symbols with more than 1,000 call sites (`fqn`, `total_callsites`,
 
 ## diff toolset
 
-All five tools take the same endpoint arguments:
+The five endpoint comparison tools take the same endpoint arguments:
 
 | Argument | Type | Required | Default | Bounds | Meaning |
 | --- | --- | --- | --- | --- | --- |
@@ -458,6 +458,33 @@ can be a commit or a tree, Bifrost uses the commit. When both endpoints are
 commits or trees, the live working tree, index, and `.gitattributes` are not
 read. Every output has `endpoints` with `base` and `target` as full commit
 hashes, `tree:<oid>`, or `worktree` for the live working tree.
+
+### list_function_sources
+
+Inventory callable declaration ranges from the current indexed workspace.
+This tool takes workspace selectors instead of Git comparison endpoints:
+
+| Argument | Type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `paths` | string array | No | All files | Exact workspace-relative files to inventory. An empty array selects none. |
+| `include_tests` | boolean | No | `true` | Include callable ranges in test regions or test-like paths. |
+
+The structured-only response has `records` and `summary`. Every record contains
+`declaration_id`, `site_id`, `fq_name`, `name`, `kind`, `signature`, `language`,
+`rel_path`, `blob_oid`, `start_line`, `end_line`, `start_byte`, `end_byte`,
+`is_test`, and `source`. The raw indexed file bytes determine `blob_oid` using
+Git's blob hash. Coordinates refer to the declaration range before attached
+comments: lines are one-based, and bytes are zero-based with an exclusive end.
+`source` preserves indexed text and includes attached leading comments. There
+is one record per range; overloads and multiple declaration sites remain separate.
+`summary.file_count` counts files contributing records, `record_count` counts
+records, and `skipped_files` lists `rel_path` and `reason` when indexed source
+or blob identity is unavailable.
+
+The inventory follows the analyzer's callable declarations. Rust block-local
+functions currently have native analysis facts but no declaration projection,
+so they are included within their enclosing function's source rather than
+returned as separate records.
 
 ### analyze_diff
 

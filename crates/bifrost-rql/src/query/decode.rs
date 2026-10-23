@@ -3899,6 +3899,7 @@ struct PatternFields<'a> {
     not_kind: Option<&'a Value>,
     name: Option<&'a Value>,
     is_async: Option<&'a Value>,
+    unsafe_context: Option<&'a Value>,
     modifier: Option<&'a Value>,
     string_value: Option<&'a Value>,
     language_rule: Option<&'a Value>,
@@ -3946,6 +3947,7 @@ fn collect_pattern_fields<'a>(
                 PatternField::NotKind => fields.not_kind = Some(value),
                 PatternField::Name => fields.name = Some(value),
                 PatternField::Async => fields.is_async = Some(value),
+                PatternField::UnsafeContext => fields.unsafe_context = Some(value),
                 PatternField::Modifier => fields.modifier = Some(value),
                 PatternField::StringValue => fields.string_value = Some(value),
                 PatternField::LanguageRule => fields.language_rule = Some(value),
@@ -4066,6 +4068,28 @@ fn decode_pattern(
         })
         .transpose()?;
 
+    let unsafe_context = fields
+        .unsafe_context
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "unsafe_context"),
+                    "expected a boolean literal",
+                )
+            })
+        })
+        .transpose()?;
+    if unsafe_context.is_some()
+        && (kinds.is_empty()
+            || kinds
+                .iter()
+                .any(|kind| !kind.satisfies(NormalizedKind::Call)))
+    {
+        return Err(QueryError::new(
+            child_path(path, "unsafe_context"),
+            "unsafe_context is only supported on call patterns",
+        ));
+    }
     let is_async = fields
         .is_async
         .map(|value| {
@@ -4337,6 +4361,7 @@ fn decode_pattern(
         not_kinds,
         name,
         is_async,
+        unsafe_context,
         modifier,
         string_value,
         language_rule,

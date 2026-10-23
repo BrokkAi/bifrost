@@ -363,6 +363,7 @@ fn diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::PendingCleanupFlowDerivationIncomplete,
         impact: CodeQueryDiagnosticImpact::Incomplete,

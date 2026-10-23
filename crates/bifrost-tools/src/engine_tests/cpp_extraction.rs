@@ -23,7 +23,7 @@ mod cpp_extraction_tests {
 
             use brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer;
 
-            use brokk_bifrost_analysis::analyzer::scala::ScalaAnalyzer;
+            use brokk_bifrost_jvm_analysis::analyzer::scala::ScalaAnalyzer;
             use std::collections::{BTreeMap, BTreeSet};
 
             let fixture = crate::inline_project::InlineTestProject::new()
@@ -752,6 +752,7 @@ mod cpp_extraction_tests {
     }
 
     mod store {
+        use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
         use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
         use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
 
@@ -877,8 +878,6 @@ mod cpp_extraction_tests {
         /// `lang` keys or the second one analyzed would read the first one's rows.
         #[test]
         fn c_and_cpp_projections_of_one_blob_use_distinct_storage_language_keys() {
-            use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
-
             let temp = tempfile::TempDir::new().unwrap();
             let source = "struct outer {\n\
              struct inner { int value; } item;\n\
@@ -1490,9 +1489,10 @@ mod cpp_extraction_tests {
         }
         /// C++ recovered-origin provenance for the remaining recovery shapes
         /// (issue #1657): a sentinel-macro region reparse records every unit the
-        /// reparse walk mints, a fragmented multiple-base export declaration
-        /// records its recovered class, and a fragmented partial specialization
-        /// records the recovered member scope.
+        /// reparse walk mints, and a fragmented multiple-base export declaration
+        /// records its recovered class. The formerly fragmented macro-constrained
+        /// partial specialization now parses cleanly under the macro-declaration
+        /// grammar and stays pinned as recovery-free.
         #[brokk_bifrost_test_macros::hardwon(
             "#1657+5554beb0001d: remaining C++ recovery shapes must retain Recovered source provenance"
         )]
@@ -1592,10 +1592,10 @@ mod cpp_extraction_tests {
                 "the recovery window must span to the displaced closing brace: {recovery:?}"
             );
 
-            // A macro-constrained template parameter fragments a partial
-            // specialization; the recovered member scope is recorded over the
-            // proven specialization range while the ordinary forward declaration
-            // stays parsed.
+            // A macro-constrained template parameter used to fragment this
+            // partial specialization; under the macro-declaration grammar the
+            // constraint macros parse as `macro_modifier`s, so this fixture now
+            // pins that the shape stays clean.
             let specialization = write_file(
                 temp.path(),
                 "expected.hpp",
@@ -1652,24 +1652,14 @@ mod cpp_extraction_tests {
             );
             let state = parse_state(&CppAdapter, &specialization);
             let recovered = recovered_units(&state);
+            // The macro-declaration grammar admits the constraint macros as
+            // `macro_modifier`s, so this fixture no longer recovers; keep it as a
+            // pin that the shape stays clean rather than silently re-breaking.
             assert_eq!(
                 recovered.len(),
-                1,
-                "records: {:?}",
+                0,
+                "the macro-constrained specialization must parse without recovery: {:?}",
                 state.materialization_records
-            );
-            let (name, recovery) = &recovered[0];
-            assert_eq!(
-                name, "lib.expected<void, E>",
-                "records: {:?}",
-                state.materialization_records
-            );
-            let source = specialization.read_to_string().unwrap();
-            let specialization_start = source.find("class expected<void, E>").unwrap();
-            let member_start = source.find("bool has_value").unwrap();
-            assert!(
-                recovery.start_byte <= specialization_start && member_start < recovery.end_byte,
-                "the recovery window must cover the specialization scope: {recovery:?}"
             );
         }
         #[test]

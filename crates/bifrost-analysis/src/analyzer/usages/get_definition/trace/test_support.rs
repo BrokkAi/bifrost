@@ -12,8 +12,10 @@ pub struct BoundaryFixture {
     pub(super) _temp: tempfile::TempDir,
     #[doc(hidden)]
     pub workspace: WorkspaceAnalyzer,
-    pub(super) file: ProjectFile,
-    pub(super) source: String,
+    #[doc(hidden)]
+    pub file: ProjectFile,
+    #[doc(hidden)]
+    pub source: String,
 }
 
 impl BoundaryFixture {
@@ -69,7 +71,8 @@ impl BoundaryFixture {
         .expect("one traced outcome per request")
     }
 
-    pub(super) fn request_for(&self, needle: &str) -> DefinitionLookupRequest {
+    #[doc(hidden)]
+    pub fn request_for(&self, needle: &str) -> DefinitionLookupRequest {
         let start = self
             .source
             .find(needle)
@@ -85,8 +88,9 @@ impl BoundaryFixture {
 
     /// The same traced resolution as [`Self::trace`], reached through the
     /// public probe entry point (#1885).
-    #[cfg(test)]
-    pub(super) fn trace_via_probe_entry_point(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn trace_via_probe_entry_point(
         &self,
         needle: &str,
     ) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
@@ -275,6 +279,7 @@ pub fn activate_fixture_catalog(
         SemanticModelRuntimeOutcome, acquire_active_semantic_models_with_evidence,
     };
     let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
         evidence: vec![evidence],
         controls: vec![SemanticModelActivationControl {

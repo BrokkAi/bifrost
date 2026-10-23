@@ -4320,3 +4320,68 @@ fn union_combines_different_row_kinds_when_only_shared_fields_are_read() {
         "{error}"
     );
 }
+
+#[test]
+fn rust_marker_impls_parse_and_round_trip() {
+    let json_query = parse_ok(json!({
+        "schema_version": 1,
+        "languages": ["rust"],
+        "match": { "kind": "class" },
+        "steps": [{ "op": "rust_marker_impls_of" }]
+    }));
+    assert_eq!(json_query.plan.steps, vec![QueryStep::RustMarkerImplsOf]);
+    assert_eq!(
+        json_query.validate_steps().unwrap(),
+        QueryValueKind::RustMarkerImpl
+    );
+    for name in ["rust-marker-impls-of", "rust_marker_impls_of"] {
+        let rql = CodeQuery::from_sexp(&format!("({name} (language rust (class)))")).unwrap();
+        assert_eq!(rql.to_canonical_json(), json_query.to_canonical_json());
+    }
+    let invalid = error_of(json!({
+        "match": { "kind": "class" },
+        "steps": [{ "op": "rust_marker_impls_of", "kind": "raw" }]
+    }));
+    assert_eq!(invalid.path, "steps[0].kind");
+}
+
+#[test]
+fn callee_provenance_columns_parse_and_round_trip() {
+    let query = CodeQuery::from_sexp(
+        r#"(project :columns (callee_provenance callee_supplier callee_type_shape callee_bounds)
+            (filter :where ((callee_provenance eq caller_supplied)
+                            (callee_supplier eq "parameter 1")
+                            (callee_type_shape eq fn_bound_generic)
+                            (callee_bounds eq ["FnMut"]))
+                (call-shape (language rust (call)))))"#,
+    )
+    .expect("callee provenance columns parse");
+    query.validate_steps().expect("callee columns validate");
+    let decoded =
+        CodeQuery::from_json(&query.to_canonical_json()).expect("JSON decoder accepts columns");
+    assert_eq!(decoded.to_canonical_json(), query.to_canonical_json());
+    assert!(
+        CodeQuery::from_sexp(
+            "(filter :where ((callee_provenance eq invented)) (call-shape (call)))"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unsafe_context_call_property_round_trips_and_rejects_non_calls() {
+    for spelling in ["unsafe-context", "unsafe_context"] {
+        for expected in [true, false] {
+            let query =
+                CodeQuery::from_sexp(&format!("(language rust (call :{spelling} {expected}))"))
+                    .expect("unsafe call property");
+            let decoded = CodeQuery::from_json(&query.to_canonical_json())
+                .expect("JSON unsafe call property");
+            assert_eq!(decoded.to_canonical_json(), query.to_canonical_json());
+        }
+    }
+    for kind in ["expression", "function", "identifier"] {
+        assert!(CodeQuery::from_sexp(&format!("({kind} :unsafe-context true)")).is_err());
+    }
+    assert!(CodeQuery::from_sexp("(call :unsafe-context 1)").is_err());
+}

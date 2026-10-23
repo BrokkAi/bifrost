@@ -88,6 +88,8 @@ use crate::analyzer::semantic::SemanticArtifact;
 
 use crate::analyzer::semantic::SemanticBudget;
 
+use crate::analyzer::semantic::SemanticExecutionBudget;
+
 use crate::analyzer::semantic::SemanticCallSite;
 
 use crate::analyzer::semantic::SemanticEffect;
@@ -143,6 +145,16 @@ pub type CrossedCalls = Box<[Box<[CallSiteId]>]>;
 /// holding its own call, would keep exponentially many classes.
 pub const MAX_CROSSED_CLASSES: usize = 16;
 
+// A per-procedure solver limit, calibrated against the #6392 corpora. Changing
+// it changes the stored derivation and requires a semantic IR rows-version bump.
+// Maximum measured: 300,017,377 in drive_scheduler_inner,
+// crates/bifrost-store/src/analyzer/resolution/fact_resolution/demand_scheduler.rs.
+// Its 13% rise from 264,531,860 is the expected cost of taken chains rerunning
+// on every predecessor visit. Wasmtime's cranelift/codegen/src/isa/s390x/inst/
+// emit_tests.rs::test_s390x_binemit visits 219,120,293 facts. The cap exceeds
+// ten times the corpus maximum (3,000,173,770), rounded up with headroom.
+const MAX_PARTIAL_FLOW_FACT_VISITS: usize = 3_500_000_000;
+
 /// The union of two flows' crossed-call sets, reduced to the sets that no
 /// other set is a subset of, for one flow that two derivations reach. More
 /// than [`MAX_CROSSED_CLASSES`] sets become their union.
@@ -180,7 +192,7 @@ pub enum PartialFlowOutcome {
     Complete,
     /// A limit truncated the relation projection's candidate set.
     Truncated,
-    /// The projection ran out of its budget; no flows are recorded.
+    /// The projection or fixpoint exhausted its budget; no flows are recorded.
     ExceededBudget,
     /// The projection failed; no flows are recorded.
     Error,
@@ -297,6 +309,8 @@ impl Crossed {
         }
     }
 
+    // Widening is order-dependent: processing order changes which classes merge.
+    // Both results are sound; eager scheduling changes groupings and widens less often.
     fn widen(sets: &[Box<[u64]>], words: usize) -> Self {
         Self {
             sets: Arc::from(vec![union_of(sets.iter(), words)]),
@@ -513,8 +527,8 @@ pub struct ExtraFlow {
     pub witness: Option<Box<[WitnessStep]>>,
 }
 
-/// The result of one extended run. `partial` is the procedure's own partial
-/// flows, as [`compute_partial_flows`] reports them. `flows` holds the facts
+/// The result of one extended run. `partial` holds the built-in seed flows
+/// when the solve completes. `flows` holds the facts
 /// that started at the extra seeds, in seed order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtendedPartialFlows {
@@ -611,6 +625,7 @@ pub trait ObservationFilter {
         point: ProgramPointId,
         phase: ObservationPhase,
         endpoint: &ValueFlowEndpoint,
+        request: &mut SemanticRequest<'_>,
     ) -> Result<bool, Self::Error>;
 }
 
@@ -624,12 +639,190 @@ impl ObservationFilter for PassThrough {
         _point: ProgramPointId,
         _phase: ObservationPhase,
         _endpoint: &ValueFlowEndpoint,
+        _request: &mut SemanticRequest<'_>,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
 
-struct Fixpoint<'a, F> {
+/// Query-scoped worklist observations for the pending-frontier regressions.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct FixpointTestMetrics {
+    pub peak_pending_taken_maps: usize,
+    pub pending_taken_maps: usize,
+    /// Point, number of entry facts, and whether the visit came from the stack.
+    pub transfers: Vec<(ProgramPointId, usize, bool)>,
+    pub stale_heap_entries: usize,
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static FIXPOINT_TEST_METRICS: std::cell::RefCell<Option<FixpointTestMetrics>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Measure a solve on this thread without sharing counters between tests.
+#[cfg(feature = "test-support")]
+pub fn with_fixpoint_test_metrics<T>(solve: impl FnOnce() -> T) -> (T, FixpointTestMetrics) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIXPOINT_TEST_METRICS.with(|metrics| *metrics.borrow_mut() = None);
+        }
+    }
+    FIXPOINT_TEST_METRICS.with(|metrics| {
+        assert!(
+            metrics.borrow().is_none(),
+            "fixpoint measurements cannot nest"
+        );
+        *metrics.borrow_mut() = Some(FixpointTestMetrics::default());
+    });
+    let _reset = Reset;
+    let result = solve();
+    let metrics = FIXPOINT_TEST_METRICS.with(|metrics| metrics.borrow_mut().take().unwrap());
+    (result, metrics)
+}
+
+#[cfg(feature = "test-support")]
+fn record_fixpoint_test_metrics(record: impl FnOnce(&mut FixpointTestMetrics)) {
+    FIXPOINT_TEST_METRICS.with(|metrics| {
+        if let Some(metrics) = metrics.borrow_mut().as_mut() {
+            record(metrics);
+        }
+    });
+}
+
+/// A differential's accepted widening changes and separately observed witnesses.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct PartialFlowReferenceComparison {
+    pub crossed_differences: usize,
+    pub witness_differences: usize,
+    pub witness_example: Option<String>,
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static REFERENCE_WIDENED: std::cell::RefCell<Option<std::collections::BTreeSet<(bool, u32, ExtraTarget)>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Compare the eager solver with the original retaining, rank-heap solver.
+/// Accept only crossed changes on facts widened in at least one run. Witness
+/// choices are counted separately. Filters must be repeatable across the runs.
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_arguments)]
+pub fn compare_partial_flows_with_reference<F: ObservationFilter>(
+    procedure: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
+    extra_seeds: &[ExtraSeed],
+    observations: &[ExtraObservation],
+    record_witnesses: bool,
+    implicit_reads: &[ImplicitHeapRead],
+    filter: &mut F,
+    request: &mut SemanticRequest<'_>,
+) -> Result<(ExtendedPartialFlows, PartialFlowReferenceComparison), F::Error> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REFERENCE_WIDENED.with(|snapshot| *snapshot.borrow_mut() = None);
+        }
+    }
+    REFERENCE_WIDENED.with(|snapshot| {
+        assert!(
+            snapshot.borrow().is_none(),
+            "reference comparisons cannot nest"
+        );
+        *snapshot.borrow_mut() = Some(Default::default());
+    });
+    let _reset = Reset;
+    let execution = request
+        .execution_budget()
+        .map(|budget| budget.fork().1)
+        .unwrap_or_else(|| SemanticExecutionBudget::new(usize::MAX));
+    let mut reference_request = request.staged_with_execution_budget(&execution);
+    let reference = compute_partial_flows_filtered_impl::<F, true>(
+        procedure,
+        snapshot,
+        extra_seeds,
+        observations,
+        record_witnesses,
+        implicit_reads,
+        filter,
+        &mut reference_request,
+    )?;
+    let reference_widened =
+        REFERENCE_WIDENED.with(|snapshot| std::mem::take(snapshot.borrow_mut().as_mut().unwrap()));
+    let eager = compute_partial_flows_filtered_impl::<F, false>(
+        procedure,
+        snapshot,
+        extra_seeds,
+        observations,
+        record_witnesses,
+        implicit_reads,
+        filter,
+        request,
+    )?;
+    let eager_widened =
+        REFERENCE_WIDENED.with(|snapshot| std::mem::take(snapshot.borrow_mut().as_mut().unwrap()));
+    let mut comparison = PartialFlowReferenceComparison::default();
+    let mut expected = reference.clone();
+    let accept = |key: (bool, u32, ExtraTarget)| {
+        assert!(
+            reference_widened.contains(&key) || eager_widened.contains(&key),
+            "unwidened crossed difference in {:?}: {key:?}",
+            procedure.semantics().locator()
+        );
+    };
+    for (old, new) in expected.flows.iter_mut().zip(&eager.flows) {
+        if old.seed == new.seed && old.target == new.target {
+            if old.crossed != new.crossed {
+                accept((false, u32::try_from(old.seed).unwrap(), old.target));
+                comparison.crossed_differences += 1;
+                old.crossed.clone_from(&new.crossed);
+            }
+            if old.witness != new.witness {
+                comparison.witness_differences += 1;
+                comparison.witness_example.get_or_insert_with(|| {
+                    format!(
+                        "{:?}: seed={} target={:?} reference={:?} eager={:?}",
+                        procedure.semantics().locator(),
+                        old.seed,
+                        old.target,
+                        old.witness,
+                        new.witness
+                    )
+                });
+                old.witness.clone_from(&new.witness);
+            }
+        }
+    }
+    for (old, new) in expected.partial.flows.iter_mut().zip(&eager.partial.flows) {
+        if old.from == new.from && old.to == new.to && old.crossed != new.crossed {
+            accept((
+                true,
+                u32::try_from(old.from.index()).unwrap(),
+                ExtraTarget::Port(old.to),
+            ));
+            comparison.crossed_differences += 1;
+            old.crossed.clone_from(&new.crossed);
+        }
+    }
+    assert_eq!(
+        expected,
+        eager,
+        "non-crossed reference difference in {:?}",
+        procedure.semantics().locator()
+    );
+    Ok((eager, comparison))
+}
+
+struct Fixpoint<'a, 'r, F> {
+    request: &'a mut SemanticRequest<'r>,
+    traversal: SemanticExecutionBudget,
     filter: &'a mut F,
     semantics: &'a ProcedureSemantics,
     /// Dense reverse-postorder rank for each program point.
@@ -653,6 +846,10 @@ struct Fixpoint<'a, F> {
     /// result or thrown port seeds at its continuation, and an extra seed with
     /// the after-effects phase seeds at its point.
     continuation_seeds: Vec<Vec<(u32, u32, bool)>>,
+    /// Seeds reapplied before observations: `(seed key, carrier, uncertain)`.
+    before_seeds: Vec<Vec<(u32, u32, bool)>>,
+    /// Merges, retreating-edge targets and before-seeded points retain history.
+    retain_entry: Vec<bool>,
     /// Observations taken before a point's events: `(observation, carrier)`.
     before_observations: Vec<Vec<(usize, u32)>>,
     /// Observations taken after a point's events and continuation seeds.
@@ -666,6 +863,8 @@ struct Fixpoint<'a, F> {
     in_states: Vec<Facts>,
     queued: Vec<bool>,
     heap: BinaryHeap<Reverse<(usize, usize)>>,
+    taken_subtree_sizes: Vec<usize>,
+    stack: Vec<usize>,
 }
 
 /// Join one fact into a map. A fact already present keeps its derivation
@@ -720,15 +919,19 @@ fn remove_carrier(facts: &mut Facts, carrier: u32) {
     }
 }
 
-impl<F: ObservationFilter> Fixpoint<'_, F> {
+impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
     fn permits(
         &mut self,
         point: ProgramPointId,
         phase: ObservationPhase,
         carrier: u32,
     ) -> Result<bool, F::Error> {
-        self.filter
-            .permits(point, phase, &self.carriers.endpoints[carrier as usize])
+        self.filter.permits(
+            point,
+            phase,
+            &self.carriers.endpoints[carrier as usize],
+            self.request,
+        )
     }
 
     /// The witness of a fact that `base` derived and that a relation at
@@ -915,6 +1118,14 @@ impl<F: ObservationFilter> Fixpoint<'_, F> {
     fn transfer(&mut self, point: ProgramPointId, mut live: Facts) -> Result<Facts, F::Error> {
         let semantics = self.semantics;
         let index = point.index();
+        for (seed, carrier, uncertain) in self.before_seeds[index].clone() {
+            if self.permits(point, ObservationPhase::BeforeEffects, carrier)? {
+                let witness = self.seed_witness(point, carrier, ObservationPhase::BeforeEffects);
+                join(&mut live, (carrier, seed), uncertain, &self.start, || {
+                    witness
+                });
+            }
+        }
         for (observation, carrier) in self.before_observations[index].clone() {
             self.observe(
                 &mut live,
@@ -1007,8 +1218,8 @@ impl<F: ObservationFilter> Fixpoint<'_, F> {
 
     /// Push the point's output along each feasible successor edge, minus the
     /// guard kills of that edge, and re-queue every successor whose entry
-    /// state grew.
-    fn propagate(&mut self, point: ProgramPointId, out: &Facts) {
+    /// state grew. Refuse before a fact visit would exceed a traversal ledger.
+    fn propagate(&mut self, point: ProgramPointId, out: &Facts) -> bool {
         let semantics = self.semantics;
         let call = invoked_call(semantics, point);
         let successors = semantics
@@ -1021,17 +1232,25 @@ impl<F: ObservationFilter> Fixpoint<'_, F> {
                 (edge.target_point, edge.kind, crossed.map(|call| call.id))
             })
             .collect::<Vec<_>>();
+        let mut changed_taken = Vec::new();
         for (target, kind, crossed_call) in successors {
             if self.infeasible[target.index()] {
                 continue;
             }
             let killed = self.edge_kills.get(&(point, target, kind));
             let mut changed = false;
+            #[cfg(feature = "test-support")]
+            let was_empty = self.in_states[target.index()].is_empty();
             // Filtering the borrowed map matches removing killed carriers
             // from an edge-local clone while preserving its BTree order.
             // Keep replaying every edge visit: widening can discard an
             // incoming class at the cap, so a later visit must join it again.
             for (&key, fact) in out {
+                if !self.request.charge_execution_traversal(1)
+                    || !self.traversal.charge_traversal(1)
+                {
+                    return false;
+                }
                 if killed.is_some_and(|carriers| carriers.contains(&key.0)) {
                     continue;
                 }
@@ -1048,12 +1267,39 @@ impl<F: ObservationFilter> Fixpoint<'_, F> {
                     || fact.witness.clone(),
                 );
             }
-            if changed && !self.queued[target.index()] {
-                self.queued[target.index()] = true;
-                self.heap
-                    .push(Reverse((self.point_ranks[target.index()], target.index())));
+            #[cfg(feature = "test-support")]
+            if was_empty
+                && !self.in_states[target.index()].is_empty()
+                && !self.retain_entry[target.index()]
+            {
+                record_fixpoint_test_metrics(|metrics| {
+                    metrics.pending_taken_maps += 1;
+                    metrics.peak_pending_taken_maps = metrics
+                        .peak_pending_taken_maps
+                        .max(metrics.pending_taken_maps);
+                });
+            }
+            if changed {
+                if self.retain_entry[target.index()] {
+                    if !self.queued[target.index()] {
+                        self.queued[target.index()] = true;
+                        self.heap
+                            .push(Reverse((self.point_ranks[target.index()], target.index())));
+                    }
+                } else {
+                    // A taken point has one predecessor, but several edges
+                    // from it can contribute facts with different edge kills.
+                    changed_taken.push(target.index());
+                }
             }
         }
+        changed_taken.sort_unstable();
+        changed_taken.dedup();
+        // Dense point IDs break size ties; neither hashes nor addresses choose order.
+        changed_taken
+            .sort_unstable_by_key(|&index| Reverse((self.taken_subtree_sizes[index], index)));
+        self.stack.extend(changed_taken);
+        true
     }
 }
 
@@ -1084,14 +1330,15 @@ fn invoked_call(
 pub fn compute_partial_flows(
     procedure: &ProcedureHandle,
     snapshot: &ValueFlowSnapshot,
+    request: &mut SemanticRequest<'_>,
 ) -> ProcedurePartialFlows {
-    compute_partial_flows_with(procedure, snapshot, &[], &[], false).partial
+    compute_partial_flows_with(procedure, snapshot, &[], &[], false, request).partial
 }
 
 /// The partial flows of one procedure, extended by extra seeds and extra
 /// observations. The procedure's own input and call-result seeds
-/// are always present, so `partial` is what [`compute_partial_flows`] reports.
-/// `flows` holds the facts of the extra seeds, with the derivation of each
+/// are always present. `partial` contains their boundary flows when the solve
+/// completes. `flows` holds the facts of the extra seeds, with the derivation of each
 /// when `record_witnesses` is set.
 pub fn compute_partial_flows_with(
     procedure: &ProcedureHandle,
@@ -1099,6 +1346,7 @@ pub fn compute_partial_flows_with(
     extra_seeds: &[ExtraSeed],
     observations: &[ExtraObservation],
     record_witnesses: bool,
+    request: &mut SemanticRequest<'_>,
 ) -> ExtendedPartialFlows {
     match compute_partial_flows_filtered(
         procedure,
@@ -1108,6 +1356,7 @@ pub fn compute_partial_flows_with(
         record_witnesses,
         &[],
         &mut PassThrough,
+        request,
     ) {
         Ok(flows) => flows,
         Err(never) => match never {},
@@ -1122,6 +1371,7 @@ pub fn compute_partial_flows_with_implicit_reads(
     observations: &[ExtraObservation],
     record_witnesses: bool,
     implicit_reads: &[ImplicitHeapRead],
+    request: &mut SemanticRequest<'_>,
 ) -> ExtendedPartialFlows {
     match compute_partial_flows_filtered(
         procedure,
@@ -1131,6 +1381,7 @@ pub fn compute_partial_flows_with_implicit_reads(
         record_witnesses,
         implicit_reads,
         &mut PassThrough,
+        request,
     ) {
         Ok(flows) => flows,
         Err(never) => match never {},
@@ -1138,7 +1389,10 @@ pub fn compute_partial_flows_with_implicit_reads(
 }
 
 /// Run the same worklist with a query-local observation filter. No filtered
-/// result is published as a policy-independent stored summary.
+/// result is published as a policy-independent stored summary. Each invocation
+/// has a fresh per-procedure traversal allowance and records fact visits in the
+/// caller's request. A refusal returns an ExceededBudget head and no flows.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_partial_flows_filtered<F: ObservationFilter>(
     procedure: &ProcedureHandle,
     snapshot: &ValueFlowSnapshot,
@@ -1147,6 +1401,30 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
     record_witnesses: bool,
     implicit_reads: &[ImplicitHeapRead],
     filter: &mut F,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ExtendedPartialFlows, F::Error> {
+    compute_partial_flows_filtered_impl::<F, false>(
+        procedure,
+        snapshot,
+        extra_seeds,
+        observations,
+        record_witnesses,
+        implicit_reads,
+        filter,
+        request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: bool>(
+    procedure: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
+    extra_seeds: &[ExtraSeed],
+    observations: &[ExtraObservation],
+    record_witnesses: bool,
+    implicit_reads: &[ImplicitHeapRead],
+    filter: &mut F,
+    request: &mut SemanticRequest<'_>,
 ) -> Result<ExtendedPartialFlows, F::Error> {
     assert!(
         snapshot.procedure() == procedure,
@@ -1170,7 +1448,6 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
         point_ranks.iter().all(|rank| *rank != usize::MAX),
         "DFS reverse postorder includes every procedure point, including isolated points"
     );
-    drop(reverse_postorder);
     let mut carriers = Carriers::default();
     let mut ports = PortTable::default();
 
@@ -1436,7 +1713,56 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
         flags
     };
 
+    let mut predecessors = vec![HashSet::new(); point_count];
+    for index in 0..point_count {
+        let point = ProgramPointId::try_from_index(index).expect("a point index fits u32");
+        for (_, edge) in semantics.successor_edges(point) {
+            predecessors[edge.target_point.index()].insert(point);
+        }
+    }
+    let mut retain_entry: Vec<bool> = predecessors
+        .iter()
+        .enumerate()
+        .map(|(index, points)| {
+            RETAIN_ALL
+                || points.len() != 1
+                || points
+                    .iter()
+                    .any(|point| point_ranks[point.index()] >= point_ranks[index])
+        })
+        .collect();
+    for (point, ..) in &before_seeds {
+        retain_entry[point.index()] = true;
+    }
+    // Taken successors have strictly greater ranks and one distinct
+    // predecessor, so this descending-rank pass counts their disjoint trees.
+    // Retained points terminate the trees. Infeasible edges may over-count.
+    let mut taken_subtree_sizes = vec![1usize; point_count];
+    for point in reverse_postorder.iter().rev() {
+        let mut successors: Vec<_> = semantics
+            .successor_edges(*point)
+            .map(|(_, edge)| edge.target_point.index())
+            .filter(|&index| !retain_entry[index])
+            .collect();
+        successors.sort_unstable();
+        successors.dedup();
+        for successor in successors {
+            taken_subtree_sizes[point.index()] += taken_subtree_sizes[successor];
+        }
+    }
+    drop(reverse_postorder);
+    // Every cycle has a non-increasing rank edge, hence a retained join.
+    // Taken chains strictly increase rank and rerun once per predecessor visit.
+    // Taking uses the predecessor's latest out, which equals its historical
+    // join only while transfer is monotone. Static kills and pointwise copies
+    // preserve that property; Crossed::widen at the class cap can discard path
+    // classes. Earlier observations and retained successors already joined the
+    // earlier wave, so taking cannot erase those observations. Removing stale
+    // dominated classes can make a later widened union smaller than the old
+    // historical union; this is the intentional rows-versioned improvement.
     let mut fixpoint = Fixpoint {
+        request,
+        traversal: SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS),
         filter,
         semantics,
         point_ranks,
@@ -1450,6 +1776,8 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
         capture_outs,
         calls,
         continuation_seeds,
+        before_seeds: vec![Vec::new(); point_count],
+        retain_entry,
         before_observations,
         after_observations,
         edge_kills,
@@ -1459,21 +1787,14 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
         in_states: vec![Facts::new(); point_count],
         queued: vec![false; point_count],
         heap: BinaryHeap::new(),
+        taken_subtree_sizes,
+        stack: Vec::new(),
     };
     for (point, seed, carrier, uncertain) in before_seeds {
-        if fixpoint.infeasible[point.index()]
-            || !fixpoint.permits(point, ObservationPhase::BeforeEffects, carrier)?
-        {
+        if fixpoint.infeasible[point.index()] {
             continue;
         }
-        let witness = fixpoint.seed_witness(point, carrier, ObservationPhase::BeforeEffects);
-        join(
-            &mut fixpoint.in_states[point.index()],
-            (carrier, seed),
-            uncertain,
-            &fixpoint.start,
-            || witness,
-        );
+        fixpoint.before_seeds[point.index()].push((seed, carrier, uncertain));
         if !fixpoint.queued[point.index()] {
             fixpoint.queued[point.index()] = true;
             fixpoint.heap.push(Reverse((
@@ -1496,17 +1817,83 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
                 .push(Reverse((fixpoint.point_ranks[index], index)));
         }
     }
-    // RPO processes DAG predecessors before successors, avoiding repeated
-    // seed waves; back edges in loops can still re-queue earlier ranks until
-    // the existing fact widening reaches its fixpoint.
+    // Retained joins keep their RPO waves; taken trees drain eagerly with
+    // the smallest child first. A pending frontier holds at most
+    // (fan-out - 1) * floor(log2(taken subtree size)) + 1 taken maps.
+    // the stack is empty whenever the heap pops; `queued` marks a pending heap entry, and stack processing clears it so the entry is skipped.
     while let Some(Reverse((_, index))) = fixpoint.heap.pop() {
-        fixpoint.queued[index] = false;
-        let point = ProgramPointId::try_from_index(index).expect("a point index fits u32");
-        let live = fixpoint.in_states[index].clone();
-        let out = fixpoint.transfer(point, live)?;
-        fixpoint.propagate(point, &out);
+        debug_assert!(fixpoint.stack.is_empty());
+        if !fixpoint.queued[index] {
+            #[cfg(feature = "test-support")]
+            record_fixpoint_test_metrics(|metrics| metrics.stale_heap_entries += 1);
+            continue;
+        }
+        let mut current = (index, false);
+        loop {
+            let (index, _from_stack) = current;
+            fixpoint.queued[index] = false;
+            let point = ProgramPointId::try_from_index(index).expect("a point index fits u32");
+            #[cfg(feature = "test-support")]
+            record_fixpoint_test_metrics(|metrics| {
+                metrics
+                    .transfers
+                    .push((point, fixpoint.in_states[index].len(), _from_stack));
+                if !fixpoint.retain_entry[index] && !fixpoint.in_states[index].is_empty() {
+                    metrics.pending_taken_maps -= 1;
+                }
+            });
+            let live = if fixpoint.retain_entry[index] {
+                fixpoint.in_states[index].clone()
+            } else {
+                std::mem::take(&mut fixpoint.in_states[index])
+            };
+            let out = fixpoint.transfer(point, live)?;
+            if !fixpoint.propagate(point, &out) {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "partial_flows.fixpoint outcome=ExceededBudget facts_visited={} flows=0 procedure={:?}",
+                        fixpoint.traversal.work().traversal_steps,
+                        procedure.semantics().locator(),
+                    )
+                });
+                return Ok(ExtendedPartialFlows {
+                    partial: ProcedurePartialFlows::without_flows(
+                        PartialFlowOutcome::ExceededBudget,
+                    ),
+                    flows: Vec::new(),
+                });
+            }
+            // Finish every edge of propagate before a successor consumes its
+            // input, including parallel Normal and Exceptional edges.
+            if let Some(index) = fixpoint.stack.pop() {
+                current = (index, true);
+            } else {
+                break;
+            }
+        }
     }
 
+    #[cfg(feature = "test-support")]
+    REFERENCE_WIDENED.with(|snapshot| {
+        if let Some(snapshot) = snapshot.borrow_mut().as_mut() {
+            *snapshot = fixpoint
+                .flows
+                .iter()
+                .filter(|(_, fact)| fact.crossed.widened)
+                .map(|(&(seed, target), _)| {
+                    if (seed as usize) < builtin_count {
+                        (
+                            true,
+                            u32::try_from(fixpoint.builtin_seeds[seed as usize].index()).unwrap(),
+                            target,
+                        )
+                    } else {
+                        (false, seed - u32::try_from(builtin_count).unwrap(), target)
+                    }
+                })
+                .collect();
+        }
+    });
     let builtin_count = u32::try_from(builtin_count).expect("a seed count fits u32");
     let mut flows = Vec::new();
     let mut extra_flows = Vec::new();
@@ -1563,6 +1950,15 @@ pub fn compute_partial_flows_filtered<F: ObservationFilter>(
             .all(|relation| relation.is_proven_complete()),
         discharged_gaps,
     };
+    brokk_bifrost_core::profiling::note_with(|| {
+        format!(
+            "partial_flows.fixpoint outcome={:?} facts_visited={} flows={} procedure={:?}",
+            partial.outcome,
+            fixpoint.traversal.work().traversal_steps,
+            partial.flows.len(),
+            procedure.semantics().locator(),
+        )
+    });
     Ok(ExtendedPartialFlows {
         partial,
         flows: extra_flows,
@@ -1763,8 +2159,8 @@ pub fn caller_exact_read_location(
 
 /// The partial flows of every procedure of one validated artifact, projected
 /// from the file alone. Index `i` is procedure `i`. A projection
-/// that fails or runs out of budget records that procedure's head and the
-/// others are still computed. `None` means the request was cancelled.
+/// that fails, or either stage exhausting its budget, records that procedure's
+/// head; the others are still computed. `None` means the request was cancelled.
 #[doc(hidden)]
 pub fn parse_time_partial_flows(
     artifact: &Arc<SemanticArtifact>,
@@ -1788,8 +2184,13 @@ pub fn parse_time_partial_flows(
             OracleLimits::default(),
             &mut SemanticRequest::new(&mut budget, cancellation),
         );
+        let execution = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
+        let mut request =
+            SemanticRequest::with_execution_budget(&mut budget, cancellation, &execution);
         flows.push(match projected {
-            Ok(SemanticOutcome::Complete { value, .. }) => compute_partial_flows(&handle, &value),
+            Ok(SemanticOutcome::Complete { value, .. }) => {
+                compute_partial_flows(&handle, &value, &mut request)
+            }
             Ok(SemanticOutcome::Cancelled { .. }) => return None,
             Ok(SemanticOutcome::ExceededBudget { .. }) => {
                 ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget)
@@ -1799,10 +2200,12 @@ pub fn parse_time_partial_flows(
             // procedure is open, and its flows are the ones the snapshot proves.
             Ok(outcome) => match outcome.available_value() {
                 Some(snapshot) => {
-                    let mut result = compute_partial_flows(&handle, snapshot);
-                    result.outcome = PartialFlowOutcome::Complete;
-                    result.open = true;
-                    result.detail = Some(outcome.label().to_owned());
+                    let mut result = compute_partial_flows(&handle, snapshot, &mut request);
+                    if result.outcome != PartialFlowOutcome::ExceededBudget {
+                        result.outcome = PartialFlowOutcome::Complete;
+                        result.open = true;
+                        result.detail = Some(outcome.label().to_owned());
+                    }
                     result
                 }
                 None => ProcedurePartialFlows::failed(outcome.label().to_owned()),
@@ -1810,5 +2213,15 @@ pub fn parse_time_partial_flows(
             Err(error) => ProcedurePartialFlows::failed(error.to_string()),
         });
     }
+    brokk_bifrost_core::profiling::note_with(|| {
+        let exceeded = artifact
+            .procedures()
+            .iter()
+            .zip(&flows)
+            .filter(|(_, partial)| partial.outcome == PartialFlowOutcome::ExceededBudget)
+            .map(|(procedure, _)| procedure.locator())
+            .collect::<Vec<_>>();
+        format!("partial_flows.heads exceeded_budget={exceeded:?}")
+    });
     Some(flows)
 }

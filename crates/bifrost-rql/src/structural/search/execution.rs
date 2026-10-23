@@ -1,5 +1,46 @@
 use super::*;
 
+/// Only a proof that every seed is scoped to absent languages can remove a
+/// branch's pipeline share. Unknown domains and unscoped seeds keep a share.
+/// Walk the plan iteratively, including nested set operands, without changing
+/// which branches execute or which diagnostics they produce.
+fn branch_has_applicable_language(
+    plan: &PhysicalQueryPlan,
+    root: PhysicalQueryNodeId,
+    scanned_languages: &HashSet<Language>,
+) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        let languages = match plan.logical_node(node).operator() {
+            LogicalQueryOperator::Seed(seed) => &seed.languages,
+            LogicalQueryOperator::OccurrenceSeed(seed) => &seed.languages,
+            LogicalQueryOperator::ScopeSeed(seed) => &seed.languages,
+            LogicalQueryOperator::BindingSeed(seed) => &seed.languages,
+            LogicalQueryOperator::GenerationSiteSeed(seed) => &seed.languages,
+            LogicalQueryOperator::ExportSeed(seed) => &seed.languages,
+            LogicalQueryOperator::PathSeed(seed) => &seed.languages,
+            LogicalQueryOperator::Step { .. }
+            | LogicalQueryOperator::Limit { .. }
+            | LogicalQueryOperator::Set { .. } => {
+                pending.extend(plan.node(node).dependencies());
+                continue;
+            }
+            LogicalQueryOperator::ConfigurationFactsSeed(_)
+            | LogicalQueryOperator::DependencyEvidenceSeed(_)
+            | LogicalQueryOperator::Correlate { .. }
+            | LogicalQueryOperator::RequireBoth { .. } => return true,
+        };
+        if languages.is_empty()
+            || languages
+                .iter()
+                .any(|language| scanned_languages.contains(language))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 struct UnaryPlanContinuation {
     node_id: PhysicalQueryNodeId,
     terminal_cap: Option<usize>,
@@ -600,6 +641,13 @@ fn execute_plan_node(
                     }
                 );
                 let dependencies = physical_node.dependencies();
+                let applicable: Vec<_> = dependencies
+                    .iter()
+                    .map(|dependency| {
+                        branch_has_applicable_language(plan, *dependency, &state.scanned_languages)
+                    })
+                    .collect();
+                let mut remaining_applicable = applicable.iter().filter(|value| **value).count();
                 let mut branch_rows = Vec::with_capacity(dependencies.len());
                 // Each branch's diagnostics stay in their own vector until the
                 // retry pass below decides which attempt survives; they are
@@ -609,12 +657,30 @@ fn execute_plan_node(
                 let mut branch_attempts: Vec<BranchAttempt> =
                     Vec::with_capacity(dependencies.len());
                 let mut cancelled_child = None;
+                let mut complete_prefix = true;
+                let mut empty_operand = false;
                 for (index, dependency) in dependencies.iter().copied().enumerate() {
-                    let branch_limits = fair_branch_limits(
+                    let mut branch_limits = fair_branch_limits(
                         &state.budget,
                         limits,
                         dependencies.len().saturating_sub(index),
                     );
+                    if *op == SetOperator::Union && applicable[index] {
+                        assert!(remaining_applicable > 0);
+                        let applicable_limits =
+                            fair_branch_limits(&state.budget, limits, remaining_applicable);
+                        // A smaller divisor cannot shrink an applicable arm's
+                        // grant. Caps are absolute cumulative counters, so
+                        // rolling unused shares forward cannot spend twice.
+                        debug_assert!(
+                            applicable_limits.max_pipeline_rows >= branch_limits.max_pipeline_rows
+                        );
+                        debug_assert!(
+                            applicable_limits.max_pipeline_rows <= limits.max_pipeline_rows
+                        );
+                        branch_limits.max_pipeline_rows = applicable_limits.max_pipeline_rows;
+                        remaining_applicable -= 1;
+                    }
                     let mut child_diagnostics = Vec::new();
                     if let Some(branch) = profile_branch.as_mut() {
                         branch.push(index);
@@ -629,6 +695,14 @@ fn execute_plan_node(
                         None,
                         &mut child_diagnostics,
                         profile_branch,
+                    );
+                    debug_assert!(
+                        state
+                            .budget
+                            .pipeline_rows
+                            .max(state.budget.provenance_steps)
+                            <= limits.max_pipeline_rows,
+                        "union branch charges must stay inside the cumulative budget"
                     );
                     if let Some(started) = dependency_started {
                         dependency_execution_ns =
@@ -655,6 +729,18 @@ fn execute_plan_node(
                         && child_diagnostics.iter().any(|diagnostic| {
                             diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
                         });
+                    // An empty operand proves the whole result empty only if
+                    // every evaluated operand has complete coverage. Otherwise
+                    // preserve the ordinary merge and starved-branch retry.
+                    complete_prefix &= !child.truncated
+                        && !child_diagnostics.iter().any(|diagnostic| {
+                            diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+                        });
+                    let ends_operator = complete_prefix
+                        && !child.cancelled
+                        && child.rows.is_empty()
+                        && (*op == SetOperator::Intersect
+                            || (*op == SetOperator::Except && index == 0));
                     branch_diagnostics.push(child_diagnostics);
                     if child.cancelled {
                         push_operator_termination(
@@ -670,8 +756,18 @@ fn execute_plan_node(
                         starved,
                     });
                     branch_rows.push(child.rows);
+                    if ends_operator {
+                        empty_operand = true;
+                        if index + 1 < dependencies.len() {
+                            push_operator_termination(
+                                &mut terminations,
+                                QueryOperatorTermination::EmptyOperand,
+                            );
+                        }
+                        break;
+                    }
                 }
-                if cancelled_child.is_none() {
+                if cancelled_child.is_none() && !empty_operand {
                     // Branch 0 ran under a share of the leftovers computed
                     // before any branch had run, so a dominant first branch
                     // starves against branches that then leave their share
@@ -1216,6 +1312,7 @@ pub(super) fn execute_parallel_seed_union(
     let analyzer = state.analyzer;
     let cancellation = state.cancellation;
     let scope = state.scope.clone();
+    let scanned_languages = &state.scanned_languages;
     let source_row_boundary = state.source_row_boundary;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
@@ -1239,6 +1336,7 @@ pub(super) fn execute_parallel_seed_union(
                     workspace: None,
                     cancellation,
                     scope: scope.clone(),
+                    scanned_languages: scanned_languages.clone(),
                     source_row_boundary,
                     step_outputs: vec![0; plan.node_count()],
                     receiver_budget_override,
@@ -1262,6 +1360,7 @@ pub(super) fn execute_parallel_seed_union(
                     cpp_expression_cache: HashMap::default(),
                     cpp_class_fact_cache: HashMap::default(),
                     cpp_class_declaration_cache: HashMap::default(),
+                    rust_marker_impls_cache: rust_marker_impls::RustMarkerImplsCache::default(),
                     callable_metrics_cache: HashMap::default(),
                     failure_handler_state_cache: FailureHandlerStateCache::default(),
                     topology_cache: topology_rows::TopologyTraversalCache::default(),

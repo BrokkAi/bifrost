@@ -232,6 +232,9 @@ impl SemanticModelLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticModelActivationProvenance {
+    /// The pack was selected without exact toolchain evidence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approximate: bool,
     pub status: String,
     pub reason: String,
     pub source_kind: String,
@@ -2375,6 +2378,18 @@ fn render_callable_shape_from_parts(
 #[doc(hidden)]
 pub fn render_type_ref(reference: &TypeRef) -> String {
     match reference {
+        TypeRef::Projection {
+            owner,
+            trait_type,
+            name,
+            arguments,
+        } => {
+            let owner = render_type_ref(owner);
+            let prefix = trait_type.as_ref().map_or(owner.clone(), |trait_| {
+                format!("<{owner} as {}>", render_type_ref(trait_))
+            });
+            format!("{prefix}::{}", render_named_type(name, arguments, false))
+        }
         TypeRef::Unknown => "<unknown>".to_owned(),
         TypeRef::Named {
             name,

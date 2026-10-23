@@ -191,18 +191,108 @@ fn go_selected_inverse_for_inner(
             "the workspace has no selected Go snapshot".into(),
         ));
     };
-    let Some(profile) = go.native_context_profile() else {
+    let Some(base) = go.native_context_base_profile() else {
         return Ok(GoSelectedReverseOutcome::Unavailable(
-            "the Go package/import profile is unavailable".into(),
+            "the Go base profile is unavailable".into(),
         ));
     };
-    let Some(context) = go
+    let path = brokk_bifrost_core::path_utils::rel_path_string(target.source());
+    // Normalize the declaration in its own context first. Today workspace
+    // source belongs to one domain; M4c adds source-bearing module providers.
+    let Some(own_profile) = go.context_profile_for_file(&path) else {
+        return Ok(GoSelectedReverseOutcome::Unavailable(format!(
+            "the target has no Go context: {path}"
+        )));
+    };
+    let mut contexts = go
         .inner
         .analyzer_store()
-        .selected_go_context(snapshot, &profile)?
-    else {
+        .go_contexts_for_file(snapshot, &base, &path)?;
+    if contexts.is_empty() {
+        return Ok(GoSelectedReverseOutcome::Unavailable(format!(
+            "Go target placement changed during context selection: {path}"
+        )));
+    }
+    contexts.sort_by_key(|(_, profile)| *profile != own_profile);
+    let mut answer = EdgeDerivationResult {
+        edges: Vec::new(),
+        completeness: EdgeCompleteness::Complete,
+        provenance: EdgeProvenance::Inverse,
+        generation: go.inner.project().analysis_generation(),
+    };
+    for (context, profile) in &contexts {
+        let check = rename_check
+            .as_mut()
+            .map(|(name, conflict)| (*name, &mut **conflict));
+        match go_selected_inverse_in_context(
+            go,
+            target,
+            context.clone(),
+            *profile,
+            include_tests,
+            explicit_candidates,
+            cancellation,
+            record_initial_rename_phases,
+            check,
+        )? {
+            GoSelectedReverseOutcome::Ready(part) => {
+                answer.edges.extend(part.edges);
+                if let EdgeCompleteness::Incomplete { reasons } = part.completeness {
+                    match &mut answer.completeness {
+                        EdgeCompleteness::Complete => {
+                            answer.completeness = EdgeCompleteness::Incomplete { reasons }
+                        }
+                        EdgeCompleteness::Incomplete { reasons: existing } => {
+                            existing.extend(reasons)
+                        }
+                    }
+                }
+            }
+            other => return Ok(other),
+        }
+    }
+    // Earlier contexts may have been superseded while later ones ran.
+    for (context, _) in &contexts {
+        use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextHeadStatus;
+        match go
+            .inner
+            .analyzer_store()
+            .go_context_head_status(context, cancellation)?
+        {
+            GoContextHeadStatus::Current => {}
+            GoContextHeadStatus::Withdrawn => {
+                return Ok(GoSelectedReverseOutcome::Stale(
+                    "Go publication changed during reverse query".into(),
+                ));
+            }
+            GoContextHeadStatus::Cancelled => return Ok(GoSelectedReverseOutcome::Cancelled),
+        }
+    }
+    Ok(GoSelectedReverseOutcome::Ready(answer))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn go_selected_inverse_in_context(
+    go: &GoAnalyzer,
+    target: &CodeUnit,
+    context: brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextIdentity,
+    profile: [u8; 32],
+    include_tests: bool,
+    explicit_candidates: Option<&HashSet<ProjectFile>>,
+    cancellation: &CancellationToken,
+    record_initial_rename_phases: bool,
+    mut rename_check: Option<(
+        &str,
+        &mut Option<brokk_bifrost_analysis::analyzer::rename::RenameFailure>,
+    )>,
+) -> Result<GoSelectedReverseOutcome<EdgeDerivationResult>> {
+    if cancellation.is_cancelled() {
+        return Ok(GoSelectedReverseOutcome::Cancelled);
+    }
+    let snapshots = go.inner.selected_workspace_snapshots();
+    let Some(_snapshot) = snapshots.get("go") else {
         return Ok(GoSelectedReverseOutcome::Unavailable(
-            "the selected Go package/import publication is unavailable".into(),
+            "the workspace has no selected Go snapshot".into(),
         ));
     };
     let (masks, content_mounts) = match go
@@ -248,6 +338,7 @@ fn go_selected_inverse_for_inner(
             return Ok(GoSelectedReverseOutcome::Cancelled);
         }
     };
+    operation.bind_go_context_publication(context.clone());
     // Explicit candidates must be admitted even when the inverse index has no
     // sites for them. Enumerated candidates retain the inverse inventory contract.
     for file in explicit_candidates.into_iter().flatten() {
@@ -270,6 +361,15 @@ fn go_selected_inverse_for_inner(
             .go_package_stage_unit_for_path(context.context_id, &path, cancellation)?
             .is_none()
         {
+            let base = go
+                .native_context_base_profile()
+                .expect("reverse query captured an active base profile");
+            if let Some(owner) = operation.go_context_for_file(&base, &path)?
+                && owner.context_id != context.context_id
+            {
+                // An explicit whole-workspace scope includes unrelated domains.
+                continue;
+            }
             if cancellation.is_cancelled() {
                 return Ok(GoSelectedReverseOutcome::Cancelled);
             }
@@ -306,12 +406,16 @@ fn go_selected_inverse_for_inner(
     {
         **conflict =
             Some(brokk_bifrost_analysis::analyzer::rename::RenameFailure { kind, message });
-        return Ok(GoSelectedReverseOutcome::Ready(EdgeDerivationResult {
-            edges: Vec::new(),
-            completeness: EdgeCompleteness::Complete,
-            provenance: EdgeProvenance::Inverse,
-            generation,
-        }));
+        return finish_go_reverse(
+            &mut operation,
+            EdgeDerivationResult {
+                edges: Vec::new(),
+                completeness: EdgeCompleteness::Complete,
+                provenance: EdgeProvenance::Inverse,
+                generation,
+            },
+            cancellation,
+        );
     }
     let mut context_metrics = SelectedResolutionContextMetrics;
     let confirmation_phase =
@@ -390,13 +494,49 @@ fn go_selected_inverse_for_inner(
             "Go selected reverse query crossed an analyzer generation".into(),
         ));
     }
+    // Projection reads structural facts through the analyzer. Release the
+    // selected connection first, then recheck publication authority below.
+    let bound_contexts = operation.bound_go_context_publications();
+    drop(operation);
     let answer = project_confirmed_references(go, target, generation, confirmed, cancellation)?;
+    for bound_context in &bound_contexts {
+        match go.inner.analyzer_store().go_context_head_status(bound_context, cancellation)? {
+        brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextHeadStatus::Current => {},
+        brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextHeadStatus::Withdrawn => {
+            return Ok(GoSelectedReverseOutcome::Stale("Go publication changed during reference projection".into()));
+        }
+        brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextHeadStatus::Cancelled => {
+            return Ok(GoSelectedReverseOutcome::Cancelled);
+        }
+    }
+    }
     if go.inner.project().analysis_generation() != generation {
         return Ok(GoSelectedReverseOutcome::Stale(
             "Go selected reverse projection crossed an analyzer generation".into(),
         ));
     }
     Ok(GoSelectedReverseOutcome::Ready(answer))
+}
+
+fn finish_go_reverse(
+    operation: &mut SelectedResolutionOperation<'_, '_>,
+    answer: EdgeDerivationResult,
+    cancellation: &CancellationToken,
+) -> Result<GoSelectedReverseOutcome<EdgeDerivationResult>> {
+    Ok(
+        match operation.finish_native(answer, &ResolutionCompletion::Complete, cancellation)? {
+            SelectedResolutionOperationOutcome::Native(answer) => {
+                GoSelectedReverseOutcome::Ready(answer)
+            }
+            SelectedResolutionOperationOutcome::Stale(reason) => {
+                GoSelectedReverseOutcome::Stale(format!("{reason:?}"))
+            }
+            SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                GoSelectedReverseOutcome::Unavailable(format!("{reason:?}"))
+            }
+            SelectedResolutionOperationOutcome::Cancelled(_) => GoSelectedReverseOutcome::Cancelled,
+        },
+    )
 }
 
 fn confirm_go_reverse_member_access(
@@ -822,7 +962,16 @@ fn project_confirmed_references(
                     .binding_targets
                     .iter()
                     .any(|alias| selected_aliases.contains(alias)));
-        if !directly_bound && !interface_dispatch && !transparent_type_alias {
+        // An unresolved literal owner cannot disprove a same-named field use.
+        // Keep that structured candidate as unproven instead of losing its site.
+        let incomplete_literal_key = metadata.site_kind()
+            == ResolutionSiteKind::CompositeLiteralKeyReference
+            && answer.binding().completion() != &ResolutionCompletion::Complete;
+        if !directly_bound
+            && !interface_dispatch
+            && !transparent_type_alias
+            && !incomplete_literal_key
+        {
             continue;
         }
         let file = ProjectFile::new(go.inner.project().root(), reference.locator.relative_path());
@@ -1183,28 +1332,29 @@ impl brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInve
         if token.is_cancelled() {
             return SelectedInverseIndexOutcome::Cancelled;
         }
-        match selected_go_context_id(go) {
-            Ok(Some(_)) => {
-                SelectedInverseIndexOutcome::Ready(Arc::new(GoNativeSelectedReferenceIndex {
-                    generation: go.inner.project().analysis_generation(),
-                    go: Box::new(go.clone()),
-                    cancellation: token,
-                }))
-            }
-            Ok(None) => SelectedInverseIndexOutcome::Unavailable(
-                "the selected Go package/import publication is unavailable".into(),
-            ),
-            Err(error) => SelectedInverseIndexOutcome::StoreError(error.to_string()),
+        if go.native_context_base_profile().is_some()
+            && go.inner.selected_workspace_snapshots().contains_key("go")
+        {
+            SelectedInverseIndexOutcome::Ready(Arc::new(GoNativeSelectedReferenceIndex {
+                generation: go.inner.project().analysis_generation(),
+                go: Box::new(go.clone()),
+                cancellation: token,
+            }))
+        } else {
+            SelectedInverseIndexOutcome::Unavailable(
+                "the selected Go package/import base profile is unavailable".into(),
+            )
         }
     }
 }
 
+#[cfg(test)]
 fn selected_go_context_id(go: &GoAnalyzer) -> Result<Option<i64>> {
     let snapshots = go.inner.selected_workspace_snapshots();
     let Some(snapshot) = snapshots.get("go") else {
         return Ok(None);
     };
-    let Some(profile) = go.native_context_profile() else {
+    let Some(profile) = go.context_profile_for_test() else {
         return Ok(None);
     };
     Ok(go
@@ -1320,6 +1470,84 @@ func externalTest() {
         (fixture, analyzer)
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6582: keyed composite-literal field keys were dropped from find-usages"
+    )]
+    fn selected_go_native_keyed_literal_fields_use_resolved_owners() {
+        use brokk_bifrost_analysis::analyzer::usages::traits::UsageAnalyzer;
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        let source = r#"package sample
+ type T struct { Key int }
+ type G[K comparable, V any] struct { Key K; Value V }
+ func use(Key string) {
+     _ = T{Key: 1}
+     _ = G[int, string]{Key: 1}
+     _ = map[string]int{Key: 1}
+ }
+"#;
+        let (fixture, analyzer) = transitive_fixture(&[("main.go", source)]);
+        let admitted = analyzer.get_analyzed_files().into_iter().collect();
+        for (name, line) in [("T.Key", 5), ("G.Key", 6)] {
+            let target = analyzer
+                .get_all_declarations()
+                .into_iter()
+                .find(|unit| unit.fq_name() == format!("example.test/transitive.{name}"))
+                .expect("literal field declaration");
+            let result = GoNativeUsageStrategy::new().find_usages(
+                &analyzer,
+                std::slice::from_ref(&target),
+                &admitted,
+                100,
+            );
+            let FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                ..
+            } = result
+            else {
+                panic!("literal fields must have complete usage evidence: {result:?}");
+            };
+            assert!(unproven_by_overload.values().all(BTreeSet::is_empty));
+            let hits = hits_by_overload.values().flatten().collect::<Vec<_>>();
+            assert_eq!(hits.len(), 1, "{name}: {hits:?}");
+            let hit = hits[0];
+            assert_eq!(hit.file, fixture.file("main.go"));
+            assert_eq!(hit.line, line);
+            assert_eq!(&source[hit.start_offset..hit.end_offset], "Key");
+            assert_eq!(hit.proof, UsageProof::Proven);
+        }
+
+        // A missing owner must keep a candidate visible as uncertain evidence.
+        let (fixture, analyzer) = transitive_fixture(&[(
+            "main.go",
+            "package sample\ntype T struct { Key int }\nfunc use() { _ = Missing{Key: 1} }\n",
+        )]);
+        let target = target_at(&analyzer, &fixture, "main.go", "Key");
+        let admitted = analyzer.get_analyzed_files().into_iter().collect();
+        let result = GoNativeUsageStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &admitted,
+            100,
+        );
+        let FuzzyResult::Incomplete {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } = result
+        else {
+            panic!("an unresolved literal owner must be incomplete: {result:?}");
+        };
+        assert!(hits_by_overload.values().all(BTreeSet::is_empty));
+        let hits = unproven_by_overload.values().flatten().collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].file, fixture.file("main.go"));
+        assert_eq!(hits[0].line, 3);
+        assert_eq!(hits[0].proof, UsageProof::Unproven);
+    }
+
     fn persist_selected_go_sources(analyzer: &GoAnalyzer) {
         for file in analyzer.get_analyzed_files() {
             assert!(
@@ -1344,7 +1572,7 @@ func externalTest() {
             .selected_snapshot_for_test()
             .expect("selected Go snapshot");
         let profile = analyzer
-            .native_context_profile()
+            .context_profile_for_test()
             .expect("selected Go native context profile");
         let report = analyzer
             .inner
@@ -1943,7 +2171,7 @@ func Use(value api.Client, httpClient *Client) {}
             .read_conn()
             .unwrap()
             .query_row(
-                "SELECT COUNT(*) FROM go_package_files members
+                "SELECT COUNT(*) FROM go_context_source_files members
              JOIN go_package_instances package USING(package_id)
              JOIN workspace_file_versions file USING(file_version_id)
              WHERE package.context_id=?1 AND file.rel_path='pkg/use.go'",
@@ -2020,7 +2248,7 @@ func Use(value api.Client, httpClient *Client) {}
             .read_conn()
             .unwrap()
             .query_row(
-                "SELECT COUNT(*) FROM go_package_files members
+                "SELECT COUNT(*) FROM go_context_source_files members
              JOIN go_package_instances package USING(package_id)
              JOIN workspace_file_versions file USING(file_version_id)
              WHERE package.context_id=?1 AND file.rel_path='pkg/use.go'",
@@ -2337,7 +2565,7 @@ var value b.T
         let (fixture, analyzer) = fixture();
         let snapshots = analyzer.inner.selected_workspace_snapshots();
         let snapshot = snapshots.get("go").expect("selected Go snapshot");
-        let profile = analyzer.native_context_profile().expect("Go profile");
+        let profile = analyzer.context_profile_for_test().expect("Go profile");
         let context = analyzer
             .inner
             .analyzer_store()
@@ -2622,7 +2850,7 @@ func use() {
         let (fixture, analyzer) = fixture();
         let snapshots = analyzer.inner.selected_workspace_snapshots();
         let snapshot = snapshots.get("go").expect("selected Go snapshot");
-        let profile = analyzer.native_context_profile().expect("Go profile");
+        let profile = analyzer.context_profile_for_test().expect("Go profile");
         let context = analyzer
             .inner
             .analyzer_store()
@@ -2673,7 +2901,8 @@ func use() {
             "candidate discovery must avoid workspace-wide version scans: {plan:#?}"
         );
         assert!(
-            plan.iter().all(|detail| !detail.contains("SCAN members")),
+            plan.iter()
+                .all(|detail| !detail.contains("SCAN path_members")),
             "candidate discovery must seek package files from visible packages: {plan:#?}"
         );
     }

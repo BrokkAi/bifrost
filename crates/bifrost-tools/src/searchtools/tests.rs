@@ -508,7 +508,7 @@ return 0
 )]
 #[test]
 fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use brokk_bifrost_core::analyzer::model::Language;
 
@@ -1426,6 +1426,7 @@ fn terminal_navigation_status_cannot_be_resolved_by_semantic_overlay() {
         )
         .expect("register semantic-model fixture");
     let request = SemanticModelActivationRequest {
+        approximate_standard_libraries: Vec::new(),
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("crate version parses"),
         evidence: vec![SemanticModelActivationEvidence {
@@ -1916,7 +1917,7 @@ fn search_symbols_under_candidate_cap_ranks_and_reports_files_as_before() {
 )]
 #[test]
 fn search_symbols_matches_leading_wildcard_patterns_as_globs() {
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use brokk_bifrost_core::analyzer::project::TestProject;
 
@@ -1973,7 +1974,7 @@ fn search_symbols_matches_leading_wildcard_patterns_as_globs() {
 )]
 #[test]
 fn search_symbols_reports_uninterpretable_patterns_instead_of_matching_nothing() {
-    use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+    use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
     use brokk_bifrost_core::analyzer::project::TestProject;
 

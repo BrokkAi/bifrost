@@ -7,7 +7,7 @@ use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 
 use brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend;
 
-use brokk_bifrost_analysis::analyzer::languages::language_support;
+use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
@@ -41,7 +41,11 @@ use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
+use brokk_bifrost_analysis::analyzer::resolution::reference_vocabulary::{
+    WithheldCallee, WithheldReference,
+};
 use brokk_bifrost_core::analyzer::model::DeclarationId;
+use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
@@ -102,6 +106,9 @@ pub struct ScanUsagesTarget {
 /// These fields mirror the scope controls on the scan-usage APIs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageGraphParams {
+    /// Include proven same-owner calls between distinct declarations in native graphs.
+    #[serde(default)]
+    pub include_same_owner: bool,
     /// Include references that live in detected test files.
     #[serde(default)]
     pub include_tests: bool,
@@ -3405,6 +3412,8 @@ fn raw_reference_incomplete_reason(entry: &ScanUsagesEntry) -> Option<String> {
     }
 }
 
+pub use brokk_bifrost_analysis::analyzer::usages::workspace_graph::ImplicitUsageGraphCallers as UsageGraphImplicitCallers;
+
 /// A definition node in the workspace usage graph.
 ///
 /// Nodes are the classes and functions (methods included) that a consumer can
@@ -3416,6 +3425,14 @@ fn raw_reference_incomplete_reason(entry: &ScanUsagesEntry) -> Option<String> {
 /// distinct nodes. `fqn` matches the names returned by [`search_symbols`].
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphNode {
+    /// The workspace trait method implemented by this Rust method. Any caller
+    /// of that trait method may dispatch here, so a backward walk from this
+    /// node also continues from the `implements` target, which is a graph node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implements: Option<DeclarationId>,
+    /// Methods callable by external trait code or implicit language operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implicit_callers: Option<UsageGraphImplicitCallers>,
     pub id: DeclarationId,
     pub fqn: String,
     /// The language ecosystem the node belongs to (JS and TS share one). Part of
@@ -3453,6 +3470,8 @@ pub struct UsageGraphCallSite {
 /// `sites.len() == weight`. Per-site snippets remain the domain of [`scan_usages`].
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphEdge {
+    /// Proven only when every retained reference site is proven.
+    pub proven: bool,
     pub from_id: DeclarationId,
     pub to_id: DeclarationId,
     pub from: String,
@@ -3465,6 +3484,11 @@ pub struct UsageGraphEdge {
     /// `(file, line, caller)` site, so `sites.len() == weight`.
     pub sites: Vec<UsageGraphCallSite>,
 }
+
+type UsageGraphEdgeSites = BTreeMap<
+    (DeclarationId, DeclarationId),
+    (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>, UsageProof),
+>;
 
 /// A symbol whose call sites exceeded the analyzer's enumeration guardrail.
 ///
@@ -3503,9 +3527,89 @@ pub struct UsageGraphIncompleteReason {
     pub module_path: Option<String>,
 }
 
+/// One possible caller whose reference did not become a drawn graph edge.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UsageGraphWithheldReference {
+    pub from_id: Option<DeclarationId>,
+    pub from: Option<String>,
+    pub path: String,
+    pub line: usize,
+    #[serde(flatten)]
+    pub callee: UsageGraphWithheldCallee,
+}
+
+/// A terminal name leaves the target set open; `to_id` names a graph node.
+/// Declarations outside the graph's type/callable domain remain terminal names.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(untagged)]
+pub enum UsageGraphWithheldCallee {
+    Named { name: String },
+    Declaration { to_id: DeclarationId },
+}
+
+fn render_usage_graph_withheld_references<'a>(
+    catalog: &WorkspaceUsageCatalog,
+    references: impl IntoIterator<Item = &'a WithheldReference>,
+) -> Vec<UsageGraphWithheldReference> {
+    let mut result = references
+        .into_iter()
+        .map(|reference| {
+            let caller = reference
+                .site
+                .enclosing
+                .as_ref()
+                .and_then(|unit| catalog.index_for_id(&unit.declaration_id()))
+                .map(|index| &catalog.nodes[index]);
+            let callee = match &reference.callee {
+                WithheldCallee::Named(name) => {
+                    UsageGraphWithheldCallee::Named { name: name.clone() }
+                }
+                WithheldCallee::Declaration(unit) if is_graph_declaration(unit) => {
+                    let index = catalog.index_for_id(&unit.declaration_id()).expect(
+                        "withheld target declaration is explicitly retained as a graph node",
+                    );
+                    UsageGraphWithheldCallee::Declaration {
+                        to_id: catalog.nodes[index].key.id.clone(),
+                    }
+                }
+                WithheldCallee::Declaration(unit) => UsageGraphWithheldCallee::Named {
+                    name: brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                        unit.terminal_name(),
+                    )
+                    .to_owned(),
+                },
+            };
+            UsageGraphWithheldReference {
+                from_id: caller.map(|node| node.key.id.clone()),
+                from: caller.map(|node| node.key.fqn.clone()),
+                path: rel_path_string(&reference.site.file),
+                line: reference.site.range.start_line,
+                callee,
+            }
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.from.cmp(&right.from))
+            .then_with(|| left.callee.cmp(&right.callee))
+            .then_with(|| left.from_id.cmp(&right.from_id))
+    });
+    result.dedup();
+    result
+}
+
 /// The resolved definition/reference graph for the whole workspace.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphResult {
+    /// Add a candidate edge from `from_id` to every node whose terminal name
+    /// matches `name`, or directly to `to_id`. When `from_id` is absent, treat
+    /// the file's declarations as possible callers.
+    pub withheld_references: Vec<UsageGraphWithheldReference>,
+    /// False when any pass could not name a withheld reference: that pass
+    /// supplies no absence evidence. Other graph completeness limits still apply.
+    pub withheld_references_complete: bool,
     pub complete: bool,
     /// Present only when this session covers an explicitly named subset of the
     /// workspace, in which case the graph spans that many files (#2770).
@@ -3663,18 +3767,21 @@ pub(crate) fn selected_usage_graph_result(
     cancellation: &CancellationToken,
 ) -> Option<UsageGraphResult> {
     let SelectedWorkspaceUsageGraphProjection {
-        nodes,
+        mut nodes,
         edges,
         forward_completeness,
         kind_projection_complete,
         unresolved_names,
+        withheld_references,
         skipped_callers,
         build_selection_unavailable,
+        domain_discovery_failures,
         ..
     } = projection;
     let mut incomplete = BTreeSet::new();
     if !projection_complete
         && ((build_selection_unavailable.is_none()
+            && domain_discovery_failures.is_empty()
             && !skipped_callers
                 .values()
                 .any(GraphFileSkipReason::opens_incompleteness))
@@ -3705,7 +3812,24 @@ pub(crate) fn selected_usage_graph_result(
             ),
         ));
     }
+    let mut ids = nodes
+        .iter()
+        .flat_map(|node| node.declaration_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    for reference in &withheld_references {
+        if let WithheldCallee::Declaration(target) = &reference.callee
+            && is_graph_declaration(target)
+            && ids.insert(target.declaration_id())
+        {
+            let catalog = WorkspaceUsageCatalog::from_declarations(
+                vec![(target.clone(), None)],
+                cancellation,
+            )?;
+            nodes.extend(catalog.nodes);
+        }
+    }
     let catalog = WorkspaceUsageCatalog::from_reduced_nodes(nodes, cancellation)?;
+    let public_withheld = render_usage_graph_withheld_references(&catalog, &withheld_references);
     // The ranking reducer's raw cap counts distinct byte offsets. The public
     // contract caps distinct `(path, line)` sites, so its finalizer must derive
     // truncation from the retained site inventory rather than importing the
@@ -3713,13 +3837,20 @@ pub(crate) fn selected_usage_graph_result(
     let truncated_by_id = BTreeMap::new();
     let mut edge_sites = BTreeMap::new();
     for edge in edges {
+        if edge.sites.is_empty() && edge.unproven_sites.is_empty() {
+            continue;
+        }
         if cancellation.is_cancelled() {
             return None;
         }
         let from = catalog.nodes[edge.from].primary.clone();
         let to = catalog.nodes[edge.to].primary.clone();
         let mut sites = Vec::with_capacity(edge.sites.len());
-        for (file, line) in edge.sites {
+        for (file, line) in edge
+            .sites
+            .into_iter()
+            .chain(edge.unproven_sites.iter().cloned())
+        {
             if cancellation.is_cancelled() {
                 return None;
             }
@@ -3730,7 +3861,16 @@ pub(crate) fn selected_usage_graph_result(
         }
         let previous = edge_sites.insert(
             (from.declaration_id(), to.declaration_id()),
-            (from, to, sites),
+            (
+                from,
+                to,
+                sites,
+                if edge.unproven_sites.is_empty() {
+                    UsageProof::Proven
+                } else {
+                    UsageProof::Unproven
+                },
+            ),
         );
         assert!(
             previous.is_none(),
@@ -3747,6 +3887,9 @@ pub(crate) fn selected_usage_graph_result(
         incomplete,
         cancellation,
     )?;
+    result.withheld_references = public_withheld;
+    result.withheld_references_complete = unresolved_names.is_some();
+    record_graph_domain_failures(&mut result, domain_discovery_failures);
     record_graph_build_selection_unavailable(&mut result, build_selection_unavailable);
     record_graph_skipped_callers(&mut result, skipped_callers, cancellation).then_some(result)
 }
@@ -3941,16 +4084,24 @@ pub(crate) fn usage_graph_at_lines(
                     row.target_id()
                 ),
             ));
-            continue;
         }
-        edge_sites
+        let entry = edge_sites
             .entry((source.key.id.clone(), target.key.id.clone()))
-            .or_insert_with(|| (source.primary.clone(), target.primary.clone(), Vec::new()))
-            .2
-            .push(UsageGraphCallSite {
-                path: rel_path_string(&row.site.file),
-                line: row.site.range.start_line,
+            .or_insert_with(|| {
+                (
+                    source.primary.clone(),
+                    target.primary.clone(),
+                    Vec::new(),
+                    UsageProof::Proven,
+                )
             });
+        if row.proof != UsageProof::Proven {
+            entry.3 = UsageProof::Unproven;
+        }
+        entry.2.push(UsageGraphCallSite {
+            path: rel_path_string(&row.site.file),
+            line: row.site.range.start_line,
+        });
     }
     if generation != analyzer.project().analysis_generation() {
         return unavailable_usage_graph_result(
@@ -4237,10 +4388,7 @@ fn usage_graph_with_passes(
     // is used only to disambiguate that exact site. A closed ambiguity keeps
     // each exact target as an unproven candidate edge. Other incomplete
     // bindings keep their existing proof and completeness behavior.
-    let mut edge_sites: BTreeMap<
-        (DeclarationId, DeclarationId),
-        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
-    > = BTreeMap::new();
+    let mut edge_sites: UsageGraphEdgeSites = BTreeMap::new();
     let mut truncated_by_id: BTreeMap<DeclarationId, usize> = BTreeMap::new();
     let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let mut endpoints_by_name: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> =
@@ -4256,6 +4404,7 @@ fn usage_graph_with_passes(
     let mut native_admitted_callers = HashSet::default();
     let mut skipped_callers = std::collections::BTreeMap::new();
     let mut build_selection_unavailable = None;
+    let mut domain_discovery_failures = BTreeSet::new();
 
     for layer in 0..params.depth {
         if cancellation.is_cancelled() {
@@ -4399,6 +4548,8 @@ fn usage_graph_with_passes(
                     projection.certify_callers(&expected_callers);
                     native_admitted_callers.extend(expected_callers);
                     skipped_callers.extend(projection.skipped_callers.clone());
+                    domain_discovery_failures
+                        .extend(projection.domain_discovery_failures.iter().cloned());
                     if let Some(reason) = &projection.build_selection_unavailable {
                         if let Some(previous) = &build_selection_unavailable {
                             assert_eq!(
@@ -4411,6 +4562,7 @@ fn usage_graph_with_passes(
                     // Skipped modules have dedicated structured reasons below.
                     if !complete
                         && ((projection.build_selection_unavailable.is_none()
+                            && projection.domain_discovery_failures.is_empty()
                             && !projection
                                 .skipped_callers
                                 .values()
@@ -4722,7 +4874,20 @@ fn usage_graph_with_passes(
         // can reach another caller in an already scanned file without asking
         // the provider to resolve that file a second time.
         for projection in &native_projections {
-            for edge in &projection.edges {
+            for edge in projection.edges.iter().chain(
+                projection
+                    .same_owner_edges
+                    .iter()
+                    .filter(|_| params.include_same_owner),
+            ) {
+                if edge.sites.is_empty()
+                    && edge.unproven_sites.is_empty()
+                    && (!params.include_same_owner
+                        || (edge.same_owner_sites.is_empty()
+                            && edge.unproven_same_owner_sites.is_empty()))
+                {
+                    continue;
+                }
                 let source = &projection.nodes[edge.from];
                 let target = &projection.nodes[edge.to];
                 if !frontier.contains(&source.key.id) {
@@ -4736,14 +4901,36 @@ fn usage_graph_with_passes(
                         .extend(target.declaration_files.iter().cloned());
                     declarations.push((target.primary.clone(), target.primary_range));
                 }
-                let sites = &mut edge_sites
+                let entry = edge_sites
                     .entry((source.key.id.clone(), target.key.id.clone()))
-                    .or_insert_with(|| (source.primary.clone(), target.primary.clone(), Vec::new()))
-                    .2;
-                sites.extend(edge.sites.iter().map(|(file, line)| UsageGraphCallSite {
-                    path: rel_path_string(file),
-                    line: *line,
-                }));
+                    .or_insert_with(|| {
+                        (
+                            source.primary.clone(),
+                            target.primary.clone(),
+                            Vec::new(),
+                            UsageProof::Proven,
+                        )
+                    });
+                if !edge.unproven_sites.is_empty()
+                    || (params.include_same_owner && !edge.unproven_same_owner_sites.is_empty())
+                {
+                    entry.3 = UsageProof::Unproven;
+                }
+                entry.2.extend(
+                    edge.sites
+                        .iter()
+                        .chain(&edge.unproven_sites)
+                        .chain(
+                            edge.same_owner_sites
+                                .iter()
+                                .chain(&edge.unproven_same_owner_sites)
+                                .filter(|_| params.include_same_owner),
+                        )
+                        .map(|(file, line)| UsageGraphCallSite {
+                            path: rel_path_string(file),
+                            line: *line,
+                        }),
+                );
             }
         }
 
@@ -5261,14 +5448,21 @@ fn usage_graph_with_passes(
                             .min_by_key(|range| (range.start_line, range.start_byte));
                         declarations.push((target.clone(), range));
                     }
-                    edge_sites
+                    let proven = !logical_family_edges.contains(&(
+                        ecosystem,
+                        from_name.clone(),
+                        to_name.clone(),
+                    ));
+                    let edge = edge_sites
                         .entry((from_id, to_id))
-                        .or_insert_with(|| (source, target, Vec::new()))
-                        .2
-                        .push(UsageGraphCallSite {
-                            path: site.path.clone(),
-                            line: site.line,
-                        });
+                        .or_insert_with(|| (source, target, Vec::new(), UsageProof::Proven));
+                    if !proven {
+                        edge.3 = UsageProof::Unproven;
+                    }
+                    edge.2.push(UsageGraphCallSite {
+                        path: site.path.clone(),
+                        line: site.line,
+                    });
                 }
             }
         }
@@ -5303,10 +5497,49 @@ fn usage_graph_with_passes(
             "workspace changed during usage graph construction".into(),
         );
     }
+    let withheld = native_projections
+        .iter()
+        .flat_map(|projection| {
+            projection.withheld_references.iter().filter(|reference| {
+                projection.admitted_callers().contains(&reference.site.file)
+                    && test_files
+                        .as_ref()
+                        .is_none_or(|filter| !filter.excludes(&reference.site.file))
+            })
+        })
+        .collect::<Vec<_>>();
+    let dispatch_endpoint_ids = native_projections
+        .iter()
+        .flat_map(|projection| &projection.nodes)
+        .flat_map(|node| {
+            node.implements.iter().chain(
+                node.implicit_callers
+                    .as_ref()
+                    .and_then(|flag| flag.self_type_id.as_ref()),
+            )
+        })
+        .collect::<HashSet<_>>();
+    declarations.extend(
+        native_projections
+            .iter()
+            .flat_map(|projection| &projection.nodes)
+            .filter(|node| dispatch_endpoint_ids.contains(&node.key.id))
+            .map(|node| (node.primary.clone(), node.primary_range)),
+    );
     declarations.retain(|(unit, _)| !skipped_callers.contains_key(unit.source()));
+    // A withheld target remains an endpoint even when its file is not an
+    // admitted caller file. Consumers must be able to follow every `to_id`.
+    for reference in &withheld {
+        if let WithheldCallee::Declaration(target) = &reference.callee
+            && is_graph_declaration(target)
+        {
+            declarations.push((target.clone(), primary_range(analyzer, target)));
+        }
+    }
     let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
         return cancelled();
     };
+    let public_withheld = render_usage_graph_withheld_references(&catalog, withheld);
     let mut result = finalize_usage_graph_result(
         analyzer,
         &unmatched_paths,
@@ -5315,6 +5548,48 @@ fn usage_graph_with_passes(
         truncated_by_id,
         incomplete,
     );
+    result.withheld_references = public_withheld;
+    result.withheld_references_complete = unavailable_passes.is_empty()
+        && native_projections
+            .iter()
+            .all(|projection| projection.unresolved_names.is_some());
+    let implicit = native_projections
+        .iter()
+        .flat_map(|projection| &projection.nodes)
+        .filter_map(|node| {
+            node.implicit_callers
+                .as_ref()
+                .map(|flag| (node.key.id.clone(), flag.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let implemented_members = native_projections
+        .iter()
+        .flat_map(|projection| &projection.nodes)
+        .filter_map(|node| {
+            node.implements
+                .as_ref()
+                .map(|member| (node.key.id.clone(), member.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let node_ids = result
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    for node in &mut result.nodes {
+        node.implements = implemented_members.get(&node.id).cloned();
+        assert!(
+            node.implements
+                .as_ref()
+                .is_none_or(|member| node_ids.contains(member)),
+            "implemented trait member is explicitly retained as a graph node"
+        );
+        node.implicit_callers = implicit.get(&node.id).cloned().map(|mut flag| {
+            flag.self_type_id = flag.self_type_id.filter(|id| node_ids.contains(id));
+            flag
+        });
+    }
+    record_graph_domain_failures(&mut result, domain_discovery_failures);
     record_graph_build_selection_unavailable(&mut result, build_selection_unavailable);
     if !record_graph_skipped_callers(&mut result, skipped_callers, cancellation) {
         return cancelled();
@@ -5339,6 +5614,32 @@ fn usage_graph_with_passes(
         );
     }
     result
+}
+
+fn record_graph_domain_failures(
+    result: &mut UsageGraphResult,
+    failures: impl IntoIterator<Item = brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphDomainDiscoveryFailure>,
+) {
+    for failure in failures {
+        let message = format!(
+            "Go discovery failed for domain {:?} (GOWORK {:?}): {}",
+            failure.domain_dir, failure.gowork_path, failure.discovery_error
+        );
+        if !result
+            .incomplete_reasons
+            .iter()
+            .any(|reason| reason.code == "domain_discovery_failed" && reason.message == message)
+        {
+            result.incomplete_reasons.push(UsageGraphIncompleteReason {
+                code: "domain_discovery_failed".into(),
+                message,
+                discovery_error: Some(failure.discovery_error),
+                path: None,
+                module_path: None,
+            });
+        }
+        result.complete = false;
+    }
 }
 
 fn record_graph_build_selection_unavailable(
@@ -5385,6 +5686,15 @@ fn record_graph_skipped_callers(
                     });
                 }
             }
+            GraphFileSkipReason::DomainDiscoveryFailed {
+                domain_dir,
+                gowork_path,
+                message,
+            } => {
+                record_graph_domain_failures(result, [brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphDomainDiscoveryFailure {
+                    domain_dir: domain_dir.clone(), gowork_path: gowork_path.clone(), discovery_error: message.clone(),
+                }]);
+            }
             GraphFileSkipReason::Unplaced => {
                 result.incomplete_reasons.push(UsageGraphIncompleteReason {
                     discovery_error: None,
@@ -5424,10 +5734,7 @@ fn finalize_usage_graph_result(
     analyzer: &dyn IAnalyzer,
     unmatched_paths: &[String],
     catalog: WorkspaceUsageCatalog,
-    edge_sites: BTreeMap<
-        (DeclarationId, DeclarationId),
-        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
-    >,
+    edge_sites: UsageGraphEdgeSites,
     mut truncated_by_id: BTreeMap<DeclarationId, usize>,
     mut incomplete: BTreeSet<(String, String)>,
 ) -> UsageGraphResult {
@@ -5445,6 +5752,8 @@ fn finalize_usage_graph_result(
                 .unwrap_or(0),
             kind: code_unit_kind_name(node.primary.kind()).to_string(),
             signature: node.primary.signature().map(str::to_string),
+            implements: node.implements.clone(),
+            implicit_callers: node.implicit_callers.clone(),
         })
         .collect();
     let mut truncated_symbols: Vec<UsageGraphTruncatedSymbol> = Vec::new();
@@ -5459,7 +5768,7 @@ fn finalize_usage_graph_result(
     });
     let max_callsites = brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES;
     let mut inbound_sites: HashMap<DeclarationId, HashSet<(String, usize)>> = HashMap::default();
-    for ((_, to_id), (_, _, sites)) in &edge_sites {
+    for ((_, to_id), (_, _, sites, _)) in &edge_sites {
         inbound_sites
             .entry(to_id.clone())
             .or_default()
@@ -5503,13 +5812,14 @@ fn finalize_usage_graph_result(
     });
 
     let mut edges = Vec::new();
-    for ((from_id, to_id), (from, to, mut sites)) in edge_sites {
+    for ((from_id, to_id), (from, to, mut sites, proof)) in edge_sites {
         if truncated_ids.contains(&to_id) {
             continue;
         }
         sites.sort();
         sites.dedup();
         edges.push(UsageGraphEdge {
+            proven: proof == UsageProof::Proven,
             from_id,
             to_id,
             from: from.fq_name(),
@@ -5568,6 +5878,8 @@ fn finalize_usage_graph_result(
         });
     }
     let mut result = UsageGraphResult {
+        withheld_references: Vec::new(),
+        withheld_references_complete: incomplete_reasons.is_empty(),
         complete: incomplete_reasons.is_empty(),
         session_subset: session_subset(analyzer),
         nodes,
@@ -5585,9 +5897,10 @@ fn record_unnamed_module_exclusions(result: &mut UsageGraphResult, analyzer: &dy
     let mut files = analyzer.source_file_inventory().rows;
     files.sort();
     for file in files {
-        let Some(root) = language_support(brokk_bifrost_core::analyzer::common::language_for_file(
-            &file,
-        ))
+        let Some(root) = language_support_for_hook(
+            brokk_bifrost_core::analyzer::common::language_for_file(&file),
+            "unnamed_module_root_for_file",
+        )
         .and_then(|support| support.unnamed_module_root_for_file(analyzer, &file)) else {
             continue;
         };
@@ -5621,10 +5934,7 @@ fn record_unnamed_module_exclusions(result: &mut UsageGraphResult, analyzer: &dy
 #[cfg(any(test, feature = "test-support"))]
 fn finalize_selected_usage_graph_result(
     catalog: WorkspaceUsageCatalog,
-    edge_sites: BTreeMap<
-        (DeclarationId, DeclarationId),
-        (CodeUnit, CodeUnit, Vec<UsageGraphCallSite>),
-    >,
+    edge_sites: UsageGraphEdgeSites,
     mut truncated_by_id: BTreeMap<DeclarationId, usize>,
     incomplete: BTreeSet<(String, String)>,
     cancellation: &CancellationToken,
@@ -5645,6 +5955,8 @@ fn finalize_selected_usage_graph_result(
                 .unwrap_or(0),
             kind: code_unit_kind_name(node.primary.kind()).to_string(),
             signature: node.primary.signature().map(str::to_string),
+            implements: node.implements.clone(),
+            implicit_callers: node.implicit_callers.clone(),
         };
         let previous = nodes_by_order.insert(
             (node.language.clone(), node.fqn.clone(), node.id.clone()),
@@ -5662,7 +5974,7 @@ fn finalize_selected_usage_graph_result(
 
     let max_callsites = brokk_bifrost_analysis::analyzer::usages::inverted_edges::MAX_CALLSITES;
     let mut inbound_sites: HashMap<DeclarationId, HashSet<(String, usize)>> = HashMap::default();
-    for ((_, to_id), (_, _, sites)) in &edge_sites {
+    for ((_, to_id), (_, _, sites, _)) in &edge_sites {
         if cancellation.is_cancelled() {
             return None;
         }
@@ -5730,7 +6042,7 @@ fn finalize_selected_usage_graph_result(
     }
 
     let mut edges_by_order = BTreeMap::new();
-    for ((from_id, to_id), (from, to, sites)) in edge_sites {
+    for ((from_id, to_id), (from, to, sites, proof)) in edge_sites {
         if cancellation.is_cancelled() {
             return None;
         }
@@ -5752,6 +6064,7 @@ fn finalize_selected_usage_graph_result(
             sites.push(site);
         }
         let edge = UsageGraphEdge {
+            proven: proof == UsageProof::Proven,
             from_id,
             to_id,
             from: from.fq_name(),
@@ -5809,6 +6122,8 @@ fn finalize_selected_usage_graph_result(
         return None;
     }
     Some(UsageGraphResult {
+        withheld_references: Vec::new(),
+        withheld_references_complete: incomplete_reasons.is_empty(),
         session_subset: None,
         complete: incomplete_reasons.is_empty(),
         nodes,
@@ -7949,6 +8264,7 @@ mod tests {
         let graph = usage_graph(
             analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: Some(vec!["src/lib.rs".to_string()]),
                 depth: 1,
@@ -8076,8 +8392,18 @@ mod tests {
             admitted_callers: HashSet::from_iter([caller_file]),
             skipped_callers: Default::default(),
             build_selection_unavailable: None,
+            domain_discovery_failures: Vec::new(),
             unresolved_names: Some(std::collections::BTreeSet::new()),
+            withheld_references: Vec::new(),
+            same_owner_edges: Vec::new(),
             edges: vec![CanonicalWorkspaceUsageProjectedEdge {
+                same_owner_sites: Vec::new(),
+                unproven_same_owner_sites: Vec::new(),
+                unproven_sites: if unproven_inbound > 0 {
+                    sites.first().cloned().into_iter().collect()
+                } else {
+                    Vec::new()
+                },
                 from: caller_index,
                 to: target_index,
                 counts: UsageReferenceCounts {
@@ -8172,6 +8498,7 @@ mod tests {
         let graph = usage_graph(
             fixture.analyzer.analyzer(),
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: false,
                 paths: Some(vec!["app/Root.java".to_string()]),
                 depth: 1,
@@ -8210,6 +8537,7 @@ mod tests {
         let graph = usage_graph(
             &analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: Some(vec!["src/lib.rs".to_string()]),
                 depth: 1,
@@ -8664,7 +8992,7 @@ mod tests {
 
     #[test]
     fn usage_graph_observes_request_cancellation_during_native_projection() {
-        use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+        use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
         use brokk_bifrost_analysis::analyzer::languages::EdgePassEntry;
 
@@ -8708,6 +9036,7 @@ mod tests {
         let result = usage_graph_with_passes(
             &analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 paths: None,
                 include_tests: true,
                 depth: 1,
@@ -8735,7 +9064,7 @@ mod tests {
 
     #[test]
     fn native_graph_dispatch_reuses_files_across_depth_and_preserves_ranking_edges() {
-        use brokk_bifrost_analysis::analyzer::java::JavaAnalyzer;
+        use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
 
         use brokk_bifrost_analysis::analyzer::languages::EdgePassEntry;
 
@@ -8801,6 +9130,9 @@ mod tests {
                     }
                     raw_proven_inbound[to] += 1;
                     edges.push(CanonicalWorkspaceUsageProjectedEdge {
+                        same_owner_sites: Vec::new(),
+                        unproven_same_owner_sites: Vec::new(),
+                        unproven_sites: Vec::new(),
                         from,
                         to,
                         counts: UsageReferenceCounts {
@@ -8815,11 +9147,14 @@ mod tests {
                     SelectedWorkspaceUsageGraphProjection {
                         nodes: catalog.nodes,
                         edges,
+                        same_owner_edges: Vec::new(),
                         raw_proven_inbound,
                         admitted_callers: HashSet::from_iter(admitted_callers.iter().cloned()),
                         skipped_callers: Default::default(),
                         build_selection_unavailable: None,
+                        domain_discovery_failures: Vec::new(),
                         unresolved_names: Some(std::collections::BTreeSet::new()),
+                        withheld_references: Vec::new(),
                         forward_completeness: EdgeCompleteness::Complete,
                         kind_projection_complete: true,
                         generation: analyzer.project().analysis_generation(),
@@ -8881,6 +9216,7 @@ mod tests {
         let public = usage_graph_with_passes(
             &analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 paths: Some(vec!["A.java".into()]),
                 include_tests: true,
                 depth: 3,
@@ -8954,6 +9290,7 @@ mod tests {
         let failed = usage_graph_with_passes(
             &analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 paths: Some(vec!["A.java".into()]),
                 include_tests: true,
                 depth: 3,
@@ -8986,6 +9323,10 @@ mod tests {
             .expect("an uncancelled selected public result must finish");
 
         assert!(!result.complete, "unproven rows make absence inconclusive");
+        assert!(
+            !result.edges[0].proven,
+            "a proven site cannot hide an unproven site on the same edge"
+        );
         assert_eq!(1, result.edges.len());
         assert_eq!(2, result.edges[0].weight);
         assert_eq!(
@@ -9093,6 +9434,7 @@ mod tests {
         let graph = usage_graph(
             analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: false,
                 paths: Some(vec!["app/Root.java".to_string()]),
                 depth: 1,
@@ -9220,6 +9562,7 @@ mod tests {
         let graph = usage_graph_with_passes(
             analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: false,
                 paths: None,
                 depth: 1,

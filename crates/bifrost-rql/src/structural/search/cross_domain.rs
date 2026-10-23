@@ -268,6 +268,7 @@ pub(super) fn cross_domain_diagnostic(
     message: String,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code,
         impact,

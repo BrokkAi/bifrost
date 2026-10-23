@@ -6,6 +6,7 @@ fn diagnostic(
     impact: CodeQueryDiagnosticImpact,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code,
         impact,
@@ -274,6 +275,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         Some("provenance: 3 paths (truncated); branches 1.0, 0")
     );
     let diagnostic = CodeQueryDiagnostic {
+        related: Vec::new(),
         source: None,
         code: CodeQueryDiagnosticCode::BroadQuery,
         impact: CodeQueryDiagnosticImpact::Advisory,

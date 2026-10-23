@@ -11,6 +11,7 @@
 pub mod extractor;
 pub mod hits;
 pub mod inverted;
+pub mod membership_scope;
 pub mod resolver;
 
 use crate::graph_support::CSharpSource;
@@ -37,6 +38,9 @@ use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 #[derive(Clone, Copy)]
 pub struct CSharpGraphSource<'a> {
     pub index: &'a dyn CodeUnitIndex,
+    /// Whether the unbounded walks may read a type hierarchy. They read it
+    /// through the reference's [`CSharpSource`], never through this handle,
+    /// which can be the unscoped analyzer.
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
 }
 

@@ -18,6 +18,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::FlowEndpoint { .. }
                 | CodeQueryResultValue::FlowWitness { .. }
                 | CodeQueryResultValue::TaintFinding { .. }
+                | CodeQueryResultValue::RustMarkerImpl { .. }
                 | CodeQueryResultValue::RustPointerFinding { .. }
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
@@ -258,6 +259,17 @@ impl CodeQueryResult {
                             if value.witnesses.len() == 1 { "" } else { "es" },
                             if value.ambiguous { "; ambiguous" } else { "" },
                             value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::RustMarkerImpl { value } => {
+                        out.push_str(&format!(
+                            "{}:{} [Rust {} impl; parameter {:?}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.trait_kind,
+                            value.parameter,
+                            value.completeness,
+                            value.id
                         ));
                     }
                     CodeQueryResultValue::RustPointerFinding { value } => {

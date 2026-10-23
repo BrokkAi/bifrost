@@ -2250,8 +2250,11 @@ fn explicit_import_model_target(
     file: &ProjectFile,
     reference: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
 ) -> Option<String> {
-    brokk_bifrost_analysis::analyzer::languages::language_support(language_for_file(file))?
-        .explicit_import_model_target(analyzer, token, file, reference)
+    brokk_bifrost_analysis::analyzer::languages::language_support_for_hook(
+        language_for_file(file),
+        "explicit_import_model_target",
+    )?
+    .explicit_import_model_target(analyzer, token, file, reference)
 }
 
 pub(crate) fn render_type_lookup(

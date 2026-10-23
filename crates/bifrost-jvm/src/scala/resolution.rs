@@ -124,7 +124,6 @@ struct ScalaResolutionBuilder<'a, 'source> {
     site_occurrences: Vec<SourceOccurrenceId>,
     declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
     name_ids: HashMap<String, ResolutionNameId>,
-    claimed_definition_units: HashSet<CodeUnit>,
     sites_by_node: HashMap<usize, ResolutionSiteId>,
     declaration_sites: HashMap<usize, ResolutionSiteId>,
     declaration_nodes: HashMap<ResolutionSiteId, Node<'source>>,
@@ -188,7 +187,6 @@ pub(super) fn extract_scala_resolution<'source>(
         site_occurrences: Vec::new(),
         declaration_sources: Vec::new(),
         name_ids: HashMap::default(),
-        claimed_definition_units: HashSet::default(),
         sites_by_node: HashMap::default(),
         declaration_sites: HashMap::default(),
         declaration_nodes: HashMap::default(),
@@ -533,9 +531,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                             };
                             matches_declaration_kind.then_some(unit)
                         });
-                    if let Some(unit) = unit
-                        && self.claimed_definition_units.insert(unit.clone())
-                    {
+                    if let Some(unit) = unit {
                         self.facts
                             .definition_units
                             .push(ResolutionDefinitionUnitFact {
@@ -654,10 +650,6 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                             && declaration.name.is_none()
                             && unit.is_function()
                     }) {
-                    assert!(
-                        self.claimed_definition_units.insert(unit.clone()),
-                        "one native declaration owns a Scala constructor unit"
-                    );
                     self.facts
                         .definition_units
                         .push(ResolutionDefinitionUnitFact {
@@ -846,7 +838,6 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         self.declaration_sites.insert(instance.id(), site);
         self.declaration_nodes.insert(site, instance);
         self.declaration_sources.push((site, declaration));
-        assert!(self.claimed_definition_units.insert(unit.clone()));
         self.facts
             .definition_units
             .push(ResolutionDefinitionUnitFact {
@@ -4305,9 +4296,11 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 .into_iter()
                 .map(|ty| self.declared_type_identity_slot(declaration, ty))
                 .collect::<Vec<_>>();
+            let site = self.facts.type_slots[owner.index()].site;
             crate::call_arguments::publish_jvm_function_type_arguments(
                 &mut self.facts,
                 owner,
+                site,
                 &arguments,
             );
         }

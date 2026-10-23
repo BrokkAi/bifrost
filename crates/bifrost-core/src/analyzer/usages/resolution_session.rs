@@ -193,6 +193,14 @@ impl ResolutionSession {
         }
     }
 
+    /// Independent cap for optional hierarchy ordering, never an aggregate stop.
+    pub fn hierarchy_order_limit(&self) -> usize {
+        self.budget.map_or(
+            super::receiver_analysis::DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS,
+            |budget| budget.max_hierarchy_order_steps,
+        )
+    }
+
     pub fn scope_step(&self) -> bool {
         self.charge(ReceiverBudgetLimit::ScopeNodes)
     }

@@ -1,3 +1,4 @@
+use super::mcp_wire::DrainedStderr;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -102,7 +103,7 @@ pub fn run_cold_first_tool_call(binary: &str, root: &Path, request: Value) -> (V
         .expect("spawn cold-start guard bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
 
     let protocol_version = "2025-11-25";
     let initialize = round_trip(

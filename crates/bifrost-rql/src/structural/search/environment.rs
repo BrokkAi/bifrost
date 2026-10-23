@@ -534,6 +534,7 @@ impl EnvironmentTraversalCache {
                     continue;
                 }
                 diagnostics.push(CodeQueryDiagnostic {
+                    related: Vec::new(),
                     source: None,
                     code,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -553,6 +554,7 @@ impl EnvironmentTraversalCache {
                 continue;
             }
             diagnostics.push(CodeQueryDiagnostic {
+                related: Vec::new(),
                 source: None,
                 code,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -592,6 +594,7 @@ impl EnvironmentTraversalCache {
             return;
         }
         diagnostics.push(CodeQueryDiagnostic {
+            related: Vec::new(),
             source: None,
             code,
             impact: CodeQueryDiagnosticImpact::Incomplete,

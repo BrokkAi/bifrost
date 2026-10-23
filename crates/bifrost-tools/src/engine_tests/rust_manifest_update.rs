@@ -136,6 +136,7 @@ mod rust_manifest_update_tests {
         let graph = usage_graph(
             analyzer,
             UsageGraphParams {
+                include_same_owner: false,
                 include_tests: true,
                 paths: None,
                 depth: 1,
