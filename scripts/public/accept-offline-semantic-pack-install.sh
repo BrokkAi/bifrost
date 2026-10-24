@@ -120,8 +120,9 @@ run_scan() {
 # exact integrity-verified external pack set selected for this engine profile.
 run_scan missing
 
-"$installer" verify "$bundle" > "$scratch/bundle-verify.txt"
-sed -n '1p' "$scratch/bundle-verify.txt"
+# install verifies the acquired bundle's integrity and metadata for any
+# generator. verify would also require this build's generator, which a pack
+# release made by an earlier engine never matches.
 "$installer" install "$bundle" "$catalog"
 "$installer" list "$catalog" --format json > "$scratch/inventory.json"
 
