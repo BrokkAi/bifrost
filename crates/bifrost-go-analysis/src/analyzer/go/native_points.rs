@@ -1007,7 +1007,8 @@ impl<'a> GoNativePointRequest<'a> {
             cancellation,
         )? {
             GoReverseCandidateOutcome::Ready(candidates) => Ok(candidates.family),
-            GoReverseCandidateOutcome::Unavailable(reason) => Err(
+            GoReverseCandidateOutcome::TargetUncovered(reason)
+            | GoReverseCandidateOutcome::Unavailable(reason) => Err(
                 brokk_bifrost_analysis::analyzer::store::StoreError::new(reason),
             ),
             GoReverseCandidateOutcome::Cancelled => Err(

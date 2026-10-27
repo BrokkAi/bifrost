@@ -1,0 +1,14 @@
+app/Cargo.toml | app/custom/build.rs | Build | build_script_build | Rust2021 | {"default"} | complete=true | noise:Build:noise/Cargo.toml
+app/Cargo.toml | app/custom/tool.rs | Binary | manual | Rust2021 | {"default"} | complete=true | app:Normal:app/Cargo.toml | dep_alias:Normal:dep/Cargo.toml | noise:Normal:noise/Cargo.toml
+app/Cargo.toml | app/src/lib.rs | Library | app | Rust2021 | {"default"} | complete=true | dep_alias:Normal:dep/Cargo.toml | noise:Normal:noise/Cargo.toml
+app/Cargo.toml | app/src/main.rs | Binary | app | Rust2021 | {"default"} | complete=true | app:Normal:app/Cargo.toml | dep_alias:Normal:dep/Cargo.toml | noise:Normal:noise/Cargo.toml
+dep/Cargo.toml | dep/src/lib.rs | Library | dep_api | Rust2021 | {"inherited_feature", "leaf_feature"} | complete=true
+member/Cargo.toml | member/src/lib.rs | Library | member | Rust2021 | {} | complete=true | dep_alias:Normal:dep/Cargo.toml
+nested/Cargo.toml | nested/src/bin/deep/main.rs | Binary | deep | Rust2021 | {} | complete=true | nested:Normal:nested/Cargo.toml
+nested/Cargo.toml | nested/src/lib.rs | Library | nested | Rust2021 | {} | complete=true
+noise/Cargo.toml | noise/src/lib.rs | Library | noise | Rust2021 | {} | complete=true
+old/Cargo.toml | old/src/bin/automatic.rs | Binary | automatic | Rust2015 | {} | complete=true
+old/Cargo.toml | old/src/main.rs | Binary | old | Rust2015 | {} | complete=true
+only-bench/Cargo.toml | only-bench/custom/entry.rs | Bench | custom | Rust2021 | {} | complete=true
+only-example/Cargo.toml | only-example/custom/entry.rs | Example | custom | Rust2021 | {} | complete=true
+only-test/Cargo.toml | only-test/custom/entry.rs | Test | custom | Rust2021 | {} | complete=true

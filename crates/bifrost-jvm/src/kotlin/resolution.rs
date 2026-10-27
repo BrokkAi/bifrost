@@ -8,8 +8,8 @@ use super::declarations::{
     kotlin_class_like_kind, kotlin_has_modifier, kotlin_identifier_text, kotlin_is_data_class,
 };
 use super::syntax::{
-    KOTLIN_TYPE_NODE_KINDS, KotlinScalarType, kotlin_call_with_callee, kotlin_callee,
-    kotlin_declared_scalar_type, kotlin_enclosing_import_header, kotlin_first_token,
+    KOTLIN_TYPE_NODE_KINDS, kotlin_binding_name_nodes, kotlin_binding_node,
+    kotlin_call_with_callee, kotlin_callee, kotlin_enclosing_import_header, kotlin_first_token,
     kotlin_import_header_segments, kotlin_is_declaration_name, kotlin_is_navigation_kind,
     kotlin_literal_scalar_type, kotlin_named_argument_label, kotlin_navigation_member,
     kotlin_navigation_receiver, kotlin_owner_label_matches, kotlin_parameter_default,
@@ -22,7 +22,10 @@ use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceOccurrenceId,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, HoistingClass};
-use brokk_bifrost_core::analyzer::tree_walk::{first_named_child_of_kind, named_children};
+use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+use brokk_bifrost_core::analyzer::tree_walk::{
+    first_named_child_of_kind, named_children, node_range,
+};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -191,7 +194,6 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     call_result_slots: HashMap<usize, ResolutionTypeSlotId>,
     handled_identifiers: HashSet<usize>,
     next_parameters: HashMap<ResolutionSiteId, u32>,
-    scalar_types_by_declaration: HashMap<ResolutionSiteId, KotlinScalarType>,
     unstable_smart_cast_bindings: HashSet<ResolutionSiteId>,
     pending_calls: Vec<(
         Node<'source>,
@@ -256,7 +258,6 @@ pub(super) fn extract_kotlin_resolution<'source>(
         call_result_slots: HashMap::default(),
         handled_identifiers: HashSet::default(),
         next_parameters: HashMap::default(),
-        scalar_types_by_declaration: HashMap::default(),
         unstable_smart_cast_bindings: HashSet::default(),
         pending_calls: Vec::new(),
         pending_constructor_properties: Vec::new(),
@@ -368,7 +369,7 @@ impl<'source, 'collector, 'declarations>
                         )
                     });
                 }
-            } else if node.kind() == "when_expression" {
+            } else if matches!(node.kind(), "when_expression" | "for_statement") {
                 context.scope = self.add_scope(
                     node,
                     context.scope,
@@ -498,6 +499,7 @@ impl<'source, 'collector, 'declarations>
                     }
                 }
                 "property_declaration" | "when_subject" => self.record_property(node, context),
+                "for_statement" => self.record_loop_variables(node, context),
                 "assignment" => self.pending_writes.push((node, context)),
                 "prefix_expression" | "postfix_expression"
                     if matches!(kotlin_first_token(node), Some("++" | "--")) =>
@@ -1669,6 +1671,40 @@ impl<'source, 'collector, 'declarations>
         site
     }
 
+    fn record_loop_variables(&mut self, node: Node<'source>, context: WalkContext) {
+        let Some(binding) = kotlin_binding_node(node) else {
+            return;
+        };
+        for name in kotlin_binding_name_nodes(binding) {
+            let Some(activation) = super::structural::KOTLIN_STRUCTURAL_SPEC
+                .binding_activation(name, node_range(node))
+            else {
+                continue;
+            };
+            let site = self.add_identifier(
+                name,
+                ResolutionSiteKind::ValueDeclaration,
+                ResolutionNamespace::Value,
+                ResolutionIdentifierRole::Declaration,
+                context.scope,
+                None,
+            );
+            let source = self.add_declaration_source(binding, Some(name), site);
+            self.collector
+                .mark_lexical(source, DeclarationKind::EnhancedForVariable);
+            // The iterable is evaluated outside the new bindings, including
+            // when it uses the same name as a loop variable.
+            self.facts.binders.push(ResolutionBinderFact {
+                declaration: site,
+                scope: context.scope,
+                kind: ResolutionBinderKind::Local,
+                hoisting: activation.hoisting,
+                activation_start: activation.activation.start_byte,
+                activation_end: activation.activation.end_byte,
+            });
+        }
+    }
+
     fn record_property(&mut self, node: Node<'source>, context: WalkContext) {
         let member_owner = self.type_body_owner(context);
         let indirect_read = named_children(node)
@@ -1738,9 +1774,6 @@ impl<'source, 'collector, 'declarations>
                 });
             }
             if let Some(type_node) = super::syntax::kotlin_binding_type_node(variable) {
-                if let Some(scalar) = kotlin_declared_scalar_type(type_node, self.source) {
-                    self.scalar_types_by_declaration.insert(site, scalar);
-                }
                 self.add_declared_type(
                     site,
                     type_node,
@@ -1873,9 +1906,6 @@ impl<'source, 'collector, 'declarations>
         }
         let type_node = super::syntax::kotlin_binding_type_node(node);
         let value_type = if let Some(type_node) = type_node {
-            if let Some(scalar) = kotlin_declared_scalar_type(type_node, self.source) {
-                self.scalar_types_by_declaration.insert(site, scalar);
-            }
             // Parameter types use the canonical declaration's classifier scope.
             // Defaults and delegation arguments keep the header context.
             self.add_declared_type(
@@ -2071,83 +2101,90 @@ impl<'source, 'collector, 'declarations>
 
     fn ensure_type_slot(
         &mut self,
-        node: Node<'source>,
+        mut node: Node<'source>,
         scope: ResolutionScopeId,
         owner: Option<ResolutionSiteId>,
     ) -> ResolutionTypeSlotId {
-        if let Some(slot) = self.type_slots_by_node.get(&node.id()).copied() {
-            return slot;
-        }
-        if node.kind() == "nullable_type" {
-            let mut underlying = node;
-            while matches!(underlying.kind(), "nullable_type" | "parenthesized_type") {
-                let Some(nested) = named_children(underlying)
-                    .into_iter()
-                    .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
-                else {
-                    break;
-                };
-                underlying = nested;
+        let mut wrappers = Vec::new();
+        let slot = loop {
+            if let Some(slot) = self.type_slots_by_node.get(&node.id()).copied() {
+                break slot;
             }
-            if underlying.kind() == "function_type" {
-                // Nullable function syntax cannot supply a non-null intrinsic
-                // invoke proof. An unknown slot keeps value application possible;
-                // receiver selection carries its own incomplete frontier.
+            if node.kind() == "nullable_type" {
+                let mut underlying = node;
+                while matches!(underlying.kind(), "nullable_type" | "parenthesized_type") {
+                    let Some(nested) = named_children(underlying)
+                        .into_iter()
+                        .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
+                    else {
+                        break;
+                    };
+                    underlying = nested;
+                }
+                if underlying.kind() == "function_type" {
+                    // Nullable function syntax cannot supply a non-null intrinsic
+                    // invoke proof. An unknown slot keeps value application possible;
+                    // receiver selection carries its own incomplete frontier.
+                    let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
+                    let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+                    self.type_slots_by_node.insert(node.id(), slot);
+                    break slot;
+                }
+            }
+            if node.kind() == "user_type" {
+                break self
+                    .record_user_type(
+                        node,
+                        WalkContext {
+                            scope,
+                            owner_type: None,
+                            callable: None,
+                            declaration: owner,
+                            singleton_owner: false,
+                            receiver_frame: None,
+                        },
+                    )
+                    .expect("Kotlin user type has a positioned type segment");
+            }
+            if node.kind() == "function_type" {
                 let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
                 let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
                 self.type_slots_by_node.insert(node.id(), slot);
-                return slot;
+                let arity = u32::try_from(kotlin_function_type_arity(node))
+                    .expect("Kotlin function type arity fits u32");
+                self.pending_applied_types.push((slot, node, scope, owner));
+                let function_name = self.intern_name(&format!("kotlin.Function{arity}"));
+                self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
+                    output: slot,
+                    name: function_name,
+                    kind: IntrinsicTypeKind::LanguageBuiltin,
+                    indirection: 0,
+                });
+                break slot;
             }
-        }
-        if node.kind() == "user_type" {
-            return self
-                .record_user_type(
-                    node,
-                    WalkContext {
-                        scope,
-                        owner_type: None,
-                        callable: None,
-                        declaration: owner,
-                        singleton_owner: false,
-                        receiver_frame: None,
-                    },
-                )
-                .expect("Kotlin user type has a positioned type segment");
-        }
-        if node.kind() == "function_type" {
+            let nested = named_children(node)
+                .into_iter()
+                .find(|child| {
+                    KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()) || child.kind() == "user_type"
+                })
+                .unwrap_or(node);
+            if nested.id() != node.id() {
+                wrappers.push(node.id());
+                node = nested;
+                continue;
+            }
             let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
             let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+            self.facts.gaps.push(ResolutionGapFact::new(
+                site,
+                ResolutionGapKind::UnsupportedTypeSyntax,
+            ));
             self.type_slots_by_node.insert(node.id(), slot);
-            let arity = u32::try_from(kotlin_function_type_arity(node))
-                .expect("Kotlin function type arity fits u32");
-            self.pending_applied_types.push((slot, node, scope, owner));
-            let function_name = self.intern_name(&format!("kotlin.Function{arity}"));
-            self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
-                output: slot,
-                name: function_name,
-                kind: IntrinsicTypeKind::LanguageBuiltin,
-                indirection: 0,
-            });
-            return slot;
+            break slot;
+        };
+        for wrapper in wrappers.into_iter().rev() {
+            self.type_slots_by_node.insert(wrapper, slot);
         }
-        let nested = named_children(node)
-            .into_iter()
-            .find(|child| {
-                KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()) || child.kind() == "user_type"
-            })
-            .unwrap_or(node);
-        if nested.id() != node.id() {
-            let slot = self.ensure_type_slot(nested, scope, owner);
-            self.type_slots_by_node.insert(node.id(), slot);
-            return slot;
-        }
-        let site = self.add_site(node, ResolutionSiteKind::TypeReference, scope);
-        let slot = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-        self.facts.gaps.push(ResolutionGapFact::new(
-            site,
-            ResolutionGapKind::UnsupportedTypeSyntax,
-        ));
-        self.type_slots_by_node.insert(node.id(), slot);
         slot
     }
 
@@ -3533,21 +3570,24 @@ impl<'source, 'collector, 'declarations>
                 ));
             }
             output
-        } else if let Some((left, right)) = self.additive_scalar_operands(expression) {
+        } else if let Some((left, right)) = kotlin_arithmetic_operands(expression) {
             let left = self.expression_slot(left, context, ResolutionTypeSlotRole::ExpressionValue);
             let right =
                 self.expression_slot(right, context, ResolutionTypeSlotRole::ExpressionValue);
             let site = self.add_site(expression, ResolutionSiteKind::BinaryExpression, scope);
             self.sites_by_node.insert(expression.id(), site);
             let output = self.add_slot(site, role);
+            // The language promotion hook admits only the built-in numeric
+            // operator members. Operator overloads on other types stay open
+            // until their callable rules are represented.
             for input in [left, right] {
                 self.facts.type_transfers.push(ResolutionTypeTransferFact {
                     input,
                     output,
-                    kind: ResolutionTypeTransferKind::ExpressionResult,
+                    kind: ResolutionTypeTransferKind::NumericPromotion,
                     indirection_delta: 0,
                     reference_indirection_delta: 0,
-                    value_transform: ResolutionTypeTransferValueTransform::Preserve,
+                    value_transform: ResolutionTypeTransferValueTransform::RuntimeOnly,
                 });
             }
             output
@@ -3563,29 +3603,6 @@ impl<'source, 'collector, 'declarations>
         self.expression_slots_by_node
             .insert((node.id(), role), slot);
         slot
-    }
-
-    fn additive_scalar_operands(
-        &self,
-        expression: Node<'source>,
-    ) -> Option<(Node<'source>, Node<'source>)> {
-        if expression.kind() != "additive_expression" || expression.child_count() != 3 {
-            return None;
-        }
-        let operator = expression.child(1)?;
-        if !matches!(operator.kind(), "+" | "-") {
-            return None;
-        }
-        let left = expression.child(0)?;
-        let right = expression.child(2)?;
-        let left_type = self.scalar_type_of_expression(left)?;
-        let right_type = self.scalar_type_of_expression(right)?;
-        // Restrict the operand transfer to scalar cases whose result keeps the
-        // exact operand type. Other Kotlin operator overloads and promotions
-        // remain open until their callable rules are represented.
-        (left_type == right_type
-            && matches!(left_type, KotlinScalarType::Int | KotlinScalarType::Long))
-        .then_some((left, right))
     }
 
     fn this_expression_receiver(
@@ -3610,30 +3627,6 @@ impl<'source, 'collector, 'declarations>
             }
             frame = receiver.parent?;
         }
-    }
-
-    fn scalar_type_of_expression(&self, mut expression: Node<'source>) -> Option<KotlinScalarType> {
-        while expression.kind() == "parenthesized_expression" {
-            let children = named_children(expression);
-            let [inner] = children.as_slice() else {
-                return None;
-            };
-            expression = *inner;
-        }
-        match expression.kind() {
-            "simple_identifier" => self.scalar_type_of_identifier(expression),
-            "integer_literal" | "long_literal" => {
-                kotlin_literal_scalar_type(expression, self.source)
-            }
-            _ => None,
-        }
-    }
-
-    fn scalar_type_of_identifier(&self, identifier: Node<'source>) -> Option<KotlinScalarType> {
-        let reference_site = *self.sites_by_node.get(&identifier.id())?;
-        self.scalar_types_by_declaration
-            .get(&self.local_value_binding(reference_site)?)
-            .copied()
     }
 
     fn local_value_binding(&self, reference_site: ResolutionSiteId) -> Option<ResolutionSiteId> {
@@ -4846,6 +4839,22 @@ fn kotlin_setter_name(property: &str) -> String {
     }
 }
 
+/// The operands of a binary arithmetic operator. Kotlin's grammar gives these
+/// expressions no field names, so the operator token is read positionally.
+fn kotlin_arithmetic_operands(expression: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    if !matches!(
+        expression.kind(),
+        "additive_expression" | "multiplicative_expression"
+    ) || expression.child_count() != 3
+    {
+        return None;
+    }
+    if !matches!(expression.child(1)?.kind(), "+" | "-" | "*" | "/" | "%") {
+        return None;
+    }
+    Some((expression.child(0)?, expression.child(2)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::declarations::parse_kotlin_file;
@@ -4902,6 +4911,106 @@ mod tests {
                     && facts.sites[member.member.index()].kind
                         == ResolutionSiteKind::ConstructorDeclaration)
         );
+    }
+
+    #[test]
+    #[hardwon("#6942: ensure_type_slot recursion depth followed source nesting")]
+    fn ensure_type_slot_deep_wrappers_are_stack_safe() {
+        let depth = 3000;
+        let source = format!("val x: {}Int{} = 0", "(".repeat(depth), ")".repeat(depth));
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut ty = None;
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "parenthesized_type" {
+                    ty = Some(node);
+                    return brokk_bifrost_core::analyzer::tree_walk::WalkControl::Break;
+                }
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
+            },
+        );
+        let ty = ty.unwrap();
+        let mut inner = ty;
+        let mut wrappers = 0;
+        while inner.kind() == "parenthesized_type" {
+            wrappers += 1;
+            inner = inner.named_child(0).unwrap();
+        }
+        assert_eq!(wrappers, depth);
+        eprintln!("ensure_type_slot: parsed {wrappers} wrappers");
+        let file = ProjectFile::new(std::env::temp_dir(), "Deep.kt");
+        let mut collector = PrimarySourceFactCollector::new(&source);
+        let declarations = HashMap::default();
+        let file = &file;
+        let source = source.as_str();
+        let collector = &mut collector;
+        let source_declarations = &declarations;
+        let mut builder = KotlinResolutionBuilder {
+            file,
+            source,
+            collector,
+            source_declarations,
+            units: HashMap::default(),
+            facts: FileResolutionFacts::default(),
+            site_occurrences: Vec::new(),
+            declaration_sources: Vec::new(),
+            names: HashMap::default(),
+            sites_by_node: HashMap::default(),
+            initialization_scopes: HashMap::default(),
+            constructor_headers: HashMap::default(),
+            pending_applied_types: Vec::new(),
+            type_slots_by_node: HashMap::default(),
+            expression_slots_by_node: HashMap::default(),
+            type_identity_slots: HashMap::default(),
+            receiver_frames: Vec::new(),
+            anonymous_type_owners: HashSet::default(),
+            type_sites: HashMap::default(),
+            type_names: HashMap::default(),
+            type_simple_names: HashMap::default(),
+            type_parents: HashMap::default(),
+            type_scope_ranges: HashMap::default(),
+            type_scope_parents: HashMap::default(),
+            call_result_slots: HashMap::default(),
+            handled_identifiers: HashSet::default(),
+            next_parameters: HashMap::default(),
+            unstable_smart_cast_bindings: HashSet::default(),
+            pending_calls: Vec::new(),
+            pending_constructor_properties: Vec::new(),
+            pending_constructor_aliases: Vec::new(),
+            pending_constructors: Vec::new(),
+            pending_initializers: Vec::new(),
+            pending_initializer_values: Vec::new(),
+            pending_writes: Vec::new(),
+            package_scope: ResolutionScopeId::new(0),
+            package_names: Vec::new(),
+            facade_name: None,
+            annotation_proofs: KotlinJvmAnnotationProofs::default(),
+            multifile_file: false,
+            interface_types: HashSet::default(),
+            value_class_types: HashSet::default(),
+            companion_types: HashSet::default(),
+            wildcard_imports: Vec::new(),
+        };
+
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, move || {
+                    let slot = builder.ensure_type_slot(ty, ResolutionScopeId::new(0), None);
+                    assert_eq!(builder.type_slots_by_node.len(), depth + 2);
+                    assert_eq!(builder.type_slots_by_node[&inner.id()], slot);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
     }
 
     fn spelling(facts: &FileResolutionFacts, name: ResolutionNameId) -> &str {

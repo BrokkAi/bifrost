@@ -50,6 +50,9 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustC
 use brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome;
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+use brokk_bifrost_analysis::analyzer::structural::selected_inverse::{
+    LazySelectedInverse, SelectedInverseAdapter, SelectedInverseFailure,
+};
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::model::Range;
 #[cfg(any(test, feature = "test-support"))]
@@ -57,11 +60,8 @@ use brokk_bifrost_core::analyzer::project::Project;
 
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
-use brokk_bifrost_core::analyzer::structural::edges::EdgeProvenance;
 
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeDerivationResult;
-
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason;
 
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseIndexOutcome;
 
@@ -322,9 +322,7 @@ pub fn selected_rust_native_usage_consumer_shadow(
 /// A generation-bound handle; each target owns and drops its row query.
 #[doc(hidden)]
 pub struct RustSelectedReferenceIndex {
-    generation: u64,
-    rust: Box<RustAnalyzer>,
-    cancellation: brokk_bifrost_core::cancellation::CancellationToken,
+    index: LazySelectedInverse<RustInverseAdapter>,
 }
 
 impl RustSelectedReferenceIndex {
@@ -335,53 +333,105 @@ impl RustSelectedReferenceIndex {
 
         use crate::analyzer::rust::selected_reverse::with_rust_selected_reverse_queries;
         matches!(
-            with_rust_selected_reverse_queries(&self.rust, &self.cancellation, |queries| queries
-                .candidate_sets(std::slice::from_ref(target))),
+            with_rust_selected_reverse_queries(
+                &self.index.adapter().rust,
+                self.index.cancellation(),
+                |queries| queries.candidate_sets(std::slice::from_ref(target))
+            ),
             RustSelectedReverseOutcome::Ready(Some(_))
         )
     }
 
     pub(crate) fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
-        use crate::analyzer::rust::selected_reverse::RustSelectedReverseOutcome;
+        self.index.inverse_for(target)
+    }
+}
 
-        use crate::analyzer::rust::selected_reverse::with_rust_selected_reverse_queries;
-        if self.rust.inner.project().analysis_generation() == self.generation {
-            match with_rust_selected_reverse_queries(&self.rust, &self.cancellation, |queries| {
-                queries.inverse_for(std::slice::from_ref(target))
-            }) {
-                RustSelectedReverseOutcome::Ready(Some(mut answers)) => {
-                    assert_eq!(answers.len(), 1);
-                    let mut answer = answers.pop().expect("one target answer");
-                    let mut edges = std::collections::BTreeMap::new();
-                    for row in answer.edges {
-                        let key = (
-                            row.site.file.clone(),
-                            row.site.range.start_byte,
-                            row.site.range.end_byte,
-                            row.target.clone(),
-                            row.usage_kind,
-                        );
-                        if let Some(previous) = edges.insert(key, row.clone()) {
-                            assert_eq!(
-                                previous, row,
-                                "one physical inverse edge has one canonical projection"
-                            );
-                        }
-                    }
-                    answer.edges = edges.into_values().collect();
-                    return answer;
-                }
-                RustSelectedReverseOutcome::Ready(None) => {
-                    return self.incomplete(EdgeIncompleteReason::InverseIndexTargetUncovered);
-                }
-                failure => eprintln!("selected inverse row query did not complete: {failure:?}"),
+struct RustInverseAdapter {
+    rust: Box<RustAnalyzer>,
+}
+
+impl SelectedInverseAdapter for RustInverseAdapter {
+    fn admit(
+        analyzer: &dyn IAnalyzer,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> std::result::Result<(u64, Self), SelectedInverseFailure> {
+        use crate::analyzer::rust::selected_reverse::{
+            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+        };
+        let Some(rust) = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            RustAnalyzer,
+        >(analyzer) else {
+            return Err(SelectedInverseFailure::Unavailable(
+                "the workspace has no Rust analyzer".into(),
+            ));
+        };
+        let generation = rust.inner.project().analysis_generation();
+        match with_rust_selected_reverse_queries(rust, cancellation, |_| Ok(())) {
+            RustSelectedReverseOutcome::Ready(()) => Ok((
+                generation,
+                Self {
+                    rust: Box::new(rust.clone()),
+                },
+            )),
+            RustSelectedReverseOutcome::Unavailable(detail) => {
+                Err(SelectedInverseFailure::Unavailable(detail))
+            }
+            RustSelectedReverseOutcome::Stale(detail) => Err(SelectedInverseFailure::Stale(detail)),
+            RustSelectedReverseOutcome::Cancelled => Err(SelectedInverseFailure::Cancelled),
+            RustSelectedReverseOutcome::StoreError(detail) => {
+                Err(SelectedInverseFailure::StoreError(detail))
             }
         }
-        self.incomplete(EdgeIncompleteReason::InverseIndexResolutionIncomplete)
     }
 
-    fn incomplete(&self, reason: EdgeIncompleteReason) -> EdgeDerivationResult {
-        EdgeDerivationResult::incomplete(vec![reason], EdgeProvenance::Inverse, self.generation)
+    fn current_generation(&self) -> u64 {
+        self.rust.inner.project().analysis_generation()
+    }
+
+    fn query(
+        &self,
+        target: &CodeUnit,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> std::result::Result<Option<EdgeDerivationResult>, SelectedInverseFailure> {
+        use crate::analyzer::rust::selected_reverse::{
+            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+        };
+        match with_rust_selected_reverse_queries(&self.rust, cancellation, |queries| {
+            queries.inverse_for(std::slice::from_ref(target))
+        }) {
+            RustSelectedReverseOutcome::Ready(Some(mut answers)) => {
+                assert_eq!(answers.len(), 1);
+                let mut answer = answers.pop().expect("one target answer");
+                let mut edges = std::collections::BTreeMap::new();
+                for row in answer.edges {
+                    let key = (
+                        row.site.file.clone(),
+                        row.site.range.start_byte,
+                        row.site.range.end_byte,
+                        row.target.clone(),
+                        row.usage_kind,
+                    );
+                    if let Some(previous) = edges.insert(key, row.clone()) {
+                        assert_eq!(
+                            previous, row,
+                            "one physical inverse edge has one canonical projection"
+                        );
+                    }
+                }
+                answer.edges = edges.into_values().collect();
+                Ok(Some(answer))
+            }
+            RustSelectedReverseOutcome::Ready(None) => Ok(None),
+            RustSelectedReverseOutcome::Unavailable(detail) => {
+                Err(SelectedInverseFailure::Unavailable(detail))
+            }
+            RustSelectedReverseOutcome::Stale(detail) => Err(SelectedInverseFailure::Stale(detail)),
+            RustSelectedReverseOutcome::Cancelled => Err(SelectedInverseFailure::Cancelled),
+            RustSelectedReverseOutcome::StoreError(detail) => {
+                Err(SelectedInverseFailure::StoreError(detail))
+            }
+        }
     }
 }
 
@@ -396,7 +446,7 @@ pub enum RustSelectedReferenceIndexOutcome {
 
 impl SelectedInverseReferenceIndex for RustSelectedReferenceIndex {
     fn generation(&self) -> u64 {
-        self.generation
+        self.index.generation()
     }
 
     fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
@@ -448,26 +498,16 @@ pub fn build_rust_selected_reference_index(
     rust: &RustAnalyzer,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> RustSelectedReferenceIndexOutcome {
-    use crate::analyzer::rust::selected_reverse::RustSelectedReverseOutcome;
-
-    use crate::analyzer::rust::selected_reverse::with_rust_selected_reverse_queries;
-    let generation = rust.inner.project().analysis_generation();
-    match with_rust_selected_reverse_queries(rust, cancellation, |_| Ok(())) {
-        RustSelectedReverseOutcome::Ready(()) => {
-            RustSelectedReferenceIndexOutcome::Ready(RustSelectedReferenceIndex {
-                generation,
-                rust: Box::new(rust.clone()),
-                cancellation: cancellation.clone(),
-            })
-        }
-        RustSelectedReverseOutcome::Unavailable(detail) => {
+    match LazySelectedInverse::<RustInverseAdapter>::build(rust, cancellation) {
+        Ok(index) => RustSelectedReferenceIndexOutcome::Ready(RustSelectedReferenceIndex { index }),
+        Err(SelectedInverseFailure::Unavailable(detail)) => {
             RustSelectedReferenceIndexOutcome::Unavailable(detail)
         }
-        RustSelectedReverseOutcome::Stale(detail) => {
+        Err(SelectedInverseFailure::Stale(detail)) => {
             RustSelectedReferenceIndexOutcome::Stale(detail)
         }
-        RustSelectedReverseOutcome::Cancelled => RustSelectedReferenceIndexOutcome::Cancelled,
-        RustSelectedReverseOutcome::StoreError(detail) => {
+        Err(SelectedInverseFailure::Cancelled) => RustSelectedReferenceIndexOutcome::Cancelled,
+        Err(SelectedInverseFailure::StoreError(detail)) => {
             RustSelectedReferenceIndexOutcome::StoreError(detail)
         }
     }

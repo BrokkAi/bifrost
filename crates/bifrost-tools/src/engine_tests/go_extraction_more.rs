@@ -1225,7 +1225,7 @@ func use() { value := helper(1); _ = value; var thing Thing; _ = thing.Field }
             else {
                 panic!("live selected import context must validate");
             };
-            let (_, _, _, _, assigned, _, imports) = input.into_parts();
+            let (_, _, _, _, assigned, _, imports, _) = input.into_parts();
             assert_eq!(imports.as_ref(), std::slice::from_ref(&binding));
             assert_eq!(
                 imports[0]

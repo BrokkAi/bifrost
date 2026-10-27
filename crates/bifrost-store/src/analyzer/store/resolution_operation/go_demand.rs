@@ -1,10 +1,8 @@
 //! Go qualified-import bridges admitted only when a root endpoint asks for
 //! its positioned lexical prefix.
+use super::demand::{ClosedForwardSource, ClosedRelations, LanguageContextPreparation};
 #[cfg(any(test, feature = "test-support"))]
-use super::demand::LanguageRootDiscovery;
-use super::demand::{
-    ClosedForwardSource, ClosedRelations, DemandProvider, LanguageContextPreparation,
-};
+use super::demand::{DemandProvider, LanguageRootDiscovery};
 use super::go_named::{
     GoDemandContext, GoPreparedImportContext, GoPreparedImportContextOutcome,
     NAMED_IMPORT_TARGET_MOUNTS,
@@ -70,6 +68,11 @@ pub struct GoForwardOperationContext<'a> {
     pub session: &'a ResolutionSession,
 }
 
+struct GoSourceRoleEntry {
+    role: String,
+    preparation_proof: Option<(super::go_named::GoPreparedContextKey, bool)>,
+}
+
 struct GoDemandState<'a, 'store, 'input> {
     operation: &'a SelectedResolutionOperation<'store, 'input>,
     base: &'a dyn BatchResolutionFragmentSource,
@@ -83,7 +86,7 @@ struct GoDemandState<'a, 'store, 'input> {
     package_inventories: HashSet<i64>,
     export_index:
         HashMap<SelectedResolutionMountOrdinal, HashMap<SemanticId, Vec<SelectedRootPathHalf>>>,
-    source_roles: HashMap<SelectedResolutionMountOrdinal, String>,
+    source_roles: HashMap<SelectedResolutionMountOrdinal, GoSourceRoleEntry>,
     base_context_mounts: HashSet<SelectedResolutionMountOrdinal>,
     #[cfg(any(test, feature = "test-support"))]
     prepared_root_source_halves:
@@ -168,8 +171,8 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
         if mount == self.caller {
             return Ok(None);
         }
-        if let Some(role) = self.source_roles.get(&mount) {
-            return Ok(Some(role.clone()));
+        if let Some(entry) = self.source_roles.get(&mount) {
+            return Ok(Some(entry.role.clone()));
         }
         let role = self.operation.go_source_role_for_mount(
             self.demand.context_id,
@@ -177,9 +180,97 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
             self.cancellation,
         )?;
         if let Some(role) = &role {
-            self.source_roles.insert(mount, role.clone());
+            self.source_roles.insert(
+                mount,
+                GoSourceRoleEntry {
+                    role: role.clone(),
+                    preparation_proof: None,
+                },
+            );
         }
         Ok(role)
+    }
+
+    fn source_context_is_proven(
+        &mut self,
+        mount: SelectedResolutionMountOrdinal,
+        role: &str,
+    ) -> Result<Option<bool>> {
+        let record = self
+            .operation
+            .ready
+            .inventory
+            .mount_record_by_ordinal(mount)?;
+        let key = self.operation.go_file_preparation_key(
+            self.demand.context_id,
+            mount,
+            record.persisted_relative_path(),
+            role,
+        );
+        if let Some((authority, proven)) = &self
+            .source_roles
+            .get(&mount)
+            .expect("preparation follows selected source-role discovery")
+            .preparation_proof
+            && authority == &key
+        {
+            return Ok(Some(*proven));
+        }
+        let Some(selection) = self
+            .operation
+            .go_context_selection(self.demand.context_id, role)?
+        else {
+            return Ok(Some(false));
+        };
+        let connection = self.operation.ready.inventory.connection();
+        let Some(members) =
+            super::super::resolution_typed::go_members::package_member_sources_in_context(
+                connection,
+                selection.identity.revision,
+                mount,
+                selection.identity.context_id,
+                record.persisted_relative_path(),
+                self.cancellation,
+            )?
+        else {
+            return Ok(None);
+        };
+        // Only the package of the operation's own sources has a frontier in
+        // its base context. A context prepared for an uncertain sibling there
+        // would close that frontier as certain, so it needs the full placement
+        // proof. A foreign package reached through an import has no base paths
+        // to retain: refusing its context withholds every reference that
+        // routes through it, such as a member promoted through a struct
+        // declared in a build-constrained file. Its prepared context carries
+        // its own inventory completion onto the import route instead.
+        let shares_base_package = members.iter().flatten().any(|member| {
+            let member = SelectedResolutionMountOrdinal::new(
+                member
+                    .ordinal()
+                    .expect("a mounted package member has an ordinal"),
+            );
+            member == self.caller || self.base_context_mounts.contains(&member)
+        });
+        let proven = if members.is_empty() || shares_base_package {
+            let Some(proven) =
+                super::super::resolution_typed::go_members::package_placement_is_proven(
+                    connection,
+                    &selection.identity,
+                    &members,
+                    self.cancellation,
+                )?
+            else {
+                return Ok(None);
+            };
+            proven
+        } else {
+            true
+        };
+        self.source_roles
+            .get_mut(&mount)
+            .expect("selected source-role entry remains live")
+            .preparation_proof = Some((key, proven));
+        Ok(Some(proven))
     }
 
     fn has_package_reference(
@@ -396,20 +487,13 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
         else {
             return Ok(None);
         };
-        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = self
-            .operation
-            .ready
-            .collect_blueprint_in_session(context, self.cancellation, self.session)?
-        else {
-            return Ok(None);
-        };
-        if matches!(
-            self.register_blueprint(&blueprint, mount, source_role)?,
-            ContextRegistrationOutcome::Cancelled
-        ) {
-            return Ok(None);
-        }
-        Ok(Some(blueprint))
+        self.operation.ready.publish_prepared_context(
+            context,
+            self.cancellation,
+            self.session,
+            None,
+            |blueprint| self.register_blueprint(blueprint, mount, source_role),
+        )
     }
 
     fn register_blueprint(
@@ -695,6 +779,19 @@ impl GoRules<'_, '_, '_, '_> {
                     ResolutionIncompleteReason::UnsupportedSemantic(source.root_semantic),
                 ]),
             }));
+        }
+        if let Some(role) = &source.source_role {
+            let Some(proven) = self.language.source_context_is_proven(source.mount, role)? else {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            };
+            if !proven {
+                // The selected source still owns its partial base paths. A new
+                // context must not close its uncertain package frontier.
+                return Ok(Read::ready(Admission::BaseOwned {
+                    completion: ResolutionCompletion::Complete,
+                    base: BaseEligibility::Retain,
+                }));
+            }
         }
         let context = source.source_role.map(|role| {
             let key = (source.mount, role);
@@ -1206,7 +1303,7 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         // directory. A reverse bound includes both roles without conflating
         // their context identities or inferring a package from its spelling.
         let connection = self.language.operation.ready.inventory.connection();
-        let mut statement = connection.prepare_cached(GO_INTERVAL_DISCOVERY_SCOPE_0_SQL)?;
+        let mut statement = connection.prepare_cached(&GO_INTERVAL_DISCOVERY_SCOPE_0_SQL)?;
         // Add role peers only for the admitted base contexts.
         let encoded = serde_json::json!(
             self.language
@@ -1323,26 +1420,9 @@ impl SelectedResolutionOperation<'_, '_> {
         maximum_batch_size: usize,
         stager: &mut dyn FnMut(&FactReferenceBatchAnswer) -> Result<()>,
     ) -> Result<FactResolutionBatchSummary> {
-        let caller_mount = self
-            .mount_table()
-            .mount_for_path("go", context.caller_path)?
-            .expect("selected Go batch caller has a source mount")
-            .ordinal();
-        if context.demand.needs_demand_provider_for(caller_mount) {
-            self.with_go_forward_operation(context, None, |operation| {
-                operation.stage_all_reference_batches(maximum_batch_size, stager)
-            })
-        } else {
-            let persisted_lexical = self.ready.lexical_source();
-            context.blueprint.with_forward_operation_in_session(
-                context.lexical,
-                &persisted_lexical,
-                context.typed,
-                context.cancellation,
-                context.session,
-                |operation| operation.stage_all_reference_batches(maximum_batch_size, stager),
-            )
-        }
+        self.with_go_forward_operation(context, None, |operation| {
+            operation.stage_all_reference_batches(maximum_batch_size, stager)
+        })
     }
 
     #[doc(hidden)]
@@ -1420,53 +1500,35 @@ impl SelectedResolutionOperation<'_, '_> {
             #[cfg(any(test, feature = "test-support"))]
             prepared_root_source_halves: HashMap::default(),
         };
-        let provider = DemandProvider::new(super::demand_closure::SharedDemand {
-            source_closures: HashMap::default(),
-            rules: GoRules {
+        self.with_shared_forward_operation(
+            GoRules {
                 language: &mut language,
                 contexts: Vec::new(),
                 preparation: None,
                 prepared: HashMap::default(),
             },
-            arena: &arena,
-            paths: &paths,
-            ready: &self.ready,
-            base: context.lexical,
-            session: context.session,
-            cancellation: context.cancellation,
-            completion: &ResolutionCompletion::Complete,
-        });
-        if let Some(artifacts) = artifacts {
-            context.blueprint.with_demand_operation_using_artifacts(
-                &source,
-                &paths,
-                context.lexical,
-                context.typed,
-                provider,
-                context.cancellation,
-                context.session,
-                artifacts,
-                run,
-            )
-        } else {
-            context.blueprint.with_demand_operation(
-                &source,
-                &paths,
-                context.lexical,
-                context.typed,
-                provider,
-                context.cancellation,
-                context.session,
-                run,
-            )
-        }
+            &arena,
+            &paths,
+            &source,
+            context.blueprint,
+            context.lexical,
+            context.typed,
+            None,
+            context.cancellation,
+            context.session,
+            artifacts,
+            run,
+        )
     }
 }
 
-pub(crate) const GO_INTERVAL_DISCOVERY_SCOPE_0_SQL: &str = "WITH directories AS (
+pub(crate) static GO_INTERVAL_DISCOVERY_SCOPE_0_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"WITH directories AS (
                SELECT DISTINCT package.provider_directory
                FROM temp.selected_resolution_mounts mounted
-               JOIN temp.selected_go_context_source_files source USING(file_version_id)
+               JOIN ({}) source USING(file_version_id)
                JOIN main.go_package_instances package
                  ON package.context_id=source.context_id AND package.package_id=source.package_id
                WHERE source.context_id=?1 AND mounted.mount_ordinal IN (SELECT value FROM json_each(?2))
@@ -1478,4 +1540,7 @@ pub(crate) const GO_INTERVAL_DISCOVERY_SCOPE_0_SQL: &str = "WITH directories AS 
                ON source.context_id=package.context_id AND source.package_id=package.package_id
              JOIN temp.selected_resolution_mounts mounted USING(file_version_id)
              JOIN temp.selected_resolution_scope_mounts selected USING(mount_ordinal)
-             WHERE package.context_id=?1 AND source.source_role IN ('go','xtest')";
+             WHERE package.context_id=?1 AND source.source_role IN ('go','xtest')"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });

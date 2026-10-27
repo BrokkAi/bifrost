@@ -617,10 +617,20 @@ labelled_enum! {
         /// Select the first result of comma-ok indexing, whose operand must
         /// support that two-result operation.
         ComponentCommaOkValue => "component_comma_ok_value",
+        /// Validate an index/dimension operand under the language rule.
+        /// Adds completion and validity to the output, never operand values.
+        IndexOperand => "index_operand",
+        /// Require conversion to the output's Element component under the
+        /// language rule. Adds completion and validity, never operand values.
+        ElementOperand => "element_operand",
     }
 }
 
 impl ResolutionTypeTransferKind {
+    pub const fn is_operand_gate(self) -> bool {
+        matches!(self, Self::IndexOperand | Self::ElementOperand)
+    }
+
     pub const fn is_operand_promotion(self) -> bool {
         matches!(self, Self::NumericPromotion | Self::StringConcatenation)
     }
@@ -1251,6 +1261,11 @@ labelled_enum! {
         /// A Scala self-type constraint used for member inheritance inside its
         /// owning template, but not as a nominal subtype relation.
         SelfType => "self_type",
+        /// A language-defined member lookup root for an interface without
+        /// direct superinterfaces. Only the public instance method signatures
+        /// admitted by the JVM language rules participate in lookup. This edge
+        /// confers neither nominal subtype proof nor protected members.
+        ImplicitInterfaceMembers => "implicit_interface_members",
     }
 }
 
@@ -2240,7 +2255,9 @@ pub struct FileResolutionFacts {
     pub callable_receivers: Vec<ResolutionCallableReceiverFact>,
     pub member_owners: Vec<ResolutionMemberOwnerFact>,
     pub deferred_member_owners: Vec<ResolutionDeferredMemberOwnerFact>,
-    /// Module declarations whose only route is a crate-level module walk, not
+    /// Module declarations reached through environment routes rather than a
+    /// lexical binder. Python file modules use selected import providers.
+    /// Rust module declarations can use a crate-level module walk, not
     /// a lexical binder: a `mod name;` a Rust macro capsule lowers from an
     /// item-macro invocation's arguments. The crate decides whether the
     /// invocation expands and mounts the module; the capsule only gives the
@@ -2308,6 +2325,39 @@ pub fn source_owned_package_references(
 }
 
 impl FileResolutionFacts {
+    /// Give an authored module its definition namespace and optional body scope.
+    /// Languages supply the declaration's source identity, namespace, and scope
+    /// construction; an external module declaration need not have a body here.
+    pub fn define_module(
+        &mut self,
+        declaration: ResolutionSiteId,
+        namespace: ResolutionNamespace,
+        body: Option<ResolutionScopeId>,
+    ) {
+        assert_eq!(
+            self.sites[declaration.index()].kind,
+            ResolutionSiteKind::ModuleDeclaration
+        );
+        assert!(
+            !self
+                .additional_definition_namespaces
+                .iter()
+                .any(|fact| { fact.declaration == declaration && fact.namespace == namespace }),
+            "one module definition namespace per declaration"
+        );
+        self.additional_definition_namespaces
+            .push(ResolutionAdditionalDefinitionNamespaceFact {
+                declaration,
+                namespace,
+                hoisting: HoistingClass::ScopeWide,
+            });
+        if let Some(body) = body {
+            let scope = &mut self.scopes[body.index()];
+            assert!(scope.owner.is_none(), "one authored owner per module body");
+            scope.owner = Some(declaration);
+        }
+    }
+
     /// Record one positional type parameter owned by a generic declaration.
     pub fn add_generic_formal(
         &mut self,

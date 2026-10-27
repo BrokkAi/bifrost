@@ -24,8 +24,7 @@ default = []
 test-support = ["brokk-bifrost-core/test-support"]
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.1" }
-rayon = "1.10.0"
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
 regex = "1.12.2"
 tree-sitter = "0.25.10"
 tree-sitter-python = "0.25.0"
@@ -33,7 +32,7 @@ toml = "0.8.23"
 
 [dev-dependencies]
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2", features = ["test-support"] }
 tempfile = "3.23.0"
 
 [lints]

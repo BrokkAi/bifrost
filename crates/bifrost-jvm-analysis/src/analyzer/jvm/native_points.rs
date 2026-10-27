@@ -202,22 +202,35 @@ impl StructuralReceiverResolver for JvmNativeRolloutPoints {
 // is focused on that callee. The reported site keeps the whole expression.
 // This mirrors Go's whole-expression anchor selection in its native points.
 fn kotlin_call_value_anchor(query: BoundedReceiverQuery<'_>) -> Option<ResolvedReferenceSite> {
-    let call = smallest_named_node_covering(
+    jvm_reference_anchor(query, |call| {
+        if call.kind() != "call_expression"
+            || call.start_byte() != query.site.focus_start_byte
+            || call.end_byte() != query.site.focus_end_byte
+        {
+            return None;
+        }
+        let callee = syntax::kotlin_callee(call)?;
+        match callee.kind() {
+            "simple_identifier" => Some(callee),
+            "navigation_expression" => syntax::kotlin_navigation_member(callee),
+            _ => None,
+        }
+    })
+}
+
+// Languages select the reference-bearing node from the syntax around the
+// requested focus. Keep the original display site while focusing the native
+// locator on the reference published by the producer.
+pub(crate) fn jvm_reference_anchor<'tree>(
+    query: BoundedReceiverQuery<'tree>,
+    select: impl FnOnce(tree_sitter::Node<'tree>) -> Option<tree_sitter::Node<'tree>>,
+) -> Option<ResolvedReferenceSite> {
+    let selected = smallest_named_node_covering(
         query.tree?.root_node(),
         query.site.focus_start_byte,
         query.site.focus_end_byte,
-    )
-    .filter(|node| {
-        node.kind() == "call_expression"
-            && node.start_byte() == query.site.focus_start_byte
-            && node.end_byte() == query.site.focus_end_byte
-    })?;
-    let callee = syntax::kotlin_callee(call)?;
-    let anchor = match callee.kind() {
-        "simple_identifier" => callee,
-        "navigation_expression" => syntax::kotlin_navigation_member(callee)?,
-        _ => return None,
-    };
+    )?;
+    let anchor = select(selected)?;
     let mut site = query.site.clone();
     site.focus_start_byte = anchor.start_byte();
     site.focus_end_byte = anchor.end_byte();
@@ -604,7 +617,7 @@ fn project_kotlin_external_boundary(
                         candidate.record.id == *declaration_id
                             && (!candidate
                                 .shard
-                                .independently_enumerates_jvm_owner(candidate.record)
+                                .independently_enumerates_jvm_owner(&candidate.record)
                                 || !candidate
                                     .record
                                     .jvm_inventory
@@ -1726,7 +1739,7 @@ fn prepare_context(
     namespace: Option<ResolutionNamespace>,
     selected_model: Option<(
         ExplicitImportModelRoute,
-        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol,
+        std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol>,
     )>,
 ) -> Result<NativePointContext> {
     Ok(

@@ -119,6 +119,9 @@ pub trait MemberAccessRules<Row>: std::fmt::Debug {
         Ok(Read::ready(Vec::new()))
     }
 
+    /// The returned completion covers every reply this call read; the cursor
+    /// merges reply completions only on cancellation. Member selections also
+    /// retain their completion in the cursor through `resume_members`.
     fn classify_row(
         &self,
         context: &MemberAccessContext<'_>,
@@ -1097,11 +1100,11 @@ pub(super) fn poll_member_access<Row>(
         )? {
             Read::Ready { .. } => {}
             Read::Cancelled(completion) => {
-                return Ok(Read::Cancelled(if request.0.is_some() {
-                    request.1.combine(&completion)
-                } else {
-                    rows.completion.combine(&completion)
-                }));
+                return Ok(Read::Cancelled(
+                    rows.cancellation_completion()
+                        .combine(&request.1)
+                        .combine(&completion),
+                ));
             }
             Read::Unavailable { reason, completion } => {
                 return Ok(Read::Unavailable {
@@ -1492,6 +1495,17 @@ impl<Row> MemberAccessState<Row> {
     }
 }
 impl<Row> MemberAccessRows<Row> {
+    fn cancellation_completion(&self) -> ResolutionCompletion {
+        self.replies
+            .iter()
+            .fold(self.completion.clone(), |completion, reply| match reply {
+                AccessPrerequisiteReply::Reference { answer, .. } => {
+                    completion.combine(answer.completion())
+                }
+                AccessPrerequisiteReply::Members { .. } => completion,
+            })
+    }
+
     pub fn resume_members(&mut self, reply: &DemandMemberSelection) {
         let AccessWait::Members { reference, lookup } = self
             .outstanding
@@ -1521,26 +1535,25 @@ impl<Row> MemberAccessRows<Row> {
         );
         if !closer_step(session, cancellation, CloserWork::CandidateClassification) {
             return Ok(Read::Cancelled(
-                self.completion.combine(answer.completion()),
+                self.cancellation_completion().combine(answer.completion()),
             ));
         }
         let Some(answer) = answer.clone_with_poll(&mut || {
             !closer_step(session, cancellation, CloserWork::CandidateClassification)
         }) else {
             return Ok(Read::Cancelled(
-                self.completion.combine(answer.completion()),
+                self.cancellation_completion().combine(answer.completion()),
             ));
         };
         let answer = Box::new(answer);
         if cancellation.is_cancelled() {
             return Ok(Read::Cancelled(
-                self.completion.combine(answer.completion()),
+                self.cancellation_completion().combine(answer.completion()),
             ));
         }
         self.outstanding
             .take()
             .expect("consume the exact reference wait once");
-        self.completion = self.completion.combine(answer.completion());
         self.replies
             .push(AccessPrerequisiteReply::Reference { key, answer });
         Ok(Read::ready(()))
@@ -1556,7 +1569,8 @@ impl<Row> MemberAccessRows<Row> {
         loop {
             if cancellation.is_cancelled() {
                 return Ok(Read::Cancelled(
-                    self.completion.combine(&cancelled_completion()),
+                    self.cancellation_completion()
+                        .combine(&cancelled_completion()),
                 ));
             }
             if self.pending.is_none() {
@@ -1566,7 +1580,7 @@ impl<Row> MemberAccessRows<Row> {
                         cancellation,
                         CloserWork::CandidateClassification,
                     ) {
-                        return Ok(Read::Cancelled(self.completion.clone()));
+                        return Ok(Read::Cancelled(self.cancellation_completion()));
                     }
                     assert!(self.pending_base.replace(self.completion.clone()).is_none());
                     let target = match project(&row)? {
@@ -1575,7 +1589,9 @@ impl<Row> MemberAccessRows<Row> {
                             value
                         }
                         Read::Cancelled(completion) => {
-                            return Ok(Read::Cancelled(self.completion.combine(&completion)));
+                            return Ok(Read::Cancelled(
+                                self.cancellation_completion().combine(&completion),
+                            ));
                         }
                         Read::Unavailable { reason, completion } => {
                             return Ok(Read::Unavailable {
@@ -1592,7 +1608,9 @@ impl<Row> MemberAccessRows<Row> {
                             self.queue = value.into_iter();
                         }
                         Read::Cancelled(completion) => {
-                            return Ok(Read::Cancelled(self.completion.combine(&completion)));
+                            return Ok(Read::Cancelled(
+                                self.cancellation_completion().combine(&completion),
+                            ));
                         }
                         Read::Unavailable { reason, completion } => {
                             return Ok(Read::Unavailable {
@@ -1619,7 +1637,7 @@ impl<Row> MemberAccessRows<Row> {
                         cancellation,
                         CloserWork::CandidateClassification,
                     ) {
-                        return Ok(Read::Cancelled(self.completion.clone()));
+                        return Ok(Read::Cancelled(self.cancellation_completion()));
                     }
                     assert!(!self.replies.iter().any(|reply| matches!(reply, AccessPrerequisiteReply::Members { reference, lookup, .. } if *reference==request.reference && *lookup==request.lookup)), "consult existing row replies before requesting a member again");
                     self.outstanding = Some(AccessWait::Members {
@@ -1638,7 +1656,7 @@ impl<Row> MemberAccessRows<Row> {
                         cancellation,
                         CloserWork::CandidateClassification,
                     ) {
-                        return Ok(Read::Cancelled(self.completion.clone()));
+                        return Ok(Read::Cancelled(self.cancellation_completion()));
                     }
                     assert!(
                         self.outstanding
@@ -1680,7 +1698,9 @@ impl<Row> MemberAccessRows<Row> {
                     self.replies.clear();
                 }
                 AccessRowPoll::Ready(Read::Cancelled(completion)) => {
-                    return Ok(Read::Cancelled(self.completion.combine(&completion)));
+                    return Ok(Read::Cancelled(
+                        self.cancellation_completion().combine(&completion),
+                    ));
                 }
                 AccessRowPoll::Ready(Read::Unavailable { reason, completion }) => {
                     return Ok(Read::Unavailable {
@@ -2402,25 +2422,43 @@ mod tests {
             _: Option<&SelectedMemberRouteTarget>,
             input: AccessRowInput<'_>,
         ) -> Result<AccessRowPoll> {
-            let key = DemandReferenceKey::caller(id("row-dependency"));
-            if let AccessRowInput::Replies(replies) = input
-                && let Some(AccessPrerequisiteReply::Reference { answer, .. }) =
-                    replies.iter().find(|reply| {
-                        matches!(reply, AccessPrerequisiteReply::Reference { key: answered, .. } if *answered == key)
-                    })
-            {
-                if answer.completion() == &ResolutionCompletion::Complete {
+            let replies = match input {
+                AccessRowInput::Start => &[][..],
+                AccessRowInput::Replies(replies) => replies,
+            };
+            let mut completion = ResolutionCompletion::Complete;
+            for name in ["row-dependency", "second-row-dependency"] {
+                let key = DemandReferenceKey::caller(id(name));
+                let answer = replies.iter().find_map(|reply| match reply {
+                    AccessPrerequisiteReply::Reference {
+                        key: answered,
+                        answer,
+                    } if *answered == key => Some(answer),
+                    _ => None,
+                });
+                let Some(answer) = answer else {
+                    if self.cancel_at_yield {
+                        self.cancellation.cancel();
+                    }
+                    return Ok(AccessRowPoll::Reference(key));
+                };
+                if answer.binding().completion() == &ResolutionCompletion::Complete {
                     assert_eq!(answer.binding().targets(), &[id("selected-dependency")]);
-                } else { assert!(answer.binding().targets().is_empty()); }
-
-                let mut facts = row(context.provenance, 0, 0, AccessKey::Fixed(0), AccessKey::Fixed(0)).facts;
-                facts.completion = answer.completion().clone();
-                return Ok(AccessRowPoll::Ready(Read::ready(Box::new(facts))));
+                } else {
+                    assert!(answer.binding().targets().is_empty());
+                }
+                completion = completion.combine(answer.binding().completion());
             }
-            if self.cancel_at_yield {
-                self.cancellation.cancel();
-            }
-            Ok(AccessRowPoll::Reference(key))
+            let mut facts = row(
+                context.provenance,
+                0,
+                0,
+                AccessKey::Fixed(0),
+                AccessKey::Fixed(0),
+            )
+            .facts;
+            facts.completion = completion;
+            Ok(AccessRowPoll::Ready(Read::ready(Box::new(facts))))
         }
     }
     #[test]
@@ -2618,7 +2656,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "#5658: incomplete Reference replies must retain the row without repeating owner reads"
+        "#5658+#6509: reference waits retain rows while binding evidence excludes unrelated type gaps"
     )]
     fn member_access_reference_wait_retains_row_and_observes_yield_and_resume_cancellation() {
         use crate::analyzer::resolution::FactReferenceSiteMetadata;
@@ -2629,7 +2667,7 @@ mod tests {
             let session = session();
             let providers = ProviderObservationStore::default();
             let context = context(&session, &selection, view, &providers);
-            for cancel in [0, 1, 2, 3] {
+            for cancel in 0..8 {
                 let answer = FactResolutionAnswer::from_selected_summary_binding(
                     FactReferenceSiteMetadata::new(
                         ResolutionSiteId::new(0),
@@ -2657,6 +2695,20 @@ mod tests {
                     },
                 );
 
+                let type_gap =
+                    ResolutionIncompleteReason::UnsupportedSemantic(id("missing-type-property"));
+                let answer = if cancel >= 4 {
+                    crate::analyzer::resolution::fact_resolution::fixture_support::answer_with_frontier(
+                        answer,
+                        crate::analyzer::resolution::TypedFrontierState::new(
+                            id("dependency-type"),
+                            Vec::new(),
+                            ResolutionCompletion::incomplete([type_gap]),
+                        ),
+                    )
+                } else {
+                    answer
+                };
                 let cancellation = CancellationToken::new();
                 let rules = ReferenceRules {
                     cancellation: &cancellation,
@@ -2698,19 +2750,100 @@ mod tests {
                     panic!("row reference wait");
                 };
                 assert_eq!((reads.get(), projections.get()), (1, 1));
-                if cancel == 2 {
+                if cancel == 2 || cancel == 5 {
                     cancellation.cancel();
                 }
                 let resumed = state
                     .rows
                     .resume_reference(key, &answer, &session, &cancellation)
                     .unwrap();
-                if cancel == 2 {
-                    assert!(matches!(resumed, Read::Cancelled(_)));
+                if cancel == 2 || cancel == 5 {
+                    let Read::Cancelled(completion) = resumed else {
+                        panic!("cancelled resume");
+                    };
+                    if cancel == 5 {
+                        assert!(completion.contains_reason(type_gap));
+                    }
                     assert!(state.rows.projected.is_empty());
                     continue;
                 }
                 assert!(matches!(resumed, Read::Ready { .. }));
+                if cancel == 7 {
+                    // A provider read can cancel while the second reference
+                    // wait still retains the first reply's type evidence.
+                    let site = MemberAccessSite {
+                        session: &session,
+                        selection: &selection,
+                        provenance: view,
+                        input_completion: &selection.completion,
+                        reference: id("reference"),
+                        lookup: id("lookup"),
+                        step: 0,
+                        namespace: ResolutionNamespace::Value,
+                    };
+                    let mut providers = ProviderObservationStore::default();
+                    let mut hooks = ResolutionCompletion::Complete;
+                    let mut evidence = ResolutionCompletion::Complete;
+                    let read = poll_member_access(
+                        &mut state.rows,
+                        &site,
+                        &rules,
+                        &mut providers,
+                        &mut hooks,
+                        &mut evidence,
+                        &cancellation,
+                        |_| panic!("held row must not read owners again"),
+                        |_| panic!("held row must not project again"),
+                        || Ok(Read::Cancelled(ResolutionCompletion::Complete)),
+                    )
+                    .unwrap();
+                    let Read::Cancelled(completion) = read else {
+                        panic!("cancelled provider read");
+                    };
+                    assert!(completion.contains_reason(type_gap));
+                    assert_eq!(
+                        state.rows.outstanding,
+                        Some(AccessWait::Reference(DemandReferenceKey::caller(id(
+                            "second-row-dependency"
+                        ))))
+                    );
+                    continue;
+                }
+                if cancel == 6 {
+                    cancellation.cancel();
+                }
+                let second = state
+                    .rows
+                    .poll(
+                        &context,
+                        &rules,
+                        &cancellation,
+                        |_| panic!("held row must not read owners again"),
+                        |_| panic!("held row must not project again"),
+                    )
+                    .unwrap();
+                if cancel == 6 {
+                    let Read::Cancelled(completion) = second else {
+                        panic!("cancelled held row");
+                    };
+                    assert!(completion.contains_reason(type_gap));
+                    continue;
+                }
+                let Read::Ready {
+                    value: Some(AccessPrerequisiteRequest::Reference(key)),
+                    ..
+                } = second
+                else {
+                    panic!("second reference wait");
+                };
+                assert_eq!(key, DemandReferenceKey::caller(id("second-row-dependency")));
+                assert!(matches!(
+                    state
+                        .rows
+                        .resume_reference(key, &answer, &session, &cancellation)
+                        .unwrap(),
+                    Read::Ready { .. }
+                ));
                 let polled = state
                     .rows
                     .poll(
@@ -2725,6 +2858,18 @@ mod tests {
                     )
                     .unwrap();
                 assert!(matches!(polled, Read::Ready { value: None, .. }));
+                if cancel == 4 {
+                    assert_eq!(
+                        answer.binding().completion(),
+                        &ResolutionCompletion::Complete
+                    );
+                    assert!(answer.completion().contains_reason(type_gap));
+                    assert_eq!(state.rows.completion, ResolutionCompletion::Complete);
+                    assert_eq!(
+                        state.rows.projected[0].facts.completion,
+                        ResolutionCompletion::Complete
+                    );
+                }
                 assert_eq!((reads.get(), projections.get()), (3, 1));
                 assert_eq!(state.rows.projected.len(), 1);
                 assert!(
@@ -3038,7 +3183,15 @@ pub(crate) mod bridge_contract {
                 occurrence: provider.occurrence(),
                 provider: provider.clone(),
                 binding: MemberBinding::Unchanged,
-                completion: ResolutionCompletion::Complete,
+                completion: replies.iter().fold(
+                    ResolutionCompletion::Complete,
+                    |completion, reply| match reply {
+                        AccessPrerequisiteReply::Reference { answer, .. } => {
+                            completion.combine(answer.completion())
+                        }
+                        AccessPrerequisiteReply::Members { .. } => completion,
+                    },
+                ),
                 coverage: Box::new([provider]),
                 witnesses: Box::new([]),
             }))))

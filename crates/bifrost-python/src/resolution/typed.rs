@@ -139,10 +139,10 @@ impl Typed<'_, '_, '_> {
                         node.child_by_field_name("object"),
                         node.child_by_field_name("attribute"),
                     ) {
-                        let object = self.values[&object.id()];
+                        let object_slot = self.values[&object.id()];
                         let receiver = self.slot(node, ResolutionTypeSlotRole::Receiver);
                         self.transfer(
-                            object,
+                            object_slot,
                             receiver,
                             ResolutionTypeTransferKind::Receiver,
                             ResolutionTypeTransferValueTransform::Preserve,
@@ -159,6 +159,38 @@ impl Typed<'_, '_, '_> {
                             .find(|id| id.site == site)
                             .unwrap()
                             .qualifier = Some(receiver);
+                        // Module imports and local values share Python's Value
+                        // namespace. The selected temporal binding, not syntax,
+                        // decides whether this prefix can continue as a module.
+                        if object.kind() == "identifier" {
+                            let prefix_reference =
+                                self.p.facts.type_slots[object_slot.index()].site;
+                            let name = self
+                                .p
+                                .facts
+                                .identifiers
+                                .iter()
+                                .find(|identifier| identifier.site == prefix_reference)
+                                .expect("a spelled operand has a reference identifier")
+                                .name;
+                            self.p
+                                .facts
+                                .root_references
+                                .push(ResolutionRootReferenceFact {
+                                    reference: site,
+                                    root_scope: ResolutionScopeId::new(0),
+                                    anchor: ResolutionRootImportAnchor::Lexical,
+                                    prefix_reference: Some(prefix_reference),
+                                    owner_continued: false,
+                                });
+                            self.p.facts.root_reference_segments.push(
+                                ResolutionRootReferenceSegmentFact {
+                                    reference: site,
+                                    position: 0,
+                                    name,
+                                },
+                            );
+                        }
                         let slot = self
                             .p
                             .facts
@@ -281,9 +313,11 @@ impl Typed<'_, '_, '_> {
                 .facts
                 .add_gap(call, ResolutionGapKind::UnsupportedExpressionType);
         }
+        // Invocation validity stays on the callee obligation. It cannot change
+        // the declaration identity carried by an otherwise proved result.
         self.p
             .facts
-            .add_gap(call, ResolutionGapKind::UnsupportedCallApplicability);
+            .add_gap(callee, ResolutionGapKind::UnsupportedCallApplicability);
         // The expression value is retained for future callable-value selection.
         // A call does not turn this value into a type object or an allocation.
         debug_assert!(matches!(
@@ -882,6 +916,7 @@ pub(super) fn produce(
         if node.kind() == "class_definition" {
             let class = declarations[&node.id()];
             let mut metaclass_expression = None;
+            let mut hierarchy_incomplete = node.has_error();
             if let Some(bases) = node.child_by_field_name("superclasses") {
                 let mut ordinal = 0;
                 for (written_ordinal, operand) in named_children_iter(bases).enumerate() {
@@ -908,6 +943,7 @@ pub(super) fn produce(
                         continue;
                     }
                     let plain = matches!(operand.kind(), "identifier" | "attribute");
+                    hierarchy_incomplete |= !plain;
                     let slot = if plain {
                         t.type_expression(operand)
                     } else {
@@ -933,6 +969,8 @@ pub(super) fn produce(
                             },
                         });
                     if plain {
+                        t.p.facts
+                            .add_gap(site, ResolutionGapKind::UnsupportedHierarchyTraversal);
                         t.p.facts.supertypes.push(ResolutionSupertypeFact {
                             subtype: class,
                             parent_ordinal: ordinal,
@@ -949,8 +987,12 @@ pub(super) fn produce(
                 metaclass_expression,
                 bases_complete: !node.has_error(),
             });
-            t.p.facts
-                .add_gap(class, ResolutionGapKind::UnsupportedHierarchyTraversal);
+            if hierarchy_incomplete {
+                // Without a normalized edge, no exact parent proof can retire
+                // this obligation. Ordinary base-less classes use implicit object.
+                t.p.facts
+                    .add_gap(class, ResolutionGapKind::UnsupportedHierarchyTraversal);
+            }
         }
         if node.kind() == "assignment"
             && let Some(left) = node

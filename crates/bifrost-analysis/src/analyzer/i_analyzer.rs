@@ -137,6 +137,31 @@ macro_rules! forward_relational_definition_batch {
 #[doc(hidden)]
 pub use crate::forward_relational_definition_batch;
 
+/// Forward request-ledger capture and replay through a language wrapper.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! forward_query_read_ledger {
+    () => {
+        fn record_read(&self, key: $crate::analyzer::read_ledger::ReadKey) {
+            $crate::analyzer::IAnalyzer::record_read(&self.inner, key);
+        }
+
+        fn record_unattributed_read(&self) {
+            $crate::analyzer::IAnalyzer::record_unattributed_read(&self.inner);
+        }
+
+        fn read_ledger_attached(&self) -> bool {
+            $crate::analyzer::IAnalyzer::read_ledger_attached(&self.inner)
+        }
+
+        fn current_thread_read_ledger(
+            &self,
+        ) -> Option<std::sync::Arc<$crate::analyzer::ReadLedger>> {
+            $crate::analyzer::IAnalyzer::current_thread_read_ledger(&self.inner)
+        }
+    };
+}
+
 /// Forward the two Git-identity invalidation operations from a public language
 /// wrapper to its generic `TreeSitterAnalyzer`.
 #[doc(hidden)]

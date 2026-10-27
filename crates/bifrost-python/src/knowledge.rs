@@ -12,6 +12,19 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct PythonKnowledge;
 
 impl LanguageKnowledge for PythonKnowledge {
+    // Applicability decides whether a Python call returns or raises, not which
+    // declaration its callee reference names.
+    fn call_applicability_may_select_callee(&self) -> bool {
+        false
+    }
+
+    // Invocation validity does not choose a declaration's modeled result type.
+    // Native typing.overload selection is not modeled; decorated values retain
+    // their existing unknown-value evidence instead of overload alternatives.
+    fn callable_result_is_applicability_independent(&self) -> bool {
+        true
+    }
+
     fn keyed_property_reads_container_element(&self) -> bool {
         true
     }

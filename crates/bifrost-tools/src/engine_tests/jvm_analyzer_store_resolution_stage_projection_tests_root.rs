@@ -242,7 +242,7 @@ mod jvm_extraction_tests {
         before_publication.execute_batch(
         "CREATE TABLE resolution_identities(id INTEGER PRIMARY KEY,identity_digest BLOB NOT NULL UNIQUE)",
     ).unwrap();
-        let names = SharedNameTable::new(SharedNameCache::new());
+        let names = SharedNameTable::new(SharedNameCache::default());
         let request = names.interner(&before_publication).intern(digest);
         assert!(!request.is_interned());
         let authority = SelectedResolutionAuthority::new(

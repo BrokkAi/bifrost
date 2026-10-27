@@ -482,7 +482,7 @@ pub mod jvm_extraction_tests {
         );
         let cancellation = CancellationToken::new();
         let operation = fixture.open_ready(&cancellation);
-        *operation.jvm_context_profile.borrow_mut() = Some(Default::default());
+        *operation.ready.jvm_context_profile.borrow_mut() = Some(Default::default());
         let other = operation
             .ready
             .inventory
@@ -492,6 +492,7 @@ pub mod jvm_extraction_tests {
             .ordinal();
         let derived_other = || {
             operation
+                .ready
                 .jvm_context_profile
                 .borrow()
                 .as_ref()
@@ -510,6 +511,7 @@ pub mod jvm_extraction_tests {
         ));
         assert!(
             operation
+                .ready
                 .jvm_context_profile
                 .borrow()
                 .as_ref()
@@ -559,7 +561,7 @@ pub mod jvm_extraction_tests {
         let fixture = JavaRootResolutionOperationFixture::new();
         let cancellation = CancellationToken::new();
         let operation = fixture.open_ready(&cancellation);
-        *operation.jvm_context_profile.borrow_mut() = Some(Default::default());
+        *operation.ready.jvm_context_profile.borrow_mut() = Some(Default::default());
         let statement = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JVM_IMPORT_TARGET_MOUNTS;
         let read = |namespace| {
             operation
@@ -576,6 +578,7 @@ pub mod jvm_extraction_tests {
         };
         let derivations = || {
             operation
+                .ready
                 .jvm_context_profile
                 .borrow()
                 .as_ref()
@@ -665,9 +668,10 @@ pub mod jvm_extraction_tests {
         let fixture = JavaRootResolutionOperationFixture::new();
         let cancellation = CancellationToken::new();
         let operation = fixture.open_ready(&cancellation);
-        *operation.jvm_context_profile.borrow_mut() = Some(Default::default());
+        *operation.ready.jvm_context_profile.borrow_mut() = Some(Default::default());
         let derivations = |operation: &SelectedResolutionOperation<'_, '_>, kind: &str| {
             operation
+                .ready
                 .jvm_context_profile
                 .borrow()
                 .as_ref()
@@ -834,8 +838,9 @@ pub mod jvm_extraction_tests {
         };
         assert!(matches!(
             operation
-                .collect_jvm_blueprint_in_session(
+                .ready.collect_blueprint_with_projection_memo(
                     context,
+                    Some(&operation.jvm_context_blueprints),
                     &cancellation,
                     &ResolutionSession::unbounded()
                 )
@@ -944,7 +949,7 @@ pub mod jvm_extraction_tests {
         drop(operation);
 
         let operation = fixture.open_ready(&cancellation);
-        *operation.jvm_context_profile.borrow_mut() = Some(Default::default());
+        *operation.ready.jvm_context_profile.borrow_mut() = Some(Default::default());
         check_import_facts(&operation);
         assert!(
             operation
@@ -1010,6 +1015,7 @@ pub mod jvm_extraction_tests {
                 &[],
                 &[],
                 &fixture.configuration,
+                &[],
                 &[],
             )
             .unwrap();
@@ -1982,7 +1988,7 @@ pub mod jvm_extraction_tests {
                     .expect("live selected metadata");
                 assert_eq!(rows.len(), count);
                 for row in &rows {
-                    assert_eq!(row.package.as_deref(), Some("use"));
+                    assert_eq!(row.package.named(), Some("use"));
                     match row.kind {
                         JavaInheritanceDeclarationKind::Type { is_interface, .. } => {
                             assert!(!is_interface)
@@ -2053,13 +2059,16 @@ pub mod jvm_extraction_tests {
                         "synthetic Java type bodies must seek {alias} with {statistics}: {synthetic_plan:#?}"
                     );
                 }
+                // The only permitted scan is the bounded json_each request
+                // array (#6594).
                 assert!(
                     synthetic_plan
                         .iter()
                         .all(|detail| !detail.contains("AUTOMATIC")
                             && !detail.contains("TEMP B-TREE")
                             && !detail.contains("CO-ROUTINE")
-                            && (!detail.starts_with("SCAN ") || detail == "SCAN request")),
+                            && (!detail.starts_with("SCAN ")
+                                || detail.starts_with("SCAN request VIRTUAL TABLE"))),
                     "{statistics}: {synthetic_plan:#?}"
                 );
                 // The canonical metadata view checks agreement of source
@@ -2070,7 +2079,8 @@ pub mod jvm_extraction_tests {
                         && (!detail.contains("TEMP B-TREE")
                             || detail == "USE TEMP B-TREE FOR count(DISTINCT)")
                         && !detail.contains("CO-ROUTINE")
-                        && (!detail.starts_with("SCAN ") || detail == "SCAN request")),
+                        && (!detail.starts_with("SCAN ")
+                            || detail.starts_with("SCAN request VIRTUAL TABLE"))),
                     "{statistics}: {plan:#?}"
                 );
             }
@@ -2349,6 +2359,7 @@ pub mod jvm_extraction_tests {
                     &[],
                     &configuration,
                     &[],
+                    &[],
                 )
                 .unwrap();
             store.reconcile_jvm_package_context(&snapshot).unwrap();
@@ -2543,7 +2554,7 @@ pub mod jvm_extraction_tests {
                     |row| brokk_bifrost_analysis::analyzer::resolution::fact_source::JavaInheritanceDeclaration {
                         definition: row.definition(),
                         name: String::new(),
-                        package: package.clone(),
+                        package: brokk_bifrost_analysis::analyzer::resolution::fact_source::JvmDeclarationPackage::Known(package.clone()),
                         kind: brokk_bifrost_analysis::analyzer::resolution::fact_source::JavaInheritanceDeclarationKind::Type {
                             is_interface: false,
                             is_singleton: false,

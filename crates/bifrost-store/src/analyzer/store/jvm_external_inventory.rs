@@ -23,17 +23,19 @@ impl AnalyzerStore {
         ) {
             return Ok(());
         }
-        let Some((types, members, _relations)) = shard.shard.payload().declaration_facts() else {
+        let Some((types, members, _relations)) = shard.decoded().payload().declaration_facts()
+        else {
             return Ok(());
         };
         let enumerated_types = types
             .iter()
+            .map(AsRef::as_ref)
             .filter(|owner| shard.admits_jvm_owner_declaration(owner))
             .collect::<Vec<_>>();
         self.publish_jvm_external_inventory_facts(
             shard.manifest.semantic_sha256.clone(),
             enumerated_types,
-            members,
+            members.iter().map(AsRef::as_ref),
             shard.manifest.completeness == Completeness::Complete,
         )
     }
@@ -43,7 +45,7 @@ impl AnalyzerStore {
         &self,
         provider_id: String,
         types: impl IntoIterator<Item = &'a crate::analyzer::semantic_model::TypeFact>,
-        members: &[MemberFact],
+        members: impl IntoIterator<Item = &'a MemberFact>,
         complete: bool,
     ) -> Result<()> {
         let enumerated_types = types.into_iter().collect::<Vec<_>>();
@@ -75,7 +77,7 @@ impl AnalyzerStore {
             return Ok(());
         }
         let types = enumerated_types.into_iter().cloned().collect::<Vec<_>>();
-        let members = members.to_vec();
+        let members = members.into_iter().cloned().collect::<Vec<_>>();
         self.conn.execute(move |conn| {
             let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let names_by_id = types

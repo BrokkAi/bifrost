@@ -1203,6 +1203,113 @@ mod tests {
         names
     }
 
+    // Grammar/adapter boundary: package identifiers are distinct segments;
+    // object_declaration and companion_object carry different authored roles.
+    #[test]
+    fn declaration_shape_grammar_boundary() {
+        let source = r#"package a.b.c
+object Registry
+class _Cache {
+    object Named
+    companion object Factory
+    class `odd name`
+}
+class Host { companion object }
+val String.wordCount: Int get() = length
+val count: Int = 0
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut grammar_shapes = Vec::new();
+        let mut receivers = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "property_declaration"
+                && let Some(receiver) = node.child_by_field_name("receiver")
+            {
+                receivers.push(&source[receiver.byte_range()]);
+            }
+            if matches!(
+                node.kind(),
+                "class_declaration" | "object_declaration" | "companion_object"
+            ) {
+                let name = first_named_child(node, "type_identifier")
+                    .map(|name| &source[name.byte_range()]);
+                grammar_shapes.push((node.kind(), name));
+            }
+            let mut cursor = node.walk();
+            stack.extend(
+                node.named_children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        assert_eq!(receivers, ["String"]);
+        assert_eq!(
+            grammar_shapes,
+            [
+                ("object_declaration", Some("Registry")),
+                ("class_declaration", Some("_Cache")),
+                ("object_declaration", Some("Named")),
+                ("companion_object", Some("Factory")),
+                ("class_declaration", Some("`odd name`")),
+                ("class_declaration", Some("Host")),
+                ("companion_object", None),
+            ]
+        );
+        let (_, parsed) = parse(source);
+        let expected = [
+            ("Registry", vec!["Registry"], false, None),
+            ("_Cache", vec!["_Cache"], false, None),
+            ("Named", vec!["_Cache", "Named"], false, None),
+            ("Factory", vec!["_Cache", "Factory"], true, None),
+            ("odd name", vec!["_Cache", "odd name"], false, None),
+            ("Host", vec!["Host"], false, None),
+            ("Companion", vec!["Host", "Companion"], true, None),
+            ("wordCount", vec!["wordCount"], false, Some("String")),
+            ("count", vec!["count"], false, None),
+        ];
+        assert_eq!(parsed.declarations().len(), expected.len());
+        for (name, suffix, companion, receiver) in expected {
+            let unit = parsed
+                .declarations()
+                .iter()
+                .find(|unit| unit.identifier() == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let mut segments = vec!["a", "b", "c"];
+            segments.extend(suffix);
+            assert_eq!(unit.fq_segment_texts(), segments, "{name}");
+            assert_eq!(
+                &unit.fq_segments_debug()[..3],
+                &[
+                    ("Package", "a".into()),
+                    ("Package", "b".into()),
+                    ("Package", "c".into())
+                ]
+            );
+            let metadata = &parsed.signature_metadata[unit][0];
+            assert_eq!(metadata.is_companion_object(), companion, "{name}");
+            assert_eq!(metadata.extension_receiver_type(), receiver, "{name}");
+            if name == "wordCount" {
+                assert_eq!(metadata.return_type_text(), Some("Int"));
+                assert_eq!(
+                    metadata
+                        .extension_receiver_type_identity()
+                        .unwrap()
+                        .nominal_name()
+                        .unwrap()
+                        .path(),
+                    &["String"]
+                );
+            }
+        }
+    }
+
     #[test]
     #[hardwon(
         "#2602: Kotlin constructor metadata was missing from usage-scan candidates and caused a timeout"

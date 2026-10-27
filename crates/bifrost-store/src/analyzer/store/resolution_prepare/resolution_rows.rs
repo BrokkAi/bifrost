@@ -656,7 +656,7 @@ pub(crate) fn gap_origin_from_code(value: i64) -> LoweringGapOrigin {
 
 /// Every coverage gap of one blob, encoded.
 ///
-/// One row per gap, plus one provenance row per distinct reason. A reason can
+/// One row per gap, plus one provenance row per minted reason. A reason can
 /// carry several gaps (853,835 gap rows name 312,129 distinct reasons on
 /// tract) and its provenance is a function of the reason, which the interior
 /// holds the same way and this asserts here.
@@ -678,7 +678,36 @@ pub(super) fn prepare_gap_rows(
     let mut shared = SharedNames::default();
     let mut rows = Vec::with_capacity(gaps.len());
     let mut provenance: HashMap<i64, PreparedGapReasonRow> = HashMap::default();
-    let mut reasons = Vec::new();
+    let mut reasons = Vec::with_capacity(identities.gap_reasons.len());
+    for (&reason, &(site, origin)) in &identities.gap_reasons {
+        let row = PreparedGapReasonRow {
+            reason: keys.semantic(reason),
+            site: i64::from(site.get()),
+            origin: gap_origin_code(origin),
+        };
+        assert!(provenance.insert(row.reason, row).is_none());
+        reasons.push(row);
+    }
+    reasons.sort_unstable_by_key(|row| row.reason);
+    // This is the per-blob write boundary. Keep this check always on: a
+    // dangling completion reason persists successfully but cannot authenticate
+    // when a selected reader later transports the answer to another worker.
+    // Checking all catalog reasons also covers every path and answer completion.
+    let dangling = identities
+        .semantics()
+        .iter()
+        .filter(|&&(reason, identity)| {
+            matches!(
+                identity,
+                crate::analyzer::resolution::ResolutionSemanticIdentity::GapReason(_)
+            ) && !provenance.contains_key(&keys.semantic(reason))
+        })
+        .map(|&(reason, _)| (reason, identities.gap_reasons.get(&reason).copied()))
+        .collect::<Vec<_>>();
+    assert!(
+        dangling.is_empty(),
+        "prepared GapReason identities must have provenance rows (reason, site and origin): {dangling:?}"
+    );
     for (gap_key, gap) in gaps.iter().enumerate() {
         let (covers, subject, lookup) = match gap.frontier() {
             LoweringCoverageFrontier::Fragment => (COVERS_FRAGMENT, 0, None),
@@ -715,13 +744,11 @@ pub(super) fn prepare_gap_rows(
             site: i64::from(gap.site().get()),
             origin: gap_origin_code(gap.origin()),
         };
-        match provenance.insert(reason, row) {
-            None => reasons.push(row),
-            Some(previous) => assert_eq!(
-                previous, row,
-                "one gap reason retains one exact lowering provenance"
-            ),
-        }
+        assert_eq!(
+            provenance.get(&reason),
+            Some(&row),
+            "one gap reason retains one exact lowering provenance"
+        );
     }
     PreparedGapRows {
         shared: shared.digests,

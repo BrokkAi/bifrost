@@ -463,17 +463,6 @@ pub mod pinned_plans {
                ON selected_resolution_mounts(blob_id, mount_ordinal);
              CREATE TEMP TABLE IF NOT EXISTS selected_resolution_scope_mounts(
                mount_ordinal INTEGER NOT NULL PRIMARY KEY CHECK(mount_ordinal >= 0)
-             ) WITHOUT ROWID, STRICT;
-             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_typed_requests_1(
-               mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
-               key0 INTEGER NOT NULL CHECK(key0 >= 0),
-               PRIMARY KEY(mount_ordinal, key0)
-             ) WITHOUT ROWID, STRICT;
-             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_typed_requests_2(
-               mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
-               key0 INTEGER NOT NULL CHECK(key0 >= 0),
-               key1 INTEGER NOT NULL CHECK(key1 >= 0),
-               PRIMARY KEY(mount_ordinal, key0, key1)
              ) WITHOUT ROWID, STRICT;",
         )
         .expect("selected resolution mount pin table");
@@ -583,6 +572,10 @@ pub mod pinned_plans {
         (
             "resolution_member_scopes_by_head",
             crate::analyzer::store::resolution_prepare::typed_rows::MEMBER_SCOPES_BY_HEAD_SQL,
+        ),
+        (
+            "resolution_jvm_aliases_by_definition",
+            crate::analyzer::store::resolution_prepare::typed_rows::JVM_ALIASES_BY_DEFINITION_SQL,
         ),
         (
             "resolution_member_owners_by_definition",
@@ -703,6 +696,217 @@ pub mod pinned_plans {
     /// repository store and against the captured statistics. Before this
     /// registry existed the dump carried its own copy of every statement and
     /// could drift from the test that asserts on it.
+    /// Catalog pins run on the active-set TEMP views, not an analyzer store.
+    /// The language-wide absence inventory is a broad stream, not a selective
+    /// question; its plan can legitimately scan the complete selected realm.
+    pub fn semantic_catalog_pins() -> Vec<(PinnedQuery, &'static str)> {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements as q;
+        vec![
+            (
+                pin(
+                    "semantic_search_owner_qualifications",
+                    q::SEARCH_OWNER_QUALIFICATIONS,
+                    vec![text(r#"["Owner17"]"#)],
+                ),
+                "catalog_declaration_types_id",
+            ),
+            (
+                pin(
+                    "semantic_search_types_by_ids",
+                    q::TYPES_BY_IDS,
+                    vec![text(r#"["Owner17"]"#)],
+                ),
+                "catalog_declaration_types_id",
+            ),
+            (
+                pin(
+                    "semantic_search_members_by_ids",
+                    q::MEMBERS_BY_IDS,
+                    vec![text(r#"["Member17"]"#)],
+                ),
+                "catalog_declaration_members_id",
+            ),
+            (
+                pin(
+                    "semantic_search_candidates",
+                    q::SEARCH_ORDERED_CANDIDATES,
+                    vec![
+                        text(r#"[{"language":"rust","id":"Owner17","name":"qualified.Owner17"}]"#),
+                        text(
+                            r#"[{"source_db":"durable","shard_key":1,"digest":"pack"},{"source_db":"session","shard_key":1,"digest":"pack"}]"#,
+                        ),
+                    ],
+                ),
+                "AUTOMATIC COVERING INDEX",
+            ),
+            (
+                pin(
+                    "semantic_payload_family_presence",
+                    q::PAYLOAD_FAMILY_PRESENCE,
+                    vec![text("durable"), integer(1), text("callable_values")],
+                ),
+                "sqlite_autoindex_catalog_semantic_payload_families_1",
+            ),
+            (
+                pin(
+                    "semantic_summary_absent_owners",
+                    q::SUMMARY_ABSENT_OWNERS,
+                    vec![text("rust"), text("name17"), integer(0)],
+                ),
+                "catalog_procedure_summaries_absence",
+            ),
+            (
+                pin(
+                    "semantic_summary_member_candidates",
+                    q::SUMMARY_MEMBER_CANDIDATES,
+                    vec![text("rust"), text("name17"), integer(0)],
+                ),
+                "catalog_procedure_summaries_absence",
+            ),
+            (
+                pin(
+                    "semantic_summary_receiverless",
+                    q::SUMMARY_RECEIVERLESS,
+                    vec![text("rust"), text("Owner17"), text("name17")],
+                ),
+                "catalog_procedure_summaries_member",
+            ),
+            (
+                pin(
+                    "semantic_summary_shard_first",
+                    q::SUMMARY_SHARD_FIRST,
+                    vec![text("durable"), integer(1)],
+                ),
+                "catalog_procedure_summaries_record_id",
+            ),
+            (
+                pin(
+                    "semantic_summary_shard_sequence",
+                    q::SUMMARY_SHARD_SEQUENCE,
+                    vec![text("durable"), integer(1)],
+                ),
+                "catalog_procedure_summaries_record_id",
+            ),
+            (
+                pin(
+                    "semantic_group_owner_ids",
+                    q::GROUP_OWNER_IDS,
+                    vec![text("Type17"), text("rust"), text("type")],
+                ),
+                "catalog_declaration_names_lookup",
+            ),
+            (
+                pin(
+                    "semantic_group_member_ids",
+                    q::MEMBER_IDS_BY_OWNERS,
+                    vec![text("[\"Owner17\"]")],
+                ),
+                "catalog_declaration_members_owner_name",
+            ),
+            (
+                pin("semantic_names", q::TYPES_BY_NAME, vec![text("Type17")]),
+                "catalog_declaration_names_lookup",
+            ),
+            (
+                pin(
+                    "semantic_member_owner_name",
+                    q::MEMBERS_BY_OWNER_NAME,
+                    vec![text("Owner17"), text("name17")],
+                ),
+                "catalog_declaration_members_owner_name",
+            ),
+            (
+                pin(
+                    "semantic_member_name_language",
+                    q::MEMBERS_BY_NAME_LANGUAGE,
+                    vec![text("name17"), text("rust")],
+                ),
+                "catalog_declaration_members_name",
+            ),
+            (
+                pin(
+                    "semantic_relations_from",
+                    q::RELATIONS_FROM,
+                    vec![text("Type17")],
+                ),
+                "catalog_declaration_relations_from",
+            ),
+            (
+                pin(
+                    "semantic_relations_to",
+                    q::RELATIONS_TO,
+                    vec![text("Base17")],
+                ),
+                "catalog_declaration_relations_to",
+            ),
+            (
+                pin(
+                    "semantic_summary_target",
+                    q::SUMMARY_TARGET,
+                    vec![
+                        text("rust"),
+                        text("path17"),
+                        text("symbol17"),
+                        integer(0),
+                        integer(0),
+                    ],
+                ),
+                "catalog_procedure_summaries_target",
+            ),
+            (
+                pin(
+                    "semantic_summary_path",
+                    q::SUMMARY_PATH,
+                    vec![text("rust"), text("path17")],
+                ),
+                "catalog_procedure_summaries_target",
+            ),
+            (
+                pin(
+                    "semantic_summary_target_family",
+                    q::SUMMARY_TARGET_FAMILY,
+                    vec![text("rust"), text("path17"), text("symbol17"), integer(0)],
+                ),
+                "catalog_procedure_summaries_target",
+            ),
+            (
+                pin(
+                    "semantic_summary_member",
+                    q::SUMMARY_MEMBER,
+                    vec![
+                        text("rust"),
+                        text("[\"Owner17\"]"),
+                        text("name17"),
+                        integer(0),
+                    ],
+                ),
+                "catalog_procedure_summaries_member",
+            ),
+            (
+                pin(
+                    "semantic_summary_applicable",
+                    q::SUMMARY_APPLICABLE,
+                    vec![
+                        text("rust"),
+                        text("[\"Owner17\"]"),
+                        text("name17"),
+                        integer(0),
+                        integer(0),
+                    ],
+                ),
+                "catalog_procedure_summaries_member",
+            ),
+            (
+                pin(
+                    "semantic_summary_id",
+                    q::SUMMARY_BY_ID,
+                    vec![text("durable"), integer(1), text("sum17")],
+                ),
+                "catalog_procedure_summaries_record_id",
+            ),
+        ]
+    }
+
     pub fn pinned_queries() -> Vec<PinnedQuery> {
         let mut queries = vec![pin(
             "jvm_native_source_membership",
@@ -714,39 +918,102 @@ pub mod pinned_plans {
                 text("module3/src/main0"),
             ],
         )];
+        // Real codec parameters exercise closed, open and proper-prefix arms.
+        let root_requests = {
+            use crate::analyzer::resolution::{
+                BatchCandidateRequest, BindingNodeId, EndpointSignature, SemanticId, StackPattern,
+                StackVariableId,
+            };
+            let requests = [
+                (vec![], false),
+                (vec![SemanticId::local(0, 1)], false),
+                (vec![SemanticId::local(0, 1), SemanticId::local(0, 2)], true),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (cells, open))| {
+                let request = BatchCandidateRequest::new(
+                    ordinal,
+                    EndpointSignature::new(
+                        BindingNodeId::universal_root(),
+                        StackPattern::new(cells, open.then(|| StackVariableId::operation_local(0))),
+                        StackPattern::closed(vec![]),
+                    ),
+                );
+                serde_json::from_str::<serde_json::Value>(
+                    &super::super::resolution_stage::codec::root_candidate_request(
+                        ordinal,
+                        &request,
+                        &crate::CancellationToken::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+            serde_json::to_string(&requests).unwrap()
+        };
+        queries.extend([
+            pin(
+                "context_forward_root_seek",
+                super::super::resolution_stage::lexical_readers::CONTEXT_FORWARD_CANDIDATES_SQL
+                    .as_str(),
+                vec![integer(1), text("[[3,7]]"), text(&root_requests)],
+            ),
+            pin(
+                "context_reverse_root_seek",
+                super::super::resolution_stage::lexical_readers::CONTEXT_REVERSE_CANDIDATES_SQL
+                    .as_str(),
+                vec![integer(1), text("[[3,7]]"), text(&root_requests)],
+            ),
+            pin(
+                "stage_reverse_root_seek",
+                super::super::resolution_stage::lexical_readers::reverse_candidate_sql(),
+                vec![
+                    Value::Null,
+                    text("[[4,7,null,1,false]]"),
+                    text("[[5,7]]"),
+                    text("[[6,7]]"),
+                    text(&root_requests),
+                    text("[[7,1,0]]"),
+                ],
+            ),
+        ]);
         queries.push(pin(
             "go_interval_resolution_operation_go_named_selected_external_imports",
-            super::super::resolution_operation::go_named::SELECTED_EXTERNAL_IMPORTS,
+            super::super::resolution_operation::go_named::SELECTED_EXTERNAL_IMPORTS.as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_named_selected_unresolved_imports",
-            super::super::resolution_operation::go_named::SELECTED_UNRESOLVED_IMPORTS,
+            super::super::resolution_operation::go_named::SELECTED_UNRESOLVED_IMPORTS.as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_named_selected_import_context_files",
-            super::super::resolution_operation::go_named::SELECTED_IMPORT_CONTEXT_FILES,
+            super::super::resolution_operation::go_named::SELECTED_IMPORT_CONTEXT_FILES.as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_named_caller_source_role",
-            super::super::resolution_operation::go_named::CALLER_SOURCE_ROLE,
+            super::super::resolution_operation::go_named::CALLER_SOURCE_ROLE.as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_named_go_file_import_rows",
-            super::super::resolution_operation::go_named::GO_FILE_IMPORT_ROWS,
+            super::super::resolution_operation::go_named::GO_FILE_IMPORT_ROWS.as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_named_go_interval_go_graph_file_exclusion_0_sql",
-            super::super::resolution_operation::go_named::GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL,
+            super::super::resolution_operation::go_named::GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL
+                .as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_named_go_interval_go_graph_file_exclusion_1_sql",
-            super::super::resolution_operation::go_named::GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL,
+            super::super::resolution_operation::go_named::GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL
+                .as_str(),
             vec![integer(1)],
         ));
         queries.push(pin(
@@ -756,12 +1023,14 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_demand_go_interval_discovery_scope_0_sql",
-            super::super::resolution_operation::go_demand::GO_INTERVAL_DISCOVERY_SCOPE_0_SQL,
+            super::super::resolution_operation::go_demand::GO_INTERVAL_DISCOVERY_SCOPE_0_SQL
+                .as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_reverse_rows_go_reverse_candidate_sites_sql",
-            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_CANDIDATE_SITES_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_CANDIDATE_SITES_SQL
+                .as_str(),
             vec![
                 integer(1),
                 integer(1),
@@ -807,7 +1076,8 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_reverse_rows_go_reverse_inventory_complete_sql",
-            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL
+                .as_str(),
             vec![
                 integer(1),
                 integer(1),
@@ -825,13 +1095,14 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_reverse_rows_go_rename_target_units_sql",
-            super::super::resolution_operation::go_reverse_rows::GO_RENAME_TARGET_UNITS_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_TARGET_UNITS_SQL
+                .as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin("go_interval_resolution_operation_go_reverse_rows_go_interval_go_reverse_candidate_sites_0_sql", super::super::resolution_operation::go_reverse_rows::GO_INTERVAL_GO_REVERSE_CANDIDATE_SITES_0_SQL, vec![integer(1),integer(1)]));
         queries.push(pin(
             "go_interval_resolution_operation_go_same_package_caller_package",
-            super::super::resolution_operation::go_same_package::CALLER_PACKAGE,
+            super::super::resolution_operation::go_same_package::CALLER_PACKAGE.as_str(),
             vec![integer(1), integer(1), integer(1)],
         ));
         queries.push(pin(
@@ -839,7 +1110,7 @@ pub mod pinned_plans {
             super::super::resolution_operation::go_same_package::PACKAGE_PEER_MOUNTS,
             vec![integer(1), integer(1), integer(1)],
         ));
-        queries.push(pin("go_interval_resolution_operation_go_same_package_point_package_with_unselected_source", super::super::resolution_operation::go_same_package::POINT_PACKAGE_WITH_UNSELECTED_SOURCE, vec![integer(1),integer(1),integer(1),integer(1)]));
+        queries.push(pin("go_interval_resolution_operation_go_same_package_point_package_with_unselected_source", super::super::resolution_operation::go_same_package::POINT_PACKAGE_WITH_UNSELECTED_SOURCE.as_str(), vec![integer(1),integer(1),integer(1),integer(1)]));
         queries.push(pin(
             "go_interval_resolution_operation_go_context_package_source_mounts",
             super::super::resolution_operation::go_context::PACKAGE_SOURCE_MOUNTS,
@@ -847,12 +1118,13 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_context_dot_import_target_mounts",
-            super::super::resolution_operation::go_context::DOT_IMPORT_TARGET_MOUNTS,
+            super::super::resolution_operation::go_context::DOT_IMPORT_TARGET_MOUNTS.as_str(),
             vec![integer(1), integer(1), integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_receiver_anchor_go_point_null_receiver_frontier",
-            super::super::resolution_operation::go_receiver_anchor::GO_POINT_NULL_RECEIVER_FRONTIER,
+            super::super::resolution_operation::go_receiver_anchor::GO_POINT_NULL_RECEIVER_FRONTIER
+                .as_str(),
             vec![integer(1), integer(1), integer(1), integer(1)],
         ));
         queries.push(pin(
@@ -886,8 +1158,8 @@ pub mod pinned_plans {
                 integer(1),
             ],
         ));
-        queries.push(pin("go_interval_resolution_operation_go_method_family_go_interval_go_method_identity_0_sql", super::super::resolution_operation::go_method_family::GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL, vec![integer(1),integer(1),integer(1)]));
-        queries.push(pin("go_interval_resolution_operation_go_method_family_go_interval_go_method_family_1_sql", super::super::resolution_operation::go_method_family::GO_INTERVAL_GO_METHOD_FAMILY_1_SQL, vec![integer(1),integer(1)]));
+        queries.push(pin("go_interval_resolution_operation_go_method_family_go_interval_go_method_identity_0_sql", super::super::resolution_operation::go_method_family::GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL.as_str(), vec![integer(1),integer(1),integer(1)]));
+        queries.push(pin("go_interval_resolution_operation_go_method_family_go_interval_go_method_family_1_sql", super::super::resolution_operation::go_method_family::GO_INTERVAL_GO_METHOD_FAMILY_1_SQL.as_str(), vec![integer(1),integer(1)]));
         queries.push(pin(
             "go_interval_resolution_typed_go_members_owner_proofs",
             super::super::resolution_typed::go_members::OWNER_PROOFS,
@@ -942,7 +1214,7 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_domain_contexts_for_definition_file",
-            super::super::go_package_context::CONTEXTS_FOR_DEFINITION_FILE_SQL,
+            super::super::go_package_context::OWNER_CONTEXT_FOR_DEFINITION_FILE_SQL,
             vec![
                 text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 integer(1),
@@ -954,7 +1226,7 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_domain_deferred_member_participation",
-            super::super::resolution_typed::go_members::NONPARTICIPATING,
+            super::super::resolution_typed::go_members::SOURCE_PARTICIPATION.as_str(),
             vec![text("[0]"), integer(1), integer(1)],
         ));
         queries.push(pin(
@@ -975,6 +1247,8 @@ pub mod pinned_plans {
             vec![integer(1), integer(1)],
         ));
         queries.extend([
+            pin("python_environment_snapshot_inputs", super::super::python_unit_summaries::SNAPSHOT_INPUTS_SQL, vec![text(&"e".repeat(64)),integer(0),integer(1)]),
+            pin("python_environment_source_rows", super::super::python_binding_rows::ENVIRONMENT_SOURCE_SQL, vec![text(&"e".repeat(64)),integer(0),integer(1),integer(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT)]),
             pin("python_owner_member_operations", super::super::python_member_rows::OWNER_OPERATIONS_SQL, vec![integer(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT),text("missing"),integer(1)]),
             pin("python_direct_member_writes", super::super::python_member_rows::DIRECT_MEMBER_WRITES_SQL, vec![integer(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT),text("missing"),integer(1),integer(super::super::resolution_prepare::resolution_rows::code(brokk_bifrost_core::analyzer::resolution_facts::ALL_BINDING_PROJECTION_KINDS,brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind::TargetCallableResultType))]),
             pin("python_builtin_namespace_closed", super::super::python_member_rows::BUILTIN_NAMESPACE_CLOSED_SQL, vec![integer(1),integer(1),integer(2)]),
@@ -1057,7 +1331,7 @@ pub mod pinned_plans {
         queries.push(pin(
             "generic_parameter_declarations",
             super::super::resolution_typed::GENERIC_PARAMETER_DECLARATIONS_SQL,
-            vec![],
+            vec![text("[[0,0]]")],
         ));
         queries.push(pin(
             "qualified_route_mounts",
@@ -1078,7 +1352,8 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_reverse_inventory_complete",
-            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL
+                .as_str(),
             vec![
                 integer(1),
                 integer(1),
@@ -1184,7 +1459,8 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_rename_target_units",
-            super::super::resolution_operation::go_reverse_rows::GO_RENAME_TARGET_UNITS_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_TARGET_UNITS_SQL
+                .as_str(),
             vec![integer(1), text("src/main.go")],
         ));
         queries.push(pin(
@@ -1209,13 +1485,14 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_rename_rebound_root_references",
-            super::super::resolution_operation::go_reverse_rows::GO_RENAME_REBOUND_ROOT_REFERENCES_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_RENAME_REBOUND_ROOT_REFERENCES_SQL.as_str(),
             vec![
                 text("[1]"),
                 text("[1]"),
                 text("[[1,1]]"),
                 text("[[1,1]]"),
                 text("len"),
+                integer(1),
             ],
         ));
         queries.push(pin(
@@ -2161,7 +2438,7 @@ pub mod pinned_plans {
 
         queries.push(pin(
             "go_dot_import_target_mounts",
-            super::super::resolution_operation::go_context::DOT_IMPORT_TARGET_MOUNTS,
+            super::super::resolution_operation::go_context::DOT_IMPORT_TARGET_MOUNTS.as_str(),
             vec![
                 integer(1),
                 integer(1),
@@ -2184,7 +2461,7 @@ pub mod pinned_plans {
         }
         queries.push(pin(
             "go_file_import_rows",
-            super::super::resolution_operation::go_named::GO_FILE_IMPORT_ROWS,
+            super::super::resolution_operation::go_named::GO_FILE_IMPORT_ROWS.as_str(),
             vec![integer(1), text(r#"[[1,1,"go"]]"#)],
         ));
         queries.push(pin(
@@ -2193,35 +2470,53 @@ pub mod pinned_plans {
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
+            "jvm_access_endpoints",
+            super::super::resolution_typed::java_access::JVM_ENDPOINTS,
+            vec![text("[[0,0]]")],
+        ));
+        queries.push(pin(
+            "scala_reference_endpoints",
+            super::super::resolution_typed::java_access::SCALA_REFERENCE_ENDPOINTS,
+            vec![text("[[0,0]]")],
+        ));
+        queries.push(pin(
+            "selected_declaration_units",
+            super::super::selected_definition::SELECTED_DECLARATION_UNITS_SQL.as_str(),
+            vec![text("[[0,0]]")],
+        ));
+        queries.push(pin(
             "java_access_endpoints",
             super::super::resolution_typed::java_access::ENDPOINTS,
-            vec![],
+            vec![text("[[0,0]]")],
         ));
         queries.push(pin(
             "go_member_declarations",
             super::super::resolution_typed::go_members::DECLARATIONS,
-            vec![],
+            vec![text("[[0,0]]")],
         ));
         queries.push(pin(
             "java_inheritance_declarations",
             super::super::resolution_typed::java_inheritance::DECLARATIONS,
-            vec![],
+            vec![text("[[0,0]]")],
         ));
         queries.push(pin(
             "java_synthetic_type_bodies",
             super::super::resolution_typed::java_inheritance::SYNTHETIC_TYPE_BODIES,
-            vec![integer(super::super::code_unit_kind_to_i64(
-                crate::analyzer::CodeUnitType::Class,
-            ))],
+            vec![
+                text("[[0,0]]"),
+                integer(super::super::code_unit_kind_to_i64(
+                    crate::analyzer::CodeUnitType::Class,
+                )),
+            ],
         ));
         queries.push(pin(
             "go_caller_source_role",
-            super::super::resolution_operation::go_named::CALLER_SOURCE_ROLE,
+            super::super::resolution_operation::go_named::CALLER_SOURCE_ROLE.as_str(),
             vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "go_caller_package",
-            super::super::resolution_operation::go_same_package::CALLER_PACKAGE,
+            super::super::resolution_operation::go_same_package::CALLER_PACKAGE.as_str(),
             vec![integer(1), integer(1), text("go")],
         ));
         queries.push(pin(
@@ -2278,6 +2573,15 @@ pub mod pinned_plans {
         queries.push(pin(
             "go_native_observed_inputs",
             super::super::go_package_context::OBSERVE_INPUTS_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(1),
+            ],
+        ));
+        queries.push(pin(
+            "go_native_refused_inputs",
+            super::super::go_package_context::REFUSED_INPUTS_SQL,
             vec![
                 text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 integer(1),
@@ -2744,12 +3048,12 @@ pub mod pinned_plans {
         queries.push(pin(
             "selected_definition_units",
             super::super::selected_definition::SELECTED_DEFINITION_UNITS_SQL.as_str(),
-            vec![],
+            vec![text("[[0,0]]")],
         ));
         queries.push(pin(
             "selected_lexical_definitions",
             super::super::selected_definition::SELECTED_LEXICAL_DEFINITIONS_SQL,
-            vec![],
+            vec![text("[[0,0]]")],
         ));
 
         let pair_count = crate::analyzer::store::import_graph::IMPORT_GRAPH_PATH_BATCH;
@@ -4190,6 +4494,19 @@ pub mod tests {
                 ]);
             for name in names {
                 let plan = explain_pin(&conn, &pinned(name));
+                if name == "resolution_jvm_aliases_by_definition" {
+                    assert!(
+                        plan.iter()
+                            .any(|row| row.contains("resolution_jvm_aliases_declaration_site")),
+                        "{state} {name}: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|row| !row.starts_with("SCAN alias")
+                            && !row.starts_with("SCAN definition")
+                            && !row.contains("AUTOMATIC")),
+                        "{state} {name}: {plan:?}"
+                    );
+                }
                 let scanned = plan
                     .iter()
                     .filter(|row| row.contains("SCAN resolution_"))
@@ -5378,6 +5695,74 @@ pub mod tests {
     }
 
     #[cfg(test)]
+    #[test]
+    #[hardwon("#6594: selected typed keys paid a DELETE and per-key INSERT before every read")]
+    fn typed_request_arrays_keep_indexed_corpus_probes() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for arity in [1, 256] {
+                let requests =
+                    serde_json::to_string(&(0..arity).map(|key| [0, key]).collect::<Vec<_>>())
+                        .unwrap();
+                for name in [
+                    "generic_parameter_declarations",
+                    "go_member_declarations",
+                    "java_access_endpoints",
+                    "jvm_access_endpoints",
+                    "scala_reference_endpoints",
+                    "java_inheritance_declarations",
+                    "java_synthetic_type_bodies",
+                    "selected_definition_units",
+                    "selected_lexical_definitions",
+                    "selected_declaration_units",
+                ] {
+                    let mut query = pinned(name);
+                    query.params[0] = rusqlite::types::Value::Text(requests.clone());
+                    let plan = explain_pin(&conn, &query);
+                    eprintln!("{state:?} arity={arity} {name}: {plan:?}");
+                    if matches!(
+                        name,
+                        "selected_definition_units" | "selected_declaration_units"
+                    ) {
+                        assert!(
+                            !plan.iter().any(|row| row.contains("TEMP B-TREE")),
+                            "{state:?} {name} must stream sorted request coordinates: {plan:?}"
+                        );
+                    }
+                    let request = plan
+                        .iter()
+                        .position(|row| row.starts_with("SCAN request VIRTUAL TABLE"))
+                        .unwrap_or_else(|| panic!("{state:?} {name}: {plan:?}"));
+                    for alias in ["mount", "interior"] {
+                        let probe = plan
+                            .iter()
+                            .position(|row| row.starts_with(&format!("SEARCH {alias} ")))
+                            .unwrap_or_else(|| panic!("{state:?} {name}: {plan:?}"));
+                        assert!(request < probe, "{state:?} {name}: {plan:?}");
+                        assert!(
+                            !plan
+                                .iter()
+                                .any(|row| row.starts_with(&format!("SCAN {alias}"))),
+                            "{state:?} {name}: {plan:?}"
+                        );
+                    }
+                    // Scala materializes its query-local templates CTE and
+                    // has always indexed that bounded result automatically.
+                    // Corpus probes must keep using their stored indexes.
+                    assert!(
+                        plan.iter().all(|row| !row.contains("AUTOMATIC")
+                            || row.starts_with("SEARCH templates ")),
+                        "{state:?} {name}: {plan:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     /// Every registered pinned query prepares and plans in both statistics
     /// states.
     ///
@@ -5833,20 +6218,79 @@ pub mod tests {
     }
 
     #[test]
+    fn python_environment_snapshot_inputs_seek_populated_relations_under_both_statistics_states() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for workspace in ["e".repeat(64), "f".repeat(64)] {
+                for ordinal in 1..=16 {
+                    let oid = format!("{ordinal:040x}");
+                    conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,'python',0,?2,?3,?4,1)", rusqlite::params![workspace,format!("pkg{ordinal}/model.py"),oid,"0".repeat(64)]).unwrap();
+                    conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,valid_from) VALUES(?1,'python',0,?2,?3,'configuration',1)", rusqlite::params![workspace,format!("pkg{ordinal}/pyproject.toml"),oid]).unwrap();
+                    conn.execute("INSERT OR IGNORE INTO workspace_input_sources VALUES(?1,?2)", rusqlite::params![oid,b"[tool.setuptools.packages.find]\nwhere = ['.']\n".as_slice()]).unwrap();
+                }
+            }
+            let query = pinned("python_environment_snapshot_inputs");
+            let mut plans = Vec::new();
+            for state in PlannerStatisticsState::BOTH {
+                state.install(conn);
+                let plan = explain_pin(conn, &query);
+                eprintln!("{state} {}: {plan:#?}", query.name);
+                let mut statement = conn.prepare(&query.sql).unwrap();
+                let rows = statement.query_map(rusqlite::params_from_iter(&query.params), |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<Vec<u8>>>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert_eq!(rows.len(),32,"{state}: source and configuration partitions must both run: {rows:?}");
+                assert_eq!(rows.iter().filter(|(_,kind,bytes)|kind == "configuration" && bytes.is_some()).count(),16,"{state}: selected configuration bytes must be read: {rows:?}");
+                plans.push((state,plan));
+            }
+            // Record both plans before checking properties, so a failure shows
+            // whether installing corpus statistics changed the access paths.
+            for (state,plan) in plans {
+                assert!(plan.iter().any(|step| step.starts_with("SEARCH v USING")
+                    && step.contains("workspace_id=? AND lang=? AND generation=?")
+                    && (step.contains("idx_workspace_file_versions_snapshot_") || step.contains("sqlite_autoindex_workspace_file_versions_"))),
+                    "{state} membership must seek its snapshot prefix: {plan:#?}");
+                assert!(plan.iter().any(|step| step.starts_with("SEARCH retained USING PRIMARY KEY (content_oid=?)")),
+                    "{state} configuration bytes must seek their content primary key: {plan:#?}");
+                assert!(plan.iter().all(|step| !step.contains("AUTOMATIC")
+                    && !["v", "retained", "workspace_file_versions", "workspace_input_sources"].iter().any(|table| step == &format!("SCAN {table}") || step.starts_with(&format!("SCAN {table} ")))),
+                    "{state} snapshot inputs must not scan base tables or build automatic indexes: {plan:#?}");
+            }
+        });
+    }
+
+    #[test]
     fn python_member_operation_readers_seek_populated_source_relations() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store.conn.execute(|conn| {
             prepare_pin_context(conn);
             fill_reverse_candidate_fixture(conn);
             conn.execute_batch("UPDATE python_member_operations SET form=1,effect=1,callee_reference=site,receiver_reference=site").unwrap();
+            let workspace = "e".repeat(64);
+            conn.execute("INSERT INTO workspace_revisions VALUES(?1,'python',0,1)", [&workspace]).unwrap();
             for blob in 1..=16 {
-                conn.execute("INSERT INTO python_binding_source VALUES(?1,?2)",rusqlite::params![blob,super::super::python_binding_rows::NATIVE_SOURCE_FORMAT]).unwrap();
+                conn.execute("INSERT INTO python_binding_source VALUES(?1,?2,0,0)",rusqlite::params![blob,super::super::python_binding_rows::NATIVE_SOURCE_FORMAT]).unwrap();
                 let path=format!("file{blob}.py");
+                let oid = format!("{blob:040x}");
+                conn.execute("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(?1,?2,'python',0)",rusqlite::params![blob,oid]).unwrap();
+                conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,'python',0,?2,?3,?4,1)",rusqlite::params![workspace,path,oid,"0".repeat(64)]).unwrap();
+                conn.execute("INSERT INTO resolution_binding_slots VALUES(?1,0,0,'known',0)",[blob]).unwrap();
+                conn.execute("INSERT INTO python_binding_imports VALUES(?1,0,2,0,1,NULL,jsonb('[\"module\"]'))",[blob]).unwrap();
+                conn.execute("INSERT INTO python_binding_export_operations VALUES(?1,0,0,1,jsonb('[\"known\"]'))",[blob]).unwrap();
+
                 conn.execute("INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) VALUES(?1,?1,'python',?2)",rusqlite::params![blob,path]).unwrap();
                 conn.execute("INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role) VALUES(1,?1,?1,?2,'source')",rusqlite::params![blob,path]).unwrap();
             }
+            let mut environment_plans = Vec::new();
             for state in PlannerStatisticsState::BOTH {
                 state.install(conn);
+                let query = pinned("python_environment_source_rows");
+                let plan = explain_pin(conn, &query);
+                eprintln!("{state} {}: {plan:#?}", query.name);
+                let mut statement = conn.prepare(&query.sql).unwrap();
+                let rows = statement.query_map(rusqlite::params_from_iter(query.params.iter()), |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert_eq!(rows.len(), 96, "{state}: every child arm must run for all 16 selected files");
+                environment_plans.push((state, plan));
+
                 for (name,index) in [("python_member_operations_inventory","python_member_operations_inventory"),("python_member_operation_names_lookup","python_member_operation_names_spelling")] {
                     let plan=explain_pin(conn,&pinned(name));
                     assert!(plan.iter().any(|line| line.contains("SEARCH") && line.contains(index)),"{state} {name}: {plan:?}");
@@ -5869,7 +6313,188 @@ pub mod tests {
                     eprintln!("M4-5 SQL state={state} name={name} source-operations=4096 rows={} vm-steps={} fullscan-steps={} plan={plan:?}",observed.len(),statement.get_status(rusqlite::StatementStatus::VmStep),statement.get_status(rusqlite::StatementStatus::FullscanStep));
                 }
             }
+            // Capture and execute both states before reporting any seek failure.
+            for (state, plan) in environment_plans {
+                assert!(plan.iter().any(|step| step.starts_with("SEARCH f USING") && step.contains("workspace_id=? AND lang=? AND generation=? AND input_kind=?")), "{state} snapshot membership must seek its workspace/language/generation/kind prefix: {plan:#?}");
+                assert!(plan.iter().any(|step| step.starts_with("SEARCH b USING") && step.contains("blob_oid=?")), "{state} selected blobs must seek by oid: {plan:#?}");
+                assert!(plan.iter().any(|step| step.starts_with("SEARCH s USING INTEGER PRIMARY KEY")), "{state} source marker must seek its blob key: {plan:#?}");
+                for (alias, arms) in [("slots",2),("i",2),("e",1),("o",2)] {
+                    let probes = plan.iter().filter(|step| step.starts_with(&format!("SEARCH {alias} "))).collect::<Vec<_>>();
+                    assert!(probes.len() >= arms && probes.iter().all(|step| step.contains("(blob_id=?")), "{state} every {alias} arm must seek its leading blob key: {plan:#?}");
+                }
+                // Scans of materialized selected/inputs and json_each are bounded query inputs.
+                // Exclude TEMP B-TREE: ORDER BY over the UNION ALL legitimately sorts.
+                assert!(plan.iter().all(|step| !step.contains("AUTOMATIC") && !["f","b","i","o","slots","e","workspace_file_versions","blobs"].iter().any(|alias| step == &format!("SCAN {alias}") || step.starts_with(&format!("SCAN {alias} "))) && !step.starts_with("SCAN python_binding_")), "{state} retained source reads must not scan base tables or build automatic indexes: {plan:#?}");
+            }
         });
+    }
+
+    #[test]
+    #[hardwon("#5671: empty boundary gap buckets scanned every scope mount and lookup")]
+    fn boundary_gap_buckets_are_sought_before_populated_mount_scopes() {
+        use rusqlite::{StatementStatus, params, params_from_iter};
+
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().unwrap();
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .unwrap();
+            prepare_pin_context(&conn);
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            let query = pinned("selected_boundary_candidate_gap_branches");
+            let mut empty_steps = None;
+            for size in [1_i64, 256] {
+                for id in 1..=size {
+                    conn.execute("INSERT OR IGNORE INTO temp.selected_resolution_mounts(mount_ordinal,blob_id) VALUES(?1,?1)", [id]).unwrap();
+                    conn.execute(
+                        "INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts VALUES(?1)",
+                        [id],
+                    )
+                    .unwrap();
+                    conn.execute("INSERT OR IGNORE INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES(?1,6,-1,7,?1,?1)", [id]).unwrap();
+                }
+                state.install(&conn);
+                let plan = explain_pin(&conn, &query);
+                let bucket = plan.iter().position(|row| row.contains("SEARCH available USING COVERING INDEX resolution_gaps_root_branches (covers=?)")).unwrap_or_else(|| panic!("{state}: {plan:?}"));
+                let scope = plan.iter().position(|row| row == "SCAN scope").unwrap();
+                assert!(bucket < scope, "{state}: bucket must lead scope: {plan:?}");
+                let mut statement = conn.prepare(&query.sql).unwrap();
+                assert!(
+                    statement
+                        .query(params_from_iter(&query.params))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .is_none()
+                );
+                let steps = statement.get_status(StatementStatus::VmStep);
+                if let Some(previous) = empty_steps {
+                    assert_eq!(
+                        steps, previous,
+                        "{state}: empty bucket work must not grow with scope: {plan:?}"
+                    );
+                }
+                empty_steps = Some(steps);
+            }
+            // Nonempty buckets still honor exact lookups and the selected scope.
+            // Blob 999 is not mounted; lookup 8 is not requested.
+            for (blob, lookup, reason) in [(1, 0, 1001), (2, 7, 1002), (3, 8, 1003), (999, 7, 1004)]
+            {
+                conn.execute("INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES(?1,5,-1,?2,?3,?3)",params![blob,lookup,reason]).unwrap();
+            }
+            state.install(&conn);
+            let rows = conn
+                .prepare(&query.sql)
+                .unwrap()
+                .query_map(params_from_iter(&query.params), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows, [(1, 0, 1001), (2, 7, 1002)]);
+        }
+    }
+
+    #[test]
+    #[hardwon("#5671: file-keyed Go participation and caller roles scanned context package files")]
+    fn go_file_keyed_readers_seek_versions_before_package_files() {
+        let store = AnalyzerStore::open_ephemeral().expect("open Go planner store");
+        let conn = store.conn.lock().expect("store mutex");
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .unwrap();
+        prepare_pin_context(&conn);
+        // Access-plan fixture: publication FK setup is irrelevant to these seeks.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for id in 1..=256_i64 {
+            let path = format!("pkg/{id}/main.go");
+            conn.execute("INSERT INTO workspace_file_versions(file_version_id,workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,?2,'go',1,?3,?4,?5,1)", rusqlite::params![id, "a".repeat(64), path, "b".repeat(40), "c".repeat(64)]).unwrap();
+            conn.execute("INSERT INTO go_package_instances(package_id,context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(?1,1,?2,'main','',?2,?3,1,jsonb('[]'),?3)",rusqlite::params![id,path,[1_u8;32]]).unwrap();
+            conn.execute(
+                "INSERT INTO go_package_files VALUES(?1,'go',?2)",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO go_context_publications VALUES(1,1,?1,'go',1,1,NULL,?2,?2,1,jsonb('[]'))",
+            rusqlite::params!["a".repeat(64), [1_u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO temp.selected_workspace_revisions VALUES(?1,'go',1,1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO temp.selected_resolution_mounts(mount_ordinal,file_version_id,semantic_language) VALUES(0,1,'go')",[]).unwrap();
+        conn.execute(
+            "INSERT INTO go_package_files VALUES(1,'ignored','pkg/1/main.go')",
+            [],
+        )
+        .unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for name in [
+                "go_domain_deferred_member_participation",
+                "go_interval_resolution_operation_go_named_caller_source_role",
+            ] {
+                let query = pinned(name);
+                let plan = explain_pin(&conn, &query);
+                let version = plan
+                    .iter()
+                    .position(|line| line.starts_with("SEARCH versions USING INTEGER PRIMARY KEY"))
+                    .unwrap_or_else(|| {
+                        panic!("{state} {name}: version primary-key seek: {plan:?}")
+                    });
+                let membership = plan
+                    .iter()
+                    .position(|line| {
+                        line.starts_with("SEARCH source USING")
+                            && line.contains("idx_go_package_files_file_role")
+                            && line.contains("rel_path=?")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{state} {name}: path-keyed membership seek: {plan:?}")
+                    });
+                assert!(
+                    version < membership,
+                    "{state} {name}: version must lead membership: {plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|line| line.starts_with("SCAN source")
+                        || line.starts_with("SCAN package")
+                        || (line.contains("AUTOMATIC")
+                            && (line.contains(" source ")
+                                || line.contains(" package ")
+                                || line.contains(" versions ")))),
+                    "{state} {name}: no context-wide membership scans: {plan:?}"
+                );
+                let rows = conn
+                    .prepare(&query.sql)
+                    .unwrap()
+                    .query_map(rusqlite::params_from_iter(query.params.iter()), |_| Ok(()))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let expected = if name == "go_domain_deferred_member_participation" {
+                    // The shared reader now returns both participating and ignored roles.
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    rows.len(),
+                    expected,
+                    "{state} {name}: fixture probe must execute"
+                );
+            }
+        }
     }
 
     #[test]

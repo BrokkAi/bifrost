@@ -7,8 +7,9 @@
 
 use super::resolver::{
     MacroLexicalBinding, MacroLexicalBindingKind, MacroLexicalReferences, MacroLocalBinding,
-    ParsedReplacementBody, VisibilityIndex, argument_children, declaration_declarator,
-    declarator_name_node, declared_name_binding, extract_variable_name, macro_type_argument_node,
+    ParsedReplacementBody, VisibilityIndex, declaration_declarator, declarator_name_node,
+    declared_name_binding, extract_variable_name, function_macro_invocation_parts,
+    macro_type_argument_node,
 };
 use crate::declarations::node_text;
 use crate::graph::syntax::function_macro_replacement_span;
@@ -149,10 +150,7 @@ fn collect_declarations(
         {
             declarations.extend(template.declarations);
         }
-        if definition.kind() == "call_expression"
-            && let Some(function) = definition
-                .child_by_field_name("function")
-                .filter(|node| node.kind() == "identifier")
+        if let Some((function, actuals)) = function_macro_invocation_parts(definition)
             && let Some((definition_file, definition_byte)) = visibility.function_macro_binding_at(
                 file,
                 node_text(function, source),
@@ -160,27 +158,24 @@ fn collect_declarations(
             )
             && let Some(template) =
                 active_definition_template(visibility, &definition_file, definition_byte)
-            && let Some(arguments) = definition.child_by_field_name("arguments")
+            && actuals.len() == template.parameters.len()
         {
-            let actuals = argument_children(arguments).collect::<Vec<_>>();
-            if actuals.len() == template.parameters.len() {
-                for local in template
-                    .escaped_locals
-                    .iter()
-                    .chain(template.formal_locals.values().flatten())
+            for local in template
+                .escaped_locals
+                .iter()
+                .chain(template.formal_locals.values().flatten())
+            {
+                if let Some(instantiated) = instantiate_binding(
+                    local,
+                    &template.parameters,
+                    &actuals,
+                    source,
+                    file,
+                    definition,
+                ) && instantiated.binding.definition == *file
                 {
-                    if let Some(instantiated) = instantiate_binding(
-                        local,
-                        &template.parameters,
-                        &actuals,
-                        source,
-                        file,
-                        definition,
-                    ) && instantiated.binding.definition == *file
-                    {
-                        let range = instantiated.binding.name_range.clone();
-                        declarations.push((range, instantiated.binding));
-                    }
+                    let range = instantiated.binding.name_range.clone();
+                    declarations.push((range, instantiated.binding));
                 }
             }
         }
@@ -260,10 +255,8 @@ fn references<'visibility, 'source: 'visibility>(
         }
         match node.kind() {
             "preproc_function_def" => definitions.push(node),
-            "call_expression"
-                if node
-                    .child_by_field_name("function")
-                    .is_some_and(|function| function.kind() == "identifier") =>
+            "call_expression" | "macro_type_specifier"
+                if function_macro_invocation_parts(node).is_some() =>
             {
                 calls.push(node)
             }
@@ -313,7 +306,7 @@ fn references<'visibility, 'source: 'visibility>(
             state.cancelled = true;
             return state;
         }
-        let Some(function) = call.child_by_field_name("function") else {
+        let Some((function, actuals)) = function_macro_invocation_parts(call) else {
             continue;
         };
         let function_name = node_text(function, source);
@@ -327,10 +320,6 @@ fn references<'visibility, 'source: 'visibility>(
         else {
             continue;
         };
-        let Some(arguments) = call.child_by_field_name("arguments") else {
-            continue;
-        };
-        let actuals = argument_children(arguments).collect::<Vec<_>>();
         if actuals.len() != template.parameters.len() {
             continue;
         }
@@ -387,9 +376,11 @@ fn references<'visibility, 'source: 'visibility>(
         // the caller's scope after expansion.  Find later references in the
         // same AST scope and retain the nearest preceding macro invocation.
         if !template.escaped_locals.is_empty()
-            && call
-                .parent()
-                .is_some_and(|parent| parent.kind() == "expression_statement")
+            && call.parent().is_some_and(|parent| {
+                parent.kind() == "expression_statement"
+                    || (call.kind() == "macro_type_specifier"
+                        && parent.kind() == "compound_statement")
+            })
         {
             collect_escaped_references(
                 visibility,
@@ -757,11 +748,8 @@ fn has_intervening_declaration(
         {
             return true;
         }
-        if node.kind() == "call_expression"
+        if let Some((function, actuals)) = function_macro_invocation_parts(node)
             && scope_contains(&scope_key(node, root), &scope_key(target, root))
-            && let Some(function) = node
-                .child_by_field_name("function")
-                .filter(|function| function.kind() == "identifier")
             && let Some((definition_file, definition_byte)) = visibility.function_macro_binding_at(
                 file,
                 node_text(function, source),
@@ -769,27 +757,16 @@ fn has_intervening_declaration(
             )
             && let Some(template) =
                 active_definition_template(visibility, &definition_file, definition_byte)
-            && let Some(arguments) = node.child_by_field_name("arguments")
+            && actuals.len() == template.parameters.len()
+            && template
+                .escaped_locals
+                .iter()
+                .filter_map(|local| {
+                    instantiate_binding(local, &template.parameters, &actuals, source, file, node)
+                })
+                .any(|local| local.name == name)
         {
-            let actuals = argument_children(arguments).collect::<Vec<_>>();
-            if actuals.len() == template.parameters.len()
-                && template
-                    .escaped_locals
-                    .iter()
-                    .filter_map(|local| {
-                        instantiate_binding(
-                            local,
-                            &template.parameters,
-                            &actuals,
-                            source,
-                            file,
-                            node,
-                        )
-                    })
-                    .any(|local| local.name == name)
-            {
-                return true;
-            }
+            return true;
         }
         push_named_children_reversed(node, &mut stack);
     }
@@ -911,13 +888,7 @@ pub(crate) fn typed_binding<'tree>(
     let mut candidates = Vec::new();
     while let Some(call) = stack.pop() {
         push_named_children_reversed(call, &mut stack);
-        if call.kind() != "call_expression" {
-            continue;
-        }
-        let Some(function) = call
-            .child_by_field_name("function")
-            .filter(|node| node.kind() == "identifier")
-        else {
+        let Some((function, actuals)) = function_macro_invocation_parts(call) else {
             continue;
         };
         let Some((definition_file, definition_byte)) = visibility.function_macro_binding_at(
@@ -932,10 +903,6 @@ pub(crate) fn typed_binding<'tree>(
         else {
             continue;
         };
-        let Some(arguments) = call.child_by_field_name("arguments") else {
-            continue;
-        };
-        let actuals = argument_children(arguments).collect::<Vec<_>>();
         if actuals.len() != template.parameters.len() {
             continue;
         }
@@ -988,4 +955,33 @@ pub(crate) fn typed_binding<'tree>(
         .into_iter()
         .max_by_key(|(byte, _)| *byte)
         .map(|(_, binding)| binding)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn lexical_budget_includes_the_last_allowed_named_node() {
+        let file = ProjectFile::new(std::env::temp_dir(), "macro-budget.c");
+        // A translation unit plus N comment nodes has exactly N + 1 named nodes.
+        // No macro calls means that the lazy visibility provider must stay unused.
+        for (comments, truncated) in [(249_999, false), (250_000, true)] {
+            let source = "// padding\n".repeat(comments);
+            let tree = crate::diagnostics::parse_cpp_tree(&source);
+            assert_eq!(tree.root_node().named_child_count(), comments);
+            let result = references(
+                || panic!("comment-only source needs no visibility index"),
+                &file,
+                tree.root_node(),
+                &source,
+                usize::MAX,
+                &mut || false,
+                None,
+                &mut Vec::new(),
+            );
+            assert_eq!(result.truncated, truncated, "{comments} comments plus root");
+            assert!(!result.cancelled);
+        }
+    }
 }

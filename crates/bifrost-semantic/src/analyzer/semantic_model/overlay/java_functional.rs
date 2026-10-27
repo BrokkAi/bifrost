@@ -3,11 +3,11 @@
 use crate::analyzer::semantic_model::overlay::*;
 
 #[doc(hidden)]
-pub struct JavaCallableInventory<'a> {
+pub struct JavaCallableInventory {
     #[doc(hidden)]
-    pub types: HashMap<&'a str, &'a SemanticModelSymbol>,
+    pub types: HashMap<String, std::sync::Arc<SemanticModelSymbol>>,
     #[doc(hidden)]
-    pub ancestry: HashMap<&'a str, HashSet<&'a str>>,
+    pub ancestry: HashMap<String, HashSet<String>>,
 }
 
 #[doc(hidden)]

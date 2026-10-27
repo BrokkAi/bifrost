@@ -74,9 +74,9 @@ pub enum GoExternalFieldGap {
 /// A borrowed declaration bound to the exact activated model and source bytes.
 /// Location and full provenance remain on the selected symbol, not a fabricated
 /// local anchor. Equality includes the active publication and pack record.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GoExternalField<'a> {
-    symbol: &'a SemanticModelSymbol,
+    symbol: std::sync::Arc<SemanticModelSymbol>,
     artifact_sha256: &'a str,
     copy: MemoryValueCopy,
 }
@@ -121,7 +121,7 @@ impl<'a> BoundGoExternalFieldLayout<'a> {
 
 impl GoExternalField<'_> {
     pub fn symbol(&self) -> &SemanticModelSymbol {
-        self.symbol
+        &self.symbol
     }
     pub fn artifact_sha256(&self) -> &str {
         self.artifact_sha256
@@ -670,21 +670,31 @@ pub fn bind_go_external_field_source(
     if field.artifact_sha256() != artifact.sha256() {
         return Err(GoExternalFieldGap::ArtifactUnbound);
     }
-    let mut remaining = max_nodes;
-    charge_route_work(&mut remaining, cancellation)?;
-    let owner_id = field
+    let owners = field
         .symbol()
         .owner_id
         .as_deref()
-        .ok_or(GoExternalFieldGap::DeclarationUnresolved)?;
-    let mut selected_owner = None;
-    for symbol in overlay.symbols() {
-        charge_route_work(&mut remaining, cancellation)?;
-        if symbol.id == owner_id && selected_owner.replace(symbol).is_some() {
-            return Err(GoExternalFieldGap::DeclarationUnresolved);
-        }
+        .map(|owner_id| {
+            overlay
+                .symbols_with_id(owner_id)
+                .records
+                .into_iter()
+                // ID postings also admit semantic contributor IDs.
+                .filter(|symbol| symbol.id == owner_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Ambiguity is independent of candidate position and the work budget.
+    if owners.len() > 1 {
+        return Err(GoExternalFieldGap::DeclarationUnresolved);
     }
-    let owner = selected_owner.ok_or(GoExternalFieldGap::DeclarationUnresolved)?;
+    let mut remaining = max_nodes;
+    charge_route_work(&mut remaining, cancellation)?;
+    let owner = owners
+        .into_iter()
+        .next()
+        .ok_or(GoExternalFieldGap::DeclarationUnresolved)?;
+    charge_route_work(&mut remaining, cancellation)?;
     if owner.provenance.ambiguous
         || owner.provenance.pack_digest != field.symbol().provenance.pack_digest
         || owner.provenance.active_model_set_hash != field.symbol().provenance.active_model_set_hash
@@ -978,7 +988,7 @@ fn charge_route_work(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct FieldSlot<'a> {
     object: ValueId,
     field: GoExternalField<'a>,
@@ -1081,7 +1091,8 @@ impl<'a> GoExternalFieldMemory<'a> {
             .as_ref()
             .and_then(|layout| layout.field_named(member))
             .ok_or(GoExternalFieldGap::FieldLayoutIncomplete)?
-            .field;
+            .field
+            .clone();
         let value = self.read_ids(object, field, cancellation)?;
         Ok(self
             .procedure
@@ -1224,7 +1235,7 @@ impl<'a> GoExternalFieldMemory<'a> {
             self.gap = Some(GoExternalFieldGap::AliasedDestination);
             return Err(GoExternalFieldGap::AliasedDestination);
         }
-        let field = layout.fields[0].field;
+        let field = layout.fields[0].field.clone();
         if matches!(
             field.copy,
             MemoryValueCopy::Unknown | MemoryValueCopy::Value
@@ -1370,7 +1381,7 @@ impl<'a> GoExternalFieldMemory<'a> {
         let mut copied = Vec::new();
         for index in 0..self.slots.len() {
             self.charge(cancellation)?;
-            let slot = self.slots[index];
+            let slot = self.slots[index].clone();
             if slot.object == destination {
                 self.gap = Some(GoExternalFieldGap::AliasedDestination);
                 return Err(GoExternalFieldGap::AliasedDestination);
@@ -1507,7 +1518,8 @@ impl<'a> GoExternalFieldQuery<'a> {
             let field = layout
                 .field_named(member)
                 .ok_or(GoExternalFieldGap::FieldLayoutIncomplete)?
-                .field;
+                .field
+                .clone();
             let related = route_related_values(
                 &route,
                 argument.value,
@@ -2166,7 +2178,12 @@ impl<'a> GoExternalFieldQuery<'a> {
                             .field_for_source(&source)
                             .ok_or(GoExternalFieldGap::FieldLayoutIncomplete)?;
                         memory.track_layout(*aggregate, &layout, cancellation)?;
-                        memory.store_initializer(&operand, &source, bound.field, cancellation)?;
+                        memory.store_initializer(
+                            &operand,
+                            &source,
+                            bound.field.clone(),
+                            cancellation,
+                        )?;
                     }
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Transfer(transfer),
@@ -2288,7 +2305,7 @@ impl<'a> GoExternalFieldQuery<'a> {
                             return Err(GoExternalFieldGap::ArtifactUnbound);
                         }
                         memory.track_layout(*base, &layout, cancellation)?;
-                        memory.store_ids(*base, expected.field, *value, cancellation)?;
+                        memory.store_ids(*base, expected.field.clone(), *value, cancellation)?;
                     }
                     SemanticEffect::Gap { gap } => {
                         let resolved = self.exact_field_gap_is_resolved(
@@ -2624,6 +2641,7 @@ impl<'a> GoExternalFieldQuery<'a> {
 mod tests {
 
     use crate::analyzer::go::external_field_memory::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     use brokk_bifrost_analysis::analyzer::semantic::ir::go_extraction_support_26::capabilities;
 
@@ -2958,41 +2976,53 @@ mod tests {
         // The state engine receives a resolved field; resolver provenance is
         // tested separately. This test checks ordered state rather than names.
         let field = GoExternalField {
-            symbol,
+            symbol: std::sync::Arc::clone(symbol),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
         let cancellation = CancellationToken::new();
         let mut memory = GoExternalFieldMemory::new(&procedure, 100);
         memory
-            .store_ids(ValueId::new(0), field, ValueId::new(2), &cancellation)
+            .store_ids(
+                ValueId::new(0),
+                field.clone(),
+                ValueId::new(2),
+                &cancellation,
+            )
             .unwrap();
         let saved = memory
-            .read_ids(ValueId::new(0), field, &cancellation)
+            .read_ids(ValueId::new(0), field.clone(), &cancellation)
             .unwrap();
         memory
             .copy_ids(ValueId::new(0), ValueId::new(1), &cancellation)
             .unwrap();
         memory
-            .store_ids(ValueId::new(0), field, ValueId::new(3), &cancellation)
+            .store_ids(
+                ValueId::new(0),
+                field.clone(),
+                ValueId::new(3),
+                &cancellation,
+            )
             .unwrap();
         assert_eq!(
             memory
-                .read_ids(ValueId::new(0), field, &cancellation)
+                .read_ids(ValueId::new(0), field.clone(), &cancellation)
                 .unwrap(),
             ValueId::new(3)
         );
         assert_eq!(
             memory
-                .read_ids(ValueId::new(1), field, &cancellation)
+                .read_ids(ValueId::new(1), field.clone(), &cancellation)
                 .unwrap(),
             saved
         );
         assert_eq!(saved, ValueId::new(2));
         let mut other_symbol = symbol.clone();
-        other_symbol.provenance.pack_digest = "other pack".to_owned();
+        std::sync::Arc::make_mut(&mut other_symbol)
+            .provenance
+            .pack_digest = "other pack".to_owned();
         let other = GoExternalField {
-            symbol: &other_symbol,
+            symbol: other_symbol,
             ..field
         };
         assert_eq!(
@@ -3014,40 +3044,50 @@ mod tests {
             },
         ] {
             let field = GoExternalField {
-                symbol: &overlay.symbols()[0],
+                symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
                 artifact_sha256: "bytes",
                 copy,
             };
             let mut memory = GoExternalFieldMemory::new(&procedure, 100);
             memory
-                .store_ids(ValueId::new(0), field, ValueId::new(2), &cancellation)
+                .store_ids(
+                    ValueId::new(0),
+                    field.clone(),
+                    ValueId::new(2),
+                    &cancellation,
+                )
                 .unwrap();
             memory
                 .copy_ids(ValueId::new(0), ValueId::new(1), &cancellation)
                 .unwrap();
             assert_eq!(
                 memory
-                    .read_ids(ValueId::new(1), field, &cancellation)
+                    .read_ids(ValueId::new(1), field.clone(), &cancellation)
                     .unwrap(),
                 ValueId::new(2)
             );
             assert_eq!(field.value_copy(), copy);
         }
         let field = GoExternalField {
-            symbol: &overlay.symbols()[0],
+            symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Value,
         };
         let mut memory = GoExternalFieldMemory::new(&procedure, 100);
         memory
-            .store_ids(ValueId::new(0), field, ValueId::new(2), &cancellation)
+            .store_ids(
+                ValueId::new(0),
+                field.clone(),
+                ValueId::new(2),
+                &cancellation,
+            )
             .unwrap();
         assert_eq!(
             memory.copy_ids(ValueId::new(0), ValueId::new(1), &cancellation),
             Err(GoExternalFieldGap::StorageUnknown)
         );
         assert_eq!(
-            memory.read_ids(ValueId::new(1), field, &cancellation),
+            memory.read_ids(ValueId::new(1), field.clone(), &cancellation),
             Err(GoExternalFieldGap::StorageUnknown)
         );
     }
@@ -3058,24 +3098,29 @@ mod tests {
         let procedure = artifact.procedure_handle(ProcedureId::new(0)).unwrap();
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
         let field = GoExternalField {
-            symbol: &overlay.symbols()[0],
+            symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
         let cancellation = CancellationToken::new();
         let mut memory = GoExternalFieldMemory::new(&procedure, 0);
         assert_eq!(
-            memory.store_ids(ValueId::new(0), field, ValueId::new(2), &cancellation),
+            memory.store_ids(
+                ValueId::new(0),
+                field.clone(),
+                ValueId::new(2),
+                &cancellation
+            ),
             Err(GoExternalFieldGap::BudgetExhausted)
         );
         assert_eq!(
-            memory.read_ids(ValueId::new(0), field, &cancellation),
+            memory.read_ids(ValueId::new(0), field.clone(), &cancellation),
             Err(GoExternalFieldGap::BudgetExhausted)
         );
         let mut memory = GoExternalFieldMemory::new(&procedure, 100);
         cancellation.cancel();
         assert_eq!(
-            memory.read_ids(ValueId::new(0), field, &cancellation),
+            memory.read_ids(ValueId::new(0), field.clone(), &cancellation),
             Err(GoExternalFieldGap::Cancelled)
         );
     }
@@ -3088,7 +3133,7 @@ mod tests {
         let foreign = foreign.procedure_handle(ProcedureId::new(0)).unwrap();
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
         let field = GoExternalField {
-            symbol: &overlay.symbols()[0],
+            symbol: std::sync::Arc::clone(&overlay.symbols()[0]),
             artifact_sha256: "bytes",
             copy: MemoryValueCopy::Reference,
         };
@@ -3096,17 +3141,81 @@ mod tests {
         let mut memory = GoExternalFieldMemory::new(&procedure, 100);
         let object = procedure.value_handle(ValueId::new(0)).unwrap();
         let value = procedure.value_handle(ValueId::new(2)).unwrap();
-        memory.store(&object, field, &value, &cancellation).unwrap();
-        assert_eq!(memory.read(&object, field, &cancellation).unwrap(), value);
+        memory
+            .store(&object, field.clone(), &value, &cancellation)
+            .unwrap();
+        assert_eq!(
+            memory.read(&object, field.clone(), &cancellation).unwrap(),
+            value
+        );
         let foreign_object = foreign.value_handle(ValueId::new(0)).unwrap();
         assert_eq!(
-            memory.read(&foreign_object, field, &cancellation),
+            memory.read(&foreign_object, field.clone(), &cancellation),
             Err(GoExternalFieldGap::ValueOutsideProcedure)
         );
         assert_eq!(
-            memory.read(&object, field, &cancellation),
+            memory.read(&object, field.clone(), &cancellation),
             Err(GoExternalFieldGap::ValueOutsideProcedure)
         );
+    }
+
+    #[test]
+    #[hardwon("#6685: Go field memory charged its budget for every unrelated overlay symbol")]
+    fn external_field_source_budget_ignores_unrelated_overlay_symbols() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+            go_extra_support_0::go_callback_source_field_test_overlay,
+            test_support::{class, overlay},
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::producer::{
+            ArtifactProducerLimits, read_exact_source_set,
+        };
+
+        let project = crate::inline_project::InlineTestProject::with_language(
+            brokk_bifrost_core::analyzer::model::Language::Go,
+        )
+        .file(
+            "api.go",
+            "package ssh\ntype Config struct { Callback func() }\n",
+        )
+        .build();
+        let artifact = read_exact_source_set(
+            project.file("api.go").root(),
+            &[std::path::PathBuf::from("api.go")],
+            1,
+            1,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut symbols = go_callback_source_field_test_overlay(artifact.sha256())
+            .symbols()
+            .into_iter()
+            .map(|symbol| (*symbol).clone())
+            .collect::<Vec<_>>();
+        symbols.extend((0..256).map(|index| class(&format!("unrelated.Type{index}"), "rust")));
+        let overlay = overlay(symbols, Vec::new());
+        let budget = 128;
+        assert!(
+            overlay.symbols().len() > budget,
+            "the old whole-set scan must exceed this budget"
+        );
+        let field =
+            resolve_go_external_field(&overlay, "example.test/ssh.Config", "Callback", &artifact)
+                .unwrap();
+        let package = super::super::GoPinnedPackage {
+            import_path: "example.test/ssh".to_owned(),
+            name: "ssh".to_owned(),
+            files: vec!["api.go".to_owned()],
+        };
+        let anchor = bind_go_external_field_source(
+            &field,
+            &overlay,
+            &artifact,
+            &package,
+            budget,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(anchor.name_anchors[0].text, "Callback");
     }
 
     #[test]

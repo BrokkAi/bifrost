@@ -1630,10 +1630,289 @@ mod tests {
             1,
             "collection must not inspect facts from an incomplete build"
         );
+        assert!(
+            gc_claim_until(&db_path) > unix_now(),
+            "the claim must still be in force while its collector waits for the lock"
+        );
+
+        // A second collector meets the first one's claim and yields at once,
+        // without queueing on the build lock behind it.
+        let second_root = repo_root.clone();
+        let second_db = db_path.clone();
+        let second = std::thread::spawn(move || {
+            let repo = Repository::open(&second_root).unwrap();
+            force_gc(&second_db, &repo, &second_root)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !second.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a second collector queued behind a claimed collection"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let second = second.join().unwrap().unwrap();
+        assert!(!second.ran, "{second:?}");
+        assert_eq!(second.total_blobs_after, 1);
+
+        // The claim is taken before the Git walk and the lock after it, so
+        // hold the lock long enough that a collector which skips instead of
+        // waiting has finished. A slow host can only make this pass falsely.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(
+            !gc.is_finished(),
+            "a forced collection returned while a builder held the lock"
+        );
 
         drop(build_lock);
         let outcome = gc.join().unwrap().unwrap();
+        assert!(outcome.ran, "{outcome:?}");
         assert_eq!(outcome.analyzer_dropped, 1);
+    }
+
+    /// A budgeted caller waits for a held build lock until the holder releases
+    /// it, publishing the wait as its phase, and gives up with an error naming
+    /// the lock when its request is cancelled.
+    #[test]
+    fn cancellable_build_lock_waits_for_the_holder_and_yields_to_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        let lock_path = format!("{}.initial-build.lock", db_path.display());
+
+        let wait_for_phase = |token: &crate::CancellationToken| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if token.phase().is_some_and(|phase| {
+                    phase.starts_with("waiting for the analyzer cache build lock")
+                }) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the waiter never published its wait for the build lock"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let held = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let token = crate::CancellationToken::new();
+        let waiter = {
+            let db_path = db_path.clone();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                AnalyzerCacheBuildLock::acquire_cancellable(&db_path, &token).map(|_| ())
+            })
+        };
+        wait_for_phase(&token);
+        assert!(!waiter.is_finished(), "the waiter took a held lock");
+        drop(held);
+        waiter.join().unwrap().unwrap();
+        assert_eq!(
+            token.phase(),
+            None,
+            "the wait's phase must end with the wait"
+        );
+
+        let held = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let token = crate::CancellationToken::new();
+        let waiter = {
+            let db_path = db_path.clone();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                AnalyzerCacheBuildLock::acquire_cancellable(&db_path, &token).map(|_| ())
+            })
+        };
+        wait_for_phase(&token);
+        token.cancel();
+        let error = waiter.join().unwrap().unwrap_err();
+        drop(held);
+        assert!(error.contains(&lock_path), "{error}");
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    /// Set or clear `BIFROST_CACHE_GC` for `run`, then restore it. Callers hold
+    /// the GC tuning guard, which serializes every core test that reaches
+    /// `maybe_gc`.
+    fn with_cache_gc_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
+        let previous = std::env::var_os("BIFROST_CACHE_GC");
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("BIFROST_CACHE_GC", value),
+                None => std::env::remove_var("BIFROST_CACHE_GC"),
+            }
+        }
+        let result = run();
+        unsafe {
+            match previous {
+                Some(previous) => std::env::set_var("BIFROST_CACHE_GC", previous),
+                None => std::env::remove_var("BIFROST_CACHE_GC"),
+            }
+        }
+        result
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// When opportunistic collection runs, over the operator switch, the
+    /// tuning, and the accounting left by the previous collection. Every row
+    /// starts from a fresh store holding `blobs` collectable rows.
+    #[test]
+    fn opportunistic_gc_runs_only_when_enabled_and_due() {
+        let now = unix_now();
+        struct Row {
+            case: &'static str,
+            cache_gc: Option<&'static str>,
+            threshold: i64,
+            interval: i64,
+            blobs: i64,
+            last_gc_at: i64,
+            blobs_at_last_gc: i64,
+            runs: bool,
+        }
+        let rows = [
+            Row {
+                case: "enabled by default and due",
+                cache_gc: None,
+                threshold: 0,
+                interval: 0,
+                blobs: 1,
+                last_gc_at: now,
+                blobs_at_last_gc: 0,
+                runs: true,
+            },
+            Row {
+                case: "disabled by the operator",
+                cache_gc: Some("disabled"),
+                threshold: 0,
+                interval: 0,
+                blobs: 1,
+                last_gc_at: now,
+                blobs_at_last_gc: 0,
+                runs: false,
+            },
+            Row {
+                case: "no growth since the last collection",
+                cache_gc: None,
+                threshold: GC_AUTO_BLOB_THRESHOLD,
+                interval: 0,
+                blobs: 1,
+                last_gc_at: 0,
+                blobs_at_last_gc: 1,
+                runs: false,
+            },
+            Row {
+                case: "growth equal to the threshold, recent collection",
+                cache_gc: None,
+                threshold: 1,
+                interval: i64::MAX,
+                blobs: 1,
+                last_gc_at: now,
+                blobs_at_last_gc: 0,
+                runs: false,
+            },
+            Row {
+                case: "growth above the threshold, recent collection",
+                cache_gc: None,
+                threshold: 1,
+                interval: i64::MAX,
+                blobs: 2,
+                last_gc_at: now,
+                blobs_at_last_gc: 0,
+                runs: true,
+            },
+        ];
+        for Row {
+            case,
+            cache_gc,
+            threshold,
+            interval,
+            blobs,
+            last_gc_at,
+            blobs_at_last_gc,
+            runs,
+        } in rows
+        {
+            let _tuning = set_tuning_for_test(threshold, interval);
+            let temp = tempfile::tempdir().unwrap();
+            let repo_root = temp.path().canonicalize().unwrap();
+            let repo = gitblob::test_repo::init_repo(&repo_root);
+            let db_path = store_with_one_collectable_blob(&repo_root);
+            if blobs == 2 {
+                Connection::open(&db_path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO blobs(blob_oid, lang, generation)
+                         VALUES('3333333333333333333333333333333333333333', 'go', 1)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            set_accounting_for_test(&db_path, last_gc_at, blobs_at_last_gc).unwrap();
+
+            let outcome =
+                with_cache_gc_env(cache_gc, || maybe_gc(&db_path, &repo, &repo_root)).unwrap();
+
+            let remaining = if runs { 0 } else { blobs };
+            assert_eq!(outcome.ran, runs, "{case}: {outcome:?}");
+            assert_eq!(
+                outcome.analyzer_dropped as i64,
+                blobs - remaining,
+                "{case}: {outcome:?}"
+            );
+            assert_eq!(outcome.total_blobs_after, remaining, "{case}: {outcome:?}");
+            assert_eq!(total_blob_count(&db_path).unwrap(), remaining, "{case}");
+            assert_eq!(gc_claim_until(&db_path), 0, "{case}: claim left behind");
+        }
+    }
+
+    /// A collection records when it ran and how many blobs it left, and the
+    /// store becomes due again once it grows past that count.
+    #[test]
+    fn collection_records_its_accounting_and_becomes_due_after_growth() {
+        let _tuning = set_tuning_for_test(0, i64::MAX);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let db_path = store_with_one_collectable_blob(&repo_root);
+
+        let before = unix_now();
+        let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
+        let after = unix_now();
+        assert!(outcome.ran, "{outcome:?}");
+        assert_eq!(outcome.analyzer_dropped, 1);
+        assert_eq!(outcome.total_blobs_after, 0);
+        let (last_gc_at, blobs_at_last_gc) = gc_accounting_for_test(&db_path).unwrap();
+        assert!(
+            (before..=after).contains(&last_gc_at),
+            "last_gc_at {last_gc_at} outside the collection window {before}..={after}"
+        );
+        assert_eq!(blobs_at_last_gc, 0);
+
+        with_cache_gc_env(None, || {
+            let idle = maybe_gc(&db_path, &repo, &repo_root).unwrap();
+            assert!(!idle.ran, "nothing grew since the collection: {idle:?}");
+
+            Connection::open(&db_path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation)
+                     VALUES('3333333333333333333333333333333333333333', 'go', 1)",
+                    [],
+                )
+                .unwrap();
+            let grown = maybe_gc(&db_path, &repo, &repo_root).unwrap();
+            assert!(
+                grown.ran,
+                "one new blob is above a zero threshold: {grown:?}"
+            );
+            assert_eq!(grown.analyzer_dropped, 1);
+        });
     }
 
     /// A collection has to return every page its deletes freed, not one page.

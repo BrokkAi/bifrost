@@ -687,48 +687,187 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// The module contract: a builder off the rayon pool runs the parallel
+    /// builder, a rayon worker runs the serial one (running the parallel one
+    /// there is the #549 deadlock shape), and `get_or_build_parallel` runs the
+    /// parallel builder everywhere. Each entry point is checked separately
+    /// because each makes the choice in its own code.
     #[test]
     #[hardwon("#549: a Rayon worker recursively building its own usage index deadlocked the pool")]
     fn selects_serial_builder_on_rayon_worker_and_parallel_off_pool() {
-        let memo = PoolSafeMemo::new();
-        let parallel_calls = AtomicUsize::new(0);
-        let serial_calls = AtomicUsize::new(0);
-
-        let value = memo.get_or_build(
-            || {
-                parallel_calls.fetch_add(1, Ordering::SeqCst);
-                "parallel"
-            },
-            || {
-                serial_calls.fetch_add(1, Ordering::SeqCst);
-                "serial"
-            },
-        );
-        assert_eq!(*value, "parallel");
-        assert_eq!(parallel_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(serial_calls.load(Ordering::SeqCst), 0);
-
-        memo.invalidate();
-
+        type Entry = fn(&PoolSafeMemo<&'static str>) -> &'static str;
+        let entries: [(&str, Entry, &str, &str); 4] = [
+            (
+                "get_or_build",
+                |memo| *memo.get_or_build(|| "parallel", || "serial"),
+                "parallel",
+                "serial",
+            ),
+            (
+                "get_or_try_build",
+                |memo| {
+                    *memo
+                        .get_or_try_build(|| Ok::<_, ()>("parallel"), || Ok("serial"))
+                        .expect("build succeeds")
+                },
+                "parallel",
+                "serial",
+            ),
+            (
+                "get_or_build_while",
+                |memo| {
+                    *memo
+                        .get_or_build_while(&|| true, || Some("parallel"), || Some("serial"))
+                        .expect("build is not stopped")
+                },
+                "parallel",
+                "serial",
+            ),
+            (
+                "get_or_build_parallel",
+                |memo| *memo.get_or_build_parallel(|| "parallel", || "serial"),
+                "parallel",
+                "parallel",
+            ),
+        ];
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(1)
             .build()
             .expect("rayon pool");
-        let value = pool.install(|| {
-            memo.get_or_build(
-                || {
-                    parallel_calls.fetch_add(1, Ordering::SeqCst);
-                    "parallel"
-                },
-                || {
-                    serial_calls.fetch_add(1, Ordering::SeqCst);
-                    "serial"
-                },
-            )
-        });
-        assert_eq!(*value, "serial");
-        assert_eq!(parallel_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(serial_calls.load(Ordering::SeqCst), 1);
+
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for (name, build, off_pool, on_pool) in entries {
+            observed.push((
+                name,
+                build(&PoolSafeMemo::new()),
+                pool.install(|| build(&PoolSafeMemo::new())),
+            ));
+            expected.push((name, off_pool, on_pool));
+        }
+        assert_eq!(
+            observed, expected,
+            "(entry point, off-pool builder, on-pool builder)"
+        );
+    }
+
+    /// Every finished build must release its builder claim in full, whatever
+    /// its entry point and outcome. A leaked pool-independent count makes
+    /// `parking_is_safe` tell a rayon worker that parking is safe while only
+    /// a rayon-dependent (shared) build is in flight, which is the #549
+    /// deadlock shape. Oracle: after each finished build, a rayon worker that
+    /// meets an off-pool shared build still in flight builds serially and
+    /// returns at once instead of parking until that build ends.
+    #[test]
+    fn finished_builds_leave_rayon_workers_free_to_build_serially() {
+        type Finish = fn(&PoolSafeMemo<usize>);
+        let finishes: [(&str, Finish); 12] = [
+            ("get_or_build ok", |memo| {
+                memo.get_or_build(|| 1, || 1);
+            }),
+            ("get_or_try_build err", |memo| {
+                assert!(memo.get_or_try_build(|| Err(()), || Err(())).is_err());
+            }),
+            ("get_or_build_while stopped", |memo| {
+                assert!(
+                    memo.get_or_build_while(&|| true, || None, || None)
+                        .is_none()
+                );
+            }),
+            ("get_or_build_while ok", |memo| {
+                assert!(
+                    memo.get_or_build_while(&|| true, || Some(1), || Some(1))
+                        .is_some()
+                );
+            }),
+            ("get_or_try_build_pool_independent ok", |memo| {
+                assert!(
+                    memo.get_or_try_build_pool_independent(|| Ok::<_, ()>(1))
+                        .is_ok()
+                );
+            }),
+            ("get_or_try_build_pool_independent err", |memo| {
+                assert!(memo.get_or_try_build_pool_independent(|| Err(())).is_err());
+            }),
+            ("get_or_try_build_pool_independent_while ok", |memo| {
+                let built =
+                    memo.get_or_try_build_pool_independent_while(&|| true, || Ok::<_, ()>(Some(1)));
+                assert!(built.expect("no error").is_some());
+            }),
+            ("get_or_try_build_pool_independent_while stopped", |memo| {
+                let built =
+                    memo.get_or_try_build_pool_independent_while(&|| true, || Ok::<_, ()>(None));
+                assert!(built.expect("no error").is_none());
+            }),
+            ("get_or_build_on_dedicated_pool ok", |memo| {
+                memo.get_or_build_on_dedicated_pool(|| 1);
+            }),
+            ("get_or_try_build_on_dedicated_pool err", |memo| {
+                assert!(memo.get_or_try_build_on_dedicated_pool(|| Err(())).is_err());
+            }),
+            ("get_or_build_on_dedicated_pool_while ok", |memo| {
+                assert!(
+                    memo.get_or_build_on_dedicated_pool_while(&|| true, || Some(1))
+                        .is_some()
+                );
+            }),
+            ("get_or_build_on_dedicated_pool_while stopped", |memo| {
+                assert!(
+                    memo.get_or_build_on_dedicated_pool_while(&|| true, || None)
+                        .is_none()
+                );
+            }),
+        ];
+
+        for (name, finish) in finishes {
+            let memo = Arc::new(PoolSafeMemo::new());
+            finish(&memo);
+            // A successful build published a value; clear it so the next
+            // caller has to claim or wait again.
+            memo.invalidate();
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let leader_memo = Arc::clone(&memo);
+            let leader = thread::spawn(move || {
+                leader_memo.get_or_build(
+                    || {
+                        started_tx.send(()).expect("announce shared build");
+                        resume_rx.recv().expect("release shared build");
+                        2
+                    },
+                    || unreachable!("off-pool build takes the parallel branch"),
+                )
+            });
+            started_rx.recv().expect("shared build starts");
+
+            let worker_memo = Arc::clone(&memo);
+            let (worker_tx, worker_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("rayon pool");
+                let value = pool.install(|| {
+                    *worker_memo.get_or_build(
+                        || panic!("a rayon worker must not run the parallel builder"),
+                        || 9,
+                    )
+                });
+                worker_tx.send(value).expect("send worker value");
+            });
+            let worker_value = worker_rx.recv_timeout(Duration::from_secs(5));
+            // Release the leader before asserting, so a failure does not
+            // leave a parked worker and a blocked leader behind.
+            resume_tx.send(()).expect("release shared build");
+            leader.join().expect("leader finishes");
+            worker.join().expect("worker finishes");
+            assert_eq!(
+                worker_value,
+                Ok(9),
+                "after `{name}`, a rayon worker parked on a shared build instead of building serially"
+            );
+        }
     }
 
     #[test]

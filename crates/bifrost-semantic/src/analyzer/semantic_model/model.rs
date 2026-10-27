@@ -26,9 +26,10 @@ use serde::{Deserialize, Serialize};
 /// formals. Version fifteen carries typed module values and callable parameter
 /// roles. Version sixteen carries exact runtime return-class sets. Version seventeen
 /// carries ordered exhaustive Python runtime direct-base claims. Version eighteen
-/// carries Rust generic defaults, implemented traits and receiver forms.
+/// carries Rust generic defaults, implemented traits and receiver forms. Version
+/// nineteen carries implementation inventories, conditions and extraction authority.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 18;
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 19;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -38,8 +39,9 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 18;
 /// pack or release asset keeps loading here until its producer regenerates it
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
-pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] =
-    &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
 /// Native callable-values facts first appeared in schema ten.
@@ -132,7 +134,7 @@ pub const DEFERRED_YIELD_SCHEMA: &str =
 #[serde(deny_unknown_fields)]
 pub struct RuntimeValuesPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exposures: Vec<RuntimeGlobalExposure>,
+    pub exposures: Vec<std::sync::Arc<RuntimeGlobalExposure>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub behaviors: Vec<KeyedReadBehavior>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -492,6 +494,7 @@ impl RuntimeValuesPayload {
         self.exposures
             .iter()
             .find(|record| record.exposure_id == id)
+            .map(AsRef::as_ref)
     }
 
     pub fn behavior(&self, id: &str) -> Option<&KeyedReadBehavior> {
@@ -899,6 +902,10 @@ pub enum RuntimeExceptionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
+    /// In-memory producer carrier. Authored documents cannot express authority.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub extraction: Option<ArtifactExtraction>,
     #[schemars(range(min = 2, max = SEMANTIC_MODEL_SCHEMA_VERSION))]
     pub schema_version: u32,
     pub pack_id: String,
@@ -939,6 +946,80 @@ pub struct AuthoredSemanticModelPack {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_correspondence: Option<PythonCorrespondenceEvidence>,
     pub shards: Vec<AuthoredShard>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactExtractionKind {
+    NpmPackageManifest,
+    TypeScriptDeclarationFile,
+    JavaSourceJar,
+    JavaClassJar,
+    ScalaSourceJar,
+    KotlinSourceJar,
+    JdkSourceZip,
+    JdkJmodSet,
+    DotNetAssembly,
+    RustdocJson,
+    RustdocJsonSet,
+    TypeScriptLibrarySet,
+    GoSourceSet,
+    PythonStub,
+    PythonSource,
+    RubyGemArchive,
+    /// One Composer-installed package tree. Composer installs sources rather
+    /// than a compiled artifact, so the ecosystem names the input instead of
+    /// the language, exactly as `NpmPackageManifest` does.
+    ComposerPackageSourceSet,
+    /// One tree of plain PHP declaration stubs: PHP source that states the
+    /// runtime's classes, interfaces, constants and functions with native
+    /// signatures and empty bodies. Distinct from `ComposerPackageSourceSet`,
+    /// which is an installed package's real, executable sources.
+    PhpDeclarationStub,
+    /// One explicit C++ include root containing exact header sources.
+    CppHeaderSourceSet,
+}
+
+/// Artifact authority is carried by the production path, never authored JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactExtraction {
+    pub kind: ArtifactExtractionKind,
+    pub inputs: ArtifactExtractionInputs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactExtractionInputs {
+    Single { sha256: String },
+    SourceSet { digest: String },
+}
+
+impl ArtifactExtraction {
+    pub fn single(kind: ArtifactExtractionKind, sha256: &str) -> Self {
+        Self {
+            kind,
+            inputs: ArtifactExtractionInputs::Single {
+                sha256: sha256.to_owned(),
+            },
+        }
+    }
+
+    pub fn source_set(kind: ArtifactExtractionKind, digest: &str) -> Self {
+        Self {
+            kind,
+            inputs: ArtifactExtractionInputs::SourceSet {
+                digest: digest.to_owned(),
+            },
+        }
+    }
+
+    pub fn digest(&self) -> &str {
+        match &self.inputs {
+            ArtifactExtractionInputs::Single { sha256 } => sha256,
+            ArtifactExtractionInputs::SourceSet { digest } => digest,
+        }
+    }
 }
 
 /// Original CSMI Python declaration-to-runtime correspondence evidence bound
@@ -2699,6 +2780,14 @@ pub struct TypeFact {
     pub type_parameter_defaults: Vec<Option<GenericParameterDefault>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implemented_traits: Vec<ImplementedTraitFact>,
+    /// Exhaustive direct implementations of traits in the same artifact source set.
+    /// This excludes compiler-derived auto traits and does not close blanket rules.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implemented_traits_complete: bool,
+    /// Exhaustive generic rules implementing this source-set trait. Absent on
+    /// compiler-derived auto traits; false never implies an empty inventory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generic_trait_impls_complete: bool,
     /// Generic impl rules owned by the implemented trait, never concrete projections.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generic_trait_impls: Vec<GenericTraitImplFact>,
@@ -2750,12 +2839,23 @@ pub struct AssociatedTypeBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementedTraitFact {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_negative: bool,
+    /// Impl-local binders, separate from the declaration owner's binders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_parameters: Vec<String>,
+    /// The exact impl target, including specializations such as Box<u8>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_pattern: Option<RustSelfPattern>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounds: Vec<GenericTraitBound>,
     pub trait_type: TypeRef,
     #[serde(default)]
     pub associated_types: Vec<AssociatedTypeBinding>,
 }
 
-/// The constructor shapes used by Rust's forwarding impls, with reference mutability.
+/// Rust impl patterns, including blanket parameters and reference mutability.
+/// Built-in shapes use a structured TypeRef constructor owner with no arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RustSelfPattern {
@@ -2784,6 +2884,7 @@ pub struct GenericTraitBound {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenericTraitImplFact {
+    /// Explicit binders; the implicit Self binder denotes self_pattern.
     pub type_parameters: Vec<String>,
     pub self_pattern: RustSelfPattern,
     pub bounds: Vec<GenericTraitBound>,
@@ -2797,6 +2898,71 @@ pub enum RustSelfForm {
     Shared,
     Mutable,
     Other { pattern: RustSelfPattern },
+}
+
+/// Prove absence using inventories from the same artifact source set. The caller
+/// supplies language-specific self-pattern unification and bound evaluation:
+/// Some(true) is applicable, Some(false) is impossible, None is unreviewed.
+///
+/// A complete concrete list alone cannot prove absence: a blanket rule can add
+/// an implementation. A complete rule list alone cannot close concrete impls.
+/// Both claims are required for inventory-based absence; an applicable explicit
+/// negative implementation is independent evidence. Missing coverage, including
+/// compiler-derived auto traits, must keep a competing method unknown.
+///
+/// Absence holds only within the source set. The orphan rule lets a downstream
+/// crate implement a source-set trait with type parameters for a source-set
+/// type when a local type appears among the trait's arguments (for example
+/// `impl AsMut<Local> for Vec<u8>`), so callers must also consult the
+/// workspace's own impls before treating a rival trait as inapplicable.
+pub fn provably_does_not_implement(
+    owner: &TypeFact,
+    trait_: &TypeFact,
+    mut concrete_applicability: impl FnMut(&ImplementedTraitFact) -> Option<bool>,
+    mut rule_applicability: impl FnMut(&GenericTraitImplFact) -> Option<bool>,
+) -> bool {
+    let targets_trait = |fact: &ImplementedTraitFact| match &fact.trait_type {
+        TypeRef::Declared { id, .. } => id == &trait_.id,
+        TypeRef::Named { name, .. } => name == &trait_.name || trait_.aliases.contains(name),
+        _ => false,
+    };
+    let mut positive_possible = false;
+    for fact in owner
+        .implemented_traits
+        .iter()
+        .filter(|fact| targets_trait(fact))
+    {
+        let applicable = concrete_applicability(fact);
+        if fact.is_negative && applicable == Some(true) {
+            return true;
+        }
+        positive_possible |= !fact.is_negative && applicable != Some(false);
+    }
+    for rule in &trait_.generic_trait_impls {
+        let applicable = rule_applicability(rule);
+        if rule.implementation.is_negative && applicable == Some(true) {
+            return true;
+        }
+        positive_possible |= !rule.implementation.is_negative && applicable != Some(false);
+    }
+    owner.implemented_traits_complete && trait_.generic_trait_impls_complete && !positive_possible
+}
+
+/// Whether an implementation outside the selected artifact evidence may apply.
+/// Artifact evidence excludes it only after language coherence rules either
+/// forbid workspace implementations or a workspace scan rules them out.
+/// A missing scan result stays unknown; macro uncertainty is not absence.
+/// Callers supply language rules without introducing a dependency on a parser
+/// or workspace analyzer into the model layer.
+pub fn additional_implementation_may_apply(
+    artifact_excludes: impl FnOnce() -> bool,
+    workspace_coherence_allows_impl: impl FnOnce() -> bool,
+    workspace_impl_may_apply: impl FnOnce() -> Option<bool>,
+) -> Option<bool> {
+    if workspace_coherence_allows_impl() && workspace_impl_may_apply()? {
+        return Some(true);
+    }
+    Some(!artifact_excludes())
 }
 
 /// Structured JVM inventory coverage. Missing coverage is deliberately open.

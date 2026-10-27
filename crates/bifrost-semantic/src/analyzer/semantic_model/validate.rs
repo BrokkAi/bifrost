@@ -182,6 +182,22 @@ impl Validator {
                 ),
             );
         }
+        if let Some(extraction) = &pack.extraction {
+            if self.predates_schema(19) {
+                self.error(
+                    "extraction.schema_version",
+                    "$.extraction",
+                    "artifact extraction requires schema 19",
+                );
+            }
+            if !brokk_bifrost_core::analyzer::canonical_hash::is_lower_sha256(extraction.digest()) {
+                self.error(
+                    "extraction.digest",
+                    "$.extraction",
+                    "extraction inputs require a lowercase SHA-256 digest",
+                );
+            }
+        }
         self.stable_id("$.pack_id", &pack.pack_id);
         self.version("$.version", &pack.version);
         self.text("$.producer.name", &pack.producer.name);
@@ -1525,6 +1541,23 @@ impl Validator {
                     {
                         self.rust_contract_version(&fact_path);
                     }
+                    if fact.implemented_traits_complete || fact.generic_trait_impls_complete {
+                        if self.predates_schema(19) {
+                            self.error(
+                                "declaration.impl_inventory_schema_version",
+                                &fact_path,
+                                "implementation inventories require schema version 19",
+                            );
+                        }
+                        self.rust_contract_version(&fact_path);
+                        if fact.generic_trait_impls_complete && fact.type_kind != TypeKind::Trait {
+                            self.error(
+                                "declaration.generic_impl_owner",
+                                &fact_path,
+                                "generic rule inventory must be owned by a trait",
+                            );
+                        }
+                    }
                     let mut parameters = fact.type_parameters.clone();
                     parameters.push("Self".to_owned());
                     if !fact.type_parameter_defaults.is_empty()
@@ -1568,27 +1601,66 @@ impl Validator {
                             &format!("{impl_path}.type_parameters"),
                             &implementation.type_parameters,
                         );
+                        let mut implicit_self = false;
+                        let mut references = vec![&implementation.implementation.trait_type];
+                        references.extend(
+                            implementation
+                                .implementation
+                                .associated_types
+                                .iter()
+                                .map(|binding| &binding.r#type),
+                        );
+                        for bound in &implementation.bounds {
+                            references.extend([&bound.subject, &bound.bound.trait_type]);
+                            references.extend(
+                                bound
+                                    .bound
+                                    .associated_types
+                                    .iter()
+                                    .map(|binding| &binding.r#type),
+                            );
+                        }
+                        let mut patterns = vec![&implementation.self_pattern];
+                        while let Some(pattern) = patterns.pop() {
+                            match pattern {
+                                RustSelfPattern::Parameter { name } => {
+                                    implicit_self |= name == "Self"
+                                }
+                                RustSelfPattern::Reference { inner, .. } => patterns.push(inner),
+                                RustSelfPattern::Constructor { owner, arguments } => {
+                                    references.push(owner);
+                                    patterns.extend(arguments);
+                                }
+                            }
+                        }
+                        crate::analyzer::semantic::common::visit_type_refs(references, |ty| {
+                            implicit_self |=
+                                matches!(ty, TypeRef::TypeParameter { name } if name == "Self");
+                        });
+                        if implicit_self && self.predates_schema(19) {
+                            self.error(
+                                "declaration.impl_self_schema_version",
+                                &impl_path,
+                                "implicit Self in generic implementation rules requires schema 19",
+                            );
+                        }
+                        // Rust's implicit Self names this rule's instantiated
+                        // self pattern, independently of its explicit binders.
+                        let mut impl_parameters = implementation.type_parameters.clone();
+                        impl_parameters.push("Self".to_owned());
                         self.rust_self_pattern(
                             &impl_path,
                             &implementation.self_pattern,
-                            &implementation.type_parameters,
+                            &impl_parameters,
                         );
                         for bound in &implementation.bounds {
-                            self.type_ref(
-                                &impl_path,
-                                &bound.subject,
-                                &implementation.type_parameters,
-                            );
-                            self.implemented_trait(
-                                &impl_path,
-                                &bound.bound,
-                                &implementation.type_parameters,
-                            );
+                            self.type_ref(&impl_path, &bound.subject, &impl_parameters);
+                            self.implemented_trait(&impl_path, &bound.bound, &impl_parameters);
                         }
                         self.implemented_trait(
                             &impl_path,
                             &implementation.implementation,
-                            &implementation.type_parameters,
+                            &impl_parameters,
                         );
                     }
                     if let Some(bases) = &fact.runtime_bases {
@@ -2072,7 +2144,7 @@ impl Validator {
         let exposures: HashMap<&str, &RuntimeGlobalExposure> = payload
             .exposures
             .iter()
-            .map(|record| (record.exposure_id.as_str(), record))
+            .map(|record| (record.exposure_id.as_str(), record.as_ref()))
             .collect();
         let mut behavior_ids = HashSet::new();
         for (index, behavior) in payload.behaviors.iter().enumerate() {
@@ -5012,19 +5084,59 @@ impl Validator {
         fact: &ImplementedTraitFact,
         parameters: &[String],
     ) {
-        self.type_ref(&format!("{path}.trait_type"), &fact.trait_type, parameters);
-        let mut names = std::collections::HashSet::new();
-        for (index, binding) in fact.associated_types.iter().enumerate() {
-            let binding_path = format!("{path}.associated_types[{index}]");
-            self.language_identifier(&binding_path, &binding.name);
-            if !names.insert(&binding.name) {
+        let mut pending = vec![(fact, parameters.to_vec(), 1usize)];
+        while let Some((fact, outer_parameters, depth)) = pending.pop() {
+            if depth > self.limits.max_depth {
                 self.error(
-                    "declaration.duplicate_associated_type",
-                    &binding_path,
-                    "duplicate associated type binding",
+                    "limit.type_depth",
+                    path,
+                    "implementation bounds exceeded type depth",
                 );
+                continue;
             }
-            self.type_ref(&binding_path, &binding.r#type, parameters);
+            if fact.is_negative
+                || fact.self_pattern.is_some()
+                || !fact.bounds.is_empty()
+                || !fact.type_parameters.is_empty()
+            {
+                if self.predates_schema(19) {
+                    self.error(
+                        "declaration.impl_conditions_schema_version",
+                        path,
+                        "implementation conditions require schema version 19",
+                    );
+                }
+                self.rust_contract_version(path);
+            }
+            let parameters = if fact.self_pattern.is_some() {
+                self.unique_names(path, &fact.type_parameters);
+                let mut parameters = fact.type_parameters.clone();
+                parameters.push("Self".to_owned());
+                parameters
+            } else {
+                outer_parameters
+            };
+            self.type_ref(&format!("{path}.trait_type"), &fact.trait_type, &parameters);
+            if let Some(pattern) = &fact.self_pattern {
+                self.rust_self_pattern(&format!("{path}.self_pattern"), pattern, &parameters);
+            }
+            let mut names = std::collections::HashSet::new();
+            for (index, binding) in fact.associated_types.iter().enumerate() {
+                let binding_path = format!("{path}.associated_types[{index}]");
+                self.language_identifier(&binding_path, &binding.name);
+                if !names.insert(&binding.name) {
+                    self.error(
+                        "declaration.duplicate_associated_type",
+                        &binding_path,
+                        "duplicate associated type binding",
+                    );
+                }
+                self.type_ref(&binding_path, &binding.r#type, &parameters);
+            }
+            for bound in &fact.bounds {
+                self.type_ref(path, &bound.subject, &parameters);
+                pending.push((&bound.bound, parameters.clone(), depth + 1));
+            }
         }
     }
 

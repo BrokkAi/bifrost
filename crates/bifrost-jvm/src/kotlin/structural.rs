@@ -766,3 +766,237 @@ impl StructuralSpec for KotlinStructuralSpec {
         }
     }
 }
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::ProjectFile;
+    use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+    use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
+
+    fn parse(source: &str) -> ParsedFile {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(
+            std::env::temp_dir().join("kotlin-grammar-boundary"),
+            "Sample.kt",
+        );
+        crate::kotlin::declarations::parse_kotlin_file(&file, source, &tree)
+    }
+
+    fn grammar_nodes<'a>(source: &'a str, kinds: &[&str]) -> Vec<(String, &'a str)> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut selected = Vec::new();
+        while let Some(node) = stack.pop() {
+            if kinds.contains(&node.kind()) {
+                selected.push((node.kind().to_owned(), &source[node.byte_range()]));
+            }
+            let mut cursor = node.walk();
+            stack.extend(
+                node.named_children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        selected
+    }
+
+    fn text<'a>(parsed: &ParsedFile, source: &'a str, id: SourceOccurrenceId) -> &'a str {
+        let range = parsed
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .occurrences
+            .occurrence(id)
+            .range;
+        &source[range.start_byte..range.end_byte]
+    }
+
+    // Ordered grammar operands and import identifiers must survive as exact
+    // role ranges, including delegated values and nested infix calls.
+    #[test]
+    fn structural_role_grammar_boundary() {
+        let source = "import a.C\nimport a.b.D\nimport a.E as Alias\nimport a.*\ninterface Empty { val absent: Int }\nval delegated by factory()\nval initialized = factory()\nval result = left combine right\nfun use() { consume(left combine right); target = source; target += delta }";
+        assert_eq!(
+            grammar_nodes(source, &["infix_expression", "assignment"]),
+            [
+                ("infix_expression".into(), "left combine right"),
+                ("infix_expression".into(), "left combine right"),
+                ("assignment".into(), "target = source"),
+                ("assignment".into(), "target += delta"),
+            ]
+        );
+        let parsed = parse(source);
+        let facts = &parsed.source_facts.as_ref().unwrap().structural;
+        let mut actual = Vec::new();
+        for (index, node) in facts.nodes().iter().enumerate() {
+            if !matches!(
+                node.kind,
+                NormalizedKind::Assignment | NormalizedKind::Call | NormalizedKind::Import
+            ) {
+                continue;
+            }
+            for role in facts.roles(index as u32) {
+                if matches!(
+                    role.role,
+                    Role::Left | Role::Right | Role::Arg | Role::Module
+                ) {
+                    actual.push((
+                        text(&parsed, source, node.occurrence),
+                        role.role,
+                        text(&parsed, source, role.occurrence),
+                        role.name.map(|id| text(&parsed, source, id)),
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            actual,
+            vec![
+                ("import a.C", Role::Module, "import a.C", Some("C")),
+                ("import a.C", Role::Module, "import a.C", Some("a.C")),
+                ("import a.b.D", Role::Module, "import a.b.D", Some("D")),
+                ("import a.b.D", Role::Module, "import a.b.D", Some("a.b.D")),
+                (
+                    "import a.E as Alias",
+                    Role::Module,
+                    "import a.E as Alias",
+                    Some("E")
+                ),
+                (
+                    "import a.E as Alias",
+                    Role::Module,
+                    "import a.E as Alias",
+                    Some("a.E")
+                ),
+                (
+                    "import a.E as Alias",
+                    Role::Module,
+                    "as Alias",
+                    Some("Alias")
+                ),
+                ("import a.*", Role::Module, "import a.*", Some("a")),
+                (
+                    "val delegated by factory()",
+                    Role::Left,
+                    "delegated",
+                    Some("delegated")
+                ),
+                (
+                    "val delegated by factory()",
+                    Role::Right,
+                    "factory()",
+                    Some("factory")
+                ),
+                (
+                    "val initialized = factory()",
+                    Role::Left,
+                    "initialized",
+                    Some("initialized")
+                ),
+                (
+                    "val initialized = factory()",
+                    Role::Right,
+                    "factory()",
+                    Some("factory")
+                ),
+                (
+                    "val result = left combine right",
+                    Role::Left,
+                    "result",
+                    Some("result")
+                ),
+                (
+                    "val result = left combine right",
+                    Role::Right,
+                    "left combine right",
+                    Some("combine")
+                ),
+                ("left combine right", Role::Arg, "right", Some("right")),
+                (
+                    "consume(left combine right)",
+                    Role::Arg,
+                    "left combine right",
+                    Some("combine")
+                ),
+                ("left combine right", Role::Arg, "right", Some("right")),
+                ("target = source", Role::Left, "target", Some("target")),
+                ("target = source", Role::Right, "source", Some("source")),
+                ("target += delta", Role::Left, "target", Some("target")),
+                ("target += delta", Role::Right, "delta", Some("delta")),
+            ]
+        );
+    }
+
+    // The numeric token owns its suffix and sign. Nested magnitude nodes
+    // must not introduce extra literal occurrences; unary identifiers are not literals.
+    #[test]
+    fn numeric_token_grammar_boundary() {
+        let source = "val a = 1u; val b = 1uL; val c = 2L; val d = -3; val e = +4.5; val f = 0xffu; val g = -value; val h = !flag";
+        assert_eq!(
+            grammar_nodes(
+                source,
+                &["unsigned_literal", "long_literal", "prefix_expression"]
+            ),
+            [
+                ("unsigned_literal".into(), "1u"),
+                ("unsigned_literal".into(), "1uL"),
+                ("long_literal".into(), "2L"),
+                ("prefix_expression".into(), "-3"),
+                ("prefix_expression".into(), "+4.5"),
+                ("unsigned_literal".into(), "0xffu"),
+                ("prefix_expression".into(), "-value"),
+                ("prefix_expression".into(), "!flag"),
+            ]
+        );
+        let parsed = parse(source);
+        let actual: Vec<_> = parsed
+            .source_facts
+            .as_ref()
+            .unwrap()
+            .structural
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == NormalizedKind::NumericLiteral)
+            .map(|node| text(&parsed, source, node.occurrence))
+            .collect();
+        assert_eq!(actual, ["1u", "1uL", "2L", "-3", "+4.5", "0xffu"]);
+    }
+
+    #[test]
+    fn recovery_grammar_boundary() {
+        let source = "fun valid() { call() }\nfun broken( {";
+        assert_eq!(
+            grammar_nodes(source, &["ERROR"]),
+            [("ERROR".into(), "fun broken( {")]
+        );
+        let parsed = parse(source);
+        let facts = &parsed.source_facts.as_ref().unwrap().structural;
+        let errors: Vec<_> = facts
+            .recovered_regions()
+            .iter()
+            .map(|span| span.text(source))
+            .collect();
+        assert_eq!(errors, ["fun broken( {"]);
+        // The query layer materializes SyntaxError from recovered regions.
+        // Capability discovery must admit those rows, alongside ordinary calls.
+        assert!(
+            facts
+                .nodes()
+                .iter()
+                .any(|node| node.kind == NormalizedKind::Call)
+        );
+        for kind in [NormalizedKind::SyntaxError, NormalizedKind::Call] {
+            assert!(KOTLIN_STRUCTURAL_SPEC.supports_kind(kind), "{kind:?}");
+        }
+    }
+}

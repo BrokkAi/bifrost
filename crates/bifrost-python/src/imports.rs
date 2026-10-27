@@ -437,20 +437,6 @@ fn remove_direct_scope_bindings(
     }
 }
 
-/// Parse the structured import facts for a Python document without executing
-/// it. LSP model binding uses the same AST-derived representation as the
-/// analyzer so external APIs are never selected by a terminal-name scan.
-pub fn parse_python_import_infos(source: &str) -> Vec<ImportInfo> {
-    let Some(tree) = parse_python_tree(source) else {
-        return Vec::new();
-    };
-    let mut imports = Vec::new();
-    for node in python_import_statement_nodes(tree.root_node()) {
-        imports.extend(python_import_infos_from_node(node, source));
-    }
-    imports
-}
-
 fn python_import_statement_nodes<'tree>(root: Node<'tree>) -> Vec<Node<'tree>> {
     let mut pending = vec![root];
     let mut nodes = Vec::new();
@@ -495,16 +481,6 @@ pub fn python_function_scoped_import_binding<'a>(
             && reference.end_byte() <= binding.scope_end_byte
             && binding.local_name == name
     })
-}
-
-/// Return source-ordered, parser-derived local bindings for explicit Python
-/// imports. The byte offset lets callers select the last visible binding rather
-/// than treating a whole document as one unordered import scope.
-pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
-    let Some(tree) = parse_python_tree(source) else {
-        return Vec::new();
-    };
-    python_import_bindings_from_tree(tree.root_node(), source)
 }
 
 /// Return structured import bindings from a tree the caller already owns.
@@ -995,7 +971,7 @@ pub fn resolve_import_files_batched(
         .collect()
 }
 
-/// The module FQN `resolve_import`'s fast path checks first, if any -- must stay in sync with the
+/// The module FQN fast path checks first, if any -- must stay in sync with the
 /// two `resolve_module_code_unit` call sites in `resolve_import_with_hint` below, since it's what
 /// lets `resolve_import_target_files` batch-resolve them ahead of the serial fallback logic.
 fn primary_module_fqn(
@@ -1022,14 +998,6 @@ fn primary_module_fqn(
             resolved_module.map(|resolved_module| format!("{resolved_module}.{name}"))
         }
     }
-}
-
-pub fn resolve_import(
-    python: &dyn PythonSource,
-    file: &ProjectFile,
-    import: &ImportInfo,
-) -> Vec<(String, CodeUnit)> {
-    resolve_import_with_hint(python, file, import, None)
 }
 
 /// `primary_hint`, when `Some`, is the already-resolved result of this import's primary module FQN

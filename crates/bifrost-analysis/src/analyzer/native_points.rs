@@ -5,7 +5,7 @@ use crate::analyzer::Language;
 use crate::analyzer::languages::BoundedReceiverQuery;
 use crate::analyzer::resolution::{
     FactProjectedTypeNodeForm, FactProjectedTypeShape, FactResolutionAnswer, ResolutionCompletion,
-    ResolutionIncompleteReason, ResolutionSlotValue,
+    ResolutionIncompleteReason, ResolutionSlotValue, SemanticId,
 };
 
 use crate::analyzer::resolution::{SelectedResolutionContextSet, SelectedSemanticLocator};
@@ -62,7 +62,7 @@ pub enum NativePointContext {
 #[doc(hidden)]
 pub struct SelectedNativeImportModel {
     #[doc(hidden)]
-    pub symbol: crate::analyzer::semantic_model::SemanticModelSymbol,
+    pub symbol: std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
     #[doc(hidden)]
     pub source_token: crate::analyzer::resolution::SemanticId,
     #[doc(hidden)]
@@ -298,7 +298,7 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
     adapt: impl FnOnce(
         T,
         ReceiverAnalysisWork,
-        Option<crate::analyzer::semantic_model::SemanticModelSymbol>,
+        Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     ) -> BoundedResolution<O>,
     unavailable_value: impl Fn(&ResolvedReferenceSite, &str, String) -> O,
 ) -> BoundedResolution<O> {
@@ -514,7 +514,9 @@ fn adapt_definition_answer_with_import_model(
     site: &ResolvedReferenceSite,
     language: Language,
     answer: SelectedNativeReferenceUnits,
-    selected_import_model: Option<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    selected_import_model: Option<
+        std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    >,
 ) -> DefinitionLookupOutcome {
     let trace_start = trace::native_projection_start();
     let member_contexts = answer.member_contexts;
@@ -630,6 +632,24 @@ fn adapt_definition_answer_with_import_model(
         .collect::<Vec<_>>();
     definitions.sort_unstable();
     definitions.dedup();
+    let diagnostic_identities = answer
+        .diagnostic_identities
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let project_identity = |identity: SemanticId| {
+        crate::analyzer::store::resolution_operation::native_units::public_diagnostic_identity(
+            "semantic",
+            definitions_by_identity.get(&identity),
+            None,
+            None,
+        )
+    };
+    let project_identity = |identity: SemanticId| {
+        diagnostic_identities
+            .get(&identity)
+            .cloned()
+            .unwrap_or_else(|| project_identity(identity))
+    };
     let completion = answer.answer.binding().completion();
     let mut incomplete_hierarchy_names = answer
         .named_reasons
@@ -701,7 +721,7 @@ fn adapt_definition_answer_with_import_model(
             .into(),
             message: format!(
                 "selected native binding has ambiguous alternatives: {:?}",
-                answer.answer.binding().targets()
+                crate::analyzer::store::resolution_operation::native_units::public_diagnostic_targets(answer.answer.binding().targets(), project_identity)
             ),
         });
     }
@@ -711,7 +731,7 @@ fn adapt_definition_answer_with_import_model(
                 "selected native binding is incomplete because hierarchy traversal is unavailable for unindexed supertype(s): {incomplete_hierarchy_names:?}"
             )
         } else {
-            format!("selected native binding is incomplete: {completion:?}")
+            format!("selected native binding is incomplete: {}", crate::analyzer::store::resolution_operation::native_units::public_completion_details(completion, project_identity))
         };
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
@@ -813,12 +833,24 @@ fn adapt_definition_answer_with_import_model(
         .and_then(|support| support.call_applicability_adapter())
         .and_then(|adapter| adapter.no_applicable_call_diagnostic())
     {
-        let rejected = answer
+        let mut rejected = answer
             .answer
             .callable_candidate_applicability()
             .iter()
             .filter(|candidate| candidate.verdict() == ApplicabilityVerdict::Inapplicable)
+            .map(|candidate| {
+                format!(
+                    "{}: {} ({})",
+                    project_identity(candidate.target()),
+                    candidate.verdict().label(),
+                    candidate
+                        .reason()
+                        .map(|reason| reason.label())
+                        .unwrap_or("none")
+                )
+            })
             .collect::<Vec<_>>();
+        rejected.sort_unstable();
         if !rejected.is_empty() {
             diagnostics.push(DefinitionLookupDiagnostic {
                 kind: kind.into(),
@@ -834,20 +866,24 @@ fn adapt_definition_answer_with_import_model(
             .site_metadata()
             .is_some_and(|metadata| metadata.namespace() == ResolutionNamespace::Constructor)
     {
-        let rejected_constructors = answer
+        let mut rejected_constructors = answer
             .answer
             .callable_candidate_applicability()
             .iter()
             .filter(|candidate| candidate.verdict() == ApplicabilityVerdict::Inapplicable)
             .map(|candidate| {
-                (
-                    definitions_by_identity
-                        .get(&candidate.target())
-                        .map(|unit| unit.fq_name()),
-                    candidate,
+                format!(
+                    "{}: {} ({})",
+                    project_identity(candidate.target()),
+                    candidate.verdict().label(),
+                    candidate
+                        .reason()
+                        .map(|reason| reason.label())
+                        .unwrap_or("none")
                 )
             })
             .collect::<Vec<_>>();
+        rejected_constructors.sort_unstable();
         if !rejected_constructors.is_empty() {
             diagnostics.push(DefinitionLookupDiagnostic {
                 kind: "no_applicable_java_constructor".into(),
@@ -899,6 +935,22 @@ fn adapt_definition_answer_with_import_model(
         trace_provenance.rejection_coverage,
     );
     trace::record_native_declared_visibilities(&declared_visibilities);
+    trace::record_native_invocation_evidence(
+        trace_start,
+        &answer
+            .answer
+            .callable_candidate_applicability()
+            .iter()
+            .filter_map(|candidate| {
+                let unit = definitions_by_identity.get(&candidate.target())?;
+                Some((
+                    unit.clone(),
+                    candidate.phase(),
+                    candidate.failing_argument(),
+                ))
+            })
+            .collect::<Vec<_>>(),
+    );
     outcome
 }
 
@@ -1036,16 +1088,29 @@ fn record_native_callable_applicability(
             verdict: candidate.verdict(),
             reason: candidate.reason(),
         };
-        if answer.binding().targets().binary_search(&candidate.target()).is_ok() {
-            selected_context.push((unit.fq_name(), record));
-        } else if candidate.verdict()
-            == brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Inapplicable
+        if answer
+            .binding()
+            .targets()
+            .binary_search(&candidate.target())
+            .is_ok()
         {
-            let member = member_contexts.iter()
+            selected_context.push((unit.fq_name(), record));
+        } else if matches!(
+            candidate.verdict(),
+            ApplicabilityVerdict::Inapplicable | ApplicabilityVerdict::LessSpecific
+        ) {
+            let member = member_contexts
+                .iter()
                 .find(|context| context.target_identity == candidate.target())
-                .and_then(|context| native_member_attribution(language, context,
-                    crate::analyzer::structural::CandidateOutcome::Rejected(
-                        RejectionReason::CallableApplicabilityDeferred)));
+                .and_then(|context| {
+                    native_member_attribution(
+                        language,
+                        context,
+                        crate::analyzer::structural::CandidateOutcome::Rejected(
+                            RejectionReason::CallableApplicabilityDeferred,
+                        ),
+                    )
+                });
             let mut rejected = TraceCandidate::rejected(
                 TraceCandidateRef::Unit(unit.clone()),
                 member.as_ref().map(|(tier, _)| *tier),
@@ -1280,9 +1345,6 @@ fn project_native_static_type(
             .projected_frontiers()
             .iter()
             .find(|frontier| frontier.slot() == slot)?;
-        if frontier.completion() != &ResolutionCompletion::Complete {
-            return None;
-        }
         let ty = if let Some(shape) = answer
             .answer
             .projected_type_shapes()
@@ -1364,6 +1426,9 @@ fn project_native_static_type(
             }
             terms.remove(&shape.root_slot())?
         } else {
+            if frontier.completion() != &ResolutionCompletion::Complete {
+                return None;
+            }
             let [value] = frontier.possible_values() else {
                 return None;
             };
@@ -1404,6 +1469,11 @@ pub fn adapt_type_answer(
     language: Language,
     answer: SelectedNativeReferenceTypes,
 ) -> TypeLookupOutcome {
+    let identities = answer
+        .diagnostic_identities
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
     adapt_type_answer_with_spelling(site, language, answer, |spelling, value, diagnostics| {
         let depth = value.ty().indirection();
         if depth == 0 {
@@ -1414,8 +1484,8 @@ pub fn adapt_type_answer(
             diagnostics.push(TypeLookupDiagnostic {
                 kind: "unsupported_type_indirection".into(),
                 message: format!(
-                    "selected {language:?} type {:?} has unsupported indirection {depth}",
-                    value.ty().identity()
+                    "selected {language:?} type {} has unsupported indirection {depth}",
+                    identities.get(&value.ty().identity()).cloned().unwrap_or_else(|| crate::analyzer::store::resolution_operation::native_units::public_diagnostic_identity(spelling, None, None, None))
                 ),
             });
             None
@@ -1444,6 +1514,23 @@ fn adapt_type_answer_with_spelling(
             "native_type_projection_unavailable",
             "selected native type identities have no supported source projection".into(),
         );
+    };
+    let identities = answer
+        .diagnostic_identities
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let project_identity = |semantic: SemanticId| {
+        identities.get(&semantic).cloned().unwrap_or_else(|| {
+            let unit = nominal
+                .iter()
+                .find_map(|(id, definition)| match definition {
+                    SelectedNativeDefinition::Unit(unit) if *id == semantic => Some(unit),
+                    _ => None,
+                });
+            crate::analyzer::store::resolution_operation::native_units::public_diagnostic_identity(
+                "semantic", unit, None, None,
+            )
+        })
     };
     let mut diagnostics = answer
         .named_reasons
@@ -1528,8 +1615,8 @@ fn adapt_type_answer_with_spelling(
         diagnostics.push(TypeLookupDiagnostic {
             kind: "incomplete_native_type".into(),
             message: format!(
-                "selected native type evidence is incomplete after supported substitutions: {:?}",
-                resolution.completion()
+                "selected native type evidence is incomplete after supported substitutions: {}",
+                crate::analyzer::store::resolution_operation::native_units::public_completion_details(resolution.completion(), project_identity)
             ),
         });
     }
@@ -1551,7 +1638,10 @@ fn adapt_type_answer_with_spelling(
             complete = false;
             diagnostics.push(TypeLookupDiagnostic {
                 kind: "missing_typed_frontier".into(),
-                message: format!("selected native type slot {slot:?} has no frontier"),
+                message: format!(
+                    "selected native type slot {} has no frontier",
+                    project_identity(slot)
+                ),
             });
             continue;
         };
@@ -1566,14 +1656,20 @@ fn adapt_type_answer_with_spelling(
                     definitions,
                     semantic_model_id: None,
                 });
+                continue;
             } else {
                 complete = false;
                 diagnostics.push(TypeLookupDiagnostic {
                     kind: "unsupported_substituted_type_shape".into(),
-                    message: format!("selected type shape is not supported: {shape:?}"),
+                    message: format!(
+                        "selected type shape is not supported for slot {}",
+                        project_identity(shape.output_slot())
+                    ),
                 });
             }
-            continue;
+            // An unsupported compound shape limits substitution/rendering;
+            // it does not invalidate nominal alternatives already proved by
+            // the frontier. Keep those alternatives with incomplete status.
         }
         complete &= frontier.completion() == &ResolutionCompletion::Complete;
         for value in frontier.possible_values() {
@@ -1609,7 +1705,8 @@ fn adapt_type_answer_with_spelling(
                 diagnostics.push(TypeLookupDiagnostic {
                     kind: "missing_nominal_type_definition".into(),
                     message: format!(
-                        "selected native type {identity:?} has no nominal source unit"
+                        "selected native type {} has no nominal source unit",
+                        project_identity(identity)
                     ),
                 });
                 continue;
@@ -1658,10 +1755,14 @@ fn adapt_type_answer_with_spelling(
             _ => {
                 diagnostics.push(TypeLookupDiagnostic {
                     kind: "ambiguous_type".into(),
-                    message: format!(
-                        "selected native type identities: {:?}",
-                        canonical.keys().collect::<Vec<_>>()
-                    ),
+                    message: format!("selected native type identities: {:?}", {
+                        let mut identities = canonical
+                            .keys()
+                            .map(|(identity, depth)| (project_identity(*identity), *depth))
+                            .collect::<Vec<_>>();
+                        identities.sort_unstable();
+                        identities
+                    }),
                 });
                 TypeLookupStatus::Ambiguous
             }

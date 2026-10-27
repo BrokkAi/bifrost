@@ -21,7 +21,6 @@ mod js_ts_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::semantic::icfg::call_evaluation_gap_applies;
 
-    use brokk_bifrost_analysis::analyzer::semantic::icfg::dispatch_read_attribution_for_exact_range;
     use brokk_bifrost_analysis::analyzer::semantic::icfg::dispatch_read_attribution_with_range;
 
     use brokk_bifrost_analysis::analyzer::semantic::icfg::invoked_call_at;
@@ -128,49 +127,6 @@ mod js_ts_extraction_tests {
             attribution,
             DispatchReadAttribution::Unattributed(
                 DispatchReadUnattributedReason::SourceRangeUnavailable
-            )
-        );
-    }
-    #[test]
-    fn duplicate_span_dispatch_is_typed_ambiguous() {
-        let fixture = AnalyzerFixture::new_for_language(
-            brokk_bifrost_core::analyzer::model::Language::TypeScript,
-            &[(
-                "dispatch-read.ts",
-                "function target() {}\nexport function caller() { target(); }\n",
-            )],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "dispatch-read.ts");
-        let cancellation = CancellationToken::default();
-        let mut budget = SemanticBudget::default();
-        let artifact = fixture
-            .analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("TypeScript semantic materialization")
-            .available_value()
-            .cloned()
-            .expect("TypeScript semantic artifact");
-        let call = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| !procedure.call_sites().is_empty())
-            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
-            .and_then(|procedure| procedure.call_site_handle(CallSiteId::new(0)))
-            .expect("fixture call site");
-        let range = brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(&call)
-            .expect("fixture call has an exact range");
-        let outcome = SemanticOutcome::<DispatchResult>::Unknown {
-            partial: None,
-            work: SemanticWork::default(),
-        };
-
-        assert_eq!(
-            dispatch_read_attribution_for_exact_range(&call, &outcome, range, 2),
-            DispatchReadAttribution::Unattributed(
-                DispatchReadUnattributedReason::SourceRangeAmbiguous
             )
         );
     }

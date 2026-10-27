@@ -539,6 +539,410 @@ pub mod rust_departing_root_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5671: a failed queue item must retire its reader before another item can panic during cleanup"
+    )]
+    fn selected_queue_merges_in_item_order_and_keeps_the_first_error() {
+        use brokk_bifrost_analysis::analyzer::resolution::local_identity::ResolutionIdentityTranslation;
+        use brokk_bifrost_analysis::analyzer::resolution::worker_transport::{
+            WorkerAnswer, schedule_selected_queue,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::CapturedSelectedResolutionInput;
+        use std::sync::{Barrier, Mutex};
+
+        struct Answer(usize);
+        impl WorkerAnswer for Answer {
+            fn translate(self, _: &impl ResolutionIdentityTranslation) -> Self {
+                self
+            }
+        }
+        let fixture = RustRootResolutionOperationFixture::new();
+        let cancellation = CancellationToken::new();
+        let input = SelectedResolutionOperationInput::new(
+            &fixture.project,
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &fixture.languages,
+            &[],
+        );
+        let captured = CapturedSelectedResolutionInput::capture(&input);
+        let SelectedResolutionOperationOpenOutcome::Ready(owner) = fixture
+            .store
+            .open_selected_resolution_operation(input, &cancellation)
+            .expect("owner operation")
+        else {
+            panic!("ready owner");
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for failure in [None, Some(false), Some(true)] {
+            let after_first_result = Barrier::new(2);
+            let completed = Mutex::new(Vec::new());
+            let (results, provisional) = pool.install(|| {
+                let mut provisional = Vec::new();
+                let results = schedule_selected_queue(
+                    &fixture.store,
+                    &captured,
+                    &[0, 1, 2, 3],
+                    &[3, 0, 2, 1],
+                    2,
+                    &cancellation,
+                    |_, &index| {
+                        // On failure, hold both workers at their first item so
+                        // neither can drain the lower-index failure's slot.
+                        // On success, item 2 proves item 3 has already returned.
+                        if index == 0 || (failure.is_some() && index == 3) {
+                            after_first_result.wait();
+                        }
+                        completed.lock().unwrap().push(index);
+                        if failure.is_none() && index == 2 {
+                            after_first_result.wait();
+                        }
+                        if let Some(panic) = failure {
+                            if panic {
+                                panic!("item {index}");
+                            }
+                            return Err(StoreError::new(format!("item {index}")));
+                        }
+                        Ok(SelectedResolutionOperationOutcome::Native(Answer(index)))
+                    },
+                    |index, answer| {
+                        assert_eq!(index, provisional.len());
+                        provisional.push(answer);
+                        Ok(())
+                    },
+                )
+                .expect("queue consumer succeeds");
+                (results, provisional)
+            });
+            let completed = completed.into_inner().unwrap();
+            if failure.is_some() {
+                assert_eq!(
+                    completed.len(),
+                    2,
+                    "neither failed worker takes another item"
+                );
+                assert!(completed.contains(&0) && completed.contains(&3));
+            } else {
+                assert_eq!(completed.len(), 4);
+                assert!(
+                    completed.iter().position(|&i| i == 3) < completed.iter().position(|&i| i == 0)
+                );
+            }
+            assert!(
+                results.iter().all(Option::is_some),
+                "failure drains every slot"
+            );
+            let answers = provisional
+                .into_iter()
+                .map(|answer| answer.reintern(&owner, [], &cancellation).unwrap().0)
+                .collect::<Vec<_>>();
+            let mut errors = Vec::new();
+            for result in results {
+                match result.expect("dispatched item") {
+                    Ok(SelectedResolutionOperationOutcome::Native(())) => {}
+                    Err(error) => errors.push(error.to_string()),
+                    _ => panic!("unexpected selected outcome"),
+                }
+            }
+            if let Some(panic) = failure {
+                assert!(answers.is_empty());
+                let own_error = |index| {
+                    if panic {
+                        format!("selected worker panicked for item {index}: item {index}")
+                    } else {
+                        format!("item {index}")
+                    }
+                };
+                assert_eq!(errors.len(), 4);
+                assert_eq!(
+                    errors[0],
+                    own_error(0),
+                    "the lowest-index item's own failure is reported first"
+                );
+                assert_eq!(errors[3], own_error(3));
+                // Whichever worker retires first drains the unclaimed slots
+                // with its own item's failure.
+                for drained in &errors[1..3] {
+                    assert!(
+                        *drained == own_error(0) || *drained == own_error(3),
+                        "a drained slot carries a retiring item's failure: {errors:?}"
+                    );
+                }
+            } else {
+                assert!(errors.is_empty());
+                assert_eq!(answers, [0, 1, 2, 3]);
+            }
+        }
+    }
+
+    struct QueueAnswer(usize);
+
+    impl brokk_bifrost_analysis::analyzer::resolution::worker_transport::WorkerAnswer for QueueAnswer {
+        fn translate(
+            self,
+            _: &impl brokk_bifrost_analysis::analyzer::resolution::local_identity::ResolutionIdentityTranslation,
+        ) -> Self {
+            self
+        }
+    }
+
+    #[test]
+    fn selected_queue_delivers_ordered_prefix_before_workers_finish() {
+        use brokk_bifrost_analysis::analyzer::resolution::worker_transport::schedule_selected_queue;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::CapturedSelectedResolutionInput;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        let fixture = RustRootResolutionOperationFixture::new();
+        let cancellation = CancellationToken::new();
+        let input = SelectedResolutionOperationInput::new(
+            &fixture.project,
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &fixture.languages,
+            &[],
+        );
+        let captured = CapturedSelectedResolutionInput::capture(&input);
+        let SelectedResolutionOperationOpenOutcome::Ready(owner) = fixture
+            .store
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        else {
+            panic!("ready owner")
+        };
+        let (first_done, wait_first) = mpsc::channel();
+        let wait_first = Mutex::new(wait_first);
+        let (release, wait_release) = mpsc::channel();
+        let wait_release = Mutex::new(wait_release);
+        let completed = Mutex::new(Vec::new());
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let owner_thread = std::thread::current().id();
+        {
+            let results = schedule_selected_queue(
+                &fixture.store,
+                &captured,
+                &[0, 1, 2, 3],
+                &[1, 0, 2, 3],
+                2,
+                &cancellation,
+                |_, &index| {
+                    if index == 0 {
+                        wait_first
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30))
+                            .unwrap();
+                    }
+                    if index >= 2 {
+                        wait_release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30))
+                            .unwrap();
+                    }
+                    completed.lock().unwrap().push(index);
+                    if index == 1 {
+                        first_done.send(()).unwrap();
+                    }
+                    Ok(SelectedResolutionOperationOutcome::Native(QueueAnswer(
+                        index,
+                    )))
+                },
+                |index, answer| {
+                    assert_eq!(std::thread::current().id(), owner_thread);
+                    assert_eq!(index, delivered.borrow().len());
+                    delivered
+                        .borrow_mut()
+                        .push(answer.reintern(&owner, [], &cancellation)?.0);
+                    if index == 1 {
+                        release.send(()).unwrap();
+                        release.send(()).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(results.iter().all(|slot| matches!(
+                slot,
+                Some(Ok(SelectedResolutionOperationOutcome::Native(())))
+            )));
+        }
+        assert_eq!(*delivered.borrow(), [0, 1, 2, 3]);
+        let completed = completed.into_inner().unwrap();
+        assert_eq!(&completed[..2], &[1, 0]);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#5671: a retiring queue worker turned an Unavailable item into a generic request error at W > 1"
+    )]
+    fn selected_queue_retirement_keeps_the_failing_items_outcome() {
+        use brokk_bifrost_analysis::analyzer::resolution::worker_transport::schedule_selected_queue;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::CapturedSelectedResolutionInput;
+
+        let fixture = RustRootResolutionOperationFixture::new();
+        let cancellation = CancellationToken::new();
+        let input = SelectedResolutionOperationInput::new(
+            &fixture.project,
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &fixture.languages,
+            &[],
+        );
+        let captured = CapturedSelectedResolutionInput::capture(&input);
+        let reason = SelectedResolutionUnavailable::GoContextUnavailable {
+            persisted_relative_path: "pkg/a.go".to_owned(),
+        };
+        let mut delivered = Vec::new();
+        // One worker answers item 0, then item 1 is Unavailable. Retirement
+        // invalidates the already delivered slot 0 and drains slot 2; every
+        // slot must report item 1's own outcome, as the inline path would.
+        let results = schedule_selected_queue(
+            &fixture.store,
+            &captured,
+            &[0, 1, 2],
+            &[0, 1, 2],
+            1,
+            &cancellation,
+            |_, &index| {
+                Ok(if index == 1 {
+                    SelectedResolutionOperationOutcome::Unavailable(reason.clone())
+                } else {
+                    SelectedResolutionOperationOutcome::Native(QueueAnswer(index))
+                })
+            },
+            |index, _| {
+                delivered.push(index);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered, [0]);
+        assert_eq!(results.len(), 3);
+        for slot in &results {
+            assert!(
+                matches!(
+                    slot,
+                    Some(Ok(SelectedResolutionOperationOutcome::Unavailable(actual))) if *actual == reason
+                ),
+                "every slot carries item 1's Unavailable outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_queue_finish_failure_invalidates_delivered_slot() {
+        use brokk_bifrost_analysis::analyzer::resolution::worker_transport::schedule_selected_queue;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::CapturedSelectedResolutionInput;
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        let fixture = RustRootResolutionOperationFixture::new();
+        let cancellation = CancellationToken::new();
+        let input = SelectedResolutionOperationInput::new(
+            &fixture.project,
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &fixture.languages,
+            &[],
+        );
+        let captured = CapturedSelectedResolutionInput::capture(&input);
+        let (entered, wait_entered) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let wait_release = Mutex::new(wait_release);
+        let mut delivered = Vec::new();
+        let results = schedule_selected_queue(
+            &fixture.store,
+            &captured,
+            &[0, 1],
+            &[0, 1],
+            1,
+            &cancellation,
+            |_, &index| {
+                if index == 1 {
+                    entered.send(()).unwrap();
+                    wait_release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap();
+                }
+                Ok(SelectedResolutionOperationOutcome::Native(QueueAnswer(
+                    index,
+                )))
+            },
+            |index, _| {
+                delivered.push(index);
+                if index == 0 {
+                    wait_entered.recv_timeout(Duration::from_secs(30)).unwrap();
+                    cancellation.cancel();
+                    release.send(()).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered.first(), Some(&0));
+        assert!(matches!(
+            &results[0],
+            Some(Ok(SelectedResolutionOperationOutcome::Cancelled(_)))
+        ));
+    }
+
+    #[test]
+    fn selected_queue_inside_single_thread_pool_completes() {
+        use brokk_bifrost_analysis::analyzer::resolution::worker_transport::schedule_selected_queue;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::CapturedSelectedResolutionInput;
+
+        let fixture = RustRootResolutionOperationFixture::new();
+        let cancellation = CancellationToken::new();
+        let input = SelectedResolutionOperationInput::new(
+            &fixture.project,
+            &fixture.workspace_id,
+            &fixture.snapshots,
+            &fixture.languages,
+            &[],
+        );
+        let captured = CapturedSelectedResolutionInput::capture(&input);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            assert!(rayon::current_thread_index().is_some());
+            let mut delivered = Vec::new();
+            let results = schedule_selected_queue(
+                &fixture.store,
+                &captured,
+                &[0, 1, 2, 3],
+                &[3, 0, 2, 1],
+                4,
+                &cancellation,
+                |_, &index| {
+                    Ok(SelectedResolutionOperationOutcome::Native(QueueAnswer(
+                        index,
+                    )))
+                },
+                |index, _| {
+                    delivered.push(index);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(delivered, [0, 1, 2, 3]);
+            assert!(results.iter().all(|slot| matches!(
+                slot,
+                Some(Ok(SelectedResolutionOperationOutcome::Native(())))
+            )));
+        });
+    }
+
+    #[test]
     pub(crate) fn rust_workspace_reverse_retains_matching_unresolved_prefix_gap() {
         let (matching, _) = rust_workspace_reverse_with_unresolved_prefix();
         assert!(matching.references().is_empty(), "{matching:?}");
@@ -1359,7 +1763,7 @@ pub mod rust_departing_root_tests {
         else {
             panic!("mount context must be ready");
         };
-        let (_, completion, _, _, _, packages, imports) = inputs.into_parts();
+        let (_, completion, _, _, _, packages, imports, _) = inputs.into_parts();
         assert!(packages.is_empty() && imports.is_empty());
         assert_eq!(completion, ResolutionCompletion::Complete);
         let mut checked_unknown = false;
@@ -1490,7 +1894,7 @@ pub mod rust_departing_root_tests {
         else {
             panic!("uncancelled mount validation must be ready");
         };
-        let (_, completion, _, _, _, packages, imports) = inputs.into_parts();
+        let (_, completion, _, _, _, packages, imports, _) = inputs.into_parts();
         assert!(packages.is_empty() && imports.is_empty());
         assert_eq!(
             completion, demand_completion,
@@ -1644,6 +2048,7 @@ pub mod rust_departing_root_tests {
             &[],
             &[],
             &configuration,
+            &[],
             &[],
         )?;
         store.reconcile_rust_crates(&snapshot)?;
@@ -3092,6 +3497,19 @@ pub mod rust_departing_root_tests {
         });
         eprintln!("production Rust point costs: {observed_costs:?}");
         for (_, search, _) in [&cold, &first_warm, &second_warm] {
+            for (label, measurement) in [
+                ("cold", &cold),
+                ("warm", &first_warm),
+                ("repeat", &second_warm),
+            ] {
+                eprintln!(
+                    "Rust point {label}: ({},{},{},{})",
+                    measurement.0.statement_count(),
+                    measurement.0.decoded_rows,
+                    measurement.1.statement_count(),
+                    measurement.1.decoded_rows
+                );
+            }
             assert_eq!(
                 point_read_freshness_groups(search),
                 1,
@@ -3273,9 +3691,18 @@ pub mod rust_departing_root_tests {
             // #6291: two constant direction-wide emptiness proof rows replace
             // the later whole-scope gap reads; statement work stays at 372.
             // Mount guards add six DDL statements and three schema rows on cold open.
-            // #5664 selected Go source view adds one schema statement and row
-            // at store open for every language; Rust search work is unchanged.
-            (275, 241, 372, 210),
+            // #5671: the inherited root-prefix seek adds two cold schema indexes.
+            // Master #5664 adds the selected Go source view at every store open:
+            // 276/242 -> 277/243 (+1 statement/schema row); search stays 372/210.
+            // The bounded scope pin retains this branch's 286 -> 277 reduction:
+            // charge site moved to engine admission; delta = rows the seek over-includes.
+            // #6594 removes two request-table CREATEs and two clears (-4
+            // opening statements and -2 schema rows): 277/243 -> 273/241. Binding
+            // the projection's keys directly removes its DELETE, INSERT, SAVEPOINT
+            // and RELEASE (-4 search statements): 372 -> 368, preserving every
+            // decoded answer row.
+            // #6594 empty-stage occupancy skips 31 measured reads; decoded rows stay fixed.
+            (273, 241, 337, 210),
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3322,7 +3749,9 @@ pub mod rust_departing_root_tests {
             // (#6102) removes the same 19 statements/four rows as the cold search.
             // The same three gap reads and one context hydration as the cold search.
             // #6291: the same two constant emptiness proof rows as cold.
-            (5, 4, 372, 210),
+            // #6594 removes the same four request-buffer writes per search.
+            // #6594: independently measured warm/repeated searches also skip 31 empty reads.
+            (5, 4, 337, 210),
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3341,7 +3770,9 @@ pub mod rust_departing_root_tests {
             // as above.
             // The same three gap reads and one context hydration as the cold search.
             // #6291: the same two constant emptiness proof rows as cold.
-            (5, 4, 372, 210),
+            // #6594 removes the same four request-buffer writes per search.
+            // #6594: independently measured warm/repeated searches also skip 31 empty reads.
+            (5, 4, 337, 210),
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);
@@ -5792,10 +6223,11 @@ pub mod rust_departing_root_tests {
                 // accounts for four of them.
                 // #5780 binding-inventory and intermediate-step evidence reads
                 // add SQL work without changing these scope charges.
-                scope_nodes: 281,
+                // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
+                scope_nodes: 277,
                 resolution_rounds: 10,
             },
-            "the interior's per-mount candidate paging charges the point request; tier-1 candidate and declaration work must remain exact"
+            "engine admission charges the point request; tier-1 candidate and declaration work must remain exact"
         );
 
         let mut unbounded_metrics = ResolutionBatchMetrics::default();
@@ -6952,7 +7384,7 @@ pub fn caller(t: &Tensor) {
         );
         fixture.replace_persisted_consumer_source(RUST_MACRO_CONSUMER_SOURCE);
         let cancellation = CancellationToken::new();
-        let cache = &fixture.store.rust_macro_include_overlay_cache;
+        let cache = &fixture.store.cache_budget;
         let initial_hits = cache.hit_count_for_test();
         let initial_inserts = cache.insert_count_for_test();
 
@@ -6984,6 +7416,7 @@ pub fn caller(t: &Tensor) {
             initial_inserts + 1,
             "the repeated operation reuses the prepared include plan"
         );
+        eprintln!("STORE_CACHE_WEIGHTS {:?}", cache.entry_weights_for_test());
     }
 
     /// A byte-identical replacement uses the persisted macro capsule; an edited
@@ -8122,7 +8555,7 @@ pub fn caller(t: &Tensor) {
         else {
             panic!("live Rust fixture context must validate")
         };
-        let (bridges, _, _, _, _, packages, imports) = inputs.into_parts();
+        let (bridges, _, _, _, _, packages, imports, _) = inputs.into_parts();
         assert!(packages.is_empty() && imports.is_empty());
         let template = bridges
             .iter()

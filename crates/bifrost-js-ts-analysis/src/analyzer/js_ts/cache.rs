@@ -48,7 +48,7 @@ pub(crate) struct JsTsMemoCaches {
     /// Raw file-path resolution targets of a file's imports (module specifier -> file), keyed by the
     /// importing file. Distinct from `imported_code_units`: this is a file-level check (does an import
     /// statement's path resolve to this file) used by `could_import_file`, not a symbol-level one --
-    /// caching it separately avoids re-running `resolve_js_ts_import_paths` for every candidate/target
+    /// caching it separately avoids re-running import-path resolution for every candidate/target
     /// pair the shared usages candidate walker checks.
     pub(crate) imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     /// Files that import a given file, keyed by imported file.

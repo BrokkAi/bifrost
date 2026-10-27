@@ -122,18 +122,33 @@ pub mod symbol_lookup;
 pub mod topology;
 pub use brokk_bifrost_core::analyzer::test_assertions;
 
+/// Whether test-assertion detection for `language` reads `file`: a file of
+/// that language that the analyzer recorded as containing tests.
+#[doc(hidden)]
+pub fn is_test_assertion_candidate(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: Language,
+) -> bool {
+    crate::analyzer::common::language_for_file(file) == language && analyzer.contains_tests(file)
+}
+
 #[doc(hidden)]
 pub fn test_assertion_source(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     language: Language,
 ) -> Option<String> {
-    if crate::analyzer::common::language_for_file(file) != language
-        || !analyzer.contains_tests(file)
-    {
+    if !is_test_assertion_candidate(analyzer, file, language) {
         return None;
     }
-    analyzer.project().read_source(file).ok()
+    // A candidate whose source cannot be read yields no findings; record why,
+    // so the report is not complete with nothing decided.
+    let source = analyzer.project().read_source(file).ok();
+    if source.is_none() {
+        analyzer.record_query_incomplete(QueryReadIncomplete::StructureUnavailable(file.clone()));
+    }
+    source
 }
 
 #[doc(hidden)]
@@ -497,11 +512,7 @@ pub(crate) use tree_sitter_analyzer::AnalyzerStoreContext;
 pub(crate) use tree_sitter_analyzer::BuildAbort;
 
 pub(crate) use tree_sitter_analyzer::RevisionBlobIdentities;
-pub(crate) use tree_sitter_analyzer::ephemeral_store_context;
-pub(crate) use tree_sitter_analyzer::persistent_store_context;
-pub(crate) use tree_sitter_analyzer::persistent_store_context_without_automatic_gc;
 pub(crate) use tree_sitter_analyzer::revision_image_store_context;
-pub(crate) use tree_sitter_analyzer::scoped_store_context;
 
 pub use tree_sitter_analyzer::BuildProgress;
 pub use tree_sitter_analyzer::BuildProgressEvent;

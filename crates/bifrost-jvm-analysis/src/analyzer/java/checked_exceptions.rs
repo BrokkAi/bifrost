@@ -356,21 +356,25 @@ mod tests {
 "#;
 
     fn cannot_reach(parameter: &str) -> bool {
+        cannot_reach_in(SOURCE, parameter)
+    }
+
+    fn cannot_reach_in(source: &str, parameter: &str) -> bool {
         let project = crate::inline_project::InlineTestProject::with_language(Language::Java)
-            .file("App.java", SOURCE)
+            .file("App.java", source)
             .build();
         let workspace = project
             .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
-        let name_start = SOURCE
+        let name_start = source
             .find(&format!(" {parameter})"))
             .expect("catch parameter in fixture")
             + 1;
-        let call_start = SOURCE[..name_start].rfind("try { ").expect("try block") + "try { ".len();
-        let call_end = call_start + SOURCE[call_start..].find(';').expect("call statement");
+        let call_start = source[..name_start].rfind("try { ").expect("try block") + "try { ".len();
+        let call_end = call_start + source[call_start..].find(';').expect("call statement");
         call_cannot_reach_catch_parameter(
             workspace.analyzer(),
             &project.file("App.java"),
-            &Arc::from(SOURCE),
+            &Arc::from(source),
             call_start..call_end,
             name_start..name_start + parameter.len(),
         )
@@ -420,5 +424,42 @@ mod tests {
     fn unproven_shapes_keep_the_binding() {
         assert!(!cannot_reach("remoteCaught"));
         assert!(!cannot_reach("anonymousCaught"));
+    }
+
+    /// A bare `Exception` is `java.lang.Exception` only through the implicit
+    /// `java.lang.*` import, which every other type scope shadows.
+    #[test]
+    #[hardwon(
+        "#7006: release builds never proved a bare `Exception` was java.lang.Exception, so no catch binding was refuted"
+    )]
+    fn a_shadowable_exception_root_keeps_the_binding() {
+        let shadowed = |prefix: &str, outer_supertype: &str| {
+            format!(
+                "{prefix}class App{outer_supertype} {{
+    static class FlowException extends Exception {{}}
+    static int quiet() {{ return 1; }}
+    void run() {{
+        try {{ quiet(); }} catch (FlowException shadowCaught) {{}}
+    }}
+}}
+"
+            )
+        };
+        assert!(cannot_reach_in(&shadowed("", ""), "shadowCaught"));
+        // A member type inherited from an unindexed supertype may be named
+        // `Exception`.
+        assert!(!cannot_reach_in(
+            &shadowed("", " extends Missing"),
+            "shadowCaught"
+        ));
+        // An unindexed single-type or on-demand import may supply it.
+        assert!(!cannot_reach_in(
+            &shadowed("import com.acme.Exception;\n", ""),
+            "shadowCaught"
+        ));
+        assert!(!cannot_reach_in(
+            &shadowed("import com.acme.*;\n", ""),
+            "shadowCaught"
+        ));
     }
 }

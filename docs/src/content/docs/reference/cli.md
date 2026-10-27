@@ -269,7 +269,7 @@ lists every condition that makes a run unreliable.
 ## Development Helper: `most_relevant_files`
 
 The source repository also builds a `most_relevant_files` binary. Release
-packages do not include it. Build it with `cargo build --bin most_relevant_files`.
+packages do not include it. Build it with `cargo build --features devtools --bin most_relevant_files`.
 
 ```text
 most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none]

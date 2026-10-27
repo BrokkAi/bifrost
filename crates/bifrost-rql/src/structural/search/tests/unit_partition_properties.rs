@@ -110,8 +110,8 @@ fn generated_project() -> impl Strategy<Value = GeneratedProject> {
 }
 
 /// The plans the property runs, one of each partitionable shape: a seed-only
-/// structural plan, a row-local step, a derived-value step, a union, and a
-/// non-structural seed family.
+/// structural plan, a row-local step, a derived-value step, a union, a flat
+/// and a nested except of file-keyed rows, and a non-structural seed family.
 fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
     let query = |label: &'static str, value: serde_json::Value| {
         (
@@ -156,6 +156,33 @@ fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
                 "union": [
                     { "match": { "kind": "function", "name": { "regex": "^fn[0-9]$" } } },
                     { "match": { "kind": "function" } }
+                ],
+                "limit": 500,
+                "result_detail": "full"
+            }),
+        ),
+        query(
+            "file-keyed except",
+            json!({
+                "schema_version": 1,
+                "except": [
+                    { "match": { "kind": "function" } },
+                    { "match": { "kind": "function", "name": { "regex": "^fn[0-9]$" } } }
+                ],
+                "limit": 500,
+                "result_detail": "full"
+            }),
+        ),
+        query(
+            "nested except",
+            json!({
+                "schema_version": 1,
+                "except": [
+                    { "except": [
+                        { "match": { "kind": "function" } },
+                        { "match": { "kind": "function", "name": { "regex": "^fn1[0-9]$" } } }
+                    ] },
+                    { "match": { "kind": "function", "name": { "regex": "^fn[0-4]$" } } }
                 ],
                 "limit": 500,
                 "result_detail": "full"
@@ -257,7 +284,7 @@ fn assert_no_cap_was_reached(
 
 proptest! {
     // Two cases: each builds a workspace analyzer over up to ten files and
-    // runs one whole execution plus one execution per seed file for four
+    // runs one whole execution plus one execution per seed file for seven
     // plans, which is about forty executions per case. The nightly
     // property-stress job cranks PROPTEST_CASES.
     #![proptest_config(ProptestConfig::with_cases(2))]

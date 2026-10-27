@@ -119,6 +119,68 @@ pub fn note_with(label: impl FnOnce() -> String) {
     note(label());
 }
 
+/// Cumulative CPU time consumed by the calling thread, for profiling samples.
+/// Callers should sample only when profiling is enabled.
+#[cfg(unix)]
+pub fn thread_cpu_time() -> Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time is writable and the clock measures the current thread.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+    assert_eq!(
+        status,
+        0,
+        "thread CPU clock: {}",
+        std::io::Error::last_os_error()
+    );
+    Duration::new(
+        time.tv_sec
+            .try_into()
+            .expect("thread CPU seconds are nonnegative"),
+        time.tv_nsec
+            .try_into()
+            .expect("thread CPU nanoseconds fit u32"),
+    )
+}
+
+/// Cumulative kernel and user CPU time consumed by the calling thread.
+/// Callers should sample only when profiling is enabled.
+#[cfg(windows)]
+pub fn thread_cpu_time() -> Duration {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let empty = || FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut creation, mut exit, mut kernel, mut user) = (empty(), empty(), empty(), empty());
+    // SAFETY: the pseudo-handle names this thread and all four outputs are writable.
+    let status = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(
+        status,
+        0,
+        "thread CPU clock: {}",
+        std::io::Error::last_os_error()
+    );
+    let ticks =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    let ticks = ticks(kernel)
+        .checked_add(ticks(user))
+        .expect("thread CPU ticks fit u64");
+    Duration::new(ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32)
+}
+
 pub fn duration(label: impl AsRef<str>, duration: Duration) {
     if !enabled() {
         return;

@@ -615,9 +615,6 @@ fn parse_format_spec(
 
 fn named_dynamic_reference(spec: &[char], start: usize) -> Option<usize> {
     let mut end = start;
-    if spec.get(end) == Some(&'r') && spec.get(end + 1) == Some(&'#') {
-        end += 2;
-    }
     let first = *spec.get(end)?;
     if !is_identifier_start(first) {
         return None;
@@ -658,7 +655,7 @@ fn push_argument_reference(
             return Err(format_error(byte_offset, start));
         }
         references.push((
-            RustFormatArgumentReference::Name(name.trim_start_matches("r#").into()),
+            RustFormatArgumentReference::Name(name.into()),
             byte_offset[start]..byte_offset[start + argument.len()],
         ));
     }
@@ -667,14 +664,9 @@ fn push_argument_reference(
 
 fn is_identifier(name: &str) -> bool {
     let mut characters = name.chars();
-    let first = if name.starts_with("r#") {
-        characters.next();
-        characters.next();
-        characters.next()
-    } else {
-        characters.next()
-    };
-    first.is_some_and(is_identifier_start) && characters.all(is_identifier_continue)
+    name != "_"
+        && characters.next().is_some_and(is_identifier_start)
+        && characters.all(is_identifier_continue)
 }
 
 const fn is_alignment(character: char) -> bool {
@@ -740,6 +732,37 @@ mod tests {
             pending.extend(node.named_children(&mut cursor));
         }
         earliest.unwrap_or_else(|| panic!("expected {name}! invocation"))
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: format names admit raw identifiers and bare underscore"
+    )]
+    fn format_argument_names_follow_std_fmt_grammar() {
+        // std::fmt uses IDENTIFIER_OR_KEYWORD, excluding a bare underscore.
+        // The same argument production supplies values, widths and precisions.
+        for (name, accepted) in [
+            ("value", true),
+            ("_value", true),
+            ("__", true),
+            ("type", true),
+            ("self", true),
+            ("r#value", false),
+            ("r#type", false),
+            ("_", false),
+        ] {
+            for format in [
+                format!("{{{name}}}"),
+                format!("{{:{name}$}}"),
+                format!("{{:.{name}$}}"),
+            ] {
+                assert_eq!(
+                    parse_rust_format_string(&format).is_ok(),
+                    accepted,
+                    "{format}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -882,5 +905,61 @@ mod tests {
                 "item"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod qs3_format_contract {
+    use super::*;
+
+    #[test]
+    fn qs3_runtime_macro_grammar_boundary() {
+        for (source, index, literal) in [
+            (r#"fn f() { log::log!(level, "{x2}"); }"#, 1, "\"{x2}\""),
+            (
+                r#"fn f() { assert_eq!(left, right, "{x2}"); }"#,
+                2,
+                "\"{x2}\"",
+            ),
+            (r#"fn f() { write!(writer, "{x2}"); }"#, 1, "\"{x2}\""),
+            (r#"fn f() { println!("{x2}"); }"#, 0, "\"{x2}\""),
+        ] {
+            let tree = crate::test_helpers::parse_rust(source);
+            let mut pending = vec![tree.root_node()];
+            let invocation = loop {
+                let node = pending.pop().unwrap();
+                if node.kind() == "macro_invocation" {
+                    break node;
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            };
+            assert_eq!(
+                invocation.child_by_field_name("macro").unwrap().kind(),
+                if source.contains("log::") {
+                    "scoped_identifier"
+                } else {
+                    "identifier"
+                }
+            );
+            let arguments = rust_format_macro_arguments(invocation, source).unwrap();
+            assert_eq!(
+                rust_macro_format_operand(invocation, source, &arguments),
+                Some(index),
+                "{source}"
+            );
+            let span = arguments[index].value_range;
+            assert_eq!(&source[span.start_byte..span.end_byte], literal);
+        }
+        // std::fmt's identifier grammar allows digits after the first character.
+        let parsed = parse_rust_format_string("{x2:width3$.precision4$}").unwrap();
+        assert_eq!(
+            parsed.references.as_ref(),
+            [
+                RustFormatArgumentReference::Name("x2".into()),
+                RustFormatArgumentReference::Name("width3".into()),
+                RustFormatArgumentReference::Name("precision4".into())
+            ]
+        );
     }
 }

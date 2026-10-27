@@ -519,10 +519,17 @@ mod tests {
         host: Option<RustDeclarationAncestry>,
         cache: &mut HashMap<usize, RustDeclarationAncestry>,
     ) {
-        for node in all_nodes(root) {
-            let expected = RustDeclarationAncestry::of(node, host);
-            let actual = RustDeclarationAncestry::of_with_cache(node, host, cache);
-            assert_eq!(actual, expected, "ancestry mismatch for {}", node.kind());
+        let nodes = all_nodes(root);
+        for order in [nodes.clone(), nodes.iter().rev().copied().collect()] {
+            cache.clear();
+            for node in order {
+                let expected = RustDeclarationAncestry::of(node, host);
+                let actual = RustDeclarationAncestry::of_with_cache(node, host, cache);
+                assert_eq!(actual, expected, "ancestry mismatch for {}", node.kind());
+                let cold =
+                    RustDeclarationAncestry::of_with_cache(node, host, &mut HashMap::default());
+                assert_eq!(cold, expected, "cold ancestry for {}", node.kind());
+            }
         }
     }
 
@@ -557,6 +564,68 @@ fn free() {}
         };
         let mut replay_cache = HashMap::default();
         assert_cached_matches_uncached(tree.root_node(), Some(host), &mut replay_cache);
+    }
+
+    #[test]
+    fn fresh_replay_properties_conjoin_host_and_inner_guards() {
+        use crate::selected_context::RustSelectedActivation;
+        use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
+        use std::collections::BTreeSet;
+
+        let source = "trait Host { #[cfg(feature = \"host\")] wrap! { #[cfg(feature = \"inner\")] fn member(&self) {} } }";
+        let tree = parse(source);
+        let invocation = all_nodes(tree.root_node())
+            .into_iter()
+            .find(|node| node.kind() == "macro_invocation")
+            .unwrap();
+        let mut graph = crate::declarations::build_rust_embedded_replay_graph(invocation, source)
+            .unwrap()
+            .unwrap();
+        let (trees, maps) = graph.split_mut();
+        let mut identities = PrimarySourceFactCollector::new(source);
+        let host = maps[0].host();
+        let mut properties = RustDeclarationPropertyCollector::new(source);
+        let member = all_nodes(trees[0].root())
+            .into_iter()
+            .find(|node| node.kind() == "function_item")
+            .unwrap();
+        let declaration = maps[0].declare_node(member, &mut identities);
+        let occurrence = maps[0].intern_node(member, &mut identities);
+        assert!(properties.for_declaration(declaration).is_none());
+        properties.record_embedded(declaration, member, host, maps[0].host_cfg());
+        assert_eq!(properties.rows.len(), 1, "fresh insertion must run");
+        let row = properties.for_declaration(declaration).unwrap();
+        assert!(row.has_impl_or_trait_ancestor);
+        assert_eq!(
+            row.nearest_declaration_boundary,
+            RustDeclarationBoundary::Trait
+        );
+        let rows = identities.finish();
+        assert_eq!(
+            rows.occurrence(occurrence).provenance,
+            SourceOccurrenceProvenance::Embedded
+        );
+        // Independent conjunction truth table: an expansion item requires both guards.
+        for (host, inner, expected) in [
+            (false, false, RustSelectedActivation::Inactive),
+            (false, true, RustSelectedActivation::Inactive),
+            (true, false, RustSelectedActivation::Inactive),
+            (true, true, RustSelectedActivation::Active),
+        ] {
+            let mut atoms = BTreeSet::new();
+            if host {
+                atoms.insert("feature = \"host\"".to_owned());
+            }
+            if inner {
+                atoms.insert("feature = \"inner\"".to_owned());
+            }
+            assert_eq!(
+                crate::cfg::crate_activation_under_site_cfg(&atoms, &row.cfg_condition, None),
+                expected,
+                "host={host} inner={inner}: {:?}",
+                row.cfg_condition
+            );
+        }
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub mod intrinsics;
 pub mod queries;
 mod regex;
 pub use regex::{decode_python_fstring_literal_segments, decode_python_string_value};
+#[cfg(any(test, feature = "test-support"))]
 mod resolution;
 pub mod runtime_values;
 pub mod source_facts;

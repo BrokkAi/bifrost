@@ -893,6 +893,11 @@ pub fn build_workspace_usage_graph_with_passes(
             passes_complete = false;
             continue;
         }
+        // An excluded source's references are unknown, never absent.
+        match entry.backend.excluded_sources(analyzer) {
+            Ok(excluded) => passes_complete &= excluded.is_empty(),
+            Err(error) => return WorkspaceUsageGraphBuildOutcome::Failed(error),
+        }
         let pass = match entry.backend {
             LanguageGraphBackend::Legacy(pass) => pass,
             LanguageGraphBackend::Native(provider) => {

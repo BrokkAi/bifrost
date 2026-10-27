@@ -1,0 +1,8 @@
+# Test-only Cargo boundary fixture; no registry or network dependencies.
+[workspace]
+resolver = "2"
+members = ["app", "dep", "noise", "member", "only-test", "only-example", "only-bench", "old", "nested"]
+[workspace.package]
+edition = "2021"
+[workspace.dependencies]
+dep_alias = { package = "dep", path = "dep", features = ["inherited_feature"] }

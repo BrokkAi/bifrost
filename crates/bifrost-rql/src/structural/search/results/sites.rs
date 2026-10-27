@@ -426,7 +426,11 @@ pub struct CodeQueryOverloadSelection {
     /// Whether the language's resolver reports the callable-applicability axis
     /// at all. `false` forces `resolution` to `unknown_shape`.
     pub supported: bool,
+    /// Every considered candidate. The candidates that the three verdict
+    /// counts below do not count are `less_specific`.
     pub considered_count: usize,
+    /// Applicable candidates that no other applicable candidate is more
+    /// specific than.
     pub applicable_count: usize,
     pub inapplicable_count: usize,
     /// Candidates whose applicability nobody could decide.
@@ -462,12 +466,27 @@ pub struct CodeQueryCallableApplicability {
     /// Position in the resolver's own consideration order, so two otherwise
     /// identical rows stay separately addressable. Never a precedence signal.
     pub ordinal: usize,
-    /// `applicable`, `inapplicable`, or `unknown`.
+    /// `applicable`, `less_specific`, `inapplicable`, or `unknown`. A
+    /// `less_specific` candidate accepts the call, but another applicable
+    /// candidate is strictly more specific than it.
     pub verdict: &'static str,
     /// The typed callable reason, present only when `verdict` is
     /// `inapplicable`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// The invocation phase whose test decided `verdict` (`strict`, `loose`,
+    /// or `variable_arity`), present only when the language's resolver phases
+    /// its overload resolution and recorded the phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    /// The zero-based ordinal of the first argument that keeps an
+    /// `inapplicable` candidate from its deciding phase, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failing_argument: Option<u32>,
+    /// The conversion `failing_argument` would need to reach its formal,
+    /// present exactly when `failing_argument` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failing_conversion: Option<&'static str>,
     /// The precedence tier the resolver considered the candidate at. Absent is
     /// unattributed, never weakest.
     #[serde(skip_serializing_if = "Option::is_none")]

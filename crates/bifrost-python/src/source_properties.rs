@@ -19,119 +19,81 @@ pub(crate) fn python_annotation_references(
     source: &str,
     source_facts: &mut PrimarySourceFactCollector<'_>,
 ) -> Vec<PythonAnnotationReferenceFact> {
-    let mut references = Vec::new();
-    match annotation.kind() {
-        "identifier" => {
-            push_annotation_reference(
-                &mut references,
-                source_facts,
-                annotation,
-                PythonAnnotationReferenceName::Lexical(
-                    crate::declarations::py_node_text(annotation, source).to_string(),
-                ),
-                0,
-            );
-        }
-        "attribute" => {
-            push_annotation_reference(
-                &mut references,
-                source_facts,
-                annotation,
-                python_attribute_reference_name(annotation, source),
-                0,
-            );
-        }
-        "string" => {
-            let Some(content) = python_string_content(annotation) else {
-                return references;
-            };
-            push_annotation_reference(
-                &mut references,
-                source_facts,
-                content,
-                PythonAnnotationReferenceName::Lexical(
-                    crate::declarations::py_node_text(content, source).to_string(),
-                ),
-                1,
-            );
-        }
-        _ => {
-            enum Work<'tree> {
-                Enter(Node<'tree>),
-                Exit(usize),
-            }
-            let mut stack = vec![Work::Enter(annotation)];
-            while let Some(work) = stack.pop() {
-                match work {
-                    Work::Exit(index) => references[index].subtree_end = references.len(),
-                    Work::Enter(node) => match node.kind() {
-                        "generic_type" | "subscript" => {
-                            // Generic arguments do not name the returned class.
-                            // Reuse the primary runtime-owner interpretation so
-                            // Optional and unions retain their existing meaning.
-                            if let Some(owner) = runtime_annotation_node(node, source) {
-                                stack.push(Work::Enter(owner));
-                            }
-                        }
-                        "member_type" => {
-                            push_annotation_reference(
-                                &mut references,
-                                source_facts,
-                                node,
-                                python_attribute_reference_name(node, source),
-                                1,
-                            );
-                        }
-                        "identifier" => {
-                            push_annotation_reference(
-                                &mut references,
-                                source_facts,
-                                node,
-                                PythonAnnotationReferenceName::Lexical(
-                                    crate::declarations::py_node_text(node, source).to_string(),
-                                ),
-                                1,
-                            );
-                        }
-                        "attribute" => {
-                            let index = push_annotation_reference(
-                                &mut references,
-                                source_facts,
-                                node,
-                                python_attribute_reference_name(node, source),
-                                1,
-                            );
-                            stack.push(Work::Exit(index));
-                            let mut cursor = node.walk();
-                            let mut children: Vec<_> = node.named_children(&mut cursor).collect();
-                            children.reverse();
-                            stack.extend(children.into_iter().map(Work::Enter));
-                        }
-                        "string" => {
-                            if let Some(content) = python_string_content(node) {
-                                push_annotation_reference(
-                                    &mut references,
-                                    source_facts,
-                                    content,
-                                    PythonAnnotationReferenceName::Lexical(
-                                        crate::declarations::py_node_text(content, source)
-                                            .to_string(),
-                                    ),
-                                    2,
-                                );
-                            }
-                        }
-                        _ => {
-                            let mut cursor = node.walk();
-                            let mut children: Vec<_> = node.named_children(&mut cursor).collect();
-                            children.reverse();
-                            stack.extend(children.into_iter().map(Work::Enter));
-                        }
-                    },
+    let mut references: Vec<PythonAnnotationReferenceFact> = Vec::new();
+    enum Work<'tree> {
+        Enter(Node<'tree>),
+        Exit(usize),
+    }
+    let mut stack = vec![Work::Enter(annotation)];
+    while let Some(work) = stack.pop() {
+        match work {
+            Work::Exit(index) => references[index].subtree_end = references.len(),
+            Work::Enter(node) => match node.kind() {
+                "generic_type" | "subscript" => {
+                    // Generic arguments do not name the returned class.
+                    // Reuse the primary runtime-owner interpretation so
+                    // Optional and unions retain their existing meaning.
+                    if let Some(owner) = runtime_annotation_node(node, source) {
+                        stack.push(Work::Enter(owner));
+                    }
                 }
-            }
+                "member_type" => {
+                    push_annotation_reference(
+                        &mut references,
+                        source_facts,
+                        node,
+                        python_attribute_reference_name(node, source),
+                        1,
+                    );
+                }
+                "identifier" => {
+                    push_annotation_reference(
+                        &mut references,
+                        source_facts,
+                        node,
+                        PythonAnnotationReferenceName::Lexical(
+                            crate::declarations::py_node_text(node, source).to_string(),
+                        ),
+                        1,
+                    );
+                }
+                "attribute" => {
+                    let index = push_annotation_reference(
+                        &mut references,
+                        source_facts,
+                        node,
+                        python_attribute_reference_name(node, source),
+                        1,
+                    );
+                    stack.push(Work::Exit(index));
+                    let mut cursor = node.walk();
+                    let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+                    children.reverse();
+                    stack.extend(children.into_iter().map(Work::Enter));
+                }
+                "string" => {
+                    if let Some(content) = python_string_content(node) {
+                        push_annotation_reference(
+                            &mut references,
+                            source_facts,
+                            content,
+                            PythonAnnotationReferenceName::Lexical(
+                                crate::declarations::py_node_text(content, source).to_string(),
+                            ),
+                            2,
+                        );
+                    }
+                }
+                _ => {
+                    let mut cursor = node.walk();
+                    let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+                    children.reverse();
+                    stack.extend(children.into_iter().map(Work::Enter));
+                }
+            },
         }
     }
+
     references
 }
 
@@ -184,24 +146,11 @@ pub(crate) fn python_return_type_identity(
 }
 
 fn python_nominal_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
-    let mut path = Vec::new();
-    let mut pending = vec![node];
-    while let Some(node) = pending.pop() {
-        match node.kind() {
-            "identifier" => path.push(crate::declarations::py_node_text(node, source).to_string()),
-            "attribute" => {
-                pending.push(node.child_by_field_name("attribute")?);
-                pending.push(node.child_by_field_name("object")?);
-            }
-            "member_type" => {
-                let mut cursor = node.walk();
-                let children: Vec<_> = node.named_children(&mut cursor).collect();
-                pending.extend(children.into_iter().rev());
-            }
-            _ => return None,
-        }
-    }
-    Some(path)
+    crate::syntax::python_static_type_path(node).map(|path| {
+        path.into_iter()
+            .map(|segment| crate::declarations::py_node_text(segment, source).to_owned())
+            .collect()
+    })
 }
 
 fn runtime_annotation_node<'tree>(mut node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
@@ -321,6 +270,8 @@ fn return_annotations_preserve_qualified_generic_and_quoted_runtime_owners() {
         ("models.Manager[A, B]", Some(vec!["models", "Manager"])),
         ("typing.Optional[models.User]", Some(vec!["models", "User"])),
         ("type[models.User]", Some(vec!["models", "User"])),
+        ("Type[models.User]", Some(vec!["models", "User"])),
+        ("Typed[User]", Some(vec!["Typed"])),
         ("\"models.User\"", Some(vec!["models", "User"])),
         ("models.User | None", Some(vec!["models", "User"])),
         ("Union[models.User, None]", Some(vec!["models", "User"])),
@@ -340,4 +291,34 @@ fn return_annotations_preserve_qualified_generic_and_quoted_runtime_owners() {
             .map(|name| name.path().iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(path, expected, "{source}");
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: member_type qualifiers lost their type wrapper"
+)]
+fn qs6_member_type_grammar_boundary() {
+    let source = "def f() -> Outer[T].Inner: pass\n";
+    let tree = crate::declarations::parse_python_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let annotation = tree
+        .root_node()
+        .named_child(0)
+        .unwrap()
+        .child_by_field_name("return_type")
+        .unwrap();
+    let member = annotation.named_child(0).unwrap();
+    assert_eq!(
+        member.kind(),
+        "member_type",
+        "{}",
+        tree.root_node().to_sexp()
+    );
+    assert_eq!(member.named_child(0).unwrap().kind(), "type");
+    assert_eq!(member.named_child(1).unwrap().kind(), "identifier");
+    let identity = python_return_type_identity(annotation, source).unwrap();
+    assert_eq!(
+        identity.nominal_name().unwrap().path(),
+        &["Outer".to_owned(), "Inner".to_owned()]
+    );
 }

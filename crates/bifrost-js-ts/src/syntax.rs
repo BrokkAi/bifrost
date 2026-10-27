@@ -1379,23 +1379,6 @@ impl JsTsLexicalBindingIndex {
             .next()
     }
 
-    /// Find structured writes to the runtime roots exposed by this syntax
-    /// tree. This method intentionally reports shadowed writes as evidence so
-    /// callers can distinguish them from writes to the actual global root.
-    pub fn runtime_global_writes(
-        &self,
-        root: Node<'_>,
-        source: &str,
-        max_facts: usize,
-    ) -> Vec<JsTsRuntimeWrite> {
-        let mut budget = JsTsRuntimeTraversalBudget {
-            remaining: usize::MAX,
-            exhausted: false,
-            visited_nodes: 0,
-        };
-        collect_runtime_global_writes_with_budget(self, root, source, max_facts, &mut budget).0
-    }
-
     fn record_assignment_targets(&mut self, target: Node<'_>, source: &str) {
         for binder in pattern_binder_identifiers(target) {
             let name = slice(binder, source);

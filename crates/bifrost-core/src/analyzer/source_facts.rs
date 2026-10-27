@@ -104,6 +104,29 @@ pub enum DeclarationAccessBoundary<Owner> {
     Template(Owner),
 }
 
+/// A language-selected package access region. Exact regions do not admit
+/// subpackages; enclosing regions compare structured package segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageAccessRegion {
+    Exact(String),
+    Enclosing(String),
+}
+
+impl PackageAccessRegion {
+    pub fn contains(&self, package: &str) -> bool {
+        match self {
+            Self::Exact(region) => package == region,
+            Self::Enclosing(region) => Self::enclosing_contains(region, package),
+        }
+    }
+    pub fn enclosing_contains(region: &str, package: &str) -> bool {
+        let mut caller = package.split('.');
+        region
+            .split('.')
+            .all(|segment| caller.next() == Some(segment))
+    }
+}
+
 /// The source-owned visibility of one declaration.
 ///
 /// This fact is keyed by the declaration identity allocated by the primary

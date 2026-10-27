@@ -1,16 +1,19 @@
 //! File-scoped native Go forward graph staging in one selected operation.
+use super::graph_workers::run_analyzer_graph_stages;
 
+use super::graph_unit::{GraphUnitFile, GraphUnitRules, stage_unit_reference_edges};
 use crate::CancellationToken;
+use crate::analyzer::resolution::fact_resolution::SelectedFactOperationBlueprint;
+use crate::analyzer::resolution::local_identity::ResolutionIdentityTranslation;
+use crate::analyzer::resolution::worker_transport::WorkerAnswer;
 use crate::analyzer::resolution::*;
-use crate::analyzer::resolution::{
-    FactReferenceEdgeBatch, NativeReferenceEdgeBatchProjector, SelectedSemanticProvenance,
-};
+use crate::analyzer::resolution::{FactReferenceEdgeBatch, NativeReferenceEdgeBatchProjector};
+use crate::analyzer::store::go_package_context::GoContextIdentity;
 use crate::analyzer::store::resolution_operation::go_demand::GoForwardOperationContext;
 use crate::analyzer::store::resolution_operation::go_named::{GoDemandContext, GoPackageStageUnit};
-use crate::analyzer::store::resolution_operation::go_same_package::GoPackageMemberIndexCache;
 use crate::analyzer::store::resolution_operation::graph_stage::{
-    GraphStageAdapter, GraphStageAdmission, GraphStageGuard, GraphStageMetrics, GraphStageResult,
-    MAX_GRAPH_STAGE_READ_BATCH_SIZE, run_graph_stages,
+    GraphStageAdapter, GraphStageAdmission, GraphStageBatches, GraphStageGuard, GraphStageMetrics,
+    GraphStageResult, MAX_GRAPH_STAGE_READ_BATCH_SIZE,
 };
 use crate::analyzer::store::resolution_operation::*;
 use crate::analyzer::store::resolution_selection::SelectedResolutionUnavailable;
@@ -21,6 +24,7 @@ use crate::hash::HashSet;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
 #[doc(hidden)]
 pub struct GoReferenceBatchProjection {
     #[doc(hidden)]
@@ -37,16 +41,52 @@ pub(crate) type GoReferenceEdgeBatchStager<'a> = dyn FnMut(
     ) -> Result<()>
     + 'a;
 
+struct GoGraphBatch {
+    file: ProjectFile,
+    source: FactReferenceBatchAnswer,
+    edges: FactReferenceEdgeBatch,
+    projections: Vec<GoReferenceBatchProjection>,
+}
+
+impl WorkerAnswer for GoGraphBatch {
+    fn translate(self, translation: &impl ResolutionIdentityTranslation) -> Self {
+        Self {
+            file: self.file,
+            source: self.source.translate(translation),
+            edges: self.edges.translate(translation),
+            // Projected CodeUnits contain stable declaration identities, not runtime aliases.
+            projections: self.projections,
+        }
+    }
+}
+
+struct GoGraphPayload {
+    batches: GraphStageBatches<GoGraphBatch>,
+    publications: Vec<GoContextIdentity>,
+}
+
+impl WorkerAnswer for GoGraphPayload {
+    fn translate(self, translation: &impl ResolutionIdentityTranslation) -> Self {
+        Self {
+            batches: self.batches.translate(translation),
+            // Persisted publication identities contain no runtime aliases.
+            publications: self.publications,
+        }
+    }
+}
+
 struct GoGraphStageAdapter<'callback> {
     analyzer: &'callback dyn IAnalyzer,
     base_profile: [u8; 32],
-    stage: &'callback mut GoReferenceEdgeBatchStager<'callback>,
-    unprojected_definitions: Vec<SemanticId>,
 }
 
 impl GraphStageAdapter for GoGraphStageAdapter<'_> {
+    // File-major staging below; persisted whole-package peers: go_same_package.rs:291-328.
+    const FILE_CHUNKS_REPRODUCE_UNIT: bool = true;
+
     type Unit = GoPackageStageUnit;
-    type HelperTables<'stage> = GoPackageMemberIndexCache;
+    type Payload = GoGraphPayload;
+    type HelperTables<'stage> = FileContextPeerMemoGuard<'stage>;
 
     fn units(
         &self,
@@ -146,295 +186,86 @@ impl GraphStageAdapter for GoGraphStageAdapter<'_> {
 
     fn helper_tables<'stage>(
         &self,
-        _operation: &'stage SelectedResolutionOperation<'_, '_>,
+        operation: &'stage SelectedResolutionOperation<'_, '_>,
         _unit: &Self::Unit,
     ) -> Result<Self::HelperTables<'stage>> {
-        Ok(GoPackageMemberIndexCache::default())
+        Ok(operation.file_context_peer_memo_scope())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_unit<'operation, 'store, 'input>(
-        &mut self,
+        &self,
         operation: &'operation SelectedResolutionOperation<'store, 'input>,
         unit: &Self::Unit,
         files: &[ProjectFile],
-        guard: &mut GraphStageGuard<'operation, 'store, Self::HelperTables<'operation>>,
+        _guard: &mut GraphStageGuard<'operation, 'store, Self::HelperTables<'operation>>,
         maximum_batch_size: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
         _metrics: &mut GraphStageMetrics,
-    ) -> Result<SelectedResolutionOperationOutcome<FactResolutionBatchSummary>> {
-        let mounts = operation.mount_table();
-        let mut context: Option<SelectedResolutionContextSet> = None;
-        let mut demand: Option<GoDemandContext> = None;
-        for file in files {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
-            }
-            let path = selected_path_key(file.rel_path());
-            let prepared = match operation.go_file_import_context_with_member_cache(
-                unit.context_id,
-                &path,
-                &unit.source_role,
-                cancellation,
-                guard.helper_tables_mut(),
-            )? {
-                GoPreparedImportContextOutcome::Ready(prepared) => *prepared,
-                GoPreparedImportContextOutcome::Unavailable => {
-                    return Ok(SelectedResolutionOperationOutcome::Unavailable(
-                        SelectedResolutionUnavailable::GoContextUnavailable {
-                            persisted_relative_path: path,
-                        },
-                    ));
-                }
-                GoPreparedImportContextOutcome::Cancelled => {
-                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                        cancelled_completion(),
-                    ));
-                }
-            };
-            context = Some(if let Some(existing) = context.take() {
-                let Some(merged) = existing.merge(prepared.context, cancellation, &|fragment| {
-                    Ok(mounts
-                        .mount_for_fragment(fragment)?
-                        .map(|mount| (mount.ordinal(), mount.semantic_language())))
-                })?
-                else {
-                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                        cancelled_completion(),
-                    ));
-                };
-                merged
-            } else {
-                prepared.context
-            });
-            if let Some(demand) = demand.as_mut() {
-                demand.merge(prepared.demand);
-            } else {
-                demand = Some(prepared.demand);
-            }
-        }
-        let context = match operation.prepare_context(
-            context.expect("a graph stage has at least one admitted file"),
+    ) -> Result<SelectedResolutionOperationOutcome<(Self::Payload, FactResolutionBatchSummary)>>
+    {
+        operation.initialize_go_base_profile(&self.base_profile);
+        let mut rules = GoGraphUnitRules {
+            prepare: |path: &str, cancellation: &CancellationToken| {
+                operation.go_file_import_context_with_role(
+                    unit.context_id,
+                    path,
+                    &unit.source_role,
+                    cancellation,
+                )
+            },
+            demand: None,
+        };
+        let previous_publications = operation
+            .bound_go_context_publications()
+            .into_iter()
+            .map(|publication| publication.context_id)
+            .collect::<HashSet<_>>();
+        let mut batches = Vec::new();
+        let outcome = stage_go_unit(
+            operation,
+            &mut rules,
+            files,
+            maximum_batch_size.min(MAX_GRAPH_STAGE_READ_BATCH_SIZE),
             cancellation,
             context_metrics,
-        )? {
-            SelectedResolutionContextValidationOutcome::Ready(context) => context,
-            SelectedResolutionContextValidationOutcome::Cancelled => {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
+            &mut NativeReferenceEdgeBatchProjector::new(self.analyzer),
+            &mut |file, source, edges, projections| {
+                batches.push(GoGraphBatch {
+                    file: file.clone(),
+                    source: source.clone(),
+                    edges: edges.clone(),
+                    projections: projections.to_vec(),
+                });
+                Ok(())
+            },
+        )?;
+        Ok(match outcome {
+            SelectedResolutionOperationOutcome::Native(summary) => {
+                let publications = operation
+                    .bound_go_context_publications()
+                    .into_iter()
+                    .filter(|publication| !previous_publications.contains(&publication.context_id))
+                    .collect();
+                SelectedResolutionOperationOutcome::Native((
+                    GoGraphPayload {
+                        batches: GraphStageBatches(batches),
+                        publications,
+                    },
+                    summary,
+                ))
             }
-        };
-        let demand = demand.expect("a graph stage has at least one admitted file");
-        let ready = operation.ready();
-        let blueprint = match ready.collect_blueprint(context, cancellation)? {
-            SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
-            SelectedFactOperationBlueprintConstruction::Cancelled { .. } => {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
+            SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                SelectedResolutionOperationOutcome::Cancelled(completion)
             }
-        };
-        if matches!(
-            ready.register_context(&blueprint, cancellation)?,
-            ContextRegistrationOutcome::Cancelled
-        ) {
-            return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                cancelled_completion(),
-            ));
-        }
-
-        let mut edge_projector = NativeReferenceEdgeBatchProjector::new(self.analyzer);
-        let mut summary = FactResolutionBatchSummary::empty();
-        let mut projection_cancelled = false;
-        let projection_session = ResolutionSession::unbounded();
-        let typed = ready.typed_source();
-        let observed_typed = SeamProfiled::observing(&typed);
-        let stager = &mut *self.stage;
-        let root_batch_size = maximum_batch_size.min(MAX_GRAPH_STAGE_READ_BATCH_SIZE);
-        for file in files {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
+            SelectedResolutionOperationOutcome::Stale(reason) => {
+                SelectedResolutionOperationOutcome::Stale(reason)
             }
-            let path = selected_path_key(file.rel_path());
-            let Some(mount) = mounts.mount_for_path("go", &path)? else {
-                return Err(StoreError::new(format!(
-                    "admitted Go graph file lacks selected mount: {file:?}"
-                )));
-            };
-            assert_eq!(mount.semantic_language(), Language::Go);
-            let fragment = mount.fragment();
-            edge_projector
-                .catalog_mut()
-                .insert_file(fragment, file.clone())?;
-            let mut fragments = HashSet::default();
-            fragments.insert(fragment);
-            let lexical = ready
-                .lexical_source()
-                .with_forward_reference_fragments(&fragments);
-            let observed_lexical = SeamProfiled::observing(&lexical);
-            let staged = operation.stage_go_reference_batches(
-                GoForwardOperationContext {
-                    blueprint: &blueprint,
-                    demand: demand.clone(),
-                    caller_path: &path,
-                    lexical: &observed_lexical,
-                    typed: &observed_typed,
-                    cancellation,
-                    session: &projection_session,
-                },
-                root_batch_size,
-                &mut |batch| {
-                    if cancellation.is_cancelled() {
-                        projection_cancelled = true;
-                        return Ok(());
-                    }
-                    let definitions = edge_projector.pending_definitions(batch);
-                    let selected_lexical = ready.lexical_source();
-                    let projection_facts = selected_lexical.reference_projection_facts(batch, cancellation)?;
-                    if cancellation.is_cancelled() { projection_cancelled = true; return Ok(()); }
-                    edge_projector.catalog_mut().replace_reference_facts(projection_facts);
-                    let mut source_definitions = Vec::new();
-                    for definition in definitions {
-                        if cancellation.is_cancelled() {
-                            projection_cancelled = true;
-                            return Ok(());
-                        }
-                        let Some(provenance) =
-                            selected_lexical.semantic_provenance(definition, cancellation)?
-                        else {
-                            projection_cancelled = true;
-                            return Ok(());
-                        };
-                        if matches!(provenance, SelectedSemanticProvenance::FragmentLocal(_)) {
-                            source_definitions.push(definition);
-                        } else {
-                            edge_projector
-                                .catalog_mut()
-                                .insert_out_of_graph_declaration(definition);
-                            edge_projector.mark_projected(definition);
-                        }
-                    }
-                    if !source_definitions.is_empty() {
-                        match crate::analyzer::store::resolution_operation::native_units::project_native_definition_units(
-                            ready,
-                            &source_definitions,
-                            cancellation,
-                            &projection_session,
-                        )? {
-                            SelectedNativeDefinitions::Ready(definitions) => {
-                                for (semantic, definition) in definitions {
-                                    match definition {
-                                        SelectedNativeDefinition::Unit(unit) => edge_projector
-                                            .catalog_mut()
-                                            .insert_graph_declaration(semantic, unit)?,
-                                        SelectedNativeDefinition::Lexical(_)
-                                        | SelectedNativeDefinition::Intrinsic { .. } => {
-                                            edge_projector
-                                                .catalog_mut()
-                                                .insert_out_of_graph_declaration(semantic)
-                                        }
-                                    }
-                                    edge_projector.mark_projected(semantic);
-                                }
-                            }
-                            SelectedNativeDefinitions::Unavailable => {
-                                for semantic in source_definitions {
-                                    match crate::analyzer::store::resolution_operation::native_units::project_native_definition_units(
-                                        ready,
-                                        std::slice::from_ref(&semantic),
-                                        cancellation,
-                                        &projection_session,
-                                    )? {
-                                        SelectedNativeDefinitions::Ready(definitions) => {
-                                            for (semantic, definition) in definitions {
-                                                match definition {
-                                                    SelectedNativeDefinition::Unit(unit) => {
-                                                        edge_projector
-                                                            .catalog_mut()
-                                                            .insert_graph_declaration(
-                                                                semantic, unit,
-                                                            )?
-                                                    }
-                                                    SelectedNativeDefinition::Lexical(_)
-                                                    | SelectedNativeDefinition::Intrinsic {
-                                                        ..
-                                                    } => edge_projector
-                                                        .catalog_mut()
-                                                        .insert_out_of_graph_declaration(semantic),
-                                                }
-                                                edge_projector.mark_projected(semantic);
-                                            }
-                                        }
-                                        SelectedNativeDefinitions::Unavailable => {
-                                            edge_projector
-                                                .catalog_mut()
-                                                .insert_out_of_graph_declaration(semantic);
-                                            edge_projector.mark_projected(semantic);
-                                            self.unprojected_definitions.push(semantic);
-                                        }
-                                        SelectedNativeDefinitions::Cancelled => {
-                                            projection_cancelled = true;
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
-                            SelectedNativeDefinitions::Cancelled => {
-                                projection_cancelled = true;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    let projected = edge_projector.project_batch(batch, cancellation)?;
-                    let mut projections = Vec::with_capacity(batch.answers().len());
-                    for answer in batch.answers() {
-                        if cancellation.is_cancelled() {
-                            projection_cancelled = true;
-                            return Ok(());
-                        }
-                        let reference_owner = match answer.reference_owner().flatten() {
-                            Some(owner) => edge_projector
-                                .catalog_mut()
-                                .graph_declaration(owner)?
-                                .cloned(),
-                            None => None,
-                        };
-                        let mut binding_targets =
-                            Vec::with_capacity(answer.answer().binding().targets().len());
-                        for &target in answer.answer().binding().targets() {
-                            if cancellation.is_cancelled() {
-                                projection_cancelled = true;
-                                return Ok(());
-                            }
-                            binding_targets.push(
-                                edge_projector
-                                    .catalog_mut()
-                                    .graph_declaration(target)?
-                                    .cloned(),
-                            );
-                        }
-                        projections.push(GoReferenceBatchProjection {
-                            reference_owner,
-                            binding_targets,
-                        });
-                    }
-                    stager(file, batch, &projected, &projections)
-                },
-            )?;
-            if projection_cancelled || cancellation.is_cancelled() {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
+            SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                SelectedResolutionOperationOutcome::Unavailable(reason)
             }
-            summary.accumulate(staged);
-        }
-        Ok(SelectedResolutionOperationOutcome::Native(summary))
+        })
     }
 }
 
@@ -467,6 +298,7 @@ pub trait GoGraphStageExt {
         base_profile: [u8; 32],
         files: &HashSet<ProjectFile>,
         maximum_batch_size: usize,
+        worker_count: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
         stage: &mut GoReferenceEdgeBatchStager<'_>,
@@ -528,37 +360,34 @@ impl GoGraphStageExt for SelectedResolutionOperation<'_, '_> {
         base_profile: [u8; 32],
         files: &HashSet<ProjectFile>,
         maximum_batch_size: usize,
+        worker_count: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
         stage: &mut GoReferenceEdgeBatchStager<'_>,
     ) -> Result<SelectedResolutionOperationOutcome<GraphStageResult>> {
         let files = files.iter().cloned().collect::<Vec<_>>();
-        let mut adapter = GoGraphStageAdapter {
+        let adapter = GoGraphStageAdapter {
             analyzer,
             base_profile,
-            stage,
-            unprojected_definitions: Vec::new(),
         };
-        let mut outcome = run_graph_stages(
+        let outcome = run_analyzer_graph_stages(
             self,
-            &mut adapter,
+            analyzer,
+            &adapter,
             &files,
             maximum_batch_size,
+            worker_count,
             cancellation,
             context_metrics,
+            |payload| {
+                for publication in payload.publications {
+                    self.bind_go_context_publication(publication);
+                }
+                payload.batches.replay(cancellation, |batch| {
+                    stage(&batch.file, &batch.source, &batch.edges, &batch.projections)
+                })
+            },
         )?;
-        if let SelectedResolutionOperationOutcome::Native(result) = &mut outcome
-            && !adapter.unprojected_definitions.is_empty()
-        {
-            result
-                .summary
-                .include_completion(&ResolutionCompletion::incomplete(
-                    adapter
-                        .unprojected_definitions
-                        .drain(..)
-                        .map(ResolutionIncompleteReason::UnsupportedSemantic),
-                ));
-        }
         Ok(outcome)
     }
 
@@ -580,255 +409,197 @@ impl GoGraphStageExt for SelectedResolutionOperation<'_, '_> {
             (1..=MAX_REFERENCE_SEEDS_PER_BATCH).contains(&maximum_batch_size),
             "reference batch size must be in 1..={MAX_REFERENCE_SEEDS_PER_BATCH}"
         );
-        let mounts = self.mount_table();
-        let mut edge_projector = NativeReferenceEdgeBatchProjector::new(analyzer);
-        let mut summary = FactResolutionBatchSummary::empty();
-        let mut unprojected_definitions = Vec::new();
         let mut ordered_files = files.iter().cloned().collect::<Vec<_>>();
         ordered_files.sort();
-
+        let mut projector = NativeReferenceEdgeBatchProjector::new(analyzer);
+        let mut summary = FactResolutionBatchSummary::empty();
         for file in &ordered_files {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
-            }
-            let path = selected_path_key(file.rel_path());
-            let Some(mount) = mounts.mount_for_path("go", &path)? else {
-                return Err(StoreError::new(format!(
-                    "admitted Go graph file lacks selected mount: {file:?}"
-                )));
+            let mut rules = GoGraphUnitRules {
+                prepare: &mut prepare_file_context,
+                demand: None,
             };
-            assert_eq!(mount.semantic_language(), Language::Go);
-            let fragment = mount.fragment();
-            edge_projector
-                .catalog_mut()
-                .insert_file(fragment, file.clone())?;
-
-            let prepared = match prepare_file_context(&path, cancellation)? {
-                GoPreparedImportContextOutcome::Ready(context) => *context,
-                GoPreparedImportContextOutcome::Unavailable => {
-                    return Ok(SelectedResolutionOperationOutcome::Unavailable(
-                        SelectedResolutionUnavailable::GoContextUnavailable {
-                            persisted_relative_path: path,
-                        },
-                    ));
-                }
-                GoPreparedImportContextOutcome::Cancelled => {
-                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                        cancelled_completion(),
-                    ));
-                }
-            };
-            let demand = prepared.demand;
-            let context =
-                match self.prepare_context(prepared.context, cancellation, context_metrics)? {
-                    SelectedResolutionContextValidationOutcome::Ready(context) => context,
-                    SelectedResolutionContextValidationOutcome::Cancelled => {
-                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                            cancelled_completion(),
-                        ));
-                    }
-                };
-            let ready = self.ready();
-            let mut fragments = HashSet::default();
-            fragments.insert(fragment);
-            let lexical = ready
-                .lexical_source()
-                .with_forward_reference_fragments(&fragments);
-            let observed_lexical = SeamProfiled::observing(&lexical);
-            let typed = ready.typed_source();
-            let observed_typed = SeamProfiled::observing(&typed);
-            let blueprint = match ready.collect_blueprint(context, cancellation)? {
-                SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
-                SelectedFactOperationBlueprintConstruction::Cancelled { .. } => {
-                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                        cancelled_completion(),
-                    ));
-                }
-            };
-            if matches!(
-                ready.register_context(&blueprint, cancellation)?,
-                ContextRegistrationOutcome::Cancelled
-            ) {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
-            }
-
-            let mut projection_cancelled = false;
-            let projection_session = ResolutionSession::unbounded();
-            let staged = self.stage_go_reference_batches(
-                GoForwardOperationContext {
-                    blueprint: &blueprint,
-                    demand,
-                    caller_path: &path,
-                    lexical: &observed_lexical,
-                    typed: &observed_typed,
-                    cancellation,
-                    session: &projection_session,
-                },
+            match stage_go_unit(
+                self,
+                &mut rules,
+                std::slice::from_ref(file),
                 maximum_batch_size,
-                &mut |batch| {
-                    if cancellation.is_cancelled() {
-                        projection_cancelled = true;
-                        return Ok(());
-                    }
-                    let definitions = edge_projector.pending_definitions(batch);
-                    let selected_lexical = ready.lexical_source();
-                    let projection_facts = selected_lexical.reference_projection_facts(batch, cancellation)?;
-                    if cancellation.is_cancelled() { projection_cancelled = true; return Ok(()); }
-                    edge_projector.catalog_mut().replace_reference_facts(projection_facts);
-                    let mut source_definitions = Vec::new();
-                    for definition in definitions {
-                        if cancellation.is_cancelled() {
-                            projection_cancelled = true;
-                            return Ok(());
-                        }
-                        let Some(provenance) =
-                            selected_lexical.semantic_provenance(definition, cancellation)?
-                        else {
-                            projection_cancelled = true;
-                            return Ok(());
-                        };
-                        if matches!(provenance, SelectedSemanticProvenance::FragmentLocal(_)) {
-                            source_definitions.push(definition);
-                        } else {
-                            edge_projector
-                                .catalog_mut()
-                                .insert_out_of_graph_declaration(definition);
-                            edge_projector.mark_projected(definition);
-                        }
-                    }
-                    if !source_definitions.is_empty() {
-                        match crate::analyzer::store::resolution_operation::native_units::project_native_definition_units(
-                            ready,
-                            &source_definitions,
-                            cancellation,
-                            &projection_session,
-                        )? {
-                            SelectedNativeDefinitions::Ready(definitions) => {
-                                for (semantic, definition) in definitions {
-                                    match definition {
-                                        SelectedNativeDefinition::Unit(unit) => edge_projector
-                                            .catalog_mut()
-                                            .insert_graph_declaration(semantic, unit)?,
-                                        SelectedNativeDefinition::Lexical(_)
-                                        | SelectedNativeDefinition::Intrinsic { .. } => {
-                                            edge_projector
-                                                .catalog_mut()
-                                                .insert_out_of_graph_declaration(semantic)
-                                        }
-                                    }
-                                    edge_projector.mark_projected(semantic);
-                                }
-                            }
-                            SelectedNativeDefinitions::Unavailable => {
-                                // One declaration outside the source-backed
-                                // CodeUnit domain must not prevent other
-                                // definitions in this reference batch from
-                                // being projected. In particular, each
-                                // reference owner needs its own canonical
-                                // projection for providers that attribute
-                                // source sites to their enclosing callable.
-                                for semantic in source_definitions {
-                                    match crate::analyzer::store::resolution_operation::native_units::project_native_definition_units(
-                                        ready,
-                                        std::slice::from_ref(&semantic),
-                                        cancellation,
-                                        &projection_session,
-                                    )? {
-                                        SelectedNativeDefinitions::Ready(definitions) => {
-                                            for (semantic, definition) in definitions {
-                                                match definition {
-                                                    SelectedNativeDefinition::Unit(unit) => {
-                                                        edge_projector
-                                                            .catalog_mut()
-                                                            .insert_graph_declaration(
-                                                                semantic, unit,
-                                                            )?
-                                                    }
-                                                    SelectedNativeDefinition::Lexical(_)
-                                                    | SelectedNativeDefinition::Intrinsic {
-                                                        ..
-                                                    } => edge_projector
-                                                        .catalog_mut()
-                                                        .insert_out_of_graph_declaration(semantic),
-                                                }
-                                                edge_projector.mark_projected(semantic);
-                                            }
-                                        }
-                                        SelectedNativeDefinitions::Unavailable => {
-                                            edge_projector
-                                                .catalog_mut()
-                                                .insert_out_of_graph_declaration(semantic);
-                                            edge_projector.mark_projected(semantic);
-                                            unprojected_definitions.push(semantic);
-                                        }
-                                        SelectedNativeDefinitions::Cancelled => {
-                                            projection_cancelled = true;
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
-                            SelectedNativeDefinitions::Cancelled => {
-                                projection_cancelled = true;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    let projected = edge_projector.project_batch(batch, cancellation)?;
-                    let mut projections = Vec::with_capacity(batch.answers().len());
-                    for answer in batch.answers() {
-                        if cancellation.is_cancelled() {
-                            projection_cancelled = true;
-                            return Ok(());
-                        }
-                        let reference_owner = match answer.reference_owner().flatten() {
-                            Some(owner) => edge_projector
-                                .catalog_mut()
-                                .graph_declaration(owner)?
-                                .cloned(),
-                            None => None,
-                        };
-                        let mut binding_targets =
-                            Vec::with_capacity(answer.answer().binding().targets().len());
-                        for &target in answer.answer().binding().targets() {
-                            if cancellation.is_cancelled() {
-                                projection_cancelled = true;
-                                return Ok(());
-                            }
-                            binding_targets.push(
-                                edge_projector
-                                    .catalog_mut()
-                                    .graph_declaration(target)?
-                                    .cloned(),
-                            );
-                        }
-                        projections.push(GoReferenceBatchProjection {
-                            reference_owner,
-                            binding_targets,
-                        });
-                    }
-                    stage(file, batch, &projected, &projections)
-                },
-            )?;
-            if projection_cancelled || cancellation.is_cancelled() {
-                return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                    cancelled_completion(),
-                ));
+                cancellation,
+                context_metrics,
+                &mut projector,
+                stage,
+            )? {
+                SelectedResolutionOperationOutcome::Native(staged) => summary.accumulate(staged),
+                outcome => return Ok(outcome),
             }
-            summary.accumulate(staged);
-        }
-
-        if !unprojected_definitions.is_empty() {
-            summary.include_completion(&ResolutionCompletion::incomplete(
-                unprojected_definitions
-                    .into_iter()
-                    .map(ResolutionIncompleteReason::UnsupportedSemantic),
-            ));
         }
         Ok(SelectedResolutionOperationOutcome::Native(summary))
     }
+}
+
+struct GoGraphUnitRules<P> {
+    prepare: P,
+    demand: Option<GoDemandContext>,
+}
+
+impl<P> GraphUnitRules for GoGraphUnitRules<P>
+where
+    P: FnMut(&str, &CancellationToken) -> Result<GoPreparedImportContextOutcome>,
+{
+    fn storage_language(&self) -> &'static str {
+        "go"
+    }
+
+    fn prepare_file_context(
+        &mut self,
+        _operation: &SelectedResolutionOperation<'_, '_>,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedResolutionOperationOutcome<Option<SelectedResolutionContextSet>>> {
+        Ok(match (self.prepare)(path, cancellation)? {
+            GoPreparedImportContextOutcome::Ready(prepared) => {
+                let prepared = *prepared;
+                if let Some(demand) = self.demand.as_mut() {
+                    demand.merge(prepared.demand);
+                } else {
+                    self.demand = Some(prepared.demand);
+                }
+                SelectedResolutionOperationOutcome::Native(Some(prepared.context))
+            }
+            GoPreparedImportContextOutcome::Unavailable => {
+                SelectedResolutionOperationOutcome::Unavailable(
+                    SelectedResolutionUnavailable::GoContextUnavailable {
+                        persisted_relative_path: path.to_owned(),
+                    },
+                )
+            }
+            GoPreparedImportContextOutcome::Cancelled => {
+                SelectedResolutionOperationOutcome::Cancelled(cancelled_completion())
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_unit_batches(
+        &self,
+        operation: &SelectedResolutionOperation<'_, '_>,
+        blueprint: &SelectedFactOperationBlueprint,
+        files: &[GraphUnitFile<'_>],
+        _lexical: &dyn BatchResolutionFragmentSource,
+        typed: &dyn SelectedTypedFactSource,
+        session: &ResolutionSession,
+        cancellation: &CancellationToken,
+        maximum_batch_size: usize,
+        sink: &mut dyn FnMut(&FactReferenceBatchAnswer) -> Result<()>,
+    ) -> Result<FactResolutionBatchSummary> {
+        let demand = self
+            .demand
+            .as_ref()
+            .expect("an admitted Go unit has demand inputs");
+        let mut summary = FactResolutionBatchSummary::empty();
+        for file in files {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let fragments = HashSet::from_iter([file.fragment]);
+            let lexical = operation
+                .ready()
+                .lexical_source()
+                .with_forward_reference_fragments(&fragments);
+            let observed_lexical = SeamProfiled::observing(&lexical);
+            let staged = operation.stage_go_reference_batches(
+                GoForwardOperationContext {
+                    blueprint,
+                    demand: demand.clone(),
+                    caller_path: &file.path,
+                    lexical: &observed_lexical,
+                    typed,
+                    cancellation,
+                    session,
+                },
+                maximum_batch_size,
+                sink,
+            )?;
+            summary.accumulate(staged);
+        }
+        Ok(summary)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_go_unit<P>(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    rules: &mut GoGraphUnitRules<P>,
+    files: &[ProjectFile],
+    maximum_batch_size: usize,
+    cancellation: &CancellationToken,
+    context_metrics: &mut SelectedResolutionContextMetrics,
+    projector: &mut NativeReferenceEdgeBatchProjector<'_>,
+    stage: &mut GoReferenceEdgeBatchStager<'_>,
+) -> Result<SelectedResolutionOperationOutcome<FactResolutionBatchSummary>>
+where
+    P: FnMut(&str, &CancellationToken) -> Result<GoPreparedImportContextOutcome>,
+{
+    stage_unit_reference_edges(
+        operation,
+        rules,
+        files,
+        maximum_batch_size,
+        cancellation,
+        context_metrics,
+        projector,
+        |projector, definitions, session, unprojected| {
+            super::graph_unit::project_native_graph_definitions(
+                operation.ready(),
+                projector,
+                definitions,
+                cancellation,
+                session,
+                unprojected,
+            )
+        },
+        |file, batch, projected, projector| {
+            stage_go_graph_projection(file, batch, projected, projector, cancellation, stage)
+        },
+    )
+}
+
+fn stage_go_graph_projection(
+    file: &ProjectFile,
+    batch: &FactReferenceBatchAnswer,
+    projected: &FactReferenceEdgeBatch,
+    edge_projector: &mut NativeReferenceEdgeBatchProjector<'_>,
+    cancellation: &CancellationToken,
+    stage: &mut GoReferenceEdgeBatchStager<'_>,
+) -> Result<bool> {
+    let mut projections = Vec::with_capacity(batch.answers().len());
+    for answer in batch.answers() {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let reference_owner = match answer.reference_owner().flatten() {
+            Some(owner) => edge_projector
+                .catalog_mut()
+                .graph_declaration(owner)?
+                .cloned(),
+            None => None,
+        };
+        let mut binding_targets = Vec::with_capacity(answer.answer().binding().targets().len());
+        for &target in answer.answer().binding().targets() {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            binding_targets.push(
+                edge_projector
+                    .catalog_mut()
+                    .graph_declaration(target)?
+                    .cloned(),
+            );
+        }
+        projections.push(GoReferenceBatchProjection {
+            reference_owner,
+            binding_targets,
+        });
+    }
+    stage(file, batch, projected, &projections)?;
+    Ok(true)
 }

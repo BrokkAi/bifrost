@@ -49,7 +49,7 @@ use brokk_bifrost_core::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Parser};
 
 const TARGET_BINDING: &str = "__target__";
 const TARGET_VALUE_BINDING: &str = "__target_value__";
@@ -3241,23 +3241,6 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
 // ===================================================================================
 // ExportIndex extraction
 // ===================================================================================
-
-pub fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
-    let mut index = ExportIndex::empty();
-    let root = tree.root_node();
-    let lexical = JsTsLexicalBindingIndex::build(root, source);
-    let commonjs = crate::commonjs::CommonJsObjects::new(root, source, &lexical);
-    let module_object_exports = collect_module_object_exports(root, source, &commonjs);
-
-    for index_id in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index_id) else {
-            continue;
-        };
-        collect_export_statement(child, source, &module_object_exports, &commonjs, &mut index);
-    }
-
-    index
-}
 
 pub(crate) fn collect_export_statement(
     node: Node<'_>,

@@ -571,3 +571,40 @@ fn is_overspecified_kotlin_literal(
     let threshold = weights.large_literal_length_threshold.max(0) as usize;
     crate::is_overspecified_string_literal(node, source, threshold)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_annotations_and_empty_spec_bodies_are_test_evidence() {
+        // These exercise the whole file classifier; empty spec bodies keep DSL
+        // calls from masking a failed supertype-evidence check.
+        for (source, expected) in [
+            ("@org.junit.jupiter.api.Test fun example() {}", true),
+            (
+                "@org.junit.jupiter.params.ParameterizedTest(name = \"case\") fun example() {}",
+                true,
+            ),
+            (
+                "class Spec : io.kotest.core.spec.style.StringSpec({})",
+                true,
+            ),
+            ("class Shipping : Runnable { override fun run() {} }", false),
+            ("@org.example.Production fun example() {}", false),
+            ("fun example() {}", false),
+        ] {
+            let tree = crate::kotlin::language::parse_tree(source).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{source}: {}",
+                tree.root_node().to_sexp()
+            );
+            assert_eq!(
+                kotlin_contains_tests(tree.root_node(), source),
+                expected,
+                "{source}"
+            );
+        }
+    }
+}

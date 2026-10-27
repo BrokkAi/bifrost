@@ -458,28 +458,31 @@ fn is_qualified_task_spawn(node: Node<'_>, source: &str) -> bool {
 }
 
 fn attach_use_module(sink: &mut RoleSink<'_>, node: Node<'_>) {
-    match node.kind() {
-        "identifier" | "scoped_identifier" | "self" | "super" | "crate" => {
-            attach_rust_role(sink, Role::Module, node, expression_name_node);
-        }
-        "use_as_clause" => {
-            if let Some(alias) = node.child_by_field_name("alias") {
-                attach_rust_role(sink, Role::Module, alias, expression_name_node);
-            } else if let Some(first) = first_named_child(node) {
-                attach_use_module(sink, first);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "scoped_identifier" | "self" | "super" | "crate" => {
+                attach_rust_role(sink, Role::Module, node, expression_name_node);
             }
-        }
-        "scoped_use_list" => {
-            if let Some(list) = node.child_by_field_name("list") {
-                attach_use_module(sink, list);
+            "use_as_clause" => {
+                if let Some(alias) = node.child_by_field_name("alias") {
+                    attach_rust_role(sink, Role::Module, alias, expression_name_node);
+                } else if let Some(first) = first_named_child(node) {
+                    pending.push(first);
+                }
             }
-        }
-        _ => {
-            for index in 0..node.named_child_count() {
-                let Some(child) = node.named_child(index) else {
-                    continue;
-                };
-                attach_use_module(sink, child);
+            "scoped_use_list" => {
+                if let Some(list) = node.child_by_field_name("list") {
+                    pending.push(list);
+                }
+            }
+            _ => {
+                // Reverse the push order to preserve the recursive walk's output.
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        pending.push(child);
+                    }
+                }
             }
         }
     }
@@ -728,51 +731,294 @@ fn rust_callee_provenance<E>(
     source: &str,
     charge: &mut dyn FnMut(usize) -> Result<(), E>,
 ) -> Result<CalleeProvenanceFact, E> {
-    let mut fact = CalleeProvenanceFact {
+    let Some(function) = call.child_by_field_name("function") else {
+        return Ok(rust_unknown_callee_provenance());
+    };
+    let method_receiver = rust_method_call_parts(function);
+    let mut callee = rust_callee_value(
+        method_receiver.map_or(function, |(receiver, _)| receiver),
+        charge,
+    )?;
+    // A local alias (`let f = init;`) carries the provenance of the binding
+    // its initializer selects. Each hop resolves the initializer at its own
+    // position, so shadowing on either side keeps the nearest binding, and
+    // `let f = f;` reads the binding before it.
+    let mut aliases: Vec<(Node<'_>, Node<'_>)> = Vec::new();
+    let binding = loop {
+        charge(1)?;
+        if matches!(callee.kind(), "scoped_identifier" | "generic_function")
+            || (callee.kind() == "field_expression" && method_receiver.is_some())
+        {
+            break None;
+        }
+        // A callable stored in a field needs value-flow provenance. In a method
+        // call the receiver was selected above, so nominal receivers still carry
+        // their own parameter type evidence.
+        if !matches!(callee.kind(), "identifier" | "self") {
+            return Ok(rust_unknown_callee_provenance());
+        }
+        let Some(binding) =
+            crate::lexical_scope::rust_value_binding_at_bounded(callee, source, charge)?
+        else {
+            break None;
+        };
+        if let Some((alias, _)) = aliases.last() {
+            // A binding is visible only after its own initializer, so every
+            // hop moves to an earlier binding and the chain terminates.
+            debug_assert!(binding.start_byte() < alias.start_byte());
+        }
+        if binding.kind() == "let_declaration"
+            && binding
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.kind() == "identifier")
+            && let Some(value) = binding.child_by_field_name("value")
+            && value.kind() != "closure_expression"
+        {
+            aliases.push((binding, callee));
+            callee = rust_callee_value(value, charge)?;
+            continue;
+        }
+        break Some(binding);
+    };
+    let fact = rust_binding_callee_provenance(callee, binding, source, charge)?;
+    if fact.provenance == CalleeProvenance::Unknown || aliases.is_empty() {
+        return Ok(fact);
+    }
+    // A write to an alias or to its source can replace the value between the
+    // initializer and the call, including from a later loop iteration.
+    aliases.extend(binding.map(|binding| (binding, callee)));
+    for (binding, occurrence) in aliases {
+        if rust_binding_may_be_written(binding, occurrence, source, charge)? {
+            return Ok(rust_unknown_callee_provenance());
+        }
+    }
+    Ok(fact)
+}
+
+fn rust_unknown_callee_provenance() -> CalleeProvenanceFact {
+    CalleeProvenanceFact {
         provenance: CalleeProvenance::Unknown,
         supplier: None,
         shape: CalleeTypeShape::Unknown,
         bounds: Vec::new(),
-    };
-    let Some(function) = call.child_by_field_name("function") else {
-        return Ok(fact);
-    };
-    let method_receiver = rust_method_call_parts(function);
-    let mut callee = method_receiver.map_or(function, |(receiver, _)| receiver);
+    }
+}
+
+/// The value a callee or alias initializer reads, through parentheses,
+/// borrows and dereferences.
+fn rust_callee_value<'tree, E>(
+    mut value: Node<'tree>,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<Node<'tree>, E> {
     loop {
         charge(1)?;
-        let inner = match callee.kind() {
-            "parenthesized_expression" => callee.named_child(0),
-            "reference_expression" => callee.child_by_field_name("value"),
+        let inner = match value.kind() {
+            "parenthesized_expression" => value.named_child(0),
+            "reference_expression" => value.child_by_field_name("value"),
             "unary_expression"
-                if callee
+                if value
                     .child(0)
                     .is_some_and(|operator| operator.kind() == "*") =>
             {
-                callee.named_child(0)
+                value.named_child(0)
             }
             _ => None,
         };
         let Some(inner) = inner else {
-            break;
+            return Ok(value);
         };
-        callee = inner;
+        value = inner;
     }
-    if matches!(callee.kind(), "scoped_identifier" | "generic_function")
-        || (callee.kind() == "field_expression" && method_receiver.is_some())
+}
+
+/// Whether any use of a value binding may replace the value it holds.
+/// `occurrence` is a use that selected the binding and supplies its spelling.
+///
+/// Rust writes an initialized binding only when it is declared `mut`, so an
+/// immutable binding needs no scan. A use of a mutable one in its scope is
+/// a write when it may assign, mutably borrow or autoref it, and the scan
+/// re-resolves each such use so a shadowing binding's writes do not count.
+fn rust_binding_may_be_written<E>(
+    binding: Node<'_>,
+    occurrence: Node<'_>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    let mutable = match binding.kind() {
+        // `&mut self` borrows mutably; only `mut self` is a mutable binding.
+        "self_parameter" => binding
+            .child(0)
+            .is_some_and(|first| first.kind() == "mutable_specifier"),
+        "mut_pattern" => true,
+        _ => {
+            let mut cursor = binding.walk();
+            binding
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.kind() == "mut_pattern")
+                || binding
+                    .named_children(&mut cursor)
+                    .any(|child| child.kind() == "mutable_specifier")
+        }
+    };
+    if !mutable {
+        return Ok(false);
+    }
+    let mut stack = Vec::new();
+    if binding.kind() == "let_declaration" {
+        // A let is in effect from its end to the end of its block.
+        let block = crate::syntax::parent_outside_attributes(binding)
+            .expect("a let declaration has an enclosing block");
+        let mut cursor = block.walk();
+        stack.extend(
+            block
+                .named_children(&mut cursor)
+                .filter(|statement| statement.start_byte() >= binding.end_byte()),
+        );
+    } else if let Some(body) = nearest_ancestor(binding, |kind| {
+        matches!(
+            kind,
+            "function_item" | "function_signature_item" | "closure_expression"
+        )
+    })
+    .and_then(|callable| callable.child_by_field_name("body"))
     {
-        fact.provenance = CalleeProvenance::Declared;
-        return Ok(fact);
+        stack.push(body);
     }
-    // A callable stored in a field needs value-flow provenance. In a method
-    // call the receiver was selected above, so nominal receivers still carry
-    // their own parameter type evidence.
-    if !matches!(callee.kind(), "identifier" | "self") {
-        return Ok(fact);
+    let name = crate::declarations::rust_node_text(occurrence, source);
+    while let Some(node) = stack.pop() {
+        charge(1)?;
+        let named_use = match node.kind() {
+            "self" => true,
+            "identifier" => matches!(
+                rust_occurrence_role(node),
+                Some(OccurrenceRole::ValueReference | OccurrenceRole::ReceiverPosition)
+            ),
+            _ => false,
+        };
+        if named_use
+            && crate::declarations::rust_node_text(node, source) == name
+            && rust_occurrence_may_write(node, charge)?
+            && crate::lexical_scope::rust_value_binding_at_bounded(node, source, charge)?
+                .is_some_and(|selected| selected.id() == binding.id())
+        {
+            return Ok(true);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
     }
-    let Some(binding) =
-        crate::lexical_scope::rust_value_binding_at_bounded(callee, source, charge)?
-    else {
+    Ok(false)
+}
+
+/// Whether a value use may write the binding it names: an assignment target,
+/// including a destructuring one, a `&mut` borrow or `ref mut` pattern
+/// scrutinee of a place it roots, a method receiver (autoref can borrow
+/// mutably), or a macro input, which can expand to any of these.
+fn rust_occurrence_may_write<E>(
+    occurrence: Node<'_>,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut node = occurrence;
+    // Composite expressions are transparent only to an assignment target;
+    // anywhere else they hold a moved or copied value, not the place.
+    let mut place = true;
+    while let Some(parent) = node.parent() {
+        charge(1)?;
+        match parent.kind() {
+            "token_tree" => return Ok(true),
+            "assignment_expression" | "compound_assignment_expr" => {
+                return Ok(is_field_of(parent, node, "left"));
+            }
+            "reference_expression" => {
+                let mut cursor = parent.walk();
+                return Ok(place
+                    && parent
+                        .named_children(&mut cursor)
+                        .any(|child| child.kind() == "mutable_specifier"));
+            }
+            "let_declaration" | "let_condition" if place && is_field_of(parent, node, "value") => {
+                return match parent.child_by_field_name("pattern") {
+                    Some(pattern) => rust_pattern_borrows_mutably(pattern, charge),
+                    None => Ok(false),
+                };
+            }
+            "match_expression" if place && is_field_of(parent, node, "value") => {
+                let Some(arms) = parent.child_by_field_name("body") else {
+                    return Ok(false);
+                };
+                let mut cursor = arms.walk();
+                for arm in arms.named_children(&mut cursor) {
+                    if let Some(pattern) = arm.child_by_field_name("pattern")
+                        && rust_pattern_borrows_mutably(pattern, charge)?
+                    {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+            "field_expression" if place && is_field_of(parent, node, "value") => {
+                // A method call, with or without a turbofish.
+                let call = nearest_ancestor(parent, |kind| kind != "generic_function");
+                if call.is_some_and(|call| {
+                    call.kind() == "call_expression"
+                        && call
+                            .child_by_field_name("function")
+                            .is_some_and(|function| call_function_target(function) == parent)
+                }) {
+                    return Ok(true);
+                }
+            }
+            "index_expression" if place && parent.named_child(0) == Some(node) => {}
+            "unary_expression"
+                if place
+                    && parent
+                        .child(0)
+                        .is_some_and(|operator| operator.kind() == "*") => {}
+            "parenthesized_expression" => {}
+            "call_expression" if is_field_of(parent, node, "arguments") => place = false,
+            "tuple_expression"
+            | "array_expression"
+            | "arguments"
+            | "field_initializer"
+            | "shorthand_field_initializer"
+            | "field_initializer_list"
+            | "struct_expression" => place = false,
+            _ => return Ok(false),
+        }
+        node = parent;
+    }
+    Ok(false)
+}
+
+/// Whether a pattern binds part of its scrutinee by `ref mut`.
+fn rust_pattern_borrows_mutably<E>(
+    pattern: Node<'_>,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        charge(1)?;
+        if node.kind() == "ref_pattern"
+            && node
+                .named_child(0)
+                .is_some_and(|inner| inner.kind() == "mut_pattern")
+        {
+            return Ok(true);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Ok(false)
+}
+
+/// Classify the value binding `callee` selected; `None` is a named item.
+fn rust_binding_callee_provenance<E>(
+    callee: Node<'_>,
+    binding: Option<Node<'_>>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<CalleeProvenanceFact, E> {
+    let mut fact = rust_unknown_callee_provenance();
+    let Some(binding) = binding else {
         fact.provenance = CalleeProvenance::Declared;
         return Ok(fact);
     };
@@ -942,6 +1188,76 @@ fn rust_callee_provenance<E>(
         fact.provenance = CalleeProvenance::Declared;
     }
     Ok(fact)
+}
+
+/// Inline and where-clause bounds on one structurally selected type. Callers
+/// select the lexical binder first; matching identifier values here does not
+/// infer a binding from spelling.
+pub fn rust_declared_type_bounds<'tree>(
+    owner: Node<'tree>,
+    ty: Node<'tree>,
+    source: &str,
+) -> Vec<Node<'tree>> {
+    let path = |node: Node<'tree>| {
+        // The native parameter rows select bare names. For a projection,
+        // compare plain path structure only; generic projections need their
+        // substitutions and must not inherit a differently applied bound.
+        let mut qualifier = node;
+        loop {
+            if qualifier.kind() == "generic_type" {
+                return None;
+            }
+            let Some(parent_path) = qualifier.child_by_field_name("path") else {
+                break;
+            };
+            qualifier = parent_path;
+        }
+        crate::graph_support::rust_path_segments(node).map(|nodes| {
+            nodes
+                .into_iter()
+                .map(|part| {
+                    brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                        crate::declarations::rust_node_text(part, source),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let expected = path(ty);
+    let same = |node: Node<'tree>| {
+        node.kind() == ty.kind()
+            && crate::graph_support::rust_path_is_leading_absolute(node)
+                == crate::graph_support::rust_path_is_leading_absolute(ty)
+            && expected
+                .as_ref()
+                .is_some_and(|expected| path(node).as_ref() == Some(expected))
+    };
+    let mut result = Vec::new();
+    if let Some(parameters) = owner.child_by_field_name("type_parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if parameter.child_by_field_name("name").is_some_and(same)
+                && let Some(bounds) = parameter.child_by_field_name("bounds")
+            {
+                result.push(bounds);
+            }
+        }
+    }
+    let mut cursor = owner.walk();
+    for clause in owner.named_children(&mut cursor) {
+        if clause.kind() != "where_clause" {
+            continue;
+        }
+        let mut cursor = clause.walk();
+        for predicate in clause.named_children(&mut cursor) {
+            if predicate.child_by_field_name("left").is_some_and(same)
+                && let Some(bounds) = predicate.child_by_field_name("bounds")
+            {
+                result.push(bounds);
+            }
+        }
+    }
+    result
 }
 
 fn rust_callee_bound_paths<E>(
@@ -1997,6 +2313,52 @@ mod result_use_tests {
     }
 
     #[test]
+    fn recovery_boundary_keeps_calls_open_and_hides_declarations() {
+        use brokk_bifrost_core::analyzer::structural::result_use::CallResultUseOpenReason;
+        let source = "match { fn nested() {} f(); }; fn sibling() {}";
+        let tree = tree(source);
+        let calls = call_nodes(&tree);
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].has_error(), "call itself must be clean");
+        let mut parent = calls[0].parent();
+        let mut recovered = false;
+        while let Some(node) = parent {
+            recovered |= node.is_error() || node.is_missing();
+            parent = node.parent();
+        }
+        assert!(recovered, "{}", tree.root_node().to_sexp());
+        assert_eq!(
+            rust_call_result_use(calls[0], source).for_port(0),
+            CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax)
+        );
+        let recovered_block = calls[0].parent().unwrap().parent().unwrap();
+        assert_eq!(recovered_block.kind(), "block");
+        let nested = recovered_block.named_child(0).unwrap();
+        assert_eq!(nested.kind(), "function_item");
+        assert_eq!(
+            nested
+                .child_by_field_name("name")
+                .unwrap()
+                .utf8_text(source.as_bytes())
+                .unwrap(),
+            "nested"
+        );
+        let parsed = crate::test_helpers::parse_rust_fixture(source);
+        let mut declarations = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.identifier())
+            .collect::<Vec<_>>();
+        declarations.sort_unstable();
+        assert_eq!(
+            declarations,
+            ["sibling"],
+            "ERROR interior must not publish declarations: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    #[test]
     fn exact_index_uses_the_call_span() {
         let source = "fn f() -> i32 { 1 }\nfn run() { f(); }\n";
         let tree = tree(source);
@@ -2102,31 +2464,172 @@ mod result_use_tests {
 
 #[test]
 fn callee_provenance_walk_obeys_the_extraction_work_allowance() {
-    let source = "fn run<F: Fn()>(f: F) { f(); }";
-    let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust grammar");
-    let mut stack = vec![tree.root_node()];
-    let call = loop {
-        let node = stack.pop().expect("fixture call");
-        if node.kind() == "call_expression" {
-            break node;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    };
-    let mut work = 0;
-    let fact = rust_callee_provenance(call, source, &mut |amount| {
-        work += amount;
-        Ok::<_, ()>(())
-    })
-    .expect("unlimited classification");
-    assert_eq!(fact.provenance, CalleeProvenance::CallerSupplied);
-    assert!(work > 1);
-    let mut remaining = work - 1;
-    assert!(
-        rust_callee_provenance(call, source, &mut |amount| {
-            remaining = remaining.checked_sub(amount).ok_or(())?;
+    // The alias form also charges the write scans of both mutable bindings.
+    for source in [
+        "fn run<F: Fn()>(f: F) { f(); }",
+        "fn run<F: FnMut()>(mut f: F) { let mut g = f; g(); }",
+    ] {
+        let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust grammar");
+        let mut stack = vec![tree.root_node()];
+        let call = loop {
+            let node = stack.pop().expect("fixture call");
+            if node.kind() == "call_expression" {
+                break node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        };
+        let mut work = 0;
+        let fact = rust_callee_provenance(call, source, &mut |amount| {
+            work += amount;
             Ok::<_, ()>(())
         })
-        .is_err()
-    );
+        .expect("unlimited classification");
+        assert_eq!(
+            fact.provenance,
+            CalleeProvenance::CallerSupplied,
+            "{source}"
+        );
+        assert!(work > 1);
+        let mut remaining = work - 1;
+        assert!(
+            rust_callee_provenance(call, source, &mut |amount| {
+                remaining = remaining.checked_sub(amount).ok_or(())?;
+                Ok::<_, ()>(())
+            })
+            .is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attribute_role_grammar_tests {
+    #[test]
+    fn grammar_derive_and_ordinary_attribute_arguments() {
+        for (attribute, expected) in [("derive", true), ("allow", false), ("custom", false)] {
+            let source = format!("#[{attribute}(Marker)] struct Item;");
+            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut pending = vec![tree.root_node()];
+            let marker = loop {
+                let node = pending.pop().expect("Marker token");
+                if node.kind() == "identifier" && node.utf8_text(source.as_bytes()) == Ok("Marker")
+                {
+                    break node;
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            };
+            assert_eq!(marker.parent().unwrap().kind(), "token_tree");
+            assert_eq!(
+                super::is_inside_derive_attribute(marker, &source),
+                expected,
+                "{attribute}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_role_grammar_boundary {
+    use super::*;
+
+    #[test]
+    fn ownership_structural_roles_follow_grammar_fields() {
+        let source = "use dep::*; use root::{a, nest::{b as c, *}}; fn f() { module::helper(); Wrapper::<Outer>::make::<Inner>(); let S { member: bound } = value; }";
+        let tree = crate::test_helpers::parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let parents = ParentIndex::new(tree.root_node());
+        let mut nodes = Vec::new();
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            nodes.push(node);
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        nodes.sort_by_key(Node::start_byte);
+        // Grammar-selected import targets and struct-pattern fields carry
+        // different namespaces despite sharing identifier-like spellings.
+        for (text, kind, parent_kind, field, role) in [
+            (
+                "dep",
+                "identifier",
+                "use_wildcard",
+                None,
+                OccurrenceRole::ImportTarget,
+            ),
+            (
+                "member",
+                "field_identifier",
+                "field_pattern",
+                Some("name"),
+                OccurrenceRole::MemberPosition,
+            ),
+            (
+                "bound",
+                "identifier",
+                "field_pattern",
+                Some("pattern"),
+                OccurrenceRole::Binder,
+            ),
+        ] {
+            let node = nodes
+                .iter()
+                .copied()
+                .find(|node| node.kind() == kind && &source[node.byte_range()] == text)
+                .unwrap();
+            let parent = node.parent().unwrap();
+            assert_eq!(parent.kind(), parent_kind);
+            assert_eq!(field_name_in_parent(parent, node), field);
+            assert_eq!(rust_occurrence_role(node), Some(role));
+        }
+        let mut output = Vec::new();
+        for node in nodes
+            .iter()
+            .copied()
+            .filter(|node| matches!(node.kind(), "call_expression" | "use_declaration"))
+        {
+            let mut facts = PrimarySourceFactCollector::new(source);
+            let mut sink = RoleSink::new(source, &mut facts, 32, None, &parents);
+            let kind = if node.kind() == "call_expression" {
+                NormalizedKind::Call
+            } else {
+                NormalizedKind::Import
+            };
+            RUST_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
+            let (_, roles, _, stop) = sink.into_parts();
+            assert_eq!(stop, None);
+            let mut selected = roles
+                .into_iter()
+                .filter(|role| {
+                    matches!(
+                        role.role,
+                        Role::Module | Role::Receiver | Role::TypeArguments
+                    )
+                })
+                .map(|role| {
+                    let range = facts.occurrence(role.occurrence).range;
+                    (
+                        role.role,
+                        source[range.start_byte..range.end_byte].to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            selected.sort_unstable();
+            output.push(selected);
+        }
+        assert_eq!(
+            output,
+            [
+                vec![(Role::Module, "dep".into())],
+                vec![(Role::Module, "a".into()), (Role::Module, "c".into())],
+                vec![(Role::Receiver, "module".into())],
+                vec![
+                    (Role::Receiver, "Wrapper::<Outer>".into()),
+                    (Role::TypeArguments, "Inner".into()),
+                    (Role::TypeArguments, "Outer".into())
+                ],
+            ]
+        );
+    }
 }

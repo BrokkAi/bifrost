@@ -4,10 +4,9 @@
 use super::*;
 use crate::analyzer::resolution::{
     CompanionTypeRelation, DeclarationAccessDecision, DeclarationAccessRequest,
-    DeclarationAccessRow, FactPageVisitor, JavaAccessEndpoint, JvmAccessEndpoint,
-    JvmDeclarationAccessRules, SelectedDeclarationAccessSource, SelectedTypedFactSource,
-    SubclassAccessContext, TypedFactReadOutcome, TypedFactRequest,
-    language_jvm_declaration_access_rules,
+    DeclarationAccessRow, FactPageVisitor, JvmAccessEndpoint, JvmDeclarationAccessRules,
+    SelectedDeclarationAccessSource, SelectedTypedFactSource, SubclassAccessContext,
+    TypedFactReadOutcome, TypedFactRequest, language_jvm_declaration_access_rules,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
@@ -25,11 +24,9 @@ pub(super) fn boundary_access_decision(
             let Some(package) = caller_package else {
                 return DeclarationAccessDecision::Unknown;
             };
-            let mut caller = package.split('.');
-            if region
-                .split('.')
-                .all(|segment| caller.next() == Some(segment))
-            {
+            if brokk_bifrost_core::analyzer::source_facts::PackageAccessRegion::enclosing_contains(
+                region, package,
+            ) {
                 DeclarationAccessDecision::Allowed
             } else {
                 DeclarationAccessDecision::Denied
@@ -53,8 +50,27 @@ pub(super) fn boundary_access_decision(
 }
 
 #[derive(Debug)]
-pub(super) struct JvmAccessPolicy {
-    pub(super) identity: SemanticId,
+pub(crate) struct JvmAccessPolicy {
+    pub(crate) identity: SemanticId,
+}
+
+// Both policy identities are stateless; canonicalize their Arc inside the
+// selected operation so independently prepared file contexts can merge without
+// relaxing the shared context's access-source correspondence requirement.
+pub(super) type JvmAccessPolicyMemo = HashMap<SemanticId, Arc<JvmAccessPolicy>>;
+
+impl SelectedResolutionOperation<'_, '_> {
+    pub(super) fn jvm_declaration_access_source(
+        &self,
+        identity: SemanticId,
+    ) -> Arc<dyn SelectedDeclarationAccessSource> {
+        Arc::clone(
+            self.jvm_access_policies
+                .borrow_mut()
+                .entry(identity)
+                .or_insert_with(|| Arc::new(JvmAccessPolicy { identity })),
+        ) as Arc<dyn SelectedDeclarationAccessSource>
+    }
 }
 
 impl SelectedDeclarationAccessSource for JvmAccessPolicy {
@@ -81,37 +97,15 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
                 ResolutionCompletion::Complete,
             ));
         };
-        let Some(java_endpoints) = facts.java_access_endpoints(&semantics, cancellation)? else {
-            return Ok(TypedFactReadOutcome::cancelled(
-                ResolutionCompletion::Complete,
-            ));
-        };
         let mut endpoints = HashMap::<SemanticId, JvmAccessEndpoint>::default();
         for endpoint in jvm_endpoints {
-            if endpoint.language == brokk_bifrost_core::analyzer::Language::Scala {
+            if matches!(
+                endpoint.language,
+                brokk_bifrost_core::analyzer::Language::Java
+                    | brokk_bifrost_core::analyzer::Language::Scala
+            ) {
                 assert!(endpoints.insert(endpoint.semantic, endpoint).is_none());
             }
-        }
-        for JavaAccessEndpoint {
-            semantic,
-            package,
-            outermost_type,
-        } in java_endpoints
-        {
-            assert!(
-                endpoints
-                    .insert(
-                        semantic,
-                        JvmAccessEndpoint {
-                            semantic,
-                            language: brokk_bifrost_core::analyzer::Language::Java,
-                            package,
-                            enclosing_templates: Vec::new(),
-                            outermost_type,
-                        },
-                    )
-                    .is_none()
-            );
         }
         let definitions = requests
             .as_slice()
@@ -163,6 +157,7 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
         }
         let templates = endpoints
             .values()
+            .filter(|endpoint| endpoint.language == brokk_bifrost_core::analyzer::Language::Scala)
             .flat_map(|endpoint| endpoint.enclosing_templates.iter().copied())
             .chain(visibilities.values().filter_map(|property| {
                 match property.boundary() {
@@ -317,11 +312,20 @@ impl SelectedDeclarationAccessSource for JvmAccessPolicy {
                     }
                 }
                 (
-                    Some(_),
-                    Some(_),
+                    Some(reference),
+                    Some(target),
                     Some(DeclaredVisibility::Protected),
                     Some(JvmDeclarationAccessRules::Java),
-                ) => DeclarationAccessDecision::Unknown,
+                ) if reference.language == brokk_bifrost_core::analyzer::Language::Java => {
+                    visibility_applies = true;
+                    if let Some(owner) = target.enclosing_templates.first().copied() {
+                        subclass_access = Some(SubclassAccessContext {
+                            enclosing_templates: reference.enclosing_templates.clone(),
+                            declaration_template: owner,
+                        });
+                    }
+                    DeclarationAccessDecision::Unknown
+                }
                 (Some(_), Some(_), _, Some(JvmDeclarationAccessRules::Kotlin)) => {
                     DeclarationAccessDecision::Unknown
                 }

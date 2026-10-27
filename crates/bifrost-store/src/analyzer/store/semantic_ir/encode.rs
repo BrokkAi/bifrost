@@ -30,7 +30,7 @@ use crate::analyzer::semantic::{
 use crate::hash::HashMap;
 
 /// The cells of every child table, row-major, in each table's column order.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) struct EncodedRows {
     cells: [Vec<Value>; Table::COUNT],
     /// The payload estimate per table.

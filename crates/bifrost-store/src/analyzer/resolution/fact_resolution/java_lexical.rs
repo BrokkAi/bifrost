@@ -1076,10 +1076,15 @@ impl FactEvaluation<'_, '_> {
         // branch instead of retaining the already-traversed subtype's gap.
         // Replay retires closed-empty branches for selected source, external
         // and intrinsic bindings before bridging, with the implicit-root proof.
-        // This is not a proof of absence: only incomplete evidence is replayed.
+        // A complete empty search discharges the source-owned hierarchy
+        // placeholder too: finding no member is not an unsupported traversal.
+        // Other lexical branches retain their independent placement uncertainty.
         if selection.owners.is_empty() && replaces_branch {
             let normalized = branch_completion.combine(&completion);
-            if normalized != *branch.completion() && normalized != ResolutionCompletion::Complete {
+            if normalized == ResolutionCompletion::Complete {
+                return Ok((additions, true));
+            }
+            if normalized != *branch.completion() {
                 let Some(endpoint) =
                     self.java_inherited_frontier_endpoint(branch.end(), &normalized)?
                 else {

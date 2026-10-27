@@ -47,9 +47,13 @@ pub struct GoWorkspacePathIndex {
 }
 
 impl GoWorkspacePathIndex {
+    /// `refused_sources` are the sources that source admission refused at the
+    /// selected revision. They supply no `package` clause and no facts, but
+    /// they are explained exclusions rather than missing inventory.
     pub fn build(
         project: &dyn Project,
         mut declared_package: impl FnMut(&ProjectFile) -> Option<String>,
+        refused_sources: &HashSet<ProjectFile>,
     ) -> Self {
         let (files, complete) = match project.all_files() {
             Ok(files) => (files, true),
@@ -67,7 +71,10 @@ impl GoWorkspacePathIndex {
             .filter(|file| !is_under_unnamed_module(file, &unnamed_module_roots, &module_roots))
             .collect::<Vec<_>>();
         let mut representative_by_directory: HashMap<PathBuf, ProjectFile> = HashMap::default();
-        for file in &go_files {
+        for file in go_files
+            .iter()
+            .filter(|file| !refused_sources.contains(*file))
+        {
             representative_by_directory
                 .entry(file.parent())
                 .and_modify(|representative| {
@@ -89,7 +96,22 @@ impl GoWorkspacePathIndex {
             let Some(declared_package) =
                 declared_package(file).filter(|declared_package| !declared_package.is_empty())
             else {
-                index.complete = false;
+                // A refused non-test source in a named module still proves
+                // its directory's importable package; a refused test file
+                // adds no importable package. Elsewhere the identity needs
+                // the clause, so absence stays unproven.
+                match refused_sources
+                    .contains(file)
+                    .then(|| index.module_import_path(file))
+                    .flatten()
+                {
+                    Some(package) => {
+                        if !is_go_test_file(file) {
+                            exact_import_paths.insert(package);
+                        }
+                    }
+                    None => index.complete = false,
+                }
                 continue;
             };
             let canonical = index.canonical_package_name(file, &declared_package);
@@ -107,7 +129,8 @@ impl GoWorkspacePathIndex {
     /// was available: the whole-workspace file listing succeeded, every listed
     /// `go.mod` was readable and lexically valid, each named module's decoded
     /// path satisfies Go's module-path element restrictions, and every Go file
-    /// inside a named module supplied a nonempty parsed `package` clause.
+    /// inside a named module supplied a nonempty parsed `package` clause or
+    /// was refused by source admission.
     /// A valid manifest without a module directive is an unnamed module
     /// boundary, so its files are excluded from the package inventory. Other
     /// go.mod directives are not semantically validated. When this is false,
@@ -186,9 +209,20 @@ impl GoWorkspacePathIndex {
             return no_module_base(file, declared_package);
         }
         let (declared_base, is_external_test) = declared_package_parts(file, declared_package);
-        let file_dir = file.parent();
         let base = self
-            .module_roots
+            .module_import_path(file)
+            .unwrap_or_else(|| no_module_base(file, declared_base));
+        external_test_package_name(base, is_external_test)
+    }
+
+    /// The import path of the file's directory under its nearest named
+    /// module, which needs no `package` clause.
+    fn module_import_path(&self, file: &ProjectFile) -> Option<String> {
+        if self.is_outside_selected_modules(file) {
+            return None;
+        }
+        let file_dir = file.parent();
+        self.module_roots
             .iter()
             .filter(|module| file_dir.starts_with(&module.workspace_dir))
             .max_by_key(|module| module.workspace_dir.components().count())
@@ -199,8 +233,6 @@ impl GoWorkspacePathIndex {
                     &relative.to_string_lossy().replace('\\', "/"),
                 ))
             })
-            .unwrap_or_else(|| no_module_base(file, declared_base));
-        external_test_package_name(base, is_external_test)
     }
 
     /// Whether two source files belong to the same nearest Go module. When
@@ -294,13 +326,18 @@ pub fn source_inventory_role(file: &ProjectFile, declared_package: &str) -> &'st
 /// Whether a source filename or parsed leading comment excludes package
 /// inventory from Go-tool-independent completion.
 pub fn source_file_has_build_constraints(file: &ProjectFile, has_build_directive: bool) -> bool {
-    let (goos, goarch) = source_filename_target(file);
+    source_path_has_build_constraints(file.rel_path(), has_build_directive)
+}
+
+/// Build constraints carried by a source-relative path or extracted directive.
+pub fn source_path_has_build_constraints(path: &Path, has_build_directive: bool) -> bool {
+    let (goos, goarch) = source_filename_target(path);
     has_build_directive || goos.is_some() || goarch.is_some()
 }
 
 /// Filename-only build selection. Directive evaluation requires Go-tool evidence.
 pub fn source_filename_matches_target(file: &ProjectFile, goos: &str, goarch: &str) -> bool {
-    let (file_os, file_arch) = source_filename_target(file);
+    let (file_os, file_arch) = source_filename_target(file.rel_path());
     file_os.is_none_or(|os| {
         os == goos
             || matches!(
@@ -310,8 +347,8 @@ pub fn source_filename_matches_target(file: &ProjectFile, goos: &str, goarch: &s
     }) && file_arch.is_none_or(|arch| arch == goarch)
 }
 
-fn source_filename_target(file: &ProjectFile) -> (Option<&str>, Option<&str>) {
-    let Some(stem) = file.rel_path().file_stem().and_then(|stem| stem.to_str()) else {
+fn source_filename_target(path: &Path) -> (Option<&str>, Option<&str>) {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return (None, None);
     };
     let stem = stem.strip_suffix("_test").unwrap_or(stem);
@@ -997,14 +1034,19 @@ mod tests {
         write_file(&root, "pkg/foo.go", "package pkg\n");
         let project = TestProject::new(root.clone(), Language::Go);
 
-        let complete = GoWorkspacePathIndex::build(&project, |_| Some("pkg".to_owned()));
+        let complete = GoWorkspacePathIndex::build(
+            &project,
+            |_| Some("pkg".to_owned()),
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
         assert!(complete.is_complete());
         assert!(complete.exact_package_exists("example.com/repo/pkg"));
 
-        let incomplete =
-            GoWorkspacePathIndex::build(&UnlistableProject { delegate: project }, |_| {
-                Some("pkg".to_owned())
-            });
+        let incomplete = GoWorkspacePathIndex::build(
+            &UnlistableProject { delegate: project },
+            |_| Some("pkg".to_owned()),
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
         assert!(!incomplete.is_complete());
         assert!(!incomplete.exact_package_exists("example.com/repo/pkg"));
         assert!(
@@ -1022,10 +1064,11 @@ mod tests {
         write_file(&root, "pkg/foo.go", "package pkg\n");
         let project = TestProject::new(root, Language::Go);
 
-        let incomplete =
-            GoWorkspacePathIndex::build(&UnreadableManifestProject { delegate: project }, |_| {
-                Some("pkg".to_owned())
-            });
+        let incomplete = GoWorkspacePathIndex::build(
+            &UnreadableManifestProject { delegate: project },
+            |_| Some("pkg".to_owned()),
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
         assert!(!incomplete.is_complete());
         assert!(!incomplete.exact_package_exists("example.com/repo/pkg"));
     }
@@ -1049,16 +1092,20 @@ mod tests {
             write_file(&root, path, source);
         }
         let project = TestProject::new(root, Language::Go);
-        let index = GoWorkspacePathIndex::build(&project, |file| {
-            Some(
-                match file.rel_path().file_name().and_then(|name| name.to_str()) {
-                    Some("a_external_test.go") => "mixed_test",
-                    Some("z_internal_test.go") => "mixed",
-                    _ => "pkg",
-                }
-                .to_owned(),
-            )
-        });
+        let index = GoWorkspacePathIndex::build(
+            &project,
+            |file| {
+                Some(
+                    match file.rel_path().file_name().and_then(|name| name.to_str()) {
+                        Some("a_external_test.go") => "mixed_test",
+                        Some("z_internal_test.go") => "mixed",
+                        _ => "pkg",
+                    }
+                    .to_owned(),
+                )
+            },
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
 
         assert!(index.is_complete());
         for import_path in [
@@ -1116,16 +1163,20 @@ mod tests {
         );
 
         let project = TestProject::new(root, Language::Go);
-        let index = GoWorkspacePathIndex::build(&project, |file| {
-            Some(
-                match file.rel_path().file_name().and_then(|name| name.to_str()) {
-                    Some("ordinary.go") => "ordinary_test",
-                    Some("external_test.go") => "external_test",
-                    _ => "external",
-                }
-                .to_owned(),
-            )
-        });
+        let index = GoWorkspacePathIndex::build(
+            &project,
+            |file| {
+                Some(
+                    match file.rel_path().file_name().and_then(|name| name.to_str()) {
+                        Some("ordinary.go") => "ordinary_test",
+                        Some("external_test.go") => "external_test",
+                        _ => "external",
+                    }
+                    .to_owned(),
+                )
+            },
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
         assert_eq!(
             index.canonical_package_name(&ordinary, "ordinary_test"),
             "example.com/repo/ordinary"
@@ -1451,13 +1502,17 @@ mod tests {
         write_file(&root, "root.go", "package rootpkg\n");
         write_file(&root, "child/child.go", "package child\n");
         let project = TestProject::new(root, Language::Go);
-        let index = GoWorkspacePathIndex::build(&project, |file| {
-            if file.parent().as_os_str().is_empty() {
-                Some("rootpkg".to_owned())
-            } else {
-                Some("child".to_owned())
-            }
-        });
+        let index = GoWorkspacePathIndex::build(
+            &project,
+            |file| {
+                if file.parent().as_os_str().is_empty() {
+                    Some("rootpkg".to_owned())
+                } else {
+                    Some("child".to_owned())
+                }
+            },
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
 
         assert!(index.is_complete());
         assert!(index.exact_package_exists("rootpkg"));

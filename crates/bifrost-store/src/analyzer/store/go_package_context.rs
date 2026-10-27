@@ -16,10 +16,14 @@ use crate::path_normalization::NormalizePath;
 use brokk_bifrost_core::analyzer::go_facts::GO_BUILD_SELECTION_FACTS_VERSION;
 use brokk_bifrost_go::package_discovery::{GoPackage, GoPackageDiscovery};
 
-/// Version 10 normalizes Go-tool membership paths before joining selected sources,
-/// including ignored files and absolute Windows test-variant paths.
+/// Version 11 admits source-bearing dependencies as providers while keeping
+/// caller ownership with each discovery domain's main modules. Version 13
+/// names a member that source admission refused with its recorded reason and
+/// folds refused inputs into each domain's input digest. Version 12 labels
+/// contexts from builds of this change before its final gap vocabulary, so
+/// those contexts are never selected.
 #[doc(hidden)]
-pub const DERIVATION_VERSION: i64 = 10;
+pub const DERIVATION_VERSION: i64 = 13;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[doc(hidden)]
@@ -42,8 +46,23 @@ pub enum GoContextHeadStatus {
 #[doc(hidden)]
 pub enum GoInputObservationOutcome {
     Ready(GoInputObservation),
-    InputsChanged,
+    InputsChanged(GoInputChange),
     Cancelled,
+}
+
+/// The first disagreement between the disk input domain and the selected
+/// revision, reported with a refused publication.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum GoInputChange {
+    /// The revision selects or refuses an input the disk listing omits.
+    Unlisted { kind: String, path: String },
+    /// The revision selects or refuses an input that no longer exists.
+    Missing { kind: String, path: String },
+    /// The input's bytes no longer hash to the revision's blob.
+    ContentChanged { kind: String, path: String },
+    /// A listed input that the revision neither selects nor records as refused.
+    Unrecorded { kind: String, path: String },
 }
 
 /// Fixed-size observation, held only through one discovery invocation.
@@ -78,6 +97,18 @@ pub(crate) const OBSERVE_INPUTS_SQL: &str =
                AND valid_from <= ?3 AND (valid_until IS NULL OR ?3 < valid_until)
              ORDER BY input_kind, rel_path";
 
+pub(crate) const REFUSED_INPUT_SQL: &str = "SELECT json(reason) FROM workspace_source_refusals
+             WHERE workspace_id = ?1 AND lang = 'go' AND generation = ?2 AND rel_path = ?3
+               AND valid_from <= ?4 AND (valid_until IS NULL OR ?4 < valid_until)";
+
+/// Sources the revision records as refused by source admission. They complete
+/// the input domain: present on disk, deliberately without a source row.
+pub(crate) const REFUSED_INPUTS_SQL: &str =
+    "SELECT rel_path, blob_oid, json(reason) FROM workspace_source_refusals
+             WHERE workspace_id = ?1 AND lang = 'go' AND generation = ?2
+               AND valid_from <= ?3 AND (valid_until IS NULL OR ?3 < valid_until)
+             ORDER BY rel_path";
+
 #[doc(hidden)]
 pub const PRIOR_HEADS_SQL: &str =
     "SELECT s.profile_digest,s.selection_id,p.context_id,p.publication_digest
@@ -105,8 +136,8 @@ pub(crate) const SELECT_CONTEXT_SQL: &str =
 pub fn base_profile_digest(discovery: &GoPackageDiscovery) -> [u8; 32] {
     let mut hash = CanonicalHasher::new(b"bifrost-go-context-base-profile:v1");
     for (key, value) in [
-        ("goos", discovery.goos.as_str()),
-        ("goarch", discovery.goarch.as_str()),
+        ("goos", discovery.build_configuration.goos.as_str()),
+        ("goarch", discovery.build_configuration.goarch.as_str()),
         ("goversion", discovery.environment.goversion.as_str()),
     ] {
         hash.field(key, value.as_bytes());
@@ -121,9 +152,14 @@ pub fn base_profile_digest(discovery: &GoPackageDiscovery) -> [u8; 32] {
     for pattern in &discovery.workspace_patterns {
         hash.field("pattern", pattern.as_bytes());
     }
-    hash.field("cgo", &[0]);
+    let cgo_identity = u8::from(discovery.build_configuration.cgo_enabled);
+    assert_eq!(
+        cgo_identity, 0,
+        "the selected Go context currently keeps the cgo identity byte disabled"
+    );
+    hash.field("cgo", &[cgo_identity]);
     hash.field("tests", &[1]);
-    for tag in &discovery.build_tags {
+    for tag in &discovery.build_configuration.tags {
         hash.field("tag", tag.as_bytes());
     }
     hash.finish()
@@ -310,13 +346,14 @@ impl AnalyzerStore {
             )
         }));
         let conn = self.read_conn()?;
-        let mut statement = conn.prepare_cached(OBSERVE_INPUTS_SQL)?;
-        let mut rows = statement.query(params![
+        let params = params![
             snapshot.workspace_id.as_str(),
             snapshot.generation.get(),
             snapshot.revision
-        ])?;
-        let mut hash = CanonicalHasher::new(b"bifrost-go-observed-inputs:v1");
+        ];
+        let mut hash = CanonicalHasher::new(b"bifrost-go-observed-inputs:v2");
+        let mut selected = conn.prepare_cached(OBSERVE_INPUTS_SQL)?;
+        let mut rows = selected.query(params)?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
                 return Ok(GoInputObservationOutcome::Cancelled);
@@ -324,29 +361,48 @@ impl AnalyzerStore {
             let kind: String = row.get(0)?;
             let path: String = row.get(1)?;
             let oid: String = row.get(2)?;
-            if !inventory.remove(&(kind.clone(), path.clone())) {
-                return Ok(GoInputObservationOutcome::InputsChanged);
+            if let Some(change) = observe_recorded_input(
+                project,
+                &mut inventory,
+                &mut hash,
+                &kind,
+                &kind,
+                path,
+                &oid,
+            )? {
+                return Ok(GoInputObservationOutcome::InputsChanged(change));
             }
-            let absolute = project.root().join(&path);
-            let bytes = match std::fs::read(&absolute) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(GoInputObservationOutcome::InputsChanged);
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if Oid::hash_object(ObjectType::Blob, &bytes)?.to_string() != oid {
-                return Ok(GoInputObservationOutcome::InputsChanged);
-            }
-            let metadata = std::fs::metadata(&absolute)?;
-            hash.field("kind", kind.as_bytes());
-            hash.field("path", path.as_bytes());
-            hash.field("oid", oid.as_bytes());
-            hash.field("modified", format!("{:?}", metadata.modified()?).as_bytes());
-            hash.field("length", &metadata.len().to_le_bytes());
         }
-        if !inventory.is_empty() {
-            return Ok(GoInputObservationOutcome::InputsChanged);
+        drop(rows);
+        drop(selected);
+        // A refused source is listed like any source; the revision records
+        // its blob and reason instead of selecting it.
+        let mut refused = conn.prepare_cached(REFUSED_INPUTS_SQL)?;
+        let mut rows = refused.query(params)?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(GoInputObservationOutcome::Cancelled);
+            }
+            let path: String = row.get(0)?;
+            let oid: String = row.get(1)?;
+            let reason: String = row.get(2)?;
+            hash.field("refusal", reason.as_bytes());
+            if let Some(change) = observe_recorded_input(
+                project,
+                &mut inventory,
+                &mut hash,
+                "source",
+                "refused",
+                path,
+                &oid,
+            )? {
+                return Ok(GoInputObservationOutcome::InputsChanged(change));
+            }
+        }
+        if let Some((kind, path)) = inventory.pop_first() {
+            return Ok(GoInputObservationOutcome::InputsChanged(
+                GoInputChange::Unrecorded { kind, path },
+            ));
         }
         if cancellation.is_cancelled() {
             return Ok(GoInputObservationOutcome::Cancelled);
@@ -403,6 +459,51 @@ impl AnalyzerStore {
             .optional()?;
         Ok(selected)
     }
+}
+
+/// Match one recorded input against the listing and its current bytes, and
+/// fold its identity into the observation. `family` is the listing family the
+/// recorded `kind` accounts for.
+fn observe_recorded_input(
+    project: &dyn Project,
+    inventory: &mut BTreeSet<(String, String)>,
+    hash: &mut CanonicalHasher,
+    family: &str,
+    kind: &str,
+    path: String,
+    oid: &str,
+) -> Result<Option<GoInputChange>> {
+    let kind_owned = || kind.to_owned();
+    if !inventory.remove(&(family.to_owned(), path.clone())) {
+        return Ok(Some(GoInputChange::Unlisted {
+            kind: kind_owned(),
+            path,
+        }));
+    }
+    let absolute = project.root().join(&path);
+    let bytes = match std::fs::read(&absolute) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(GoInputChange::Missing {
+                kind: kind_owned(),
+                path,
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if Oid::hash_object(ObjectType::Blob, &bytes)?.to_string() != oid {
+        return Ok(Some(GoInputChange::ContentChanged {
+            kind: kind_owned(),
+            path,
+        }));
+    }
+    let metadata = std::fs::metadata(&absolute)?;
+    hash.field("kind", kind.as_bytes());
+    hash.field("path", path.as_bytes());
+    hash.field("oid", oid.as_bytes());
+    hash.field("modified", format!("{:?}", metadata.modified()?).as_bytes());
+    hash.field("length", &metadata.len().to_le_bytes());
+    Ok(None)
 }
 
 struct PackageRows {
@@ -628,9 +729,51 @@ impl AnalyzerStore {
             {
                 continue;
             }
+            // Source availability and main-module ownership are separate roles.
+            // Resolve admitted inventory once per tool member before classifying the provider.
+            let mut selected_members = Vec::new();
+            for (absolute, ignored) in go_tool_source_members(&package) {
+                let relative = absolute.strip_prefix(&root).ok().and_then(|path| {
+                    crate::path_utils::workspace_rel_path(
+                        &crate::path_utils::workspace_relative_slash_path(path),
+                    )
+                });
+                let member = if let Some(relative) = &relative {
+                    conn.query_row(
+                        CANONICAL_SOURCE_SQL,
+                        params![
+                            snapshot.workspace_id.as_str(),
+                            snapshot.generation.get(),
+                            crate::path_utils::workspace_relative_slash_path(relative),
+                            snapshot.revision
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<i64>>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                } else {
+                    None
+                };
+                selected_members.push((absolute, ignored, relative, member));
+            }
+            // A main module's packages are workspace source even when no member
+            // is admitted; that case keeps its unselected_source_input gaps. A
+            // dependency is a workspace provider only when its source is admitted
+            // here, as for a local replace.
             let provider_kind = if package.standard {
                 "standard"
-            } else if package.module.as_ref().is_some_and(|module| !module.main) {
+            } else if package.module.as_ref().is_some_and(|module| !module.main)
+                && !selected_members
+                    .iter()
+                    .any(|(_, _, _, member)| member.is_some())
+            {
                 "module"
             } else {
                 "workspace"
@@ -689,46 +832,41 @@ impl AnalyzerStore {
             // instance. TestGoFiles/XTestGoFiles alone describe possible tests;
             // they do not select an internal or external test variant. Ignored
             // paths record exclusion evidence without admitting source or imports.
-            let selected_paths = if source_less_provider {
-                std::collections::BTreeMap::new()
-            } else {
-                go_tool_source_members(&package)
-            };
-            for (absolute, ignored) in selected_paths {
-                let relative = absolute.strip_prefix(&root).ok().and_then(|path| {
-                    crate::path_utils::workspace_rel_path(
-                        &crate::path_utils::workspace_relative_slash_path(path),
-                    )
-                });
-                let member = if let Some(relative) = &relative {
-                    conn.query_row(
-                        CANONICAL_SOURCE_SQL,
-                        params![
-                            snapshot.workspace_id.as_str(),
-                            snapshot.generation.get(),
-                            crate::path_utils::workspace_relative_slash_path(relative),
-                            snapshot.revision
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, Option<String>>(3)?,
-                                row.get::<_, Option<i64>>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?
-                } else {
-                    None
-                };
+            if source_less_provider {
+                selected_members.clear();
+            }
+            for (absolute, ignored, relative, member) in selected_members {
                 let Some((_id, _oid, declared, state, version)) = member else {
-                    if !ignored {
-                        gaps.push(
-                            json!({"code":"unselected_source_input", "evidence":{"path":absolute}}),
-                        );
+                    if ignored {
+                        continue;
                     }
+                    // A refusal is an explained exclusion: it limits only the
+                    // packages that compile the file, and names its reason.
+                    let refusal = match &relative {
+                        Some(relative) => conn
+                            .query_row(
+                                REFUSED_INPUT_SQL,
+                                params![
+                                    snapshot.workspace_id.as_str(),
+                                    snapshot.generation.get(),
+                                    crate::path_utils::workspace_relative_slash_path(relative),
+                                    snapshot.revision
+                                ],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?,
+                        None => None,
+                    };
+                    gaps.push(match refusal {
+                        Some(reason) => json!({"code":"source_admission_refused", "evidence":{
+                            "path":absolute,
+                            "reason":serde_json::from_str::<serde_json::Value>(&reason)
+                                .expect("the schema checks refusal reasons are JSON"),
+                        }}),
+                        None => {
+                            json!({"code":"unselected_source_input", "evidence":{"path":absolute}})
+                        }
+                    });
                     continue;
                 };
                 if !ignored
@@ -1224,6 +1362,43 @@ impl AnalyzerStore {
         }
         drop(files);
         drop(query);
+        // A refused source has no row above, so no package learned of it there,
+        // and its package clause is unknown. Every package in its directory is
+        // partial over it, with the file and reason as package evidence. The
+        // gap stays on the packages: a context-level gap would make every
+        // request in the workspace incomplete.
+        let mut refused = conn.prepare_cached(REFUSED_INPUTS_SQL)?;
+        let mut refusals = refused.query(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision
+        ])?;
+        while let Some(refusal) = refusals.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let path: String = refusal.get(0)?;
+            if !admits(&root.join(&path)) {
+                continue;
+            }
+            let reason: serde_json::Value = serde_json::from_str(&refusal.get::<_, String>(2)?)
+                .expect("the schema checks refusal reasons are JSON");
+            publication.field("refused-path", path.as_bytes());
+            let directory = root.join(Path::new(&path).parent().unwrap_or(Path::new("")));
+            for package in packages
+                .values_mut()
+                .filter(|package| package.directory == directory)
+            {
+                package.complete = false;
+                package
+                    .gaps
+                    .push(json!({"code":"source_admission_refused","evidence":{
+                        "path":path,"reason":reason
+                    }}));
+            }
+        }
+        drop(refusals);
+        drop(refused);
         for package in packages.values_mut() {
             let declared = &names[&package.import_path];
             if declared.len() != 1 {
@@ -1331,7 +1506,23 @@ impl AnalyzerStore {
                 hash
             })
             .collect::<Vec<_>>();
-        for (path, oid, _, _) in &rows {
+        // A refused source is a domain input too: `go list` reads its bytes.
+        let refused = conn
+            .prepare_cached(REFUSED_INPUTS_SQL)?
+            .query_map(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let selected = rows.iter().map(|(path, oid, _, _)| ("path", path, oid));
+        let refused = refused
+            .iter()
+            .map(|(path, oid)| ("refused-path", path, oid));
+        for (field, path, oid) in selected.chain(refused) {
             let path_value = Path::new(path);
             let owner = path_value
                 .parent()
@@ -1350,7 +1541,7 @@ impl AnalyzerStore {
                         || path_value
                             == Path::new(&domain.gowork_path).with_file_name("go.work.sum"));
                 if member || workfile {
-                    hash.field("path", path.as_bytes());
+                    hash.field(field, path.as_bytes());
                     hash.field("oid", oid.as_bytes());
                 }
             }
@@ -1422,7 +1613,8 @@ pub(crate) const MISSING_MEMBER_PATHS_SQL: &str="SELECT member.rel_path FROM go_
      AND file.valid_from<=?2 AND (file.valid_until IS NULL OR ?2<file.valid_until)) ORDER BY member.rel_path";
 
 // Q1/Q4: membership is authority, never an ancestor-directory approximation.
-// M4c will extend provider membership; only workspace providers have sources today.
+// Provider membership selects every build context holding the source as a target.
+// Owner lookup selects only main-module packages to resolve and scan callers once.
 pub(crate) const CONTEXTS_FOR_FILE_SQL: &str = r#"
 SELECT DISTINCT c.selection_id, c.context_id, c.publication_digest, s.profile_digest
 FROM go_package_files f
@@ -1436,7 +1628,23 @@ WHERE f.rel_path=?6 AND p.provider_kind='workspace' AND f.source_role<>'ignored'
 ORDER BY c.context_id
 "#;
 
-pub(crate) const CONTEXTS_FOR_DEFINITION_FILE_SQL: &str = r#"
+pub(crate) const OWNER_CONTEXT_FOR_FILE_SQL: &str = r#"
+SELECT DISTINCT c.selection_id, c.context_id, c.publication_digest, s.profile_digest
+FROM go_package_files f
+JOIN go_package_instances p ON p.package_id=f.package_id
+JOIN go_context_publications c ON c.context_id=p.context_id
+JOIN go_context_selections s ON s.selection_id=c.selection_id
+WHERE f.rel_path=?6 AND p.provider_kind='workspace' AND f.source_role<>'ignored'
+  AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
+  AND s.base_profile_digest=?4 AND s.derivation_version=?5
+  AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
+  AND (p.provider_module_path IS NULL OR EXISTS(
+    SELECT 1 FROM go_context_domain_modules m
+    WHERE m.context_id=c.context_id AND m.module_path=p.provider_module_path))
+ORDER BY c.context_id
+"#;
+
+pub(crate) const OWNER_CONTEXT_FOR_DEFINITION_FILE_SQL: &str = r#"
 SELECT DISTINCT c.selection_id, c.context_id, c.publication_digest, s.profile_digest
 FROM go_package_files f
 JOIN go_package_instances p ON p.package_id=f.package_id
@@ -1446,6 +1654,9 @@ WHERE f.rel_path=?6 AND p.provider_kind='workspace'
   AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
   AND s.base_profile_digest=?4 AND s.derivation_version=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
+  AND (p.provider_module_path IS NULL OR EXISTS(
+    SELECT 1 FROM go_context_domain_modules m
+    WHERE m.context_id=c.context_id AND m.module_path=p.provider_module_path))
 ORDER BY c.context_id
 "#;
 
@@ -1458,13 +1669,28 @@ pub(crate) fn go_contexts_for_file_on(
     contexts_for_file_statement_on(conn, snapshot, base, path, CONTEXTS_FOR_FILE_SQL)
 }
 
-pub(crate) fn go_contexts_for_definition_file_on(
+pub(crate) fn go_owner_context_for_file_on(
     conn: &rusqlite::Connection,
     snapshot: &WorkspaceSnapshotId,
     base: &[u8; 32],
     path: &str,
 ) -> Result<Vec<(GoContextIdentity, [u8; 32])>> {
-    contexts_for_file_statement_on(conn, snapshot, base, path, CONTEXTS_FOR_DEFINITION_FILE_SQL)
+    contexts_for_file_statement_on(conn, snapshot, base, path, OWNER_CONTEXT_FOR_FILE_SQL)
+}
+
+pub(crate) fn go_owner_context_for_definition_file_on(
+    conn: &rusqlite::Connection,
+    snapshot: &WorkspaceSnapshotId,
+    base: &[u8; 32],
+    path: &str,
+) -> Result<Vec<(GoContextIdentity, [u8; 32])>> {
+    contexts_for_file_statement_on(
+        conn,
+        snapshot,
+        base,
+        path,
+        OWNER_CONTEXT_FOR_DEFINITION_FILE_SQL,
+    )
 }
 
 fn contexts_for_file_statement_on(
@@ -1515,6 +1741,22 @@ impl AnalyzerStore {
         let contexts = {
             let conn = self.read_conn()?;
             go_contexts_for_file_on(&conn, snapshot, base, path)?
+        };
+        for (context, _) in &contexts {
+            self.validate_go_context_members(context)?;
+        }
+        Ok(contexts)
+    }
+    #[doc(hidden)]
+    pub fn go_owner_context_for_file(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        base: &[u8; 32],
+        path: &str,
+    ) -> Result<Vec<(GoContextIdentity, [u8; 32])>> {
+        let contexts = {
+            let conn = self.read_conn()?;
+            go_owner_context_for_file_on(&conn, snapshot, base, path)?
         };
         for (context, _) in &contexts {
             self.validate_go_context_members(context)?;

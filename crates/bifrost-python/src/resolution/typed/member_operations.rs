@@ -530,6 +530,31 @@ pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &Ha
                     receiver_reference = Some(reference);
                 }
             }
+            // Literal member observations use the operation's existing receiver
+            // value, exactly as an attribute reference does. Unknown names keep
+            // their unsupported name site and cannot prove exclusion.
+            if matches!(
+                form,
+                PythonMemberForm::Getattr | PythonMemberForm::Setattr | PythonMemberForm::Delattr
+            ) && let PythonMemberNames::Exact(exact) = &names
+                && let [member] = exact.as_slice()
+                && let Some(receiver) = receiver_slot
+            {
+                t.p.facts.sites[name_site.index()].kind = ResolutionSiteKind::MemberReference;
+                t.p.facts.identifiers.push(PositionedIdentifierFact {
+                    site: name_site,
+                    name: *member,
+                    role: ResolutionIdentifierRole::Reference,
+                    namespace: ResolutionNamespace::Value,
+                    qualifier: Some(receiver),
+                });
+                let value =
+                    t.p.facts
+                        .allocate_type_slot(name_site, ResolutionTypeSlotRole::ExpressionValue);
+                t.p.facts.binding_projections.push(
+                    BindingProjectionFact::target_declared_value_type(name_site, value),
+                );
+            }
             let effect = match form {
                 PythonMemberForm::Getattr => PythonMemberEffect::Read,
                 PythonMemberForm::Delattr => PythonMemberEffect::Delete,

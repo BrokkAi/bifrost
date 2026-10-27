@@ -99,7 +99,7 @@ impl<'tree> ExportedMacroDefinitions<'tree> {
         Self { definitions }
     }
 
-    fn from_root(root: Node<'tree>, source: &str) -> Self {
+    pub(crate) fn from_root(root: Node<'tree>, source: &str) -> Self {
         let mut pending = vec![(root, None)];
         let mut definitions = Vec::new();
         while let Some((node, parent)) = pending.pop() {
@@ -335,10 +335,23 @@ fn match_local_macro_invocation_using_definitions<'tree>(
     exported_definitions: Option<&ExportedMacroDefinitions<'tree>>,
     lexical_context: Node<'tree>,
 ) -> Option<Result<MacroArmMatch, MacroMatchError>> {
+    let arguments = crate::declarations::rust_macro_invocation_arguments(invocation)?;
+    let definition =
+        local_macro_definition(invocation, source, exported_definitions, lexical_context)?;
+    Some(match_syntax_macro_rules(
+        definition, source, arguments, source,
+    ))
+}
+
+fn local_macro_definition<'tree>(
+    invocation: Node<'tree>,
+    source: &str,
+    exported_definitions: Option<&ExportedMacroDefinitions<'tree>>,
+    lexical_context: Node<'tree>,
+) -> Option<Node<'tree>> {
     let textual_name =
         crate::declarations::rust_unqualified_macro_invocation_name(invocation, source);
     let name = textual_name.or_else(|| crate_root_macro_invocation_name(invocation, source))?;
-    let arguments = crate::declarations::rust_macro_invocation_arguments(invocation)?;
     let mut root = invocation;
     // Match through the same original-coordinate scopes as explicit imports.
     for scope in macro_lexical_scopes(invocation, lexical_context) {
@@ -360,20 +373,85 @@ fn match_local_macro_invocation_using_definitions<'tree>(
             {
                 return None;
             }
-            return Some(match_syntax_macro_rules(
-                definition, source, arguments, source,
-            ));
+            return Some(definition);
         }
         root = scope;
     }
-    let definition = if let Some(exported_definitions) = exported_definitions {
+    if let Some(exported_definitions) = exported_definitions {
         exported_definitions.unique_named(name, source)
     } else {
         ExportedMacroDefinitions::from_root(root, source).unique_named(name, source)
-    }?;
-    Some(match_syntax_macro_rules(
-        definition, source, arguments, source,
-    ))
+    }
+}
+
+/// A matched arm can authorize ordinary item replay even if an unselected
+/// arm is not a passthrough. Require all input tokens to belong to the item
+/// captures, since declaration replay reparses the original input as a whole.
+/// The inventory predicate cannot prove this: repetition separators are not
+/// emitted as child nodes by the grammar and can sit outside Item captures.
+pub(crate) fn local_macro_invocation_replays_items_only(
+    invocation: Node<'_>,
+    source: &str,
+    exported_definitions: &ExportedMacroDefinitions<'_>,
+) -> bool {
+    let Some(arguments) = crate::declarations::rust_macro_invocation_arguments(invocation) else {
+        return false;
+    };
+    let Some(definition) =
+        local_macro_definition(invocation, source, Some(exported_definitions), invocation)
+    else {
+        return false;
+    };
+    let mut cursor = definition.walk();
+    let item_arms = definition
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "macro_rule")
+        .map(|rule| {
+            crate::declarations::rust_macro_rule_expands_to_its_arguments_only(rule, source)
+        })
+        .collect::<Vec<_>>();
+    // Ordinary expression/type macros cannot authorize item replay. Avoid
+    // matching (and reparsing their captures) a second time for this question.
+    if !item_arms.iter().any(|item_arm| *item_arm) {
+        return false;
+    }
+    let Ok(matched) = match_syntax_macro_rules(definition, source, arguments, source) else {
+        return false;
+    };
+    if !item_arms[matched.arm_index] {
+        return false;
+    }
+    // The arguments-only rule refuses meta bindings and separated repetitions,
+    // so a successful match of an item-only arm leaves every input token inside
+    // an Item capture. A failure here means that rule has a hole.
+    debug_assert!(
+        item_captures_cover_input(arguments, &matched),
+        "item-only arm {} left input outside its Item captures: {:?}",
+        matched.arm_index,
+        &source[arguments.byte_range()]
+    );
+    true
+}
+
+fn item_captures_cover_input(arguments: Node<'_>, matched: &MacroArmMatch) -> bool {
+    let mut pending = interior_tokens(arguments).0;
+    while let Some(node) = pending.pop() {
+        if node.is_extra() {
+            continue;
+        }
+        if matched.bindings.iter().any(|binding| {
+            binding.fragment == MacroFragmentKind::Item
+                && binding.contains(node.start_byte(), node.end_byte())
+        }) {
+            continue;
+        }
+        if node.child_count() == 0 {
+            return false;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    true
 }
 
 /// Read root-path macro authority once from real syntax, excluding generated
@@ -1227,6 +1305,19 @@ impl MacroTranscriber {
                     &chunks,
                 )
             {
+                // A literal crate-qualified path is resolved in the same
+                // crate as this source-local invocation, even for an exported
+                // macro. This relies on source-local replay: literal `crate::`
+                // and `$crate::` have the same crate only when definition and
+                // invocation belong to that crate. Cross-crate replay must use
+                // ordinary_crate_anchors and definition_crate_anchors separately.
+                // This transcriber carries no crate identities to assert here.
+                // The definition by itself supplied no such authority.
+                let crate_qualified =
+                    matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+                        && crate::graph_support::rust_path_segments(node).is_some_and(|segments| {
+                            segments.first().is_some_and(|head| head.kind() == "crate")
+                        });
                 let reference_role =
                     if crate::resolution::rust_enclosing_item_generic_parameter_namespace(
                         node, &expanded,
@@ -1234,6 +1325,17 @@ impl MacroTranscriber {
                     .is_some()
                     {
                         None
+                    } else if crate_qualified {
+                        if node.kind() == "scoped_type_identifier" {
+                            Some(MacroTranscribedReferenceRole::Type)
+                        } else if node.parent().is_some_and(|parent| {
+                            parent.kind() == "call_expression"
+                                && parent.child_by_field_name("function") == Some(node)
+                        }) {
+                            Some(MacroTranscribedReferenceRole::Call)
+                        } else {
+                            None
+                        }
                     } else {
                         match crate::structural::rust_occurrence_role(node) {
                         Some(brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole::TypeOperand)
@@ -1994,7 +2096,13 @@ use brokk_bifrost_core::analyzer::tree_walk::first_named_child_of_kind as named_
 fn first_source_item(root: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
-        .find(|child| crate::declarations::rust_is_indexable_item_kind(child.kind()))
+        // Retain the grammar's attribute wrapper: an item fragment owns its
+        // outer attributes as well as the declaration they decorate.
+        .find(|child| {
+            crate::declarations::rust_is_indexable_item_kind(
+                crate::syntax::unwrap_attributes(*child).kind(),
+            )
+        })
 }
 
 fn largest_clean_node_starting_at(root: Node<'_>, start: usize) -> Option<Node<'_>> {
@@ -2400,6 +2508,478 @@ mod tests {
 
     fn binding_text<'a>(source: &'a str, binding: &MacroBinding) -> &'a str {
         &source[binding.start_byte..binding.end_byte]
+    }
+
+    #[test]
+    #[ignore = "finds real bug (#6861): expression fragment accepts a lone comma argument outside an opaque macro"]
+    #[hardwon("#6861: the pinned Rust grammar accepts a lone comma in call arguments")]
+    fn grammar_macro_expression_lone_comma_argument() {
+        let direct = parse("fn f() { nested!().method(,); }");
+        assert!(
+            direct.root_node().has_error(),
+            "the pinned grammar accepted a lone comma outside opaque macro input: {}",
+            direct.root_node().to_sexp()
+        );
+        let source = "macro_rules! take { ($e:expr) => {}; } take!(nested!().method(,));";
+        let tree = parse(source);
+        let (definition, arguments) = definition_and_invocation(&tree, source);
+        assert_eq!(
+            match_syntax_macro_rules(definition, source, arguments, source),
+            Err(MacroMatchError::NoArmMatched)
+        );
+    }
+
+    #[test]
+    fn grammar_macro_expression_recovery_boundary() {
+        for (expression, accepted) in [
+            ("nested!(,)", true),
+            ("nested!().method()", true),
+            ("nested!(,).method()", true),
+            ("nested!().method(, value)", false),
+        ] {
+            let source = format!("macro_rules! take {{ ($e:expr) => {{}}; }} take!({expression});");
+            let tree = parse(&source);
+            let (definition, arguments) = definition_and_invocation(&tree, &source);
+            if !accepted {
+                let (wrapped, prefix) = wrap_fragment(MacroFragmentKind::Expr, expression);
+                let recovered = parse(&wrapped);
+                let node = recovered
+                    .root_node()
+                    .descendant_for_byte_range(prefix, prefix + expression.len())
+                    .unwrap();
+                assert_ne!(node.kind(), "macro_invocation");
+                assert!(node.has_error(), "{}", node.to_sexp());
+            }
+            let result = match_syntax_macro_rules(definition, &source, arguments, &source);
+            if accepted {
+                let matched = result.unwrap();
+                assert_eq!(binding_text(&source, &matched.bindings[0]), expression);
+            } else {
+                assert_eq!(result, Err(MacroMatchError::NoArmMatched));
+            }
+        }
+    }
+
+    #[test]
+    fn grammar_macro_identifier_role_positions() {
+        for (body, role) in [
+            ("fn generated(&$t) {}", MacroIdentRole::Unused),
+            ("fn generated(_: &$t) {}", MacroIdentRole::Type),
+            ("fn generated() -> $t { loop {} }", MacroIdentRole::Type),
+            ("fn generated() { $t(); }", MacroIdentRole::Value),
+        ] {
+            let source = format!("macro_rules! take {{ ($t:ident) => {{ {body} }}; }}");
+            let tree = parse(&source);
+            let right = named_descendant(tree.root_node(), "macro_rule")
+                .unwrap()
+                .child_by_field_name("right")
+                .unwrap();
+            assert_eq!(
+                ident_transcriber_role(right, &source, "t"),
+                role,
+                "{source}"
+            );
+            if body == "fn generated() -> $t { loop {} }" {
+                let metavar = named_descendant(right, "metavariable").unwrap();
+                assert_eq!(metavar.prev_sibling().unwrap().kind(), "->");
+                assert_eq!(ident_role_from_siblings(metavar), MacroIdentRole::Type);
+            }
+        }
+    }
+
+    #[test]
+    fn grammar_exported_macro_inventory() {
+        let source = "mod hidden { #[macro_export] macro_rules! yes { () => {}; } macro_rules! no { () => {}; } } #[cfg(any())] mod disabled { #[macro_export] macro_rules! absent { () => {}; } }";
+        let tree = parse(source);
+        assert!(!tree.root_node().has_error());
+        let exports = ExportedMacroDefinitions::from_root(tree.root_node(), source);
+        assert_eq!(exports.definitions.len(), 1);
+        let exported = exports.unique_named("yes", source).unwrap();
+        assert_eq!(exported.kind(), "macro_definition");
+        assert!(exports.unique_named("no", source).is_none());
+        assert!(exports.unique_named("absent", source).is_none());
+    }
+
+    #[test]
+    fn grammar_macro_fragment_inherits_source_scope() {
+        let source = "macro_rules! inner { ($t:ty) => {}; } fn run() { outer!(inner!(Item)); }";
+        let tree = parse(source);
+        let outer = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+        let arguments = crate::declarations::rust_macro_invocation_arguments(outer).unwrap();
+        let start = source.find("inner!(Item)").unwrap();
+        let binding = MacroBinding {
+            name: "e".to_owned(),
+            fragment: MacroFragmentKind::Expr,
+            start_byte: start,
+            end_byte: start + "inner!(Item)".len(),
+            repetition_path: Vec::new(),
+            ident_role: None,
+        };
+        let fragment = parse_bound_fragment(&binding, source).unwrap();
+        let inner = named_descendant(fragment.root_node(), "macro_invocation").unwrap();
+        let matched =
+            match_local_macro_invocation_using_definitions(inner, source, None, arguments)
+                .expect("lexical source scope supplies inner")
+                .unwrap();
+        assert_eq!(binding_text(source, &matched.bindings[0]), "Item");
+    }
+
+    #[test]
+    fn grammar_transcriber_repetition_static_path_coordinates() {
+        let source = "macro_rules! take { ($($t:ty),*) => {\n    $(\n        fn generated(_: $t) {\n            crate::target();\n        }\n    )*\n}; }";
+        let tree = parse(source);
+        let definition = named_descendant(tree.root_node(), "macro_definition").unwrap();
+        let rule = named_descendant(definition, "macro_rule").unwrap();
+        let right = rule.child_by_field_name("right").unwrap();
+        let parsed = parse_macro_transcriber(right, source);
+        // The static reparse tolerates surrounding recovery; selected clean
+        // paths must still retain their original byte and point coordinates.
+        let path = named_descendant(parsed.tree.root_node(), "scoped_identifier").unwrap();
+        let start = source.find("crate::target").unwrap();
+        assert_eq!(path.byte_range(), start..start + "crate::target".len());
+        assert_eq!(path.start_position(), tree_sitter::Point::new(3, 12));
+    }
+
+    #[test]
+    fn grammar_tt_replay_reference_spans() {
+        let source = "macro_rules! take { ($($t:tt)*) => { fn generated() { $($t)* } }; } take!(target(); crate::other());";
+        let tree = parse(source);
+        let (definition, arguments) = definition_and_invocation(&tree, source);
+        let matched = match_syntax_macro_rules(definition, source, arguments, source).unwrap();
+        let transcriber = capture_macro_transcribers(definition, source)
+            .remove(0)
+            .unwrap();
+        let output = transcriber.replayed_tt_output(
+            &matched.bindings,
+            source,
+            MacroTranscriberParseContext::Item,
+        );
+        let target = source.rfind("target").unwrap();
+        assert!(
+            output
+                .fragments
+                .iter()
+                .any(|fragment| fragment.start_byte == target
+                    && fragment.end_byte == target + 6
+                    && fragment.source == MacroTranscribedSource::Invocation
+                    && fragment.reference_role == Some(MacroTranscribedReferenceRole::Call)),
+            "{output:#?}"
+        );
+        assert!(
+            output
+                .fragments
+                .iter()
+                .any(|fragment| fragment.start_byte == target
+                    && fragment.end_byte == target + "target()".len()
+                    && fragment.syntax_kind == "call_expression"
+                    && fragment.source == MacroTranscribedSource::Invocation),
+            "{output:#?}"
+        );
+        let other = source.rfind("other").unwrap();
+        assert!(
+            output
+                .paths
+                .iter()
+                .any(|path| path.segments.contains(&(other, other + 5))),
+            "{output:#?}"
+        );
+    }
+
+    #[test]
+    fn grammar_macro_replay_substitution() {
+        // Each expected expansion is authored independently from the macro
+        // substitution rules. Compare grammar trees, so trivia is irrelevant.
+        for (rule, input, expected) in [
+            (
+                "(#![$m:meta]) => { fn generated() {} }",
+                "#![doc = \"text\"]",
+                "fn generated() {}",
+            ),
+            (
+                "(#[$m:meta]) => { fn generated() {} }",
+                "#[doc = \"text\"]",
+                "fn generated() {}",
+            ),
+            (
+                "($v:vis $t:ty) => { $v fn generated(_: $t) {} }",
+                "pub(crate) Item",
+                "pub(crate) fn generated(_: Item) {}",
+            ),
+            (
+                "($v:vis $t:ty) => { $v fn generated(_: $t) {} }",
+                "Item",
+                "fn generated(_: Item) {}",
+            ),
+            ("($($t:ty),*) => { $(fn generated(_: $t) {})* }", "", ""),
+            (
+                "($($t:ty),*) => { $(fn generated(_: $t) {})* }",
+                "Item, Other",
+                "fn generated(_: Item) {} fn generated(_: Other) {}",
+            ),
+            ("($($t:ty)?) => { $(fn generated(_: $t) {})? }", "", ""),
+            (
+                "($($t:ty)?) => { $(fn generated(_: $t) {})? }",
+                "Item",
+                "fn generated(_: Item) {}",
+            ),
+            (
+                "($($t:ty),+) => { $(fn generated(_: $t) {})+ }",
+                "Item, Other",
+                "fn generated(_: Item) {} fn generated(_: Other) {}",
+            ),
+            (
+                "($($t:tt)*) => { fn generated() { $($t)* } }",
+                "target();",
+                "fn generated() { target(); }",
+            ),
+            (
+                "($t:ident) => { fn generated() -> $t { loop {} } }",
+                "Item",
+                "fn generated() -> Item { loop {} }",
+            ),
+            (
+                "($t:ident) => { fn generated(&$t) {} }",
+                "self",
+                "fn generated(&self) {}",
+            ),
+        ] {
+            let source = format!("macro_rules! take {{ {rule}; }} take!({input});");
+            let tree = parse(&source);
+            let (definition, arguments) = definition_and_invocation(&tree, &source);
+            let matched =
+                match_syntax_macro_rules(definition, &source, arguments, &source).unwrap();
+            let transcriber = capture_macro_transcribers(definition, &source)
+                .remove(0)
+                .unwrap();
+            let (expanded, _) = transcriber
+                .replay(&matched.bindings, &source)
+                .expect("valid substitution");
+            let actual = parse(&expanded);
+            assert!(!actual.root_node().has_error(), "{expanded}");
+            assert_eq!(
+                actual.root_node().to_sexp(),
+                parse(expected).root_node().to_sexp(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_macro_binding_coordinates_and_namespaces() {
+        for (matcher, argument, fragment, evidence) in [
+            (
+                "$t:ty",
+                "Item",
+                MacroFragmentKind::Ty,
+                MacroNamespaceEvidence::Type,
+            ),
+            (
+                "$t:expr",
+                "target()",
+                MacroFragmentKind::Expr,
+                MacroNamespaceEvidence::Value,
+            ),
+            (
+                "$t:ident",
+                "true",
+                MacroFragmentKind::Ident,
+                MacroNamespaceEvidence::Value,
+            ),
+        ] {
+            let source = format!(
+                "// non-ASCII: \u{e9}\nmacro_rules! take {{ ({matcher}) => {{ $t }}; }}\nfn f() {{\n    take!({argument});\n}} "
+            );
+            let tree = parse(&source);
+            let (definition, arguments) = definition_and_invocation(&tree, &source);
+            let matched =
+                match_syntax_macro_rules(definition, &source, arguments, &source).unwrap();
+            let binding = &matched.bindings[0];
+            assert_eq!(binding.fragment, fragment);
+            assert_eq!(binding_text(&source, binding), argument);
+            if fragment != MacroFragmentKind::Ident {
+                assert_eq!(
+                    token_namespace_evidence(&matched, binding.start_byte, binding.end_byte),
+                    Some(evidence)
+                );
+                let parsed = parse_bound_fragment(binding, &source).unwrap();
+                let node = parsed
+                    .root_node()
+                    .descendant_for_byte_range(binding.start_byte, binding.end_byte)
+                    .unwrap();
+                assert_eq!(node.start_position(), tree_sitter::Point::new(3, 10));
+                assert_eq!(node.byte_range(), binding.start_byte..binding.end_byte);
+                let input = capture_macro_input(arguments, &source, &|| true).unwrap();
+                let lowered = lower_selected_macro_input_with_sources(
+                    &input,
+                    &matched,
+                    RustMacroItemContainer::Lexical,
+                );
+                let occurrences = lowered
+                    .sources
+                    .occurrences()
+                    .iter()
+                    .filter(|row| {
+                        row.range.start_byte == binding.start_byte
+                            && row.range.end_byte == binding.end_byte
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !occurrences.is_empty(),
+                    "selected fragment publishes its source span"
+                );
+                assert!(occurrences.iter().all(|row| row.provenance == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded), "{occurrences:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn grammar_macro_fragment_offsets() {
+        use MacroFragmentKind::{Expr, Item, Pat, Ty};
+        use MacroNamespaceEvidence::{Declaration, Type, Value};
+
+        let source = "// \u{e9}\nty!(&Caf\u{e9});\nexpr!(<Caf\u{e9} as Trait>::make(nested!(value)));\npat!(Some(ref caf\u{e9}));\nitem!(struct Caf\u{e9};);\n";
+        let tree = parse(source);
+        assert!(!tree.root_node().has_error());
+        // Fragment interior, original token, wrapped token, grammar parent and
+        // field. These coordinates are literal UTF-8 byte counts, not outputs
+        // from the wrapper or namespace classifier.
+        for (fragment, interior, original, wrapped_span, kind, parent_kind, field, evidence) in [
+            (
+                Ty,
+                10..16,
+                11..16,
+                22..27,
+                "type_identifier",
+                "reference_type",
+                Some("type"),
+                Type,
+            ),
+            (
+                Expr,
+                25..63,
+                26..31,
+                23..28,
+                "type_identifier",
+                "qualified_type",
+                Some("type"),
+                Type,
+            ),
+            (
+                Expr,
+                25..63,
+                35..40,
+                32..37,
+                "type_identifier",
+                "qualified_type",
+                Some("alias"),
+                Type,
+            ),
+            (
+                Expr,
+                25..63,
+                43..47,
+                40..44,
+                "identifier",
+                "scoped_identifier",
+                Some("name"),
+                Value,
+            ),
+            (
+                Pat,
+                71..86,
+                80..85,
+                27..32,
+                "identifier",
+                "ref_pattern",
+                None,
+                Value,
+            ),
+            (
+                Item,
+                95..108,
+                102..107,
+                7..12,
+                "type_identifier",
+                "struct_item",
+                Some("name"),
+                Declaration,
+            ),
+        ] {
+            let token = tree
+                .root_node()
+                .descendant_for_byte_range(original.start, original.end)
+                .unwrap();
+            let invocation =
+                enclosing_macro_invocation_for_argument(token).expect("argument invocation");
+            let name = invocation.child_by_field_name("macro").unwrap();
+            assert!(enclosing_macro_invocation_for_argument(name).is_none());
+            let arguments =
+                crate::declarations::rust_macro_invocation_arguments(invocation).unwrap();
+            assert_eq!(arguments.child(0).unwrap().end_byte(), interior.start);
+            assert_eq!(
+                arguments
+                    .child(arguments.child_count() - 1)
+                    .unwrap()
+                    .start_byte(),
+                interior.end
+            );
+            let fragment_source = &source[interior.clone()];
+            let (wrapped, prefix) = wrap_fragment(fragment, fragment_source);
+            let parsed = parse(&wrapped);
+            assert!(
+                !parsed.root_node().has_error(),
+                "{}",
+                parsed.root_node().to_sexp()
+            );
+            let node = parsed
+                .root_node()
+                .descendant_for_byte_range(wrapped_span.start, wrapped_span.end)
+                .unwrap();
+            assert_eq!(node.kind(), kind);
+            assert_eq!(node.byte_range(), wrapped_span);
+            assert_eq!(node.parent().unwrap().kind(), parent_kind);
+            if let Some(field) = field {
+                assert_eq!(
+                    node.parent().unwrap().child_by_field_name(field),
+                    Some(node)
+                );
+            } else {
+                assert_eq!(node.parent().unwrap().named_child(0), Some(node));
+            }
+            assert_eq!(&wrapped[wrapped_span.clone()], &source[original.clone()]);
+            assert_eq!(wrapped_span.start - prefix + interior.start, original.start);
+            assert_eq!(wrapped_span.end - prefix + interior.start, original.end);
+            assert_eq!(
+                classify_fragment_interior(
+                    fragment,
+                    fragment_source,
+                    original.start - interior.start,
+                    original.end - interior.start
+                ),
+                Some(evidence)
+            );
+            if fragment == Expr {
+                // The inner invocation is syntax only after the outer argument
+                // is reparsed. Its name is still excluded from its arguments.
+                let nested = parsed
+                    .root_node()
+                    .descendant_for_byte_range(45, 51)
+                    .unwrap();
+                assert_eq!(nested.kind(), "identifier");
+                assert_eq!(nested.utf8_text(wrapped.as_bytes()).unwrap(), "nested");
+                assert!(enclosing_macro_invocation_for_argument(nested).is_none());
+                let value = parsed
+                    .root_node()
+                    .descendant_for_byte_range(53, 58)
+                    .unwrap();
+                assert_eq!(
+                    enclosing_macro_invocation_for_argument(value)
+                        .unwrap()
+                        .child_by_field_name("macro"),
+                    Some(nested)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2843,7 +3423,10 @@ cut_error!(format!("bad"),);
     }
 
     #[test]
-    #[hardwon("#4482: item fragments rejected use declarations")]
+    #[hardwon(
+        "#4482: item fragments rejected use declarations; #6861: dropped meta prefixes admitted item replay"
+    )]
+    #[hardwon("#6912: item fragments rejected leading outer attributes")]
     fn item_fragments_match_use_declarations() {
         let source = "macro_rules! m { ($item:item) => {}; } m!(use alloc::vec::Vec;);";
         let tree = parse(source);
@@ -2855,6 +3438,69 @@ cut_error!(format!("bad"),);
             binding_text(source, &matched.bindings[0]),
             "use alloc::vec::Vec;"
         );
+
+        // The inventory and selected-arm paths must agree when an arm drops
+        // an input attribute instead of replaying it as part of the item, and
+        // when a separated repetition consumes a comma that no Item capture
+        // holds (the grammar emits no node for the separator).
+        for (pattern, expansion, input, admitted) in [
+            ("$item:item", "$item", "fn ordinary() {}", true),
+            (
+                "$item:item",
+                "$item",
+                "#[derive(Debug)] pub struct Carried;",
+                true,
+            ),
+            (
+                "$($item:item)*",
+                "$($item)*",
+                "#[allow(dead_code)] /* between */ #[derive(Debug)] pub struct First; #[derive(Clone)] struct Second;",
+                true,
+            ),
+            (
+                "#[$m:meta] $item:item",
+                "$item",
+                "#[cfg(any())] fn hidden() {}",
+                false,
+            ),
+            (
+                "$($item:item)*",
+                "$($item)*",
+                "fn a() {} /* extra */ fn b() {}",
+                true,
+            ),
+            (
+                "$($item:item),*",
+                "$($item)*",
+                "fn a() {}, fn b() {}",
+                false,
+            ),
+        ] {
+            let source =
+                format!("macro_rules! m {{ ({pattern}) => {{ {expansion} }}; }} m!({input});");
+            let tree = parse(&source);
+            let (definition, arguments) = definition_and_invocation(&tree, &source);
+            match_syntax_macro_rules(definition, &source, arguments, &source).unwrap_or_else(
+                |error| panic!("arm must match before admission: {error:?}: {source}"),
+            );
+            assert_eq!(
+                crate::declarations::rust_macro_definition_expands_to_its_arguments_only(
+                    definition, &source,
+                ),
+                admitted,
+                "inventory: {source}",
+            );
+            let exports = ExportedMacroDefinitions::from_root(tree.root_node(), &source);
+            assert_eq!(
+                local_macro_invocation_replays_items_only(
+                    arguments.parent().expect("invocation"),
+                    &source,
+                    &exports,
+                ),
+                admitted,
+                "selected arm: {source}",
+            );
+        }
 
         let nonmatching = "macro_rules! m { ($item:item) => {}; } m!(let value = 1;);";
         let tree = parse(nonmatching);

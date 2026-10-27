@@ -268,25 +268,6 @@ impl CppCompileContexts {
             None => CppExternalIncludeResolution::Undeclared,
         }
     }
-
-    /// Every distinct explicit root that can supply an external angle include.
-    ///
-    /// The result is sorted for deterministic dependency discovery. It is a
-    /// source-set inventory, not proof that every compile configuration reaches
-    /// every root; per-reference resolution must still use
-    /// [`Self::resolve_external_angle_include`].
-    pub fn external_angle_include_roots(&self, workspace_root: &Path) -> Vec<PathBuf> {
-        let mut roots = self
-            .by_source
-            .values()
-            .flatten()
-            .flat_map(|context| context.external_angle_include_roots(workspace_root))
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        roots.sort();
-        roots.dedup();
-        roots
-    }
 }
 
 impl CppCompileContext {
@@ -324,14 +305,6 @@ impl CppCompileContext {
         } else {
             CompiledLanguage::Cpp
         }
-    }
-
-    /// Explicit external roots in compiler search order for angle includes.
-    pub fn external_angle_include_roots<'a>(
-        &'a self,
-        workspace_root: &'a Path,
-    ) -> impl Iterator<Item = &'a Path> + 'a {
-        self.external_include_roots(workspace_root, false)
     }
 
     fn external_include_roots<'a>(
@@ -376,7 +349,9 @@ impl CppCompileContext {
             if let Ok(candidate) = including_directory.join(include).canonicalize()
                 && candidate.is_file()
             {
-                if candidate.starts_with(&workspace_root) {
+                // `canonicalize` keeps the Windows verbatim prefix that
+                // `workspace_root` normalizes away; compare in one spelling.
+                if candidate.clone().normalize().starts_with(&workspace_root) {
                     return None;
                 }
                 if let Some(root) = self
@@ -691,7 +666,7 @@ mod tests {
     #[test]
     fn arguments_entry_collects_include_paths_and_macro_names() {
         let (_temp, project) = project_with_database(Some(
-            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-iquotequotes","-isystem","system-include","-DDEBUG=1","-D","FEATURE","-c","src/main.cpp"]}]"#,
+            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-iquotequotes","-isystem","system-include","-DDEBUG=1","-D","FEATURE=a=b","-c","src/main.cpp"]}]"#,
         ));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
         let contexts = CppCompileContexts::load(&project);
@@ -712,6 +687,7 @@ mod tests {
         );
         assert!(context.defined_macros.contains("DEBUG"));
         assert!(context.defined_macros.contains("FEATURE"));
+        assert!(!context.defined_macros.contains("FEATURE=a"));
     }
 
     #[test]
@@ -1243,5 +1219,51 @@ mod tests {
 
         let cx = context(&["cl.exe", "/c", "file.cpp"]);
         assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.cpp")));
+    }
+
+    #[test]
+    #[hardwon("#6929: a Windows verbatim prefix made an in-workspace sibling external")]
+    fn quoted_sibling_external_header_respects_workspace_boundary() {
+        // Filesystem identity is the oracle: quoted lookup first chooses a
+        // sibling; only a sibling outside the workspace belongs to this API.
+        let outer = tempfile::tempdir().unwrap();
+        let outer_root = outer.path().canonicalize().unwrap();
+        let workspace = outer_root.join("workspace");
+        let external = outer_root.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        for directory in [&workspace, &external] {
+            std::fs::write(directory.join("caller.hpp"), "#include \"sibling.hpp\"\n").unwrap();
+            std::fs::write(directory.join("sibling.hpp"), "struct S {};\n").unwrap();
+        }
+        // A declared root can contain the workspace; it still must not turn
+        // an in-workspace sibling into an external artifact.
+        let cx = super::parse_compile_arguments(
+            &workspace,
+            &[
+                "clang++".into(),
+                "-I".into(),
+                outer_root.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            cx.resolve_external_include(
+                &workspace,
+                &workspace.join("caller.hpp"),
+                Path::new("sibling.hpp"),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            cx.resolve_external_include(
+                &workspace,
+                &external.join("caller.hpp"),
+                Path::new("sibling.hpp"),
+                true
+            ),
+            Some((outer_root, external.join("sibling.hpp")))
+        );
     }
 }

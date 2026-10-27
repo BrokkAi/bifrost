@@ -59,6 +59,25 @@ def _decode_tagged_variant(decoder: Any, data: Any, tag: str, class_name: str) -
     return decoder(payload, class_name)
 
 
+class ArtifactExtractionKindVariant1(StrEnum):
+    NPM_PACKAGE_MANIFEST = 'npm_package_manifest'
+    TYPE_SCRIPT_DECLARATION_FILE = 'type_script_declaration_file'
+    JAVA_SOURCE_JAR = 'java_source_jar'
+    JAVA_CLASS_JAR = 'java_class_jar'
+    SCALA_SOURCE_JAR = 'scala_source_jar'
+    KOTLIN_SOURCE_JAR = 'kotlin_source_jar'
+    JDK_SOURCE_ZIP = 'jdk_source_zip'
+    JDK_JMOD_SET = 'jdk_jmod_set'
+    DOT_NET_ASSEMBLY = 'dot_net_assembly'
+    RUSTDOC_JSON = 'rustdoc_json'
+    RUSTDOC_JSON_SET = 'rustdoc_json_set'
+    TYPE_SCRIPT_LIBRARY_SET = 'type_script_library_set'
+    GO_SOURCE_SET = 'go_source_set'
+    PYTHON_STUB = 'python_stub'
+    PYTHON_SOURCE = 'python_source'
+    RUBY_GEM_ARCHIVE = 'ruby_gem_archive'
+
+
 class ChannelDirection(StrEnum):
     BIDIRECTIONAL = 'bidirectional'
     RECEIVE = 'receive'
@@ -356,6 +375,34 @@ class WildcardVariance(StrEnum):
     ANY = 'any'
     EXTENDS = 'extends'
     SUPER = 'super'
+
+
+@dataclass(frozen=True)
+class ArtifactExtraction:
+    inputs: ArtifactExtractionInputsVariant1 | ArtifactExtractionInputsVariant2
+    kind: ArtifactExtractionKindVariant1 | str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ArtifactExtraction:
+        return _decode_artifact_extraction(data, 'ArtifactExtraction')
+
+
+@dataclass(frozen=True)
+class ArtifactExtractionInputsVariant1:
+    sha256: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ArtifactExtractionInputsVariant1:
+        return _decode_artifact_extraction_inputs_variant1(data, 'ArtifactExtractionInputsVariant1')
+
+
+@dataclass(frozen=True)
+class ArtifactExtractionInputsVariant2:
+    digest: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ArtifactExtractionInputsVariant2:
+        return _decode_artifact_extraction_inputs_variant2(data, 'ArtifactExtractionInputsVariant2')
 
 
 @dataclass(frozen=True)
@@ -854,10 +901,13 @@ class CodeQueryCallSite:
 @dataclass(frozen=True)
 class CodeQueryCallableApplicability:
     candidate: CodeQueryCandidateRefVariant1 | CodeQueryCandidateRefVariant2 | CodeQueryCandidateRefVariant3 | CodeQueryCandidateRefVariant4 | CodeQueryCandidateRefVariant5 | CodeQueryCandidateRefVariant6 | CodeQueryCandidateRefVariant7
+    failing_argument: int | None
+    failing_conversion: str | None
     id: str
     language: str
     ordinal: int
     path: str
+    phase: str | None
     range: CodeQueryRange
     reason: str | None
     selected: bool
@@ -5170,6 +5220,7 @@ class SemanticModelProvenance:
     active_model_set_hash: str
     ambiguous: bool
     completeness: SemanticModelCompleteness
+    extraction: ArtifactExtraction | None
     origin: SemanticModelOriginKind
     pack_digest: str
     pack_id: str
@@ -5336,6 +5387,73 @@ class TypeRefVariant9:
     @classmethod
     def from_dict(cls, data: Any) -> TypeRefVariant9:
         return _decode_type_ref_variant9(data, 'TypeRefVariant9')
+
+def _decode_artifact_extraction(value: Any, prefix: str = 'ArtifactExtraction') -> ArtifactExtraction:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'inputs',
+        'kind',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'inputs',
+        'kind',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    inputs_value = _decode_defs_artifact_extraction_inputs(value['inputs'], f"{prefix}.inputs")
+    kind_value = _decode_defs_artifact_extraction_kind(value['kind'], f"{prefix}.kind")
+    return ArtifactExtraction(
+        inputs=inputs_value,
+        kind=kind_value,
+    )
+
+def _decode_artifact_extraction_inputs_variant1(value: Any, prefix: str = 'ArtifactExtractionInputsVariant1') -> ArtifactExtractionInputsVariant1:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'sha256',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'sha256',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    sha256_value = _decode_string(value['sha256'], f"{prefix}.sha256")
+    return ArtifactExtractionInputsVariant1(
+        sha256=sha256_value,
+    )
+
+def _decode_artifact_extraction_inputs_variant2(value: Any, prefix: str = 'ArtifactExtractionInputsVariant2') -> ArtifactExtractionInputsVariant2:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'digest',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'digest',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    digest_value = _decode_string(value['digest'], f"{prefix}.digest")
+    return ArtifactExtractionInputsVariant2(
+        digest=digest_value,
+    )
 
 def _decode_code_query_absent_member_finding(value: Any, prefix: str = 'CodeQueryAbsentMemberFinding') -> CodeQueryAbsentMemberFinding:
     if not isinstance(value, dict):
@@ -7362,10 +7480,13 @@ def _decode_code_query_callable_applicability(value: Any, prefix: str = 'CodeQue
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'candidate',
+        'failing_argument',
+        'failing_conversion',
         'id',
         'language',
         'ordinal',
         'path',
+        'phase',
         'range',
         'reason',
         'selected',
@@ -7394,10 +7515,22 @@ def _decode_code_query_callable_applicability(value: Any, prefix: str = 'CodeQue
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     candidate_value = _decode_defs_code_query_candidate_ref(value['candidate'], f"{prefix}.candidate")
+    if 'failing_argument' in value:
+        failing_argument_value = _decode_defs_code_query_result_item_union_48_properties_failing_argument(value['failing_argument'], f"{prefix}.failing_argument")
+    else:
+        failing_argument_value = None
+    if 'failing_conversion' in value:
+        failing_conversion_value = _decode_defs_code_query_result_item_union_48_properties_failing_conversion(value['failing_conversion'], f"{prefix}.failing_conversion")
+    else:
+        failing_conversion_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     ordinal_value = _decode_defs_code_query_result_item_union_48_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
     path_value = _decode_string(value['path'], f"{prefix}.path")
+    if 'phase' in value:
+        phase_value = _decode_defs_code_query_result_item_union_48_properties_phase(value['phase'], f"{prefix}.phase")
+    else:
+        phase_value = None
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
     if 'reason' in value:
         reason_value = _decode_defs_code_query_result_item_union_48_properties_reason(value['reason'], f"{prefix}.reason")
@@ -7420,10 +7553,13 @@ def _decode_code_query_callable_applicability(value: Any, prefix: str = 'CodeQue
         provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
     return CodeQueryCallableApplicability(
         candidate=candidate_value,
+        failing_argument=failing_argument_value,
+        failing_conversion=failing_conversion_value,
         id=id_value,
         language=language_value,
         ordinal=ordinal_value,
         path=path_value,
+        phase=phase_value,
         range=range_value,
         reason=reason_value,
         selected=selected_value,
@@ -21852,6 +21988,78 @@ def _decode_configuration_route_selector_variant2(value: Any, prefix: str = 'Con
         _Index=_Index_value,
     )
 
+class ArtifactExtractionInputs(metaclass=_TaggedUnionMeta):
+    @classmethod
+    def from_dict(cls, data: Any) -> ArtifactExtractionInputs:
+        if not isinstance(data, dict):
+            raise TypeDecoderError("expected tagged object")
+        if 'kind' not in data:
+            raise DecoderError(f"missing discriminator 'kind'")
+        tag_value = data['kind']
+        decoder = _artifact_extraction_inputs_decoders.get(tag_value)
+        if decoder is None:
+            raise DecoderError(f"unknown discriminator {tag_value!r}")
+        return decoder(data)
+
+def _decode_defs_artifact_extraction_inputs(value: Any, prefix: str = 'ArtifactExtractionInputs') -> ArtifactExtractionInputsVariant1 | ArtifactExtractionInputsVariant2:
+    return ArtifactExtractionInputs.from_dict(value)
+
+def _decode_defs_artifact_extraction_inputs_union_0_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'single'"
+    if value != 'single':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_artifact_extraction_inputs_union_1_properties_kind(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'source_set'"
+    if value != 'source_set':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_artifact_extraction_kind(value: Any, prefix: str = "union") -> ArtifactExtractionKindVariant1 | str:
+    errors = []
+    try:
+        return _decode_defs_artifact_extraction_kind_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_defs_artifact_extraction_kind_union_1(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_defs_artifact_extraction_kind_union_2(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_defs_artifact_extraction_kind_union_3(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_artifact_extraction_kind_union_0(value: Any, prefix: str = 'ArtifactExtractionKindVariant1') -> ArtifactExtractionKindVariant1:
+    values_repr = "['npm_package_manifest', 'type_script_declaration_file', 'java_source_jar', 'java_class_jar', 'scala_source_jar', 'kotlin_source_jar', 'jdk_source_zip', 'jdk_jmod_set', 'dot_net_assembly', 'rustdoc_json', 'rustdoc_json_set', 'type_script_library_set', 'go_source_set', 'python_stub', 'python_source', 'ruby_gem_archive']"
+    if value not in ('npm_package_manifest', 'type_script_declaration_file', 'java_source_jar', 'java_class_jar', 'scala_source_jar', 'kotlin_source_jar', 'jdk_source_zip', 'jdk_jmod_set', 'dot_net_assembly', 'rustdoc_json', 'rustdoc_json_set', 'type_script_library_set', 'go_source_set', 'python_stub', 'python_source', 'ruby_gem_archive'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return ArtifactExtractionKindVariant1(value)
+
+def _decode_defs_artifact_extraction_kind_union_1(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'composer_package_source_set'"
+    if value != 'composer_package_source_set':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_artifact_extraction_kind_union_2(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'php_declaration_stub'"
+    if value != 'php_declaration_stub':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_artifact_extraction_kind_union_3(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'cpp_header_source_set'"
+    if value != 'cpp_header_source_set':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
 def _decode_defs_channel_direction(value: Any, prefix: str = 'ChannelDirection') -> ChannelDirection:
     values_repr = "['bidirectional', 'receive', 'send']"
     if value not in ('bidirectional', 'receive', 'send'):
@@ -27632,11 +27840,47 @@ def _decode_defs_code_query_result_item_union_47_properties_value_id(value: Any,
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_item_union_48_properties_failing_argument(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_48_properties_failing_argument_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_48_properties_failing_argument_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_result_item_union_48_properties_failing_conversion(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_48_properties_ordinal(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
+
+def _decode_defs_code_query_result_item_union_48_properties_phase(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_result_item_union_48_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
     if not isinstance(value, list):
@@ -33462,6 +33706,18 @@ def _decode_defs_semantic_model_proof(value: Any, prefix: str = 'SemanticModelPr
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return SemanticModelProof(value)
 
+def _decode_defs_semantic_model_provenance_properties_extraction(value: Any, prefix: str = "union") -> ArtifactExtraction | None:
+    errors = []
+    try:
+        return _decode_artifact_extraction(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_semantic_model_provenance_properties_rule_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -33973,6 +34229,7 @@ def _decode_semantic_model_provenance(value: Any, prefix: str = 'SemanticModelPr
         'active_model_set_hash',
         'ambiguous',
         'completeness',
+        'extraction',
         'origin',
         'pack_digest',
         'pack_id',
@@ -34008,6 +34265,10 @@ def _decode_semantic_model_provenance(value: Any, prefix: str = 'SemanticModelPr
     active_model_set_hash_value = _decode_string(value['active_model_set_hash'], f"{prefix}.active_model_set_hash")
     ambiguous_value = _decode_boolean(value['ambiguous'], f"{prefix}.ambiguous")
     completeness_value = _decode_defs_semantic_model_completeness(value['completeness'], f"{prefix}.completeness")
+    if 'extraction' in value:
+        extraction_value = _decode_defs_semantic_model_provenance_properties_extraction(value['extraction'], f"{prefix}.extraction")
+    else:
+        extraction_value = None
     origin_value = _decode_defs_semantic_model_origin_kind(value['origin'], f"{prefix}.origin")
     pack_digest_value = _decode_string(value['pack_digest'], f"{prefix}.pack_digest")
     pack_id_value = _decode_string(value['pack_id'], f"{prefix}.pack_id")
@@ -34025,6 +34286,7 @@ def _decode_semantic_model_provenance(value: Any, prefix: str = 'SemanticModelPr
         active_model_set_hash=active_model_set_hash_value,
         ambiguous=ambiguous_value,
         completeness=completeness_value,
+        extraction=extraction_value,
         origin=origin_value,
         pack_digest=pack_digest_value,
         pack_id=pack_id_value,
@@ -34437,6 +34699,19 @@ def _decode_type_ref_variant9(value: Any, prefix: str = 'TypeRefVariant9') -> Ty
     )
 
 TAGGED_UNION_VARIANTS = {}
+
+_artifact_extraction_inputs_decoders = {
+    'single': lambda data: _decode_tagged_variant(_decode_artifact_extraction_inputs_variant1, data, 'kind', 'ArtifactExtractionInputsVariant1'),
+    'source_set': lambda data: _decode_tagged_variant(_decode_artifact_extraction_inputs_variant2, data, 'kind', 'ArtifactExtractionInputsVariant2'),
+}
+ArtifactExtractionInputs._variant_types = (ArtifactExtractionInputsVariant1, ArtifactExtractionInputsVariant2,)
+TAGGED_UNION_VARIANTS['ArtifactExtractionInputs'] = (
+    'kind',
+    {
+        'single': ArtifactExtractionInputsVariant1,
+        'source_set': ArtifactExtractionInputsVariant2,
+    },
+)
 
 _code_query_candidate_ref_decoders = {
     'intrinsic': lambda data: _decode_tagged_variant(_decode_code_query_candidate_ref_variant1, data, 'candidate_kind', 'CodeQueryCandidateRefVariant1'),

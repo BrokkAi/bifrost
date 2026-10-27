@@ -690,6 +690,77 @@ mod relational_inverted_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#6942: scan_node recursion depth followed source nesting"
+    )]
+    fn java_scan_node_deep_parentheses_are_stack_safe() {
+        let depth = 3000;
+        let source = format!(
+            "class Target {{ int run() {{ int value = {}0{}; Target ref = null; return value; }} }}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut wrappers = 0;
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "parenthesized_expression" {
+                    wrappers += 1;
+                }
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
+            },
+        );
+        assert_eq!(wrappers, depth);
+        eprintln!("scan_node: parsed {wrappers} parenthesized expressions");
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("Target.java", &source)
+            .build();
+        let analyzer = JavaAnalyzer::from_project(project.project().clone());
+        let target = analyzer
+            .get_definitions("Target")
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .unwrap();
+        let spec = TargetSpec::from_target(&analyzer, &target).unwrap();
+        let file = project.file("Target.java");
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, || {
+                    with_java_graph_source(&analyzer, |graph| {
+                        let caches = OwnedReturnTypeCaches::default();
+                        let outcome = extractor::scan_file_evidence(
+                            &analyzer,
+                            graph.token,
+                            &graph,
+                            &file,
+                            &spec,
+                            &caches.caches(),
+                            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+                        );
+                        let JavaFileEvidenceBuildOutcome::Complete(evidence) = outcome else {
+                            panic!("scan did not complete");
+                        };
+                        assert!(
+                            !evidence.hits.is_empty(),
+                            "the reference after the nested expression must be visited"
+                        );
+                    });
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "65ea4f91bb3b: Java inverse references omitted physical copies that shared an FQN"
     )]
     fn java_type_reference_reaches_each_duplicate_source_copy() {

@@ -56,6 +56,8 @@ use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
 
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_core::analyzer::structural::callable::FailingArgument;
+use brokk_bifrost_core::analyzer::structural::callable::InvocationPhase;
 
 use std::cell::RefCell;
 
@@ -452,6 +454,33 @@ pub(crate) fn record_native_declared_visibilities(rows: &[(CodeUnit, DeclaredVis
     });
 }
 
+/// Enrich the callable rows one native operation emitted with the invocation
+/// phase and failing argument its applicability check recorded. Overloads
+/// share a name, so rows are matched by their exact candidate declaration.
+pub(crate) fn record_native_invocation_evidence(
+    start: usize,
+    rows: &[(CodeUnit, Option<InvocationPhase>, Option<FailingArgument>)],
+) {
+    with_recorder(|recorder| {
+        assert!(
+            start <= recorder.candidates.len(),
+            "native projection retains its emission boundary"
+        );
+        for candidate in &mut recorder.candidates[start..] {
+            if candidate.callable.is_none() {
+                continue;
+            }
+            if let TraceCandidateRef::Unit(unit) = &candidate.candidate
+                && let Some((_, phase, failing_argument)) =
+                    rows.iter().find(|(target, _, _)| target == unit)
+            {
+                candidate.invocation_phase = *phase;
+                candidate.failing_argument = *failing_argument;
+            }
+        }
+    });
+}
+
 /// Stage `tier` for the next outcome constructor that reports one of
 /// `fq_names`.
 #[doc(hidden)]
@@ -637,6 +666,25 @@ impl Drop for DeepScope {
 #[doc(hidden)]
 pub fn deep_scope_is(name: &str) -> bool {
     with_recorder(|recorder| recorder.deep_name.as_deref() == Some(name)).unwrap_or(false)
+}
+
+/// Auxiliary proof lookups are not candidates for the reference being traced.
+/// Preserve the caller's entire recorder, including pending attribution, while
+/// the nested lookup runs. Restoration also happens when the lookup unwinds.
+#[doc(hidden)]
+pub fn without_recording<T>(lookup: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Recorder>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECORDER.with(|recorder| {
+                let mut recorder = recorder.borrow_mut();
+                debug_assert!(recorder.is_none());
+                *recorder = self.0.take();
+            });
+        }
+    }
+    let _restore = Restore(RECORDER.with(|recorder| recorder.borrow_mut().take()));
+    lookup()
 }
 
 /// Install a recorder for the extent of one batch.

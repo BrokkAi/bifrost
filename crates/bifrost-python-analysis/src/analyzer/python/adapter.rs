@@ -20,7 +20,7 @@ use brokk_bifrost_python::declarations::{
     module_code_unit, parse_python_file, python_module_fq, python_module_name,
 };
 use brokk_bifrost_python::queries::PYTHON_QUERY_DIRECTORY;
-use brokk_bifrost_python::test_detection::python_source_contains_tests;
+use brokk_bifrost_python::test_detection::python_tree_contains_tests;
 use tree_sitter::Tree;
 
 #[derive(Clone, Default)]
@@ -106,10 +106,10 @@ impl LanguageAdapter for PythonAdapter {
         &self,
         _file: &ProjectFile,
         source: &str,
-        _tree: &Tree,
+        tree: &Tree,
         _parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
     ) -> bool {
-        python_source_contains_tests(source)
+        python_tree_contains_tests(tree.root_node(), source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -122,6 +122,15 @@ impl LanguageAdapter for PythonAdapter {
         source: &str,
         tree: &Tree,
     ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
+        #[cfg(any(test, feature = "test-support"))]
+        if super::trial_native_python_selected() {
+            return brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
+                self.project(),
+                file,
+                source,
+                tree,
+            );
+        }
         parse_python_file(self.project(), file, source, tree)
     }
 

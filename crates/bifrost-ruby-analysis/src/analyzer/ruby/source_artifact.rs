@@ -408,6 +408,8 @@ fn project_type<'tree>(
         }
     }
     types.push(TypeFact {
+        implemented_traits_complete: false,
+        generic_trait_impls_complete: false,
         jvm_inventory: None,
         type_parameter_defaults: Vec::new(),
         implemented_traits: Vec::new(),

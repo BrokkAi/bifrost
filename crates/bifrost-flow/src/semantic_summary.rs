@@ -7,6 +7,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::analyzer::canonical_hash::{CanonicalHasher, parse_lower_sha256};
 use crate::analyzer::semantic::cfg_algorithms::{
@@ -283,9 +284,9 @@ impl std::error::Error for ProcedureSummaryBindingError {
 }
 
 struct SelectedUnmaterializedSummaryFamily {
-    payload_identity: usize,
+    order: usize,
+    shard: Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelShard>,
     language: String,
-    payload: Vec<CompiledProcedureSummary>,
     root_ids: HashSet<String>,
 }
 
@@ -309,34 +310,23 @@ pub fn bind_active_unmaterialized_procedure_summaries(
             continue;
         };
         let family = families
-            .entry(selected.payload.as_ptr() as usize)
+            .entry(Arc::as_ptr(&selected.shard) as usize)
             .or_insert_with(|| SelectedUnmaterializedSummaryFamily {
-                payload_identity: selected.payload.as_ptr() as usize,
+                order: active.procedure_summary_shard_order(&selected.shard),
+                shard: Arc::clone(&selected.shard),
                 language: selected.shard.manifest.language.clone(),
-                payload: selected.payload.to_vec(),
                 root_ids: HashSet::default(),
             });
         family.root_ids.insert(selected.record.id.clone());
     }
 
     let mut families = families.into_values().collect::<Vec<_>>();
-    families.sort_unstable_by(|left, right| {
-        left.language.cmp(&right.language).then_with(|| {
-            left.payload
-                .iter()
-                .map(|summary| (&summary.model_id, &summary.id))
-                .cmp(
-                    right
-                        .payload
-                        .iter()
-                        .map(|summary| (&summary.model_id, &summary.id)),
-                )
-        })
-    });
+    families.sort_unstable_by_key(|family| family.order);
     let mut aliases = Vec::new();
     for family in families {
-        let by_id = family
-            .payload
+        let payload = active
+            .procedure_summary_family(&family.shard, family.root_ids.iter().map(String::as_str));
+        let by_id = payload
             .iter()
             .map(|summary| (summary.id.as_str(), summary))
             .collect::<HashMap<_, _>>();
@@ -368,8 +358,7 @@ pub fn bind_active_unmaterialized_procedure_summaries(
                 }
             }
         }
-        let summaries = family
-            .payload
+        let summaries = payload
             .iter()
             .filter(|summary| selected_ids.contains(&summary.id))
             .cloned()
@@ -398,7 +387,7 @@ pub fn bind_active_unmaterialized_procedure_summaries(
                 let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                     continue;
                 };
-                if selected.payload.as_ptr() as usize == family.payload_identity
+                if Arc::ptr_eq(&selected.shard, &family.shard)
                     && selected.record.model_id == summary.model_id
                     && selected.record.id == summary.id
                 {
@@ -489,14 +478,10 @@ pub fn bind_active_unmaterialized_procedure_summaries(
     .map_err(|source| ProcedureSummaryBindingError::InvalidSummarySet { source })
 }
 
-fn select_unmaterialized_flow_summary<'matched, 'model>(
-    matched: &'matched ProcedureSummaryMatch<'model>,
+fn select_unmaterialized_flow_summary(
+    matched: &ProcedureSummaryMatch,
 ) -> Result<
-    Option<
-        &'matched brokk_bifrost_analysis::analyzer::semantic_model::ActivatedProcedureSummary<
-            'model,
-        >,
-    >,
+    Option<&brokk_bifrost_analysis::analyzer::semantic_model::ActivatedProcedureSummary>,
     ProcedureSummaryBindingError,
 > {
     if matched.applicability
@@ -532,8 +517,8 @@ fn select_unmaterialized_flow_summary<'matched, 'model>(
                 });
             }
             Ok(conflicting_flow_candidates_agree(
-                first.record,
-                rest.iter().map(|other| other.record),
+                &first.record,
+                rest.iter().map(|other| other.record.as_ref()),
             )
             .then_some(first))
         }
@@ -550,12 +535,15 @@ fn conflicting_flow_candidates_agree<'a>(
 }
 
 /// Bind one already-selected compiled summary family to exact mounted procedures.
-pub fn bind_compiled_procedure_summaries(
-    summaries: &[CompiledProcedureSummary],
+pub fn bind_compiled_procedure_summaries<T: std::borrow::Borrow<CompiledProcedureSummary>>(
+    summaries: &[T],
     bindings: Vec<ExactProcedureSummaryTargetBinding>,
     compatibility: ExternalSummaryCompatibilityKey,
 ) -> Result<ExternalSemanticSummarySet, ProcedureSummaryBindingError> {
-    let mut records = summaries.iter().collect::<Vec<_>>();
+    let mut records = summaries
+        .iter()
+        .map(std::borrow::Borrow::borrow)
+        .collect::<Vec<_>>();
     records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     if let Some(pair) = records.windows(2).find(|pair| pair[0].id == pair[1].id) {
         return Err(ProcedureSummaryBindingError::AmbiguousTarget {

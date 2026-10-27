@@ -109,7 +109,10 @@ use std::sync::Arc;
 // change; the code-query tutorial pages elide such ids (#5016).
 // #5911: ordered decomposition observes cancellation and records target traversal;
 // old artifacts must not bypass the shared planner or its stopped outcomes.
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v48";
+// Quicksilver round 6: the regex and structural facts the lowerer reads, the
+// alias-scan budget (exhaustion is Budget, not "no mutation") and runtime key
+// shapes (radix indices, tuple keys) change for unchanged bytes.
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v49";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";

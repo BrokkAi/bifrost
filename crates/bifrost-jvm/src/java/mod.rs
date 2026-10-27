@@ -2,6 +2,7 @@
 
 pub mod adapter;
 pub mod clones;
+pub mod conversion;
 pub mod declarations;
 pub mod diagnostics;
 pub mod exceptions;

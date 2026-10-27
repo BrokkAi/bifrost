@@ -235,6 +235,119 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[hardwon("#6942: receiver_type_declaration recursion depth followed source nesting")]
+    fn scala_receiver_type_declaration_deep_fields_are_stack_safe() {
+        use brokk_bifrost_core::analyzer::tree_walk::node_range;
+        use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+            ClassRangeIndex, FileDeclarations, FileEdgeScanInput,
+        };
+        use brokk_bifrost_core::hash::HashMap;
+        use brokk_bifrost_core::text_utils::compute_line_starts;
+        use brokk_bifrost_jvm::scala::graph::inverted::scan_edge_file;
+
+        let depth = 3000;
+        let source = format!(
+            "package app\nclass Link {{ val next: Link = this; def end(): Int = 1; def deep(): Int = this{}.end() }}",
+            ".next".repeat(depth)
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&brokk_bifrost_jvm::scala::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut longest = 0;
+        let mut declarations = FileDeclarations {
+            enclosers: Vec::new(),
+            definitions: HashMap::default(),
+        };
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "function_definition" {
+                    let name = node
+                        .child_by_field_name("name")
+                        .unwrap()
+                        .utf8_text(source.as_bytes())
+                        .unwrap();
+                    let key = format!("app.Link.{name}");
+                    declarations
+                        .enclosers
+                        .push((node.start_byte(), node.end_byte(), key.clone()));
+                    declarations
+                        .definitions
+                        .insert(key, vec![(node.start_byte(), node.end_byte())]);
+                }
+                if node.kind() == "call_expression" {
+                    let mut value = node.child_by_field_name("function").unwrap();
+                    let mut count = 0;
+                    while value.kind() == "field_expression" {
+                        count += 1;
+                        value = value.child_by_field_name("value").unwrap();
+                    }
+                    longest = longest.max(count);
+                }
+                brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
+            },
+        );
+        assert_eq!(longest, depth + 1);
+        eprintln!("receiver_type_declaration: parsed {longest} field values");
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file("Link.scala", "package app\nclass Link { val next: Link = this; def end(): Int = 1; def deep(): Int = this.end() }")
+            .build();
+        let analyzer = ScalaAnalyzer::new(project.project_dyn());
+        // Index the declarations without sending the deep body through the unrelated
+        // native fact producer. The edge scanner consumes its own parsed query tree.
+        let types = analyzer.project_types();
+        let file = project.file("Link.scala");
+        let state = types.bulk_file_state(&file).unwrap();
+        let link = analyzer
+            .get_definitions("app.Link")
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .unwrap();
+        let class_ranges =
+            ClassRangeIndex::from_class_spans([(link, node_range(tree.root_node()))]);
+        let line_starts = compute_line_starts(&source);
+        let nodes = HashSet::from_iter(["app.Link.deep".to_owned(), "app.Link.end".to_owned()]);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, || {
+                    let query = AnalyzerQueryScope::new(&analyzer);
+                    let input = FileEdgeScanInput::new(
+                        &tree,
+                        &source,
+                        &line_starts,
+                        Language::Scala,
+                        &nodes,
+                        &declarations,
+                    );
+                    let edges = scan_edge_file(
+                        &analyzer,
+                        query.token(),
+                        &types,
+                        &file,
+                        &state,
+                        class_ranges,
+                        &input,
+                    );
+                    assert!(
+                        edges
+                            .edge_lines
+                            .contains_key(&("app.Link.deep".to_owned(), "app.Link.end".to_owned())),
+                        "the deep call must produce an edge: {:?}",
+                        edges.edge_lines
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
+    }
+
+    #[test]
     #[hardwon(
         "#2844: A complete real Scala inbound graph is reused by dead-code lookup without invoking the builder again"
     )]

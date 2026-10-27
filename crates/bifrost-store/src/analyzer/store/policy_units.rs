@@ -796,8 +796,8 @@ fn write_unit(
     let mut intern = conn.prepare_cached(
         "INSERT INTO policy_read_keys(
            key_digest, kind, family, languages, rel_path, name, index_key,
-           blob_oid, subject, start_byte, end_byte, digest
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+           blob_oid, subject, start_byte, end_byte, digest, site_ordinal
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(key_digest) DO NOTHING",
     )?;
     let mut find =
@@ -821,6 +821,7 @@ fn write_unit(
             columns.start_byte,
             columns.end_byte,
             columns.digest,
+            columns.site_ordinal,
         ])?;
         let read_id = find.query_row(params![columns.key_digest.as_slice()], |row| {
             row.get::<_, i64>(0)
@@ -986,7 +987,7 @@ fn load_unit_reads(conn: &rusqlite::Connection, unit_id: i64) -> Result<Vec<Read
     let mut statement = conn.prepare_cached(
         "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
                 keys.name, keys.index_key, keys.blob_oid, keys.subject,
-                keys.start_byte, keys.end_byte, keys.digest
+                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal
          FROM policy_unit_reads AS membership
          JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
          WHERE membership.unit_id = ?1",
@@ -1183,6 +1184,7 @@ mod tests {
                     site: ProcedureCallSiteLocator {
                         start_byte: 4,
                         end_byte: 18,
+                        ordinal: 0,
                     },
                 },
                 digest,

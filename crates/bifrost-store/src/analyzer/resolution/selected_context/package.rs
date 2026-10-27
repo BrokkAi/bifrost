@@ -672,6 +672,15 @@ impl SelectedPackageBridgeDescriptor {
     }
 }
 
+impl SelectedPackageBridgeDescriptor {
+    pub(super) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        self.completion.charge_retained(heap);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::engine::PreloadedFragmentSource;

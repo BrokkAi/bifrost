@@ -125,7 +125,7 @@ pub(in crate::analyzer::java::semantic) fn callable_shape<'tree>(
         || is_static
         || has_modifier(node, "private")
         || has_modifier(node, "final")
-        || enclosing_type_is_final(node)
+        || brokk_bifrost_jvm::java::declarations::enclosing_java_type_is_final(node)
     {
         DispatchExtensibility::Closed
     } else {
@@ -216,17 +216,6 @@ fn enclosing_initializer_container(node: Node<'_>) -> Option<Node<'_>> {
         current = current.parent()?;
     }
     (current.kind() == "class_body").then_some(current)
-}
-
-fn enclosing_type_is_final(node: Node<'_>) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(parent.kind(), "class_declaration" | "record_declaration") {
-            return parent.kind() == "record_declaration" || has_modifier(parent, "final");
-        }
-        current = parent.parent();
-    }
-    false
 }
 
 pub(in crate::analyzer::java::semantic) fn has_modifier(node: Node<'_>, modifier: &str) -> bool {

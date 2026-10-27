@@ -2554,7 +2554,7 @@ pub(in crate::analyzer::semantic_model::csmi) fn export_document(
             // The annotation describes a Boolean predicate. Clone only this
             // export-local declaration to serialize that distinct result type.
             let mut predicate = member.clone();
-            predicate
+            std::sync::Arc::make_mut(&mut predicate)
                 .signature
                 .as_mut()
                 .expect("signature above")

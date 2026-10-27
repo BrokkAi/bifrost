@@ -7,7 +7,7 @@
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionScopeKind};
 use brokk_bifrost_core::analyzer::structural::callable::{
-    ApplicabilityVerdict, CallableRejectionReason,
+    ApplicabilityVerdict, CallableRejectionReason, FailingArgument, InvocationPhase,
 };
 
 use super::super::fact_source::{
@@ -203,6 +203,22 @@ pub enum ImplicitReceiverScopeKind {
 
 #[doc(hidden)]
 pub trait CallApplicabilityAdapter: Sync {
+    /// Interpret a repeated formal's producer type for this actual. A
+    /// language may prove fixed-arity use of a whole sequence here.
+    #[allow(clippy::too_many_arguments)]
+    fn repeated_parameter_type(
+        &self,
+        _evaluation: &mut FactEvaluation<'_, '_>,
+        _actual_slot: SemanticId,
+        _formal_slot: SemanticId,
+        _actual: ResolutionTypeRef,
+        formal: ResolutionTypeRef,
+        _repeated_actual_count: usize,
+        _states: &StateMap,
+    ) -> StoreResult<Option<ResolutionTypeRef>> {
+        Ok(Some(formal))
+    }
+
     fn implicit_receiver_lookup(&self) -> Option<ImplicitReceiverLookup> {
         None
     }
@@ -315,6 +331,17 @@ pub trait CallApplicabilityAdapter: Sync {
         _states: &StateMap,
     ) -> Option<ResolutionCompletion> {
         None
+    }
+
+    /// The invocation phase whose test decided `assessment`, and the first
+    /// argument that failed it, for a language whose overload resolution is
+    /// phased. The outer `None` reports cancellation.
+    fn invocation_evidence(
+        &self,
+        _evaluation: &mut FactEvaluation<'_, '_>,
+        _assessment: &CandidateAssessment,
+    ) -> StoreResult<Option<(Option<InvocationPhase>, Option<FailingArgument>)>> {
+        Ok(Some((None, None)))
     }
 
     /// Precedence within one candidate set, before value-application insertion.
@@ -484,6 +511,27 @@ pub trait CallApplicabilityAdapter: Sync {
         )
     }
 
+    fn candidate_formal_is_subtype(
+        &self,
+        _evaluation: &mut FactEvaluation<'_, '_>,
+        _subtype: SemanticId,
+        _supertype: SemanticId,
+        _states: &StateMap,
+    ) -> StoreResult<Option<bool>> {
+        Ok(Some(false))
+    }
+
+    fn invocation_phase(&self, _candidate: &CandidateAssessment) -> Option<InvocationPhase> {
+        None
+    }
+
+    /// Whether an applicable candidate that selection drops for being less
+    /// specific keeps a trace row of verdict `less_specific`. Off by default,
+    /// so a language's published rows change only when it opts in.
+    fn reports_less_specific_candidates(&self) -> bool {
+        false
+    }
+
     fn compare_conversion(
         &self,
         left: ConversionEvidence,
@@ -534,6 +582,19 @@ pub trait CallApplicabilityAdapter: Sync {
         _previous_states: &StateMap,
     ) -> StoreResult<Option<(ResolutionAnswer, Option<SemanticId>)>> {
         Ok(Some((answer, None)))
+    }
+
+    /// Prove a language's reference conversion without admitting boxing or
+    /// replacing the existing primitive invocation phases.
+    fn proves_reference_conversion(
+        &self,
+        _evaluation: &mut FactEvaluation<'_, '_>,
+        _operand_slots: [SemanticId; 2],
+        _source: ResolutionTypeRef,
+        _target: ResolutionTypeRef,
+        _states: &StateMap,
+    ) -> StoreResult<Option<bool>> {
+        Ok(Some(false))
     }
 
     fn classify_primitive_pairs(
@@ -713,15 +774,15 @@ impl FactEvaluation<'_, '_> {
             &super::FactMemberOwner,
             &super::FactMemberOwner,
             bool,
-        ) -> bool,
+        ) -> Option<bool>,
         language: Language,
     ) -> StoreResult<Option<(HashSet<SemanticId>, bool)>> {
         let mut requested = candidates.iter().copied().collect::<BTreeSet<_>>();
-        requested.extend(
-            owners
-                .values()
-                .filter_map(|owner| owner.as_ref().map(super::FactMemberOwner::owner)),
-        );
+        requested.extend(owners.values().filter_map(|owner| {
+            owner
+                .as_ref()
+                .map(|owner| self.method_declaration_owner(owner))
+        }));
         let Some(rows) = self
             .session
             .java_declarations(&requested.into_iter().collect::<Vec<_>>())?
@@ -768,13 +829,19 @@ impl FactEvaluation<'_, '_> {
                 if base_owner.receiver() != derived_owner.receiver() {
                     continue;
                 }
-                let Some(nearer) =
-                    self.method_owner_inherits(derived_owner.owner(), base_owner.owner())
-                else {
+                let Some(nearer) = self.method_owner_inherits(
+                    self.method_declaration_owner(derived_owner),
+                    self.method_declaration_owner(base_owner),
+                ) else {
                     return Ok(None);
                 };
                 let language_dominates =
                     additional_dominance(base, derived, base_owner, derived_owner, nearer);
+                if !nearer && language_dominates.is_none() {
+                    unresolved = true;
+                    continue;
+                }
+                let language_dominates = language_dominates.unwrap_or(false);
                 if !nearer && !language_dominates {
                     continue;
                 }
@@ -783,12 +850,12 @@ impl FactEvaluation<'_, '_> {
                         language_method_is_instance_for_override(
                             language,
                             accesses.get(&base).copied().flatten(),
-                            declarations.get(&base_owner.owner()),
+                            declarations.get(&self.method_declaration_owner(base_owner)),
                         ),
                         language_method_is_instance_for_override(
                             language,
                             accesses.get(&derived).copied().flatten(),
-                            declarations.get(&derived_owner.owner()),
+                            declarations.get(&self.method_declaration_owner(derived_owner)),
                         ),
                     ) {
                         (Some(true), Some(true)) => {}
@@ -851,7 +918,7 @@ impl FactEvaluation<'_, '_> {
             &owners,
             signatures,
             previous_states,
-            |_, _, _, _, _| false,
+            |_, _, _, _, _| Some(false),
             Language::Scala,
         )?
         else {
@@ -894,6 +961,13 @@ impl FactEvaluation<'_, '_> {
         };
         if member.kind() != ResolutionMemberKind::Method {
             return None;
+        }
+        if let Some((_, rules)) = self.implicit_interface_member_rules(member) {
+            debug_assert_eq!(
+                rules.visibility,
+                brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility::Public
+            );
+            return Some(ResolutionMemberAccess::Instance);
         }
         match self.hierarchy.member_owner_metadata.get(&member.target()) {
             Some(super::ExactMemberOwnerMetadata::Unique(row)) => {
@@ -1339,28 +1413,125 @@ fn map_matching_argument_lists(
     }
 }
 
+/// Compare matching formals using only proved subtype relations. This is
+/// shared by languages whose overload specificity follows their formal types.
 #[doc(hidden)]
-pub fn select_candidate_indices<A: CallApplicabilityAdapter + ?Sized>(
+pub fn compare_formal_types(
+    left: ConversionEvidence,
+    right: ConversionEvidence,
+    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+) -> PartialOrder {
+    if left.kind == ConversionKind::Unknown || right.kind == ConversionKind::Unknown {
+        return PartialOrder::Unknown;
+    }
+    let (Some(left_source), Some(right_source), Some(left_target), Some(right_target)) = (
+        left.source_type,
+        right.source_type,
+        left.target_type,
+        right.target_type,
+    ) else {
+        return PartialOrder::Unknown;
+    };
+    if left_source != right_source {
+        return PartialOrder::Incomparable;
+    }
+    if left_target == right_target {
+        return PartialOrder::Equal;
+    }
+    if subtype_relations.get(&(left_target, right_target)) == Some(&true) {
+        PartialOrder::Better
+    } else if subtype_relations.get(&(right_target, left_target)) == Some(&true) {
+        PartialOrder::Worse
+    } else {
+        PartialOrder::Incomparable
+    }
+}
+
+/// What candidate selection did with one assessed candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionDisposition {
+    /// Kept: no other candidate dominates it in the deciding phase, or its
+    /// applicability is still unknown.
+    Kept,
+    /// Refused by its own applicability check.
+    Refused,
+    /// Applicable, but only in a later invocation phase than another candidate.
+    LaterPhase,
+    /// Applicable in the deciding phase, but another applicable candidate of
+    /// that phase is more specific.
+    LessSpecific,
+}
+
+fn selection_dispositions<A: CallApplicabilityAdapter + ?Sized>(
     adapter: &A,
     assessments: &[CandidateAssessment],
     subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
-) -> Vec<usize> {
+) -> Vec<SelectionDisposition> {
+    let earliest_phase = assessments
+        .iter()
+        .filter(|candidate| candidate.verdict == ApplicabilityVerdict::Applicable)
+        .filter_map(|candidate| adapter.invocation_phase(candidate))
+        .min();
     assessments
         .iter()
         .enumerate()
-        .filter_map(|(index, candidate)| {
+        .map(|(index, candidate)| {
             if candidate.verdict == ApplicabilityVerdict::Inapplicable {
-                return None;
+                return SelectionDisposition::Refused;
             }
             if candidate.verdict == ApplicabilityVerdict::Unknown {
-                return Some(index);
+                return SelectionDisposition::Kept;
+            }
+            if adapter
+                .invocation_phase(candidate)
+                .is_some_and(|phase| Some(phase) > earliest_phase)
+            {
+                return SelectionDisposition::LaterPhase;
             }
             let dominated = assessments.iter().enumerate().any(|(other_index, other)| {
                 index != other_index
                     && other.verdict == ApplicabilityVerdict::Applicable
                     && dominates(adapter, other, candidate, subtype_relations)
             });
-            (!dominated).then_some(index)
+            if dominated {
+                SelectionDisposition::LessSpecific
+            } else {
+                SelectionDisposition::Kept
+            }
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn select_candidate_indices<A: CallApplicabilityAdapter + ?Sized>(
+    adapter: &A,
+    assessments: &[CandidateAssessment],
+    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+) -> Vec<usize> {
+    selection_dispositions(adapter, assessments, subtype_relations)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, disposition)| {
+            (disposition == SelectionDisposition::Kept).then_some(index)
+        })
+        .collect()
+}
+
+/// The applicable candidates that selection dropped because another applicable
+/// candidate of the same phase is more specific. It is the predicate
+/// [`select_candidate_indices`] used, so a row built from it can never report a
+/// dominance the selection did not apply.
+#[doc(hidden)]
+pub fn less_specific_indices<A: CallApplicabilityAdapter + ?Sized>(
+    adapter: &A,
+    assessments: &[CandidateAssessment],
+    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+) -> Vec<usize> {
+    selection_dispositions(adapter, assessments, subtype_relations)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, disposition)| {
+            (disposition == SelectionDisposition::LessSpecific).then_some(index)
         })
         .collect()
 }
@@ -1426,7 +1597,7 @@ impl FactEvaluation<'_, '_> {
                 declarations.iter().find_map(|declaration| {
                     adapter.intrinsic_function_arity(&format!(
                         "{}.{}",
-                        declaration.package.as_deref()?,
+                        declaration.package.named()?,
                         declaration.name
                     ))
                 })
@@ -1760,6 +1931,9 @@ impl FactEvaluation<'_, '_> {
                 ApplicabilityVerdict::Unknown => {
                     return Ok(Some(ResultApplicationAssessment::Unknown));
                 }
+                ApplicabilityVerdict::LessSpecific => {
+                    unreachable!("one candidate's assessment never compares specificity")
+                }
             }
         }
         Ok(Some(ResultApplicationAssessment::Applicable {
@@ -1849,7 +2023,9 @@ fn dominates<A: CallApplicabilityAdapter + ?Sized>(
     right: &CandidateAssessment,
     subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
 ) -> bool {
-    if left.conversions.len() != right.conversions.len() {
+    if adapter.invocation_phase(left) != adapter.invocation_phase(right)
+        || left.conversions.len() != right.conversions.len()
+    {
         return false;
     }
     let mut strictly_better = false;

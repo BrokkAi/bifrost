@@ -124,46 +124,9 @@ pub fn dispatch_read_attribution_with_range(
     outcome: &SemanticOutcome<DispatchResult>,
     range: Result<crate::analyzer::Range, SemanticProviderError>,
 ) -> DispatchReadAttribution {
-    let Ok(range) = range else {
-        return DispatchReadAttribution::Unattributed(
-            DispatchReadUnattributedReason::SourceRangeUnavailable,
-        );
-    };
-    let matching_calls = call
-        .procedure()
-        .semantics()
-        .call_sites()
-        .iter()
-        .filter(|candidate| {
-            call.procedure()
-                .semantics()
-                .source_mapping(candidate.source)
-                .is_some_and(|mapping| {
-                    let span = mapping.locator.anchor().span();
-                    span.start_byte() as usize == range.start_byte
-                        && span.end_byte() as usize == range.end_byte
-                })
-        })
-        .take(2)
-        .count();
-    dispatch_read_attribution_for_exact_range(call, outcome, range, matching_calls)
-}
-
-#[doc(hidden)]
-pub fn dispatch_read_attribution_for_exact_range(
-    call: &CallSiteHandle,
-    outcome: &SemanticOutcome<DispatchResult>,
-    range: crate::analyzer::Range,
-    matching_calls: usize,
-) -> DispatchReadAttribution {
-    if matching_calls != 1 {
-        return DispatchReadAttribution::Unattributed(
-            DispatchReadUnattributedReason::SourceRangeAmbiguous,
-        );
-    }
-    let Some(question) =
+    let Some(question) = range.ok().and_then(|range| {
         crate::analyzer::semantic::workspace_oracle::procedure_dispatch_question(call, range)
-    else {
+    }) else {
         return DispatchReadAttribution::Unattributed(
             DispatchReadUnattributedReason::SourceRangeUnavailable,
         );

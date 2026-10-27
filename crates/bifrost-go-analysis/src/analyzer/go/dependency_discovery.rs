@@ -54,7 +54,8 @@ const MAX_GO_STDERR_BYTES: usize = 1024 * 1024;
 const MAX_GO_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 
 pub use brokk_bifrost_go::package_discovery::{
-    GoEnvironment, GoModule, GoPackage, GoPackageDiscovery, GoPackageError,
+    GoBuildConfiguration, GoEnvironment, GoModule, GoPackage, GoPackageDiscovery, GoPackageError,
+    host_build_configuration, selected_build_configuration,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,9 +273,9 @@ fn discover_domain_with_runner(
         };
         environment
     };
-    let goos = discovery.goos.as_deref().unwrap_or(&environment.goos);
-    let goarch = discovery.goarch.as_deref().unwrap_or(&environment.goarch);
-    if goos.is_empty() || goarch.is_empty() {
+    let build_configuration =
+        selected_build_configuration(discovery, &environment.goos, &environment.goarch);
+    if build_configuration.goos.is_empty() || build_configuration.goarch.is_empty() {
         return failed_outcome(
             "go.target_missing",
             "Go environment discovery did not return a target GOOS and GOARCH".to_owned(),
@@ -296,10 +297,10 @@ fn discover_domain_with_runner(
             "-mod=readonly"
         }),
     ];
-    if !discovery.build_tags.is_empty() {
+    if !build_configuration.tags.is_empty() {
         list_args.push(OsString::from(format!(
             "-tags={}",
-            discovery.build_tags.join(",")
+            build_configuration.tags.join(",")
         )));
     }
     if domain.gowork_path.is_empty() {
@@ -314,7 +315,12 @@ fn discover_domain_with_runner(
     }
     let list_invocation = GoInvocation {
         args: list_args,
-        env: target_environment(discovery, &environment, goos, goarch),
+        env: target_environment(
+            discovery,
+            &environment,
+            &build_configuration.goos,
+            &build_configuration.goarch,
+        ),
         stdout_limit: MAX_GO_LIST_STDOUT_BYTES,
         description: "Go package discovery",
     };
@@ -365,9 +371,7 @@ fn discover_domain_with_runner(
                         failure: None,
                         packages,
                         environment: environment.clone(),
-                        goos: goos.to_owned(),
-                        goarch: goarch.to_owned(),
-                        build_tags: discovery.build_tags.clone(),
+                        build_configuration: build_configuration.clone(),
                         workspace_patterns: discovery.workspace_patterns.clone(),
                         vendor,
                     }),
@@ -390,9 +394,7 @@ fn discover_domain_with_runner(
         failure: None,
         packages: packages.clone(),
         environment: environment.clone(),
-        goos: goos.to_owned(),
-        goarch: goarch.to_owned(),
-        build_tags: discovery.build_tags.clone(),
+        build_configuration: build_configuration.clone(),
         workspace_patterns: discovery.workspace_patterns.clone(),
         vendor,
     };
@@ -407,8 +409,8 @@ fn discover_domain_with_runner(
         return finish(build_curated_pack_evidence_outcome(
             packages,
             &environment,
-            goos,
-            goarch,
+            &build_configuration.goos,
+            &build_configuration.goarch,
             discovery,
             vendor,
             limits,
@@ -465,8 +467,8 @@ fn discover_domain_with_runner(
         packages,
         &environment,
         &root,
-        goos,
-        goarch,
+        &build_configuration.goos,
+        &build_configuration.goarch,
         discovery,
         vendor,
         limits,
@@ -575,6 +577,7 @@ fn build_curated_pack_evidence_outcome(
 }
 
 fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, OsString)> {
+    let build_configuration = host_build_configuration(config);
     let mut env = reviewed_host_environment(|name| std::env::var_os(name));
     env.extend([
         os_env("GOTOOLCHAIN", "local"),
@@ -583,7 +586,14 @@ fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, 
         os_env("GOENV", "off"),
         os_env("GOWORK", "off"),
         os_env("GOFLAGS", "-buildvcs=false"),
-        os_env("CGO_ENABLED", "0"),
+        os_env(
+            "CGO_ENABLED",
+            if build_configuration.cgo_enabled {
+                "1"
+            } else {
+                "0"
+            },
+        ),
     ]);
     if let Some(path) = &config.gopath {
         env.push((OsString::from("GOPATH"), path.as_os_str().to_os_string()));
@@ -1530,10 +1540,10 @@ mod tests {
                 ["example.test/app"]
             );
             assert_eq!(found.deps_errors[0].err, "dependency failure");
-            assert_eq!(discovery.goos, "linux");
-            assert_eq!(discovery.goarch, "arm64");
+            assert_eq!(discovery.build_configuration.goos, "linux");
+            assert_eq!(discovery.build_configuration.goarch, "arm64");
             assert_eq!(discovery.environment.goversion, "go1.25.1");
-            assert_eq!(discovery.build_tags, ["integration", "safe"]);
+            assert_eq!(discovery.build_configuration.tags, ["integration", "safe"]);
             assert_eq!(discovery.workspace_patterns, ["./cmd/..."]);
             assert!(!discovery.vendor);
             // Semantic pack filtering remains independent of native membership.

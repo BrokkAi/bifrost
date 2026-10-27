@@ -492,6 +492,21 @@ impl Drop for KeyScope {
     }
 }
 
+/// Include a durable semantic catalog in the existing SQL profile.
+pub fn install_catalog_durable(conn: &Connection) {
+    install(conn, ConnectionRole::Writer);
+}
+
+/// Include the session catalog in the existing SQL profile.
+pub fn install_catalog_session(conn: &Connection) {
+    install(conn, ConnectionRole::SessionReader);
+}
+
+/// Include an immutable active-set reader in the existing SQL profile.
+pub fn install_catalog_active(conn: &Connection) {
+    install(conn, ConnectionRole::Reader);
+}
+
 /// Install the profile hook on one analyzer-store connection.
 ///
 /// Called from the single opener in `cache_db`, so no connection can be missed.

@@ -10,7 +10,7 @@ use crate::analyzer::resolution::{
 // by the selected blob and its source declaration; no workspace scan or live
 // filesystem metadata supplies an inheritance decision.
 pub(in crate::analyzer::store) const DECLARATIONS: &str = r#"
-SELECT request.mount_ordinal, request.key0, units.kind, meta.content_package,
+SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'), units.kind, meta.content_package,
        metadata.class_like_is_interface, metadata.callable_override_modifier,
        metadata.callable_is_static, metadata.callable_declared_visibility,
        metadata.callable_modifiers_recorded, units.identifier,
@@ -18,9 +18,9 @@ SELECT request.mount_ordinal, request.key0, units.kind, meta.content_package,
                WHERE segment.blob_id=units.blob_id AND segment.unit_key=units.unit_key
                  AND segment.seg_ordinal=units.fq_segment_count-1
                  AND segment.seg_kind='companion')
-FROM temp.selected_resolution_typed_requests_1 AS request
+FROM json_each(?1) AS request
 CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.mount_ordinal=request.mount_ordinal
+  ON mount.mount_ordinal=json_extract(request.value, '$[0]')
 CROSS JOIN main.resolution_fragment_interiors AS interior
   ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
  AND interior.semantic_language=mount.semantic_language
@@ -28,7 +28,7 @@ CROSS JOIN main.resolution_fragment_interiors AS interior
  AND interior.publication_state='complete'
 CROSS JOIN main.resolution_semantic_sites AS semantic
   ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
- AND semantic.semantic_key=request.key0
+ AND semantic.semantic_key=json_extract(request.value, '$[1]')
 CROSS JOIN main.source_fact_manifests AS source
   ON source.blob_id=semantic.blob_id AND source.publication_state='complete'
 CROSS JOIN main.source_native_declaration_bridges AS bridge
@@ -50,12 +50,12 @@ CROSS JOIN main.blob_meta AS meta ON meta.blob_id=units.blob_id AND meta.is_comp
 // definition unit, when present, must be the synthetic class; local companions
 // can have a lexical declaration without a parser unit.
 pub(in crate::analyzer::store) const SYNTHETIC_TYPE_BODIES: &str = r#"
-SELECT request.mount_ordinal, request.key0, meta.content_package,
+SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'), meta.content_package,
        CASE WHEN mount.semantic_language='scala' THEN COALESCE(units.identifier, '') ELSE '' END,
        mount.semantic_language='scala'
-FROM temp.selected_resolution_typed_requests_1 AS request
+FROM json_each(?1) AS request
 CROSS JOIN temp.selected_resolution_mounts AS mount
-  ON mount.mount_ordinal=request.mount_ordinal
+  ON mount.mount_ordinal=json_extract(request.value, '$[0]')
 CROSS JOIN main.resolution_fragment_interiors AS interior
   ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
  AND interior.semantic_language=mount.semantic_language
@@ -63,7 +63,7 @@ CROSS JOIN main.resolution_fragment_interiors AS interior
  AND interior.publication_state='complete'
 CROSS JOIN main.resolution_semantic_sites AS semantic
   ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
- AND semantic.semantic_key=request.key0
+ AND semantic.semantic_key=json_extract(request.value, '$[1]')
 CROSS JOIN main.resolution_member_scope_properties AS scope
   ON scope.blob_id=semantic.blob_id AND scope.definition_semantic_key=semantic.semantic_key AND scope.scope_kind='type_body'
 CROSS JOIN main.source_fact_manifests AS source
@@ -78,7 +78,7 @@ WHERE (mount.semantic_language='java' AND NOT EXISTS (
   SELECT 1 FROM main.source_native_declaration_bridges AS bridge
   WHERE bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site))
    OR (mount.semantic_language='scala' AND semantic.namespace='value'
-       AND (units.unit_key IS NULL OR (units.kind=?1 AND units.synthetic=1))
+       AND (units.unit_key IS NULL OR (units.kind=?2 AND units.synthetic=1))
        AND EXISTS (
          SELECT 1 FROM main.resolution_additional_definition_namespaces AS term_type
          WHERE term_type.blob_id=semantic.blob_id
@@ -129,12 +129,14 @@ pub(super) fn read(
         if coordinates.is_empty() {
             continue;
         }
-        if !selection.replace_resolution_requests_1(coordinates.keys().copied(), cancellation)? {
-            return Ok(None);
-        }
+        let requests = json_pair_array(
+            coordinates
+                .keys()
+                .map(|(mount, key)| (i64::from(mount.get()), *key)),
+        );
         let rows = source.read_statement(cancellation, |connection| {
             let mut statement = connection.prepare_cached(DECLARATIONS)?;
-            let mut rows = statement.query([])?;
+            let mut rows = statement.query([&requests])?;
             let mut found = Vec::new();
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
@@ -176,7 +178,9 @@ pub(super) fn read(
                 found.push(JavaInheritanceDeclaration {
                     definition,
                     name: row.get(9)?,
-                    package: row.get(3)?,
+                    package: crate::analyzer::resolution::fact_source::JvmDeclarationPackage::Known(
+                        row.get(3)?,
+                    ),
                     kind,
                 });
             }
@@ -204,13 +208,17 @@ pub(super) fn read(
         if unsourced.is_empty() {
             continue;
         }
-        if !selection.replace_resolution_requests_1(unsourced, cancellation)? {
-            return Ok(None);
-        }
+        let requests = json_pair_array(
+            unsourced
+                .into_iter()
+                .map(|(mount, key)| (i64::from(mount.get()), key)),
+        );
         let synthetic = source.read_statement(cancellation, |connection| {
             let mut statement = connection.prepare_cached(SYNTHETIC_TYPE_BODIES)?;
-            let mut rows =
-                statement.query([super::super::code_unit_kind_to_i64(CodeUnitType::Class)])?;
+            let mut rows = statement.query(rusqlite::params![
+                requests,
+                super::super::code_unit_kind_to_i64(CodeUnitType::Class)
+            ])?;
             let mut found = Vec::new();
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
@@ -223,7 +231,9 @@ pub(super) fn read(
                 found.push(JavaInheritanceDeclaration {
                     definition: coordinates[&coordinate],
                     name: row.get(3)?,
-                    package: row.get(2)?,
+                    package: crate::analyzer::resolution::fact_source::JvmDeclarationPackage::Known(
+                        row.get(2)?,
+                    ),
                     kind: JavaInheritanceDeclarationKind::Type {
                         is_interface: false,
                         is_singleton: row.get(4)?,

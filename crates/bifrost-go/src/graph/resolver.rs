@@ -2300,7 +2300,11 @@ mod tests {
             }
             _ => None,
         };
-        let workspace_paths = GoWorkspacePathIndex::build(&project, &package_clauses);
+        let workspace_paths = GoWorkspacePathIndex::build(
+            &project,
+            &package_clauses,
+            &brokk_bifrost_core::hash::HashSet::default(),
+        );
         let all_files = project.all_files().unwrap();
         let consumer = ProjectFile::new(root.clone(), "consumer.go");
         let dir_index = build_parent_dir_index(all_files.iter());

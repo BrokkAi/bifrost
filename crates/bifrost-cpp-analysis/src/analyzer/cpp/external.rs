@@ -635,11 +635,11 @@ pub(crate) enum CppExternalTypeModelResolution {
     Conflict,
 }
 
-fn exact_generated_cpp_symbols_in_headers<'overlay>(
-    overlay: &'overlay SemanticModelOverlay,
+fn exact_generated_cpp_symbols_in_headers(
+    overlay: &SemanticModelOverlay,
     headers: &[ReachedExternalHeader],
     qualified_name: &str,
-) -> Vec<&'overlay SemanticModelSymbol> {
+) -> Vec<Arc<SemanticModelSymbol>> {
     let mut records = overlay
         .symbols_named(qualified_name)
         .records
@@ -792,7 +792,7 @@ pub(crate) fn external_member_resolution(
                 .any(|member| {
                     member.name == member_name
                         && member.visibility == Visibility::Public
-                        && symbol_is_in_headers(member, headers)
+                        && symbol_is_in_headers(&member, headers)
                 })
             {
                 return CppExternalMemberResolution::Indexed;
@@ -972,6 +972,8 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
     let name =
         brokk_bifrost_analysis::analyzer::semantic::module_identity_owner(Path::new(header))?;
     Some(TypeFact {
+        implemented_traits_complete: false,
+        generic_trait_impls_complete: false,
         jvm_inventory: None,
         type_parameter_defaults: Vec::new(),
         implemented_traits: Vec::new(),
@@ -1425,6 +1427,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
+                implemented_traits_complete: false,
+                generic_trait_impls_complete: false,
                 jvm_inventory: None,
                 type_parameter_defaults: Vec::new(),
                 implemented_traits: Vec::new(),
@@ -1708,7 +1712,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             });
         DependencyPackProduction {
             pack: Some(AuthoredSemanticModelPack {
-                schema_version:
+                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::source_set(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtractionKind::CppHeaderSourceSet, artifact.sha256())),
+schema_version:
                     brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: "bifrost.external.cpp-headers".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -2875,6 +2880,84 @@ mod tests {
             "a wrong-return-type overload must not acquire an implicit assignment role"
         );
     }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4829fbf1febe: quicksilver round 4 batch 2: header-pack owner records depended on HashMap iteration order"
+    )]
+    fn produced_header_pack_is_byte_identical_for_out_of_line_members() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <widget>\n")
+            .expect("source");
+        ProjectFile::new(root.clone(), "fake/include/widget")
+            .write(concat!(
+                "namespace ns { class Widget { public: void first(); void second(); };\n",
+                "inline void Widget::first() {} inline void Widget::second() {} }\n",
+            ))
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let [dependency] = discovery.dependencies.as_slice() else {
+            panic!("one C++ include-root dependency: {discovery:#?}");
+        };
+        let ResolvedDependencyArtifactInput::SourceSet {
+            root,
+            relative_paths,
+        } = &dependency.artifacts[0].input
+        else {
+            panic!("C++ dependency uses a source set");
+        };
+        let exact = read_exact_source_set(
+            root,
+            relative_paths,
+            DependencyPackLimits::default().max_source_files_per_artifact,
+            DependencyPackLimits::default().max_source_path_depth,
+            &ArtifactProducerLimits::default(),
+        )
+        .expect("exact source set");
+        let artifacts = [ExactDependencyArtifact::from_exact(
+            DependencyArtifactRole::Declarations,
+            ExternalArtifactKind::CppHeaderSourceSet,
+            None,
+            exact,
+        )];
+        let generate = || {
+            let production = CppDependencyPackAdapter.produce(
+                dependency,
+                &artifacts,
+                &ArtifactProducerLimits::default(),
+                None,
+            );
+            let pack = production.pack.expect("C++ pack");
+            let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+            else {
+                panic!("declaration facts");
+            };
+            let widget = types
+                .iter()
+                .find(|fact| fact.name == "ns.Widget")
+                .expect("Widget type");
+            for name in ["first", "second"] {
+                assert!(
+                    members
+                        .iter()
+                        .any(|member| member.owner == widget.id && member.name == name),
+                    "class owns {name}: {members:#?}"
+                );
+            }
+            serde_json::to_vec(&pack).expect("serialized header pack")
+        };
+        assert_eq!(generate(), generate());
+    }
+
     /// The pack type model carries a type's identity and shape, never a source
     /// spelling: a parameter written `const T&` must reach the pack as a
     /// reference to `T`, and the pack must validate.

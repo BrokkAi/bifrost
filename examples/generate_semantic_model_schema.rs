@@ -1,13 +1,20 @@
 use brokk_bifrost::analyzer::semantic_model::{
     CompilerOptions, CompressionPolicy, SourceFormat, authoring_json_schema, compile_source,
+    compiled_manifest_json_schema,
 };
 use std::path::PathBuf;
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let output = root.join("schemas/semantic-model-pack-v18.schema.json");
+    let output = root.join("schemas/semantic-model-pack-v19.schema.json");
     std::fs::write(&output, authoring_json_schema()).expect("write generated JSON Schema");
     println!("wrote {}", output.display());
+
+    std::fs::write(
+        root.join("schemas/semantic-model-compiled-manifest-v19.schema.json"),
+        compiled_manifest_json_schema(),
+    )
+    .expect("write compiled manifest schema");
 
     let fixtures = root.join("tests/fixtures/semantic-model-packs");
     generate_golden(

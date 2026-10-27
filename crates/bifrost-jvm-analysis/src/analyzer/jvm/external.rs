@@ -3110,8 +3110,8 @@ impl<'a> JvmExternalDeclarations<'a> {
                     .into_iter()
                     .find(|symbol| self.admits_pack_symbol(symbol))?;
                 let answer = overlay.java_reference_widening(
-                    source_symbol,
-                    target_symbol,
+                    &source_symbol,
+                    &target_symbol,
                     MAX_MEMBER_SURFACE_OWNERS,
                     None,
                 );
@@ -3270,7 +3270,7 @@ impl<'a> JvmExternalDeclarations<'a> {
         let mut declarations = qualified_model_symbols(overlay, fqn)
             .into_iter()
             .filter(|symbol| self.admits_pack_symbol(symbol))
-            .filter_map(pack_external_type);
+            .filter_map(|symbol| pack_external_type(&symbol));
         let declared = declarations.next()?;
         // Two activated packs claiming one qualified name is ambiguity, not a
         // declaration: the name exists but which declaration it denotes is not
@@ -3315,7 +3315,7 @@ impl<'a> JvmExternalDeclarations<'a> {
             .records
             .into_iter()
             .find(|symbol| self.admits_pack_symbol(symbol))?;
-        let surface = overlay.owner_surface(owner_symbol);
+        let surface = overlay.owner_surface(&owner_symbol);
         surface
             .closure
             .iter()
@@ -3332,7 +3332,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                             && JVM_SEMANTIC_PACK_LANGUAGES.contains(&symbol.language.as_str())
                     })
                     .collect::<Vec<_>>();
-                let member = *matched.first()?;
+                let member = matched.first()?.clone();
                 let mut call_shapes = Vec::new();
                 let mut call_shapes_incomplete = false;
                 for symbol in &matched {
@@ -3694,12 +3694,13 @@ impl JvmExternalMember {
         let (owner_fqn, member_name) = self.fqn.rsplit_once('.')?;
         let mut selected = None;
         for owner in active.types_named(owner_fqn).records {
-            if !owner.shard.admits_jvm_owner_declaration(owner.record) {
+            if !owner.shard.admits_jvm_owner_declaration(&owner.record) {
                 continue;
             }
-            let (_, members, _) = owner.shard.shard.payload().declaration_facts()?;
+            let (_, members, _) = owner.shard.decoded().payload().declaration_facts()?;
             for (ordinal, member) in members
                 .iter()
+                .map(AsRef::as_ref)
                 .chain(
                     owner
                         .record
@@ -3884,13 +3885,7 @@ enum JavaExternalInvocationPhase {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JavaExternalConversion {
-    Strict,
-    Loose,
-    Inapplicable,
-    Unknown,
-}
+pub(crate) use brokk_bifrost_jvm::java::conversion::JavaConversion as JavaExternalConversion;
 
 /// Select the unique most-specific signature under Java's fixed-arity
 /// invocation phases. `None` preserves uncertainty when one of the structured
@@ -4163,126 +4158,69 @@ pub(crate) fn java_external_conversion_in(
     formal: &TypeRef,
     surface: Option<&JvmExternalDeclarations<'_>>,
 ) -> JavaExternalConversion {
-    if (matches!(actual, TypeRef::Array { .. }) && java_external_primitive(formal).is_some())
-        || (java_external_primitive(actual).is_some() && matches!(formal, TypeRef::Array { .. }))
-    {
-        return JavaExternalConversion::Inapplicable;
+    struct Types<'s, 'a, 't> {
+        surface: Option<&'s JvmExternalDeclarations<'a>>,
+        terms: std::marker::PhantomData<&'t TypeRef>,
     }
-    if !java_known_ground_type(actual) || !java_known_ground_type(formal) {
-        return JavaExternalConversion::Unknown;
+    impl<'t> brokk_bifrost_jvm::java::conversion::JavaConversionTypes for Types<'_, '_, 't> {
+        type Type = &'t TypeRef;
+        type Error = std::convert::Infallible;
+        fn ground(&self, ty: Self::Type) -> bool {
+            java_known_ground_type(ty)
+        }
+        fn same(&self, a: Self::Type, b: Self::Type) -> bool {
+            java_external_same_static_type(a, b)
+        }
+        fn primitive(
+            &self,
+            ty: Self::Type,
+        ) -> Option<brokk_bifrost_jvm::java::primitives::JavaPrimitive> {
+            java_external_primitive(ty)
+        }
+        fn element(&self, ty: Self::Type) -> Option<Self::Type> {
+            match ty {
+                TypeRef::Array { element } => Some(element),
+                _ => None,
+            }
+        }
+        fn name(&self, ty: Self::Type) -> Option<&str> {
+            java_external_reference_name(ty)
+        }
+        fn named(&self, ty: Self::Type) -> bool {
+            matches!(ty, TypeRef::Named { .. })
+        }
+        fn nominal_widening(
+            &mut self,
+            a: Self::Type,
+            b: Self::Type,
+        ) -> Result<Option<bool>, Self::Error> {
+            Ok(self
+                .surface
+                .and_then(|surface| surface.java_nominal_widening(a, b)))
+        }
+        fn boxed_widening(
+            &mut self,
+            source: brokk_bifrost_jvm::java::primitives::JavaPrimitive,
+            target: Self::Type,
+        ) -> Result<Option<bool>, Self::Error> {
+            Ok(self.surface.and_then(|surface| {
+                surface.java_nominal_widening(
+                    &TypeRef::named(brokk_bifrost_jvm::java::conversion::wrapper_name(source)),
+                    target,
+                )
+            }))
+        }
     }
-    let actual_primitive = java_external_primitive(actual);
-    let formal_primitive = java_external_primitive(formal);
-    match (actual_primitive, formal_primitive) {
-        (Some(actual), Some(formal)) => {
-            return if brokk_bifrost_jvm::java::primitives::primitive_converts(actual, formal) {
-                JavaExternalConversion::Strict
-            } else {
-                JavaExternalConversion::Inapplicable
-            };
-        }
-        (Some(_), None) if matches!(formal, TypeRef::Array { .. }) => {
-            return JavaExternalConversion::Inapplicable;
-        }
-        (Some(actual), None) => {
-            let Some(formal_name) = java_external_reference_name(formal) else {
-                return JavaExternalConversion::Unknown;
-            };
-            return if java_external_wrapper_name(actual) == Some(formal_name)
-                || formal_name == "java.lang.Object"
-            {
-                JavaExternalConversion::Loose
-            } else if formal_name == "java.lang.String" {
-                JavaExternalConversion::Inapplicable
-            } else {
-                let Some(wrapper) = java_external_wrapper_name(actual) else {
-                    return JavaExternalConversion::Unknown;
-                };
-                match java_external_reference_conversion(&TypeRef::named(wrapper), formal, surface)
-                {
-                    JavaExternalConversion::Strict => JavaExternalConversion::Loose,
-                    conversion => conversion,
-                }
-            };
-        }
-        (None, Some(formal)) => {
-            if matches!(actual, TypeRef::Named { name, .. } if name == "<null>") {
-                return JavaExternalConversion::Inapplicable;
-            }
-            let Some(actual_name) = java_external_reference_name(actual) else {
-                return JavaExternalConversion::Unknown;
-            };
-            return if let Some(unboxed) = java_external_wrapper_primitive(actual_name) {
-                if brokk_bifrost_jvm::java::primitives::primitive_converts(unboxed, formal) {
-                    JavaExternalConversion::Loose
-                } else {
-                    JavaExternalConversion::Inapplicable
-                }
-            } else if matches!(actual, TypeRef::Named { .. }) {
-                // Only the eight nominal wrapper types have an unboxing
-                // conversion; arrays and other ground reference types do not.
-                JavaExternalConversion::Inapplicable
-            } else {
-                JavaExternalConversion::Unknown
-            };
-        }
-        (None, None) => {}
-    }
-    java_external_reference_conversion(actual, formal, surface)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn java_external_reference_conversion(
-    mut actual: &TypeRef,
-    mut formal: &TypeRef,
-    surface: Option<&JvmExternalDeclarations<'_>>,
-) -> JavaExternalConversion {
-    loop {
-        if java_external_same_static_type(actual, formal)
-            || matches!(actual, TypeRef::Named { name, .. } if name == "<null>")
-        {
-            return JavaExternalConversion::Strict;
-        }
-        match (actual, formal) {
-            (TypeRef::Array { element: source }, TypeRef::Array { element: target }) => {
-                if java_external_primitive(source).is_some()
-                    || java_external_primitive(target).is_some()
-                {
-                    return if java_external_same_static_type(source, target) {
-                        JavaExternalConversion::Strict
-                    } else {
-                        JavaExternalConversion::Inapplicable
-                    };
-                }
-                actual = source;
-                formal = target;
-            }
-            (TypeRef::Array { .. }, _) => {
-                return if matches!(
-                    java_external_reference_name(formal),
-                    Some("java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable")
-                ) {
-                    JavaExternalConversion::Strict
-                } else {
-                    JavaExternalConversion::Inapplicable
-                };
-            }
-            (_, TypeRef::Array { .. }) => return JavaExternalConversion::Inapplicable,
-            _ => {
-                return if java_external_reference_name(formal) == Some("java.lang.Object")
-                    && java_external_reference_name(actual).is_some()
-                {
-                    JavaExternalConversion::Strict
-                } else {
-                    match surface.and_then(|surface| surface.java_nominal_widening(actual, formal))
-                    {
-                        Some(true) => JavaExternalConversion::Strict,
-                        Some(false) => JavaExternalConversion::Inapplicable,
-                        None => JavaExternalConversion::Unknown,
-                    }
-                };
-            }
-        }
+    match brokk_bifrost_jvm::java::conversion::classify(
+        &mut Types {
+            surface,
+            terms: std::marker::PhantomData,
+        },
+        actual,
+        formal,
+    ) {
+        Ok(value) => value,
+        Err(error) => match error {},
     }
 }
 
@@ -4336,41 +4274,6 @@ fn java_external_reference_name(type_ref: &TypeRef) -> Option<&str> {
         TypeRef::Declared { id, arguments, .. } if arguments.is_empty() => Some(id),
         _ => None,
     }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn java_external_wrapper_name(
-    primitive: brokk_bifrost_jvm::java::primitives::JavaPrimitive,
-) -> Option<&'static str> {
-    use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
-    Some(match primitive {
-        JavaPrimitive::Boolean => "java.lang.Boolean",
-        JavaPrimitive::Byte => "java.lang.Byte",
-        JavaPrimitive::Short => "java.lang.Short",
-        JavaPrimitive::Char => "java.lang.Character",
-        JavaPrimitive::Int => "java.lang.Integer",
-        JavaPrimitive::Long => "java.lang.Long",
-        JavaPrimitive::Float => "java.lang.Float",
-        JavaPrimitive::Double => "java.lang.Double",
-    })
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn java_external_wrapper_primitive(
-    name: &str,
-) -> Option<brokk_bifrost_jvm::java::primitives::JavaPrimitive> {
-    use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
-    Some(match name {
-        "java.lang.Boolean" => JavaPrimitive::Boolean,
-        "java.lang.Byte" => JavaPrimitive::Byte,
-        "java.lang.Short" => JavaPrimitive::Short,
-        "java.lang.Character" => JavaPrimitive::Char,
-        "java.lang.Integer" => JavaPrimitive::Int,
-        "java.lang.Long" => JavaPrimitive::Long,
-        "java.lang.Float" => JavaPrimitive::Float,
-        "java.lang.Double" => JavaPrimitive::Double,
-        _ => return None,
-    })
 }
 
 impl JvmExternalCallShape {
@@ -5811,6 +5714,7 @@ mod tests {
         };
         let root = tempfile::tempdir().expect("isolated Java project");
         let analyzer = JavaAnalyzer::from_project(TestProject::new(root.path(), Language::Java));
+        let active = Arc::new(active);
         let overlay = Arc::new(
             SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 << 20)
                 .expect("fixture overlay"),
@@ -6476,8 +6380,8 @@ mod tests {
         let store =
             brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
         for shard in active.shards() {
-            store.publish_jvm_external_owner_inventory(shard).unwrap();
-            store.publish_jvm_external_owner_inventory(shard).unwrap();
+            store.publish_jvm_external_owner_inventory(&shard).unwrap();
+            store.publish_jvm_external_owner_inventory(&shard).unwrap();
         }
         let conn = store.read_conn().unwrap();
         let complete: bool = conn
@@ -6526,6 +6430,7 @@ mod tests {
             ]
         );
         let analyzer = JavaAnalyzer::from_project(project);
+        let active = Arc::new(active);
         let overlay = Arc::new(
             brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay::build(
                 &analyzer,

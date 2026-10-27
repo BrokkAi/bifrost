@@ -602,9 +602,19 @@ WHERE NOT EXISTS (
 // `INDEXED BY` keeps the primary-key path from walking a blob's unrelated gap
 // rows to reach these roots or prove a miss. Scope mounts drive both
 // statements, so gaps outside the request closure do not qualify the answer.
+// First seek the coverage bucket once. An empty bucket cannot contribute any
+// mounted rows; driving from its existence avoids walking every scope mount
+// and requested lookup just to prove that global absence. For nonempty buckets,
+// scope still drives the selective (covers, blob_id, lookup) header seeks.
 pub(super) const CANDIDATE_GAP_BOUNDARY_BRANCHES_SQL: &str = r#"
 SELECT m.mount_ordinal, h.lookup, h.reason
-FROM temp.selected_resolution_scope_mounts AS scope
+FROM (
+  SELECT 1 FROM main.resolution_gaps AS available
+       INDEXED BY resolution_gaps_root_branches
+  WHERE available.subject = -1 AND available.covers = ?1
+  LIMIT 1
+) AS root_bucket
+CROSS JOIN temp.selected_resolution_scope_mounts AS scope
 CROSS JOIN temp.selected_resolution_mounts AS m
      ON m.mount_ordinal = scope.mount_ordinal
 CROSS JOIN json_each(?2) AS requested
@@ -1360,9 +1370,9 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                 );
             }
         }
-        // Stage rows retain the raw lowering metadata, including internal
-        // synthetic sites. Read only requested selected-host rows.
-        if !self.selection.stage_has_no_content() {
+        // Stage metadata and names have independent authority: semantics may
+        // be absent while a staged path still supplies a lookup spelling.
+        {
             let requests = serde_json::to_string(
                 &batch
                     .answers()
@@ -1373,7 +1383,13 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                     .collect::<Vec<_>>(),
             )
             .expect("reference requests serialize");
-            let staged = self.read_statement(cancellation, |connection| {
+            let staged = if self
+                .selection
+                .stage_family_is_empty(super::resolution_stage::StageFamily::Semantics)?
+            {
+                (!cancellation.is_cancelled()).then(Vec::new)
+            } else {
+                self.read_statement(cancellation, |connection| {
                 let mut statement = connection.prepare_cached(
                     "SELECT input.key,s.source_site,s.namespace,s.site_kind,s.start_byte,s.end_byte,s.unqualified,s.owner_kind,s.owner_key,s.owner_shared,s.receiver_origin \
                      FROM json_each(?1) input JOIN temp.selected_resolution_stage_semantics s ON s.semantic_key IS input.value->>0 AND s.semantic_shared IS input.value->>1 \
@@ -1382,11 +1398,26 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                 Ok(Some(statement.query_map([&requests], |row| {
                     Ok((row.get::<_,usize>(0)?,row.get::<_,u32>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,usize>(4)?,row.get::<_,usize>(5)?,row.get::<_,bool>(6)?,row.get::<_,i64>(7)?,row.get::<_,Option<i64>>(8)?,row.get::<_,Option<i64>>(9)?,row.get::<_,Option<i64>>(10)?))
                 })?.collect::<rusqlite::Result<Vec<_>>>()?))
-            })?;
+            })?
+            };
             let Some(staged) = staged else {
                 return Ok(Vec::new());
             };
-            let names = self.read_statement(cancellation, |connection| {
+            let names = if self
+                .selection
+                .stage_family_is_globally_empty(super::resolution_stage::StageFamily::Recipes)?
+                || (self
+                    .selection
+                    .stage_family_is_empty(super::resolution_stage::StageFamily::QualifiedRoutes)?
+                    && (self.selection.stage_family_is_globally_empty(
+                        super::resolution_stage::StageFamily::Nodes,
+                    )? || self
+                        .selection
+                        .stage_family_is_empty(super::resolution_stage::StageFamily::Paths)?))
+            {
+                (!cancellation.is_cancelled()).then(Vec::new)
+            } else {
+                self.read_statement(cancellation, |connection| {
                 let mut statement = connection.prepare_cached(
                     "WITH requests AS (SELECT key AS input,value->>0 AS semantic_key,value->>1 AS semantic_shared FROM json_each(?1)), \
                      names AS (SELECT r.input,p.producer_id,p.host_ordinal,CASE WHEN p.root_terminal_shared IS NULL THEN p.end_lead_key END AS name_key,COALESCE(p.root_terminal_shared,p.end_lead_shared) AS name_shared \
@@ -1398,7 +1429,8 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                      JOIN temp.selected_resolution_stage_recipes recipe ON recipe.producer_id=n.producer_id AND recipe.semantic_key IS n.name_key AND recipe.semantic_shared IS n.name_shared"
                 )?;
                 Ok(Some(statement.query_map([requests], |row| Ok((row.get::<_,usize>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?))
-            })?;
+            })?
+            };
             let Some(names) = names else {
                 return Ok(Vec::new());
             };
@@ -2339,6 +2371,7 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
                     decode_stored_lookup_recipe(language, row.get(2)?, &row.get::<_, String>(3)?, digest),
                 );
             }
+            if !self.selection.stage_family_is_empty(super::resolution_stage::StageFamily::Recipes)? {
             let mut statement = conn.prepare_cached(r#"
 SELECT input.key,recipe.semantic_language,recipe.namespace,recipe.spelling
 FROM json_each(?1) input
@@ -2363,6 +2396,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 } else {
                     stored.insert(semantic, recipe);
                 }
+            }
             }
             Ok(Some(stored))
         })?
@@ -3389,7 +3423,16 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 }
             }
         }
-        let keys = self.candidate_request_keys(requests, cancellation)?;
+        let Some(keys) = self.candidate_request_keys(requests, cancellation)? else {
+            return Ok((
+                BatchCandidateCompletionOutcome::new(
+                    requests.len(),
+                    with_cancelled(ResolutionCompletion::Complete),
+                    vec![ResolutionCompletion::Complete; requests.len()],
+                ),
+                true,
+            ));
+        };
         let nodes = keys
             .iter()
             .filter_map(|key| match key.node {
@@ -3846,7 +3889,9 @@ JOIN temp.selected_resolution_stage_recipes recipe
         // their intersection can contribute, and the scope is bound into the
         // header statement, so this already holds only mounts that will open.
         let positions = self.candidate_mount_positions(direction, requests, scope, cancellation)?;
-        let keys = self.candidate_request_keys(requests, cancellation)?;
+        let Some(keys) = self.candidate_request_keys(requests, cancellation)? else {
+            return Ok(CandidatePageVisit::Cancelled);
+        };
         for &position in &positions {
             let mount = &*self.mount_record(SelectedResolutionMountOrdinal::new(
                 u32::try_from(position).expect("mount position fits u32"),
@@ -3923,15 +3968,16 @@ JOIN temp.selected_resolution_stage_recipes recipe
     /// decides which blobs can answer at all; the cell decides which bucket of
     /// that blob's index the request reads, exactly as `CandidateLeadCell` and
     /// `CandidateNodeIndex::extend_buckets_for` do in the heap.
+    // None is cancellation, never an empty completed request inventory.
     fn candidate_request_keys(
         &self,
         requests: &[BatchCandidateRequest],
         cancellation: &CancellationToken,
-    ) -> StoreResult<Vec<CandidateRequestKey>> {
+    ) -> StoreResult<Option<Vec<CandidateRequestKey>>> {
         let mut keys = Vec::with_capacity(requests.len());
         for request in requests {
             if cancellation.is_cancelled() {
-                return Ok(Vec::new());
+                return Ok(None);
             }
             let endpoint = request.endpoint();
             let node = if endpoint.node() == BindingNodeId::universal_root() {
@@ -3941,7 +3987,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                     .authority
                     .node_catalog_provenance(endpoint.node(), cancellation)?
                 {
-                    None => return Ok(Vec::new()),
+                    None => return Ok(None),
                     Some(Some(SelectedNodeProvenance::FragmentLocal(local))) => {
                         CandidateRequestNode::Local(
                             local.mount().ordinal(),
@@ -3984,7 +4030,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
             };
             keys.push(CandidateRequestKey { node, lead });
         }
-        Ok(keys)
+        Ok(Some(keys))
     }
 
     /// One mount's candidate matches, from its `resolution_paths` rows.
@@ -4040,7 +4086,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
         keys: &[CandidateRequestKey],
         request_ordinal_base: usize,
         maximum_page_rows: usize,
-        resolution_session: Option<&ResolutionSession>,
+        _resolution_session: Option<&ResolutionSession>,
         cancellation: &CancellationToken,
         visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
     ) -> StoreResult<CandidatePageVisit> {
@@ -4185,12 +4231,6 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 request_ordinal_base + ordinal,
                 "candidate requests retain canonical whole-batch ordinals"
             );
-            let charge_admitted_rows = request.uses_root_terminal_targets();
-            if !charge_admitted_rows
-                && resolution_session.is_some_and(|session| !session.scope_step())
-            {
-                break;
-            }
             work += 1;
             if work.is_multiple_of(CANDIDATE_ROW_CANCELLATION_QUANTUM)
                 && cancellation.is_cancelled()
@@ -4202,11 +4242,6 @@ JOIN temp.selected_resolution_stage_recipes recipe
             // page-limited read's answer identical.
             rows.sort_unstable_by_key(|row| row.identity);
             for row in rows.iter() {
-                if !charge_admitted_rows
-                    && resolution_session.is_some_and(|session| !session.scope_step())
-                {
-                    break 'requests;
-                }
                 work += 1;
                 if work.is_multiple_of(CANDIDATE_ROW_CANCELLATION_QUANTUM)
                     && cancellation.is_cancelled()
@@ -4216,11 +4251,6 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 let offered_endpoint = decode_selected_endpoint(&context, row.node, &row.endpoint);
                 if !request.admits_candidate(&offered_endpoint) {
                     continue;
-                }
-                if charge_admitted_rows
-                    && resolution_session.is_some_and(|session| !session.scope_step())
-                {
-                    break 'requests;
                 }
                 page.push(BatchCandidateMatch::new(
                     row.identity,
@@ -5828,6 +5858,14 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
             return Ok(None);
         };
         Ok(Some(evidence))
+    }
+
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        self.selection
+            .namespace_definition_providers()
+            .iter()
+            .map(|(_, language, _)| *language)
+            .collect()
     }
 
     fn semantic_language_of(
@@ -9911,55 +9949,17 @@ impl SelectedResolutionLexicalSource<'_, '_> {
                 cancellation,
             );
         }
-        let Some(rows) =
-            stage::context_candidate_rows(self.selection, context, requests, sql, cancellation)?
-        else {
-            return candidate_completion_after_visit(
-                requests.len(),
-                completion,
-                CandidatePageVisit::Cancelled,
-                cancellation,
-            );
-        };
-        let mut page = Vec::with_capacity(maximum_page_rows);
-        for (ordinal, identity) in rows {
-            // The former context cursor charges only offered rows. Unlike the
-            // stage aggregate, budget exhaustion discards its pending page
-            // and adds cancellation to the supplied once-read base coverage.
-            if cancellation.is_cancelled() || session.is_some_and(|session| !session.scope_step()) {
-                return candidate_completion_after_visit(
-                    requests.len(),
-                    completion,
-                    CandidatePageVisit::Cancelled,
-                    cancellation,
-                );
-            }
-            page.push(BatchCandidateMatch::new(identity, ordinal));
-            if page.len() == maximum_page_rows {
-                let keep_going = visitor(&page)?;
-                if cancellation.is_cancelled() {
-                    return candidate_completion_after_visit(
-                        requests.len(),
-                        completion,
-                        CandidatePageVisit::Cancelled,
-                        cancellation,
-                    );
-                }
-                if !keep_going {
-                    return Ok(completion);
-                }
-                page.clear();
-            }
-        }
-        if !page.is_empty() && !cancellation.is_cancelled() {
-            visitor(&page)?;
-        }
-        candidate_completion_after_visit(
-            requests.len(),
-            completion,
-            CandidatePageVisit::Exhausted,
+        let visit = stage::visit_context_candidates(
+            self.selection,
+            context,
+            requests,
+            sql,
+            maximum_page_rows,
+            session,
             cancellation,
-        )
+            visitor,
+        )?;
+        candidate_completion_after_visit(requests.len(), completion, visit, cancellation)
     }
 }
 

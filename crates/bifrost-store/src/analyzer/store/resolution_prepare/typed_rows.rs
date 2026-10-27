@@ -2352,3 +2352,16 @@ pub(crate) struct PreparedGenericFormalDefaultRow {
 }
 
 pub(crate) const GENERIC_FORMAL_DEFAULTS_BY_OWNER_SQL: &str = "SELECT owner_definition, ordinal, default_slot FROM resolution_generic_formal_defaults WHERE blob_id = ?1 AND owner_definition IN (SELECT value FROM json_each(?2)) ORDER BY owner_definition, ordinal";
+
+// The semantic-site primary key selects one authored definition before its
+// aliases; ordered child rows preserve the exact binary-owner route.
+pub(crate) const JVM_ALIASES_BY_DEFINITION_SQL: &str = "SELECT definition.semantic_key, alias.alias, alias.member_name, alias.kind, alias.status,
+    (SELECT json_group_array(spelling) FROM
+       (SELECT spelling FROM resolution_jvm_alias_owner_segments segment
+        WHERE segment.blob_id=alias.blob_id AND segment.alias=alias.alias ORDER BY ordinal))
+    FROM json_each(?2) request
+    CROSS JOIN resolution_semantic_sites definition
+      ON definition.blob_id=?1 AND definition.semantic_key=request.value AND definition.semantic_role='definition'
+    CROSS JOIN resolution_jvm_aliases alias
+      ON alias.blob_id=definition.blob_id AND alias.declaration_site=definition.source_site
+    ORDER BY definition.semantic_key, alias.alias";

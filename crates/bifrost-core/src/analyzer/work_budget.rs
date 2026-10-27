@@ -235,3 +235,94 @@ mod tests {
         );
     }
 }
+
+/// The ledger against a field-by-field oracle written out by hand for a
+/// three-dimension work shape, so the last dimension is checked as well as the
+/// first. The macro's labels and limit helpers are unused here.
+#[cfg(test)]
+#[allow(dead_code)]
+mod work_budget_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    define_work_dimensions! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Dimension;
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct Work;
+        all: [3];
+        Rows => rows = 0,
+        Bytes => bytes = 0,
+        Nodes => nodes = 0,
+    }
+
+    /// Small values make every comparison likely; values near `usize::MAX`
+    /// make the sum overflow.
+    fn amount() -> impl Strategy<Value = usize> {
+        prop_oneof![4 => 0usize..6, 1 => (0usize..3).prop_map(|less| usize::MAX - less)]
+    }
+
+    fn work() -> impl Strategy<Value = Work> {
+        (amount(), amount(), amount()).prop_map(|(rows, bytes, nodes)| Work { rows, bytes, nodes })
+    }
+
+    /// The first dimension, in declaration order, whose usage plus work
+    /// overflows or exceeds its limit.
+    fn expected_exceeded(
+        limits: Work,
+        used: Work,
+        work: Work,
+    ) -> Option<WorkBudgetExceeded<Dimension>> {
+        [
+            (Dimension::Rows, limits.rows, used.rows, work.rows),
+            (Dimension::Bytes, limits.bytes, used.bytes, work.bytes),
+            (Dimension::Nodes, limits.nodes, used.nodes, work.nodes),
+        ]
+        .into_iter()
+        .find_map(|(dimension, limit, used, work)| {
+            let sum = used.checked_add(work);
+            let attempted = sum.unwrap_or(usize::MAX);
+            (sum.is_none() || attempted > limit).then_some(WorkBudgetExceeded {
+                dimension,
+                limit,
+                attempted,
+            })
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn check_and_charge_match_the_fieldwise_oracle(
+            limits in work(),
+            used in work(),
+            work in work(),
+        ) {
+            let expected = expected_exceeded(limits, used, work);
+            let ledger = BudgetLedger::new(limits, used);
+            prop_assert_eq!(ledger.check(work).err(), expected);
+
+            let mut charged = ledger.clone();
+            let staged = ledger.staged_charge(work);
+            match expected {
+                Some(exceeded) => {
+                    prop_assert_eq!(charged.charge(work), Err(exceeded));
+                    prop_assert_eq!(charged.used(), used);
+                    prop_assert_eq!(staged, Err(exceeded));
+                }
+                None => {
+                    prop_assert_eq!(charged.charge(work), Ok(()));
+                    let sum = Work {
+                        rows: used.rows + work.rows,
+                        bytes: used.bytes + work.bytes,
+                        nodes: used.nodes + work.nodes,
+                    };
+                    prop_assert_eq!(charged.used(), sum);
+                    prop_assert_eq!(staged.map(|staged| staged.used()), Ok(sum));
+                }
+            }
+            prop_assert_eq!(charged.limits(), limits);
+            prop_assert_eq!(ledger.used(), used);
+        }
+    }
+}

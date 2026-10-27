@@ -270,6 +270,30 @@ mod tests {
     }
 
     #[test]
+    fn grammar_positional_attribute_trivia_ownership() {
+        let source = "struct Tuple(#[allow(dead_code)] /* attached trivia */ pub Item, Other);";
+        let tree = parse(source);
+        let fields = named_descendant(tree.root_node(), "ordered_field_declaration_list");
+        let entries = rust_positional_fields(fields).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0.kind(), "type_identifier");
+        // The visibility token follows the attributes in this production.
+        let visibility = entries[0].1.unwrap();
+        assert_eq!(attribute_paths(visibility, source), ["allow"]);
+        assert!(attribute_paths(entries[1].0, source).is_empty());
+        assert_eq!(parent_outside_attributes(entries[0].0), Some(fields));
+        assert_eq!(parent_outside_attributes(fields), fields.parent());
+
+        let tree = parse("#[marker] struct Item;");
+        let wrapper = tree.root_node().named_child(0).unwrap();
+        let attributes = wrapper.child_by_field_name("attributes").unwrap();
+        let payload = unwrap_attributes(wrapper);
+        // An attribute group is a child of the wrapper but is not its payload.
+        assert_eq!(parent_outside_attributes(attributes), Some(wrapper));
+        assert_eq!(parent_outside_attributes(payload), Some(tree.root_node()));
+    }
+
+    #[test]
     fn unwraps_and_reads_declaration_attributes() {
         let source = "#[first] #[cfg(test)] static ITEM: u8 = 0;";
         let tree = parse(source);
@@ -384,5 +408,300 @@ mod tests {
             )
             .unwrap();
         assert!(malformed.root_node().has_error());
+    }
+
+    #[test]
+    fn grammar_field_name_layout() {
+        use crate::field_roles::{
+            RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
+            rust_is_field_declaration_name,
+        };
+
+        let source = "// \u{e9}\nstruct S { r#type: T, caf\u{e9}: U }\nfn f() { S { r#type: value, caf\u{e9} }; let S { r#type: ref mut renamed, ref caf\u{e9} } = value; }\n";
+        let tree = parse(source);
+        // Original UTF-8 coordinates, independently counted from the fixture.
+        // Shorthand initializers have an unnamed first child; the other names
+        // are carried by the explicit grammar field listed here.
+        for (kind, field, name_kind, span, owner_span, extra_field, extra_span) in [
+            (
+                "field_declaration",
+                Some("name"),
+                "field_identifier",
+                17..23,
+                None,
+                Some("type"),
+                Some(25..26),
+            ),
+            (
+                "field_declaration",
+                Some("name"),
+                "field_identifier",
+                28..33,
+                None,
+                Some("type"),
+                Some(35..36),
+            ),
+            (
+                "field_initializer",
+                Some("field"),
+                "field_identifier",
+                52..58,
+                Some(48..49),
+                Some("value"),
+                Some(60..65),
+            ),
+            (
+                "shorthand_field_initializer",
+                None,
+                "identifier",
+                67..72,
+                Some(48..49),
+                None,
+                None,
+            ),
+            (
+                "field_pattern",
+                Some("name"),
+                "field_identifier",
+                84..90,
+                Some(80..81),
+                Some("pattern"),
+                Some(92..107),
+            ),
+            (
+                "field_pattern",
+                Some("name"),
+                "shorthand_field_identifier",
+                113..118,
+                Some(80..81),
+                None,
+                None,
+            ),
+        ] {
+            let focused = tree
+                .root_node()
+                .descendant_for_byte_range(span.start, span.end)
+                .unwrap();
+            assert_eq!(focused.kind(), name_kind);
+            assert_eq!(focused.byte_range(), span);
+            let mut node = focused;
+            while node.kind() != kind {
+                node = node.parent().expect("field owner");
+            }
+            let name = field
+                .map_or_else(
+                    || node.named_child(0),
+                    |field| node.child_by_field_name(field),
+                )
+                .unwrap();
+            assert_eq!(name, focused);
+            if let Some(field) = extra_field {
+                assert_eq!(
+                    node.child_by_field_name(field).unwrap().byte_range(),
+                    extra_span.unwrap()
+                );
+            }
+            for focus in [focused, node] {
+                let declared = match classify_rust_field_name(focus) {
+                    RustFieldNameRole::Declaration { name } => {
+                        assert_eq!(name, focused);
+                        assert!(owner_span.is_none());
+                        true
+                    }
+                    RustFieldNameRole::Reference {
+                        owner_type,
+                        name,
+                        container,
+                    } => {
+                        assert_eq!(name, focused);
+                        assert_eq!(owner_type.byte_range(), owner_span.clone().unwrap());
+                        assert_eq!(
+                            container,
+                            if kind == "field_pattern" {
+                                RustStructFieldContainer::Pattern
+                            } else {
+                                RustStructFieldContainer::Literal
+                            }
+                        );
+                        let owner = if kind == "field_pattern" {
+                            node.parent().unwrap()
+                        } else {
+                            node.parent().unwrap().parent().unwrap()
+                        };
+                        assert_eq!(
+                            owner.child_by_field_name(if kind == "field_pattern" {
+                                "type"
+                            } else {
+                                "name"
+                            }),
+                            Some(owner_type)
+                        );
+                        if kind != "field_pattern" {
+                            assert_eq!(owner.child_by_field_name("body"), node.parent());
+                        }
+                        false
+                    }
+                    RustFieldNameRole::Other => panic!("unclassified {kind}"),
+                };
+                assert_eq!(
+                    rust_is_field_declaration_name(focus, span.start, span.end),
+                    declared
+                );
+                assert!(!rust_is_field_declaration_name(
+                    focus,
+                    span.start,
+                    span.end - 1
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn grammar_declaration_original_byte_ranges() {
+        use crate::graph_support::inspect_rust_named_declaration_node;
+        use brokk_bifrost_core::analyzer::model::CodeUnitType;
+        use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
+        use std::collections::BTreeSet;
+
+        // The only index input used by the adapter is a navigation range.
+        struct RangeIndex(Range);
+        impl CodeUnitIndex for RangeIndex {
+            fn project(&self) -> &dyn brokk_bifrost_core::analyzer::project::Project {
+                unimplemented!()
+            }
+            fn languages(&self) -> BTreeSet<Language> {
+                unimplemented!()
+            }
+            fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+                unimplemented!()
+            }
+            fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+                unimplemented!()
+            }
+            fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+                unimplemented!()
+            }
+            fn enclosing_code_unit_for_lines(
+                &self,
+                _: &ProjectFile,
+                _: usize,
+                _: usize,
+            ) -> Option<CodeUnit> {
+                unimplemented!()
+            }
+            fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+                unimplemented!()
+            }
+            fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+                unimplemented!()
+            }
+            fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+                unimplemented!()
+            }
+            fn ranges(&self, _: &CodeUnit) -> Vec<Range> {
+                vec![self.0]
+            }
+        }
+
+        let source = "// \u{e9}\n#[tag]\nstruct Caf\u{e9} { field: u8 }\nouter! { inner! { #[tag] fn r\u{e9}sum\u{e9}() {} } }\n";
+        let tree = parse(source);
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "grammar.rs");
+        // name, declaration/name/body/attribute byte spans and grammar kind.
+        for (name, kind, declaration, name_span, body, attributes, interiors) in [
+            (
+                "Caf\u{e9}",
+                "struct_item",
+                13..39,
+                20..25,
+                26..39,
+                6..12,
+                &[][..],
+            ),
+            (
+                "r\u{e9}sum\u{e9}",
+                "function_item",
+                65..81,
+                68..76,
+                79..81,
+                58..64,
+                &[48..84, 57..82][..],
+            ),
+        ] {
+            let mut region_tree = tree.clone();
+            for interior in interiors {
+                let invocation = named_descendant(region_tree.root_node(), "macro_invocation");
+                let arguments =
+                    crate::declarations::rust_macro_invocation_arguments(invocation).unwrap();
+                assert_eq!(arguments.kind(), "token_tree");
+                assert_eq!(arguments.child(0).unwrap().end_byte(), interior.start);
+                assert_eq!(
+                    arguments
+                        .child(arguments.child_count() - 1)
+                        .unwrap()
+                        .start_byte(),
+                    interior.end
+                );
+                region_tree = crate::lexical_scope::parse_rust_region_tree(
+                    source,
+                    interior.start,
+                    interior.end,
+                )
+                .unwrap();
+                assert!(!region_tree.root_node().has_error());
+            }
+            let unit = CodeUnit::new(file.clone(), CodeUnitType::Class, "", name);
+            // Probe even the final continuation byte of each UTF-8 name.
+            for probe in [
+                name_span.clone(),
+                name_span.start..name_span.start + 1,
+                name_span.end - 1..name_span.end,
+            ] {
+                let index = RangeIndex(Range {
+                    start_byte: probe.start,
+                    end_byte: probe.end,
+                    start_line: 0,
+                    end_line: 0,
+                });
+                let actual = inspect_rust_named_declaration_node(
+                    &index,
+                    &unit,
+                    tree.root_node(),
+                    source,
+                    |node, original| {
+                        assert_eq!(original, source);
+                        assert_eq!(node.kind(), kind);
+                        assert_eq!(node.byte_range(), declaration);
+                        let name_node = node.child_by_field_name("name").unwrap();
+                        assert_eq!(name_node.byte_range(), name_span);
+                        assert_eq!(&original[name_node.byte_range()], name);
+                        assert_eq!(node.child_by_field_name("body").unwrap().byte_range(), body);
+                        let wrapper = node.parent().unwrap();
+                        assert_eq!(wrapper.kind(), "declaration_with_attribute");
+                        assert_eq!(wrapper.child_by_field_name("declaration"), Some(node));
+                        assert_eq!(
+                            wrapper
+                                .child_by_field_name("attributes")
+                                .unwrap()
+                                .byte_range(),
+                            attributes
+                        );
+                        node.byte_range()
+                    },
+                );
+                assert_eq!(actual, Some(declaration.clone()));
+            }
+        }
+        // Macro invocation names cannot be interpreted as embedded declarations.
+        let unit = CodeUnit::new(file, CodeUnitType::Class, "", "r\u{e9}sum\u{e9}");
+        let index = RangeIndex(Range {
+            start_byte: 40,
+            end_byte: 45,
+            start_line: 0,
+            end_line: 0,
+        });
+        assert!(
+            inspect_rust_named_declaration_node(&index, &unit, tree.root_node(), source, |_, _| ())
+                .is_none()
+        );
     }
 }

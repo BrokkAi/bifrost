@@ -63,9 +63,8 @@ pub struct RustCargoManifestFacts {
     pub version: u16,
     pub is_workspace: bool,
     pub workspace_members: Box<[PathBuf]>,
-    /// Workspace-relative directory patterns this workspace never claims.
-    /// Cargo accepts glob patterns here, so each entry is matched by path
-    /// component rather than compared for equality.
+    /// Literal workspace-relative directories this workspace never claims,
+    /// including their descendants. Cargo does not expand exclude globs.
     pub workspace_excludes: Box<[PathBuf]>,
     pub workspace_package_edition: Option<RustCargoEdition>,
     pub package: Option<RustCargoPackageFact>,
@@ -140,13 +139,6 @@ pub enum RustCargoDependencyKind {
 }
 
 impl RustCargoManifestFacts {
-    /// Parse versioned facts from manifest bytes without using a mount path.
-    pub fn from_source(source: &str) -> Result<Self, String> {
-        let document = RustCargoManifestDocument::from_source(source)
-            .map_err(|error| format!("invalid Cargo manifest facts: {error}"))?;
-        Self::from_document(&document)
-    }
-
     /// Derive operation-local facts from one already parsed Cargo document.
     pub(crate) fn from_document(manifest: &RustCargoManifestDocument) -> Result<Self, String> {
         let is_workspace = manifest.get("workspace").is_some();
@@ -591,10 +583,6 @@ impl RustSelectedTopologyInput {
 
     pub fn manifest_count(&self) -> usize {
         self.manifests.len()
-    }
-
-    pub fn manifest_directory_count(&self) -> usize {
-        self.manifests_by_directory.len()
     }
 
     pub fn source_paths(&self) -> impl Iterator<Item = &Path> {
@@ -1932,237 +1920,6 @@ pub struct RustSelectedMacroVisibility {
     pub exported: bool,
 }
 
-/// Select a textual macro through the selected file-backed module ancestry.
-/// Each parent lookup occurs at its module declaration, not at the end of the
-/// parent file. Multiple placements must agree on the canonical definition.
-pub fn rust_selected_textual_macro<'facts>(
-    context: &RustSelectedContext,
-    file: &Path,
-    position: usize,
-    name: &str,
-    source: impl Fn(&Path) -> Option<&'facts RustUsageFacts>,
-    imports_macros: impl Fn(&Path, SourceDeclarationId) -> bool,
-    keep_going: &dyn Fn() -> bool,
-) -> RustSelectedBuildOutcome<Option<(PathBuf, SourceDeclarationId)>> {
-    type Query = (PathBuf, usize);
-    type Definition = (PathBuf, SourceDeclarationId);
-    type Rank = (usize, std::cmp::Reverse<usize>);
-    enum Frame {
-        Visit(Query),
-        Finish {
-            query: Query,
-            local: Vec<(Rank, Definition)>,
-            imported: Vec<(Rank, Query)>,
-            parents: Vec<Query>,
-        },
-    }
-    let initial = (file.to_path_buf(), position);
-    let mut pending = vec![Frame::Visit(initial.clone())];
-    let mut active = BTreeSet::new();
-    let mut answers = BTreeMap::<Query, Option<Definition>>::new();
-    while let Some(frame) = pending.pop() {
-        if !keep_going() {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        match frame {
-            Frame::Visit(query) => {
-                if answers.contains_key(&query) {
-                    continue;
-                }
-                if !active.insert(query.clone()) {
-                    answers.insert(query, None);
-                    continue;
-                }
-                let (file, position) = &query;
-                let Some(facts) = source(file) else {
-                    answers.insert(query.clone(), None);
-                    active.remove(&query);
-                    continue;
-                };
-                let mut local = Vec::new();
-                for definition in &context.macro_visibility {
-                    if !keep_going() {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    if definition.file == *file
-                        && definition.name == name
-                        && definition.visible_after <= *position
-                        && definition.scope_start <= *position
-                        && (*position < definition.scope_end
-                            || facts.module_routes.scopes.first().is_some_and(|root| {
-                                *position == root.body_end
-                                    && definition.scope_start == root.body_start
-                                    && definition.scope_end == root.body_end
-                            }))
-                    {
-                        local.push((
-                            (
-                                definition.scope_end - definition.scope_start,
-                                std::cmp::Reverse(definition.visible_after),
-                            ),
-                            (file.clone(), definition.declaration),
-                        ));
-                    }
-                }
-                let mut imported = Vec::new();
-                let mut parents = Vec::new();
-                for edge in &context.module_edges {
-                    if !keep_going() {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    if edge.target_file == *file && edge.declaring_file != *file {
-                        let Some(parent) = source(&edge.declaring_file) else {
-                            continue;
-                        };
-                        let route = parent
-                            .module_routes
-                            .routes
-                            .iter()
-                            .find(|route| Some(route.declaration) == edge.declaration)
-                            .expect("file-backed module edge has a source route");
-                        parents.push((edge.declaring_file.clone(), route.declaration_start));
-                    }
-                    if edge.declaring_file != *file
-                        || !edge
-                            .declaration
-                            .is_some_and(|declaration| imports_macros(file, declaration))
-                    {
-                        continue;
-                    }
-                    let (owner, visible_after, target_position) = if edge.target_file == *file {
-                        let scope = facts
-                            .module_routes
-                            .scopes
-                            .iter()
-                            .find(|scope| scope.declaration == edge.declaration)
-                            .expect("inline module edge has a source scope");
-                        let owner = &facts.module_routes.scopes
-                            [scope.parent.expect("inline module has a parent")];
-                        (owner, scope.body_end, scope.body_end.saturating_sub(1))
-                    } else {
-                        let route = facts
-                            .module_routes
-                            .routes
-                            .iter()
-                            .find(|route| Some(route.declaration) == edge.declaration)
-                            .expect("file-backed module edge has a source route");
-                        let Some(target) = source(&edge.target_file) else {
-                            continue;
-                        };
-                        let Some(root) = target.module_routes.scopes.first() else {
-                            continue;
-                        };
-                        (
-                            &facts.module_routes.scopes[route.scope],
-                            route.declaration_end,
-                            root.body_end,
-                        )
-                    };
-                    if visible_after <= *position
-                        && owner.body_start <= *position
-                        && (*position < owner.body_end
-                            || facts.module_routes.scopes.first().is_some_and(|root| {
-                                *position == root.body_end
-                                    && owner.body_start == root.body_start
-                                    && owner.body_end == root.body_end
-                            }))
-                    {
-                        imported.push((
-                            (
-                                owner.body_end - owner.body_start,
-                                std::cmp::Reverse(visible_after),
-                            ),
-                            (edge.target_file.clone(), target_position),
-                        ));
-                    }
-                }
-                for splice in &context.include_splices {
-                    if !keep_going() {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    if splice.included_file == *file {
-                        parents.push((splice.host_file.clone(), splice.include_start));
-                    }
-                    if splice.host_file != *file || splice.include_start >= *position {
-                        continue;
-                    }
-                    let owner = facts
-                        .module_routes
-                        .scopes
-                        .iter()
-                        .filter(|scope| {
-                            scope.body_start <= splice.include_start
-                                && splice.include_start < scope.body_end
-                        })
-                        .min_by_key(|scope| scope.body_end - scope.body_start)
-                        .expect("include is inside its host module");
-                    if owner.body_start <= *position
-                        && (*position < owner.body_end
-                            || facts.module_routes.scopes.first().is_some_and(|root| {
-                                *position == root.body_end
-                                    && owner.body_start == root.body_start
-                                    && owner.body_end == root.body_end
-                            }))
-                        && let Some(root) = source(&splice.included_file)
-                            .and_then(|facts| facts.module_routes.scopes.first())
-                    {
-                        imported.push((
-                            (
-                                owner.body_end - owner.body_start,
-                                std::cmp::Reverse(splice.include_start),
-                            ),
-                            (splice.included_file.clone(), root.body_end),
-                        ));
-                    }
-                }
-                let dependencies = imported
-                    .iter()
-                    .map(|(_, query)| query.clone())
-                    .chain(parents.iter().cloned())
-                    .collect::<Vec<_>>();
-                pending.push(Frame::Finish {
-                    query,
-                    local,
-                    imported,
-                    parents,
-                });
-                pending.extend(dependencies.into_iter().map(Frame::Visit));
-            }
-            Frame::Finish {
-                query,
-                mut local,
-                imported,
-                parents,
-            } => {
-                for (rank, dependency) in imported {
-                    if let Some(Some(definition)) = answers.get(&dependency) {
-                        local.push((rank, definition.clone()));
-                    }
-                }
-                local.sort();
-                let selected = if let Some((rank, definition)) = local.first() {
-                    local
-                        .iter()
-                        .take_while(|(other, _)| other == rank)
-                        .all(|(_, candidate)| candidate == definition)
-                        .then(|| definition.clone())
-                } else {
-                    let candidates = parents
-                        .iter()
-                        .map(|parent| answers.get(parent).cloned().flatten())
-                        .collect::<BTreeSet<_>>();
-                    (candidates.len() == 1)
-                        .then(|| candidates.into_iter().next().flatten())
-                        .flatten()
-                };
-                active.remove(&query);
-                answers.insert(query, selected);
-            }
-        }
-    }
-    RustSelectedBuildOutcome::Ready(answers.remove(&initial).flatten())
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RustSelectedIncludeSplice {
     pub host_file: PathBuf,
@@ -2592,10 +2349,12 @@ fn build_rust_selected_context_from_maps_with_progress(
                 &mut gaps,
                 progress,
             );
-            let RustSelectedBuildOutcome::Ready(RustSelectedActivation::Active) = scope_activation
-            else {
-                continue;
+            let RustSelectedBuildOutcome::Ready(scope_activation) = scope_activation else {
+                return Ok(RustSelectedBuildOutcome::Stopped);
             };
+            if scope_activation != RustSelectedActivation::Active {
+                continue;
+            }
             if !(0..source_topologies[file.as_path()].scope_activations[scope_index].len())
                 .all(|_| progress(RustSelectedContextWork::ScopeNode))
             {
@@ -3284,613 +3043,6 @@ pub fn build_rust_selected_topology_context_from_prepared_with_progress(
     Ok(RustSelectedBuildOutcome::Ready(context))
 }
 
-/// Resolve exact selected named-import authorities through the immutable Cargo
-/// and module topology. The caller derives both authority sets from mounted
-/// common paths, so this function never reconstructs their local coordinates.
-pub fn compile_rust_selected_root_bridge_topology(
-    context: &RustSelectedContext,
-    imports: impl IntoIterator<Item = RustSelectedRootImportAuthority>,
-    exports: impl IntoIterator<Item = RustSelectedRootExportAuthority>,
-) -> Box<[RustSelectedRootBridgeTopology]> {
-    let RustSelectedBuildOutcome::Ready(bridges) =
-        compile_rust_selected_root_bridge_topology_with_progress(
-            context,
-            imports,
-            exports,
-            &mut |_| true,
-        )
-    else {
-        unreachable!("an always-live selected Rust bridge build cannot stop")
-    };
-    bridges
-}
-
-pub fn compile_rust_selected_root_bridge_topology_with_progress(
-    context: &RustSelectedContext,
-    imports: impl IntoIterator<Item = RustSelectedRootImportAuthority>,
-    exports: impl IntoIterator<Item = RustSelectedRootExportAuthority>,
-    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
-) -> RustSelectedBuildOutcome<Box<[RustSelectedRootBridgeTopology]>> {
-    let mut selected_imports = BTreeSet::new();
-    for import in imports {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        selected_imports.insert(import);
-    }
-    let mut selected_exports = BTreeSet::new();
-    for export in exports {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        selected_exports.insert(export);
-    }
-    let mut bridges = BTreeSet::new();
-    let topology = RustSelectedTopologyAuthority {
-        context,
-        imports: &selected_imports,
-        exports: &selected_exports,
-    };
-    for import in &selected_imports {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        for membership in &context.target_memberships {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if membership.file != import.source_file
-                || membership.module_segments != import.source_module_segments
-            {
-                continue;
-            }
-            let mut route = Vec::new();
-            for segment in &import.route {
-                if !progress(RustSelectedContextWork::ScopeNode) {
-                    return RustSelectedBuildOutcome::Stopped;
-                }
-                route.push(segment.as_str());
-            }
-            let RustSelectedBuildOutcome::Ready(import_targets) = selected_topology_import_targets(
-                topology.context,
-                membership,
-                topology.imports,
-                topology.exports,
-                &route,
-                import.anchor,
-                progress,
-            ) else {
-                return RustSelectedBuildOutcome::Stopped;
-            };
-            for target in import_targets {
-                if !progress(RustSelectedContextWork::ScopeNode) {
-                    return RustSelectedBuildOutcome::Stopped;
-                }
-                let RustSelectedBuildOutcome::Ready(targets) = selected_topology_export_targets(
-                    topology,
-                    membership,
-                    std::slice::from_ref(&target),
-                    &import.target_name,
-                    import.namespace,
-                    progress,
-                ) else {
-                    return RustSelectedBuildOutcome::Stopped;
-                };
-                for target in targets {
-                    if !progress(RustSelectedContextWork::ScopeNode) {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    bridges.insert(RustSelectedRootBridgeTopology {
-                        source_file: import.source_file.clone(),
-                        source_root_scope: import.source_root_scope,
-                        target_file: target.target_file,
-                        target_root_scope: target.target_root_scope,
-                        route: import.route.clone(),
-                        source_import_ordinal: import.source_import_ordinal,
-                        anchor: import.anchor,
-                        source_name: import.source_name.clone(),
-                        target_name: target.name,
-                        namespace: import.namespace,
-                        declaration_authority: target.declaration_authority.clone(),
-                    });
-                }
-            }
-        }
-    }
-    RustSelectedBuildOutcome::Ready(bridges.into_iter().collect::<Vec<_>>().into_boxed_slice())
-}
-
-/// Compile selected root bridges from an indexed topology. Workspace and
-/// bounded caller operations share this implementation: progress charges the
-/// actual indexed traversal rather than repeated full relation scans. The
-/// legacy compiler remains a differential oracle for canonical bridge output.
-/// The canonical macro-export route proves public exposure at the crate root;
-/// the declaration and physical target file retain their original identity.
-fn macro_crate_root_exposure(
-    export: &RustSelectedRootExportAuthority,
-) -> RustSelectedRootExportAuthority {
-    assert_eq!(export.namespace, ResolutionNamespace::Macro);
-    let mut exposed = export.clone();
-    exposed.target_module_segments = Box::new([]);
-    let authority = exposed
-        .declaration_authority
-        .as_mut()
-        .expect("macro export exposure has canonical declaration authority");
-    authority.declaring_module_segments = Box::new([]);
-    authority.visibility = RustVisibility::Public;
-    exposed
-}
-
-#[derive(Clone, Copy)]
-struct RustSelectedTopologyAuthority<'a> {
-    context: &'a RustSelectedContext,
-    imports: &'a BTreeSet<RustSelectedRootImportAuthority>,
-    exports: &'a BTreeSet<RustSelectedRootExportAuthority>,
-}
-
-fn selected_topology_export_targets(
-    topology: RustSelectedTopologyAuthority<'_>,
-    requester: &RustSelectedTargetMembership,
-    initial_targets: &[RustSelectedImportTarget],
-    target_name: &str,
-    namespace: ResolutionNamespace,
-    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
-) -> RustSelectedBuildOutcome<BTreeSet<RustSelectedRootExportAuthority>> {
-    let mut selected = BTreeSet::new();
-    let mut pending = VecDeque::new();
-    for target in initial_targets {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        let RustSelectedBuildOutcome::Ready(visible) =
-            selected_module_route_is_visible_with_progress(
-                &topology.context.module_edges,
-                &target.crate_root,
-                &requester.crate_root,
-                &requester.module_segments,
-                &target.module_segments,
-                progress,
-            )
-        else {
-            return RustSelectedBuildOutcome::Stopped;
-        };
-        if visible {
-            pending.push_back((requester.clone(), target.clone(), target_name.to_string()));
-        }
-    }
-    let mut visited = BTreeSet::new();
-    while let Some((requester, target, requested_name)) = pending.pop_front() {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        if namespace == ResolutionNamespace::Macro && target.module_segments.is_empty() {
-            for export in topology.exports {
-                if !progress(RustSelectedContextWork::ScopeNode) {
-                    return RustSelectedBuildOutcome::Stopped;
-                }
-                if export.namespace != namespace || export.name != requested_name {
-                    continue;
-                }
-                let Some(authority) = &export.declaration_authority else {
-                    continue;
-                };
-                if authority.crate_root != target.crate_root {
-                    continue;
-                }
-                for route in &topology.context.root_routes {
-                    if !progress(RustSelectedContextWork::ScopeNode) {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    if route.kind == RustSelectedRootRouteKind::ExportedMacro
-                        && route.file == export.target_file
-                        && route.declaration == Some(authority.declaration)
-                    {
-                        selected.insert(macro_crate_root_exposure(export));
-                    }
-                }
-            }
-        }
-        for target_membership in &topology.context.target_memberships {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if target_membership.crate_root != target.crate_root
-                || target_membership.module_segments != target.module_segments
-            {
-                continue;
-            }
-            if !visited.insert((
-                requester.crate_root.clone(),
-                requester.module_segments.clone(),
-                target_membership.crate_root.clone(),
-                target_membership.module_segments.clone(),
-                target_membership.file.clone(),
-                requested_name.clone(),
-                namespace,
-            )) {
-                continue;
-            }
-            for direct in topology.exports.iter().filter(|export| {
-                export.target_file == target_membership.file
-                    && export.target_module_segments == target_membership.module_segments
-                    && export.name == requested_name
-                    && export.namespace == namespace
-                    && export
-                        .declaration_authority
-                        .as_ref()
-                        .is_some_and(|authority| {
-                            authority.reaches(&requester.crate_root, &requester.module_segments)
-                        })
-            }) {
-                selected.insert(direct.clone());
-            }
-            for route in &topology.context.root_routes {
-                if !progress(RustSelectedContextWork::ScopeNode) {
-                    return RustSelectedBuildOutcome::Stopped;
-                }
-                if route.file != target_membership.file
-                    || route.owner_module_segments != target_membership.module_segments
-                    || !rust_module_visibility_reaches(
-                        &route.visibility,
-                        requester.crate_root == target_membership.crate_root,
-                        &requester.module_segments,
-                        &target_membership.module_segments,
-                    )
-                {
-                    continue;
-                }
-                let forwarded_name = match route.kind {
-                    RustSelectedRootRouteKind::NamedReexport
-                        if route.local_name.as_deref() == Some(requested_name.as_str()) =>
-                    {
-                        route.target_name.as_deref()
-                    }
-                    RustSelectedRootRouteKind::GlobReexport => Some(requested_name.as_str()),
-                    _ => None,
-                };
-                let (Some(route_segments), Some(forwarded_name)) =
-                    (route.route_segments.as_deref(), forwarded_name)
-                else {
-                    continue;
-                };
-                let mut route_names = Vec::new();
-                for segment in route_segments {
-                    if !progress(RustSelectedContextWork::ScopeNode) {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    route_names.push(segment.as_str());
-                }
-                let RustSelectedBuildOutcome::Ready(forwarded_targets) =
-                    selected_topology_import_targets(
-                        topology.context,
-                        target_membership,
-                        topology.imports,
-                        topology.exports,
-                        &route_names,
-                        route.anchor,
-                        progress,
-                    )
-                else {
-                    return RustSelectedBuildOutcome::Stopped;
-                };
-                for forwarded_target in forwarded_targets {
-                    if !progress(RustSelectedContextWork::ScopeNode) {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    let RustSelectedBuildOutcome::Ready(visible) =
-                        selected_module_route_is_visible_with_progress(
-                            &topology.context.module_edges,
-                            &forwarded_target.crate_root,
-                            &target_membership.crate_root,
-                            &target_membership.module_segments,
-                            &forwarded_target.module_segments,
-                            progress,
-                        )
-                    else {
-                        return RustSelectedBuildOutcome::Stopped;
-                    };
-                    if visible {
-                        pending.push_back((
-                            target_membership.clone(),
-                            forwarded_target,
-                            forwarded_name.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    RustSelectedBuildOutcome::Ready(selected)
-}
-
-/// Compile the continuation of a bare Rust Type-prefix after the native
-/// resolver has selected its exact source declaration.
-///
-/// The first module edge is joined by `(declaring_file, declaration)`, never
-/// by its displayed module name.  Only after that identity join does the
-/// ordinary selected topology resolver interpret `route` relative to the
-/// selected module.  A type declaration with no matching module edge therefore
-/// produces no module continuation, allowing the caller to preserve its
-/// separate type/member path rather than silently selecting a same-named
-/// module.
-#[allow(clippy::too_many_arguments)]
-pub fn compile_rust_selected_module_prefix_continuation_with_progress(
-    context: &RustSelectedContext,
-    requester: &RustSelectedTargetMembership,
-    imports: &BTreeSet<RustSelectedRootImportAuthority>,
-    exports: &BTreeSet<RustSelectedRootExportAuthority>,
-    declaring_file: &Path,
-    declaration: SourceDeclarationId,
-    route: &[String],
-    anchor: ResolutionRootImportAnchor,
-    target_name: &str,
-    namespace: ResolutionNamespace,
-    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
-) -> RustSelectedBuildOutcome<BTreeSet<RustSelectedRootExportAuthority>> {
-    let mut exact_module_targets = BTreeSet::new();
-    for edge in &context.module_edges {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        if edge.declaring_file != declaring_file || edge.declaration != Some(declaration) {
-            continue;
-        }
-        if !rust_module_visibility_reaches(
-            &edge.visibility,
-            edge.crate_root == requester.crate_root,
-            &requester.module_segments,
-            &edge.declaring_module_segments,
-        ) {
-            continue;
-        }
-        let Some(target_membership) = context.target_memberships.iter().find(|membership| {
-            membership.crate_root == edge.crate_root
-                && membership.file == edge.target_file
-                && membership.module_segments == edge.module_segments
-        }) else {
-            continue;
-        };
-        exact_module_targets.insert(RustSelectedImportTarget {
-            crate_root: target_membership.crate_root.clone(),
-            module_segments: target_membership.module_segments.clone(),
-        });
-    }
-    if exact_module_targets.is_empty() {
-        return RustSelectedBuildOutcome::Ready(BTreeSet::new());
-    }
-
-    let route_names = route.iter().map(String::as_str).collect::<Vec<_>>();
-    let mut continuation_targets = Vec::new();
-    for target in exact_module_targets {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        let Some(target_membership) = context.target_memberships.iter().find(|membership| {
-            membership.crate_root == target.crate_root
-                && membership.module_segments == target.module_segments
-        }) else {
-            continue;
-        };
-        if route_names.is_empty() {
-            continuation_targets.push(target);
-            continue;
-        }
-        let RustSelectedBuildOutcome::Ready(targets) = selected_topology_import_targets(
-            context,
-            target_membership,
-            imports,
-            exports,
-            &route_names,
-            anchor,
-            progress,
-        ) else {
-            return RustSelectedBuildOutcome::Stopped;
-        };
-        continuation_targets.extend(targets);
-    }
-    selected_topology_export_targets(
-        RustSelectedTopologyAuthority {
-            context,
-            imports,
-            exports,
-        },
-        requester,
-        &continuation_targets,
-        target_name,
-        namespace,
-        progress,
-    )
-}
-
-fn selected_topology_import_targets(
-    context: &RustSelectedContext,
-    source: &RustSelectedTargetMembership,
-    imports: &BTreeSet<RustSelectedRootImportAuthority>,
-    exports: &BTreeSet<RustSelectedRootExportAuthority>,
-    route: &[&str],
-    anchor: ResolutionRootImportAnchor,
-    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
-) -> RustSelectedBuildOutcome<Vec<RustSelectedImportTarget>> {
-    if !progress(RustSelectedContextWork::ScopeNode) {
-        return RustSelectedBuildOutcome::Stopped;
-    }
-    if anchor == ResolutionRootImportAnchor::Absolute {
-        for _ in route {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-        }
-        if !source.edition.uses_uniform_paths() {
-            let module_segments = route
-                .iter()
-                .map(|segment| (*segment).to_string())
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            return RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: source.crate_root.clone(),
-                module_segments,
-            }]);
-        }
-    }
-    let Some(first) = route.first().copied() else {
-        return RustSelectedBuildOutcome::Ready(Vec::new());
-    };
-    if matches!(first, "crate" | "self" | "super") {
-        for _ in route {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-        }
-        return RustSelectedBuildOutcome::Ready(
-            resolve_same_crate_module(&source.module_segments, route)
-                .map(|module_segments| {
-                    vec![RustSelectedImportTarget {
-                        crate_root: source.crate_root.clone(),
-                        module_segments,
-                    }]
-                })
-                .unwrap_or_default(),
-        );
-    }
-    let mut extern_crate_names = BTreeSet::new();
-    for root_route in &context.root_routes {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        if root_route.file == source.file
-            && root_route.owner_module_segments == source.module_segments
-            && root_route.kind == RustSelectedRootRouteKind::ExternCrate
-            && root_route.local_name.as_deref() == Some(first)
-            && let Some(target_name) = root_route.target_name.as_deref()
-        {
-            extern_crate_names.insert(target_name);
-        }
-    }
-    let dependency_name = if extern_crate_names.len() == 1 {
-        extern_crate_names.first().copied()
-    } else if extern_crate_names.is_empty() && source.edition.uses_uniform_paths() {
-        Some(first)
-    } else {
-        None
-    };
-    let mut dependencies = Vec::new();
-    if let Some(dependency_name) = dependency_name {
-        for dependency in &context.dependency_edges {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if dependency.source_crate_root == source.crate_root
-                && dependency.exposed_name == dependency_name
-            {
-                let mut module_segments = Vec::new();
-                for segment in &route[1..] {
-                    if !progress(RustSelectedContextWork::ScopeNode) {
-                        return RustSelectedBuildOutcome::Stopped;
-                    }
-                    module_segments.push((*segment).to_string());
-                }
-                dependencies.push(RustSelectedImportTarget {
-                    crate_root: dependency.target_crate_root.clone(),
-                    module_segments: module_segments.into_boxed_slice(),
-                });
-            }
-        }
-    }
-    let binding_file = if source.edition.uses_uniform_paths() {
-        &source.file
-    } else {
-        let mut root_file = None;
-        for membership in &context.target_memberships {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if membership.crate_root == source.crate_root && membership.module_segments.is_empty() {
-                root_file = Some(&membership.file);
-                break;
-            }
-        }
-        let Some(root_file) = root_file else {
-            return RustSelectedBuildOutcome::Ready(Vec::new());
-        };
-        root_file
-    };
-    let binding_module_segments = if source.edition.uses_uniform_paths() {
-        source.module_segments.as_ref()
-    } else {
-        &[]
-    };
-    let local_type_binding = exports.iter().any(|export| {
-        export.target_file == *binding_file
-            && export.target_module_segments.as_ref() == binding_module_segments
-            && export.name == first
-            && export.namespace == ResolutionNamespace::Type
-    }) || {
-        let mut found = false;
-        for import in imports {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if import.source_file == *binding_file
-                && import.source_module_segments.as_ref() == binding_module_segments
-                && import.source_name == first
-                && import.namespace == ResolutionNamespace::Type
-            {
-                found = true;
-                break;
-            }
-        }
-        found
-    } || context.root_routes.iter().any(|route| {
-        route.file == *binding_file
-            && route.owner_module_segments.as_ref() == binding_module_segments
-            && route.kind == RustSelectedRootRouteKind::Module
-            && route.local_name.as_deref() == Some(first)
-    });
-    let mut module_segments = if source.edition.uses_uniform_paths() {
-        source.module_segments.to_vec()
-    } else {
-        Vec::new()
-    };
-    for segment in route {
-        if !progress(RustSelectedContextWork::ScopeNode) {
-            return RustSelectedBuildOutcome::Stopped;
-        }
-        module_segments.push((*segment).to_string());
-    }
-    if local_type_binding && anchor != ResolutionRootImportAnchor::Absolute {
-        let mut selected = false;
-        for membership in &context.target_memberships {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if membership.crate_root == source.crate_root
-                && membership.module_segments.as_ref() == module_segments
-            {
-                selected = true;
-                break;
-            }
-        }
-        if selected {
-            return RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: source.crate_root.clone(),
-                module_segments: module_segments.into_boxed_slice(),
-            }]);
-        }
-        return RustSelectedBuildOutcome::Ready(Vec::new());
-    }
-    if anchor == ResolutionRootImportAnchor::Absolute {
-        assert!(
-            source.edition.uses_uniform_paths(),
-            "Rust 2015 leading-absolute routes return at the crate root"
-        );
-        RustSelectedBuildOutcome::Ready(dependencies)
-    } else if source.edition.uses_uniform_paths() || !dependencies.is_empty() {
-        RustSelectedBuildOutcome::Ready(dependencies)
-    } else {
-        RustSelectedBuildOutcome::Ready(Vec::new())
-    }
-}
-
 /// The edition a detached Rust file is read under.
 ///
 /// A detached file belongs to no Cargo target, so no package edition applies to
@@ -3981,12 +3133,10 @@ fn effective_cargo_edition(
 
 /// Whether one `[workspace]` manifest claims the package in `package_directory`.
 ///
-/// A workspace claims every package under its directory except the ones its
-/// `exclude` patterns name. Cargo treats an excluded directory as outside the
-/// workspace entirely, so it inherits nothing from `[workspace.package]` and
-/// is not a member. Bifrost's own root manifest excludes `.claude/worktrees/*`
-/// precisely because those checkouts hold whole copies of the repository whose
-/// manifests must not be claimed by the surrounding workspace.
+/// Excludes name literal workspace-relative directories, including their
+/// descendants. Cargo does not expand wildcards in `exclude`. Nested checkouts
+/// establish their own workspace boundary with their own `[workspace]`; callers
+/// choose the nearest workspace before asking whether it claims a package.
 fn cargo_workspace_claims_package(
     workspace_directory: &Path,
     facts: &RustCargoManifestFacts,
@@ -4001,7 +3151,7 @@ fn cargo_workspace_claims_package(
     !facts
         .workspace_excludes
         .iter()
-        .any(|pattern| cargo_path_pattern_covers(pattern, relative))
+        .any(|excluded| crate::cargo_routes::cargo_workspace_exclude_covers(excluded, relative))
 }
 
 /// An excluded package is outside the enclosing workspace, even when its
@@ -4053,76 +3203,6 @@ fn cargo_package_is_excluded_from_selected_workspace(
             directory,
         ),
     ))
-}
-
-/// Whether one Cargo path pattern names `path` or one of its ancestors.
-///
-/// Cargo matches these entries as globs against workspace-relative directory
-/// paths. Matching walks `Path` components so the same pattern behaves the
-/// same on Windows and Unix, and an excluded directory also excludes every
-/// package nested inside it.
-fn cargo_path_pattern_covers(pattern: &Path, path: &Path) -> bool {
-    let mut pattern_components = pattern.components();
-    let mut path_components = path.components();
-    loop {
-        let Some(expected) = pattern_components.next() else {
-            // The pattern named an ancestor directory of this path.
-            return true;
-        };
-        let Some(actual) = path_components.next() else {
-            return false;
-        };
-        let (Component::Normal(expected), Component::Normal(actual)) = (expected, actual) else {
-            if expected != actual {
-                return false;
-            }
-            continue;
-        };
-        let (Some(expected), Some(actual)) = (expected.to_str(), actual.to_str()) else {
-            return false;
-        };
-        if !cargo_name_pattern_matches(expected, actual) {
-            return false;
-        }
-    }
-}
-
-/// Whether one Cargo glob component matches one path component.
-///
-/// `*` stands for any run of characters inside a single component and `?` for
-/// exactly one. The walk is iterative with one backtrack point, so a pattern
-/// cannot recurse on deeply repeated wildcards.
-fn cargo_name_pattern_matches(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let name = name.as_bytes();
-    let mut pattern_index = 0_usize;
-    let mut name_index = 0_usize;
-    let mut star: Option<(usize, usize)> = None;
-    while name_index < name.len() {
-        match pattern.get(pattern_index) {
-            Some(b'*') => {
-                star = Some((pattern_index, name_index));
-                pattern_index += 1;
-            }
-            Some(b'?') => {
-                pattern_index += 1;
-                name_index += 1;
-            }
-            Some(&expected) if expected == name[name_index] => {
-                pattern_index += 1;
-                name_index += 1;
-            }
-            _ => match star {
-                Some((star_pattern, star_name)) => {
-                    pattern_index = star_pattern + 1;
-                    name_index = star_name + 1;
-                    star = Some((star_pattern, name_index));
-                }
-                None => return false,
-            },
-        }
-    }
-    pattern[pattern_index..].iter().all(|byte| *byte == b'*')
 }
 
 fn selected_root_bridges(
@@ -4648,40 +3728,6 @@ fn selected_module_route_is_visible(
     })
 }
 
-fn selected_module_route_is_visible_with_progress(
-    module_edges: &[RustSelectedModuleEdge],
-    target_crate_root: &Path,
-    source_crate_root: &Path,
-    source_module: &[String],
-    target_module: &[String],
-    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
-) -> RustSelectedBuildOutcome<bool> {
-    for length in 1..=target_module.len() {
-        let mut visible = false;
-        for edge in module_edges {
-            if !progress(RustSelectedContextWork::ScopeNode) {
-                return RustSelectedBuildOutcome::Stopped;
-            }
-            if edge.crate_root == target_crate_root
-                && edge.module_segments.as_ref() == &target_module[..length]
-                && rust_module_visibility_reaches(
-                    &edge.visibility,
-                    target_crate_root == source_crate_root,
-                    source_module,
-                    &edge.declaring_module_segments,
-                )
-            {
-                visible = true;
-                break;
-            }
-        }
-        if !visible {
-            return RustSelectedBuildOutcome::Ready(false);
-        }
-    }
-    RustSelectedBuildOutcome::Ready(true)
-}
-
 fn rust_module_visibility_reaches(
     visibility: &RustVisibility,
     same_crate: bool,
@@ -5182,6 +4228,52 @@ mod tests {
             })
             .collect();
         (sources, vec![manifest])
+    }
+
+    #[test]
+    fn grammar_module_path_attribute_directories() {
+        let root = std::env::current_dir().unwrap();
+        let file = Path::new("src").join("outer.rs");
+        for (source, attribute, directory) in [
+            (
+                "#[path = \"alt\"] pub mod inline { pub mod child; }",
+                Some("alt"),
+                Path::new("src").join("alt"),
+            ),
+            (
+                "pub mod inline { pub mod child; }",
+                None,
+                Path::new("src").join("outer").join("inline"),
+            ),
+        ] {
+            let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mount = source_mount_from_tree(&root, file.clone(), source, &tree);
+            let facts = &mount.facts.module_routes;
+            let inline = facts
+                .scopes
+                .iter()
+                .find(|scope| scope.module_name == "inline")
+                .unwrap();
+            assert_eq!(inline.path_attribute.as_deref(), attribute);
+            let route = facts
+                .routes
+                .iter()
+                .find(|route| route.module_name == "child")
+                .unwrap();
+            let RustSelectedBuildOutcome::Ready(paths) =
+                module_candidates(&file, facts, false, route, &mut |_| true)
+            else {
+                panic!("uncancelled path selection completes");
+            };
+            assert_eq!(
+                paths.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from([
+                    directory.join("child.rs"),
+                    directory.join("child").join("mod.rs")
+                ])
+            );
+        }
     }
 
     #[test]
@@ -6118,49 +5210,13 @@ mod tests {
                 && route.anchor == ResolutionRootImportAnchor::Absolute
                 && route.local_name.as_deref() == Some("ExternalItem")
         }));
-        let source = context
-            .target_memberships
-            .iter()
-            .find(|membership| {
+        assert!(
+            context.target_memberships.iter().any(|membership| {
                 membership.crate_root == Path::new("app/src/lib.rs")
                     && membership.file == Path::new("app/src/lib.rs")
                     && membership.module_segments.is_empty()
-            })
-            .expect("app crate root membership");
-        let imports = BTreeSet::new();
-        let exports = BTreeSet::new();
-        let mut progress = |_| true;
-        let absolute = selected_topology_import_targets(
-            &context,
-            source,
-            &imports,
-            &exports,
-            &["engine"],
-            ResolutionRootImportAnchor::Absolute,
-            &mut progress,
-        );
-        assert_eq!(
-            absolute,
-            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: PathBuf::from("engine/src/lib.rs"),
-                module_segments: Box::new([]),
-            }])
-        );
-        let bare = selected_topology_import_targets(
-            &context,
-            source,
-            &imports,
-            &exports,
-            &["engine"],
-            ResolutionRootImportAnchor::Lexical,
-            &mut progress,
-        );
-        assert_eq!(
-            bare,
-            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: PathBuf::from("app/src/lib.rs"),
-                module_segments: vec!["engine".to_string()].into_boxed_slice(),
-            }])
+            }),
+            "the consumer crate root remains in the selected topology"
         );
     }
 
@@ -6219,64 +5275,6 @@ mod tests {
         assert!(context.root_routes.iter().any(|route| {
             route.kind == RustSelectedRootRouteKind::GlobUse && route.route == "crate::later"
         }));
-    }
-
-    #[test]
-    fn textual_macro_inheritance_uses_module_declaration_order() {
-        for (root, expected) in [
-            (
-                "macro_rules! inherited { ($t:ty) => {}; }\nmod child;\n",
-                true,
-            ),
-            (
-                "mod child;\nmacro_rules! inherited { ($t:ty) => {}; }\n",
-                false,
-            ),
-        ] {
-            let (sources, manifests) = inputs_from_files(&[
-                (
-                    "app/Cargo.toml",
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-                ),
-                ("app/src/lib.rs", root),
-                ("app/src/child.rs", "inherited!(usize);\n"),
-            ]);
-            let context =
-                build_rust_selected_context(sources.clone(), manifests, same_crate_profile())
-                    .unwrap();
-            let result = rust_selected_textual_macro(
-                &context,
-                Path::new("app/src/child.rs"),
-                0,
-                "inherited",
-                |path| {
-                    sources
-                        .iter()
-                        .find(|source| source.relative_path == path)
-                        .map(|source| &source.facts)
-                },
-                |_, _| false,
-                &|| true,
-            );
-            let RustSelectedBuildOutcome::Ready(result) = result else {
-                panic!("unbounded lookup stops");
-            };
-            assert_eq!(result.is_some(), expected);
-            if let Some((file, declaration)) = result {
-                assert_eq!(file, Path::new("app/src/lib.rs"));
-                assert_eq!(
-                    declaration,
-                    sources
-                        .iter()
-                        .find(|source| source.relative_path == file)
-                        .unwrap()
-                        .facts
-                        .module_routes
-                        .item_macros[0]
-                        .declaration
-                );
-            }
-        }
     }
 
     #[test]
@@ -6454,13 +5452,63 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: leading dot excludes missed workspace directories"
+    )]
+    fn workspace_excludes_normalize_leading_current_directory() {
+        let manifest = RustSelectedManifestMount::from_source(
+            "Cargo.toml",
+            "[workspace]\nexclude = [\"./vendor\"]\n",
+        )
+        .unwrap();
+        for path in ["vendor", "vendor/nested"] {
+            assert!(
+                !cargo_workspace_claims_package(Path::new(""), &manifest.facts, Path::new(path)),
+                "{path}"
+            );
+        }
+        assert!(cargo_workspace_claims_package(
+            Path::new(""),
+            &manifest.facts,
+            Path::new("vendor-other")
+        ));
+    }
+
+    #[test]
+    #[hardwon("#6846: Cargo workspace excludes are literal paths, not globs")]
+    fn workspace_excludes_match_literal_directories() {
+        for (excluded, path, claimed) in [
+            ("pkg?", "pkg\u{e9}", true),
+            ("pkg?", "pkgx", true),
+            ("pkg?", "pkg?", false),
+            ("pkg*", "pkg\u{e9}", true),
+            ("pkg*", "pkg*", false),
+            ("vendor/*", "vendor/app", true),
+            ("vendor/*", "vendor/*/app", false),
+            ("./vendor", "vendor/app", false),
+            ("vendor", "vendor-other", true),
+        ] {
+            let manifest = RustSelectedManifestMount::from_source(
+                "Cargo.toml",
+                &format!("[workspace]\nexclude = [{excluded:?}]\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                cargo_workspace_claims_package(Path::new(""), &manifest.facts, Path::new(path)),
+                claimed,
+                "exclude={excluded:?}, path={path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn excluded_directories_leave_the_enclosing_cargo_workspace() {
         let manifest = RustSelectedManifestMount::from_source(
             "Cargo.toml",
             concat!(
                 "[workspace]\n",
                 "members = [\"crates/app\"]\n",
-                "exclude = [\".claude/worktrees/*\", \"vendor/*\"]\n",
+                "exclude = [\".claude/worktrees\", \"vendor\"]\n",
                 "[workspace.package]\n",
                 "edition = \"2024\"\n",
             ),
@@ -6495,7 +5543,7 @@ mod tests {
                 concat!(
                     "[workspace]\n",
                     "members = [\"crates/app\"]\n",
-                    "exclude = [\"vendor/*\"]\n",
+                    "exclude = [\"vendor\"]\n",
                     "[workspace.package]\n",
                     "edition = \"2024\"\n",
                 ),
@@ -6549,7 +5597,6 @@ mod tests {
                 concat!(
                     "[workspace]\n",
                     "members = [\"crates/app\"]\n",
-                    "exclude = [\"vendor/*\"]\n",
                     "[workspace.package]\n",
                     "edition = \"2024\"\n",
                 ),
@@ -6560,8 +5607,12 @@ mod tests {
             ),
             ("crates/app/src/lib.rs", "pub fn member() {}\n"),
             (
+                "vendor/Cargo.toml",
+                "[workspace]\nmembers = [\"app\"]\n[workspace.package]\nedition = \"2015\"\n",
+            ),
+            (
                 "vendor/app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2015\"\n",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
             ),
             ("vendor/app/src/lib.rs", "pub fn vendored() {}\n"),
         ];
@@ -6604,7 +5655,7 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(files, [Path::new(root)].into());
             // Two packages named `app` are two crates. The member inherits the
-            // workspace edition; the excluded copy keeps its own and is never
+            // workspace edition; the nested workspace supplies its own and is never
             // merged into the member's crate.
             assert!(
                 context
@@ -7989,33 +7040,13 @@ mod tests {
                 && route.anchor == ResolutionRootImportAnchor::Absolute
                 && route.local_name.as_deref() == Some("AbsoluteItem")
         }));
-        let source = context
-            .target_memberships
-            .iter()
-            .find(|membership| {
+        assert!(
+            context.target_memberships.iter().any(|membership| {
                 membership.crate_root == Path::new("app/src/lib.rs")
                     && membership.file == Path::new("app/src/lib.rs")
                     && membership.module_segments.is_empty()
-            })
-            .expect("consumer crate-root membership");
-        let imports = BTreeSet::new();
-        let exports = BTreeSet::new();
-        let mut progress = |_| true;
-        let absolute = selected_topology_import_targets(
-            &context,
-            source,
-            &imports,
-            &exports,
-            &["root_model"],
-            ResolutionRootImportAnchor::Absolute,
-            &mut progress,
-        );
-        assert_eq!(
-            absolute,
-            RustSelectedBuildOutcome::Ready(vec![RustSelectedImportTarget {
-                crate_root: PathBuf::from("app/src/lib.rs"),
-                module_segments: vec!["root_model".to_string()].into_boxed_slice(),
-            }])
+            }),
+            "the consumer crate root remains in the selected topology"
         );
     }
 

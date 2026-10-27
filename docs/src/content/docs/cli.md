@@ -356,7 +356,8 @@ revision and what each part of that evaluation read. A later run against the
 same base skips the base export and build, and recomputes only the parts of
 the working tree whose inputs changed. Findings, identities, diagnostics,
 completion tiers, and the exit status do not depend on the cache contents. An
-ordinary full scan also stores complete policy units in the cache. A later
+ordinary full scan also stores complete policy units in the cache, and a
+later full scan reuses the ones whose recorded inputs it verifies. A later
 pull-request scan whose base is the scanned revision reuses those units for its
 base evaluation, and reuses the working-tree units whose recorded inputs it
 verifies. Units from incomplete or widened work are never reused as complete

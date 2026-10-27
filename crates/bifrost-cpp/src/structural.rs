@@ -132,16 +132,16 @@ pub fn cpp_call_result_use(call: Node<'_>, source: &str) -> CallResultUseSite {
 }
 
 fn cpp_type_is_void(type_node: Node<'_>, source: &str) -> bool {
-    let mut stack = vec![type_node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "primitive_type" && node_text(node, source) == Some("void") {
-            return true;
+    let base = match type_node.kind() {
+        "type_descriptor" if type_node.child_by_field_name("declarator").is_none() => {
+            type_node.child_by_field_name("type")
         }
-        for index in (0..node.named_child_count()).rev() {
-            stack.push(node.named_child(index).expect("named child exists"));
-        }
-    }
-    false
+        "primitive_type" => Some(type_node),
+        _ => None,
+    };
+    base.is_some_and(|base| {
+        base.kind() == "primitive_type" && node_text(base, source) == Some("void")
+    })
 }
 
 fn has_recovery_ancestor(mut node: Node<'_>) -> bool {
@@ -495,33 +495,416 @@ fn switch_case_is_long(switch: Node<'_>) -> bool {
     })
 }
 
-fn enum_name_sets(root: Node<'_>, source: &str) -> Vec<HashSet<String>> {
-    let mut names = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "enum_specifier" {
-            let mut declared = HashSet::default();
-            let mut enum_stack = vec![node];
-            while let Some(enum_node) = enum_stack.pop() {
-                if enum_node.kind() == "enumerator"
-                    && let Some(name) = enum_node.child_by_field_name("name")
-                    && let Some(text) = node_text(name, source)
-                {
-                    declared.insert(text.to_owned());
-                }
-                enum_stack.extend(
-                    named_children_iter(enum_node)
-                        .filter(|child| !child.is_extra() && child.kind() != "enum_specifier"),
-                );
+/// Declaration evidence retained only while classifying one switch.
+#[derive(Clone, Copy)]
+struct CppSwitchDeclaration<'tree> {
+    type_node: Node<'tree>,
+    declarator: Node<'tree>,
+}
+
+fn cpp_switch_scope(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "compound_statement"
+            | "for_statement"
+            | "for_range_loop"
+            | "if_statement"
+            | "switch_statement"
+            | "while_statement"
+            | "catch_clause"
+    )
+}
+
+fn cpp_switch_local_declaration<'tree>(
+    switch: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<CppSwitchDeclaration<'tree>> {
+    let condition = condition_expression(switch)?;
+    let function = std::iter::successors(switch.parent(), |node| node.parent())
+        .find(|node| matches!(node.kind(), "function_definition" | "lambda_expression"))?;
+    enum Step<'tree> {
+        Enter(Node<'tree>),
+        LeaveScope,
+    }
+    enum Binding<'tree> {
+        Unknown,
+        Declaration(CppSwitchDeclaration<'tree>),
+    }
+    let mut stack = vec![Step::Enter(function)];
+    // Only the requested identifier is retained at each lexical tier.
+    let mut scopes: Vec<Option<Binding<'tree>>> = vec![None];
+    while let Some(step) = stack.pop() {
+        let node = match step {
+            Step::LeaveScope => {
+                scopes.pop().expect("entered scope");
+                continue;
             }
-            if !declared.is_empty() {
-                names.push(declared);
-            }
+            Step::Enter(node) => node,
+        };
+        if node == condition {
+            return scopes.iter().rev().find_map(Option::as_ref).and_then(
+                |binding| match binding {
+                    Binding::Unknown => None,
+                    Binding::Declaration(declaration) => Some(*declaration),
+                },
+            );
+        }
+        if node != function
+            && matches!(
+                node.kind(),
+                "function_definition"
+                    | "lambda_expression"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "enum_specifier"
+            )
+        {
             continue;
         }
-        stack.extend(named_children_iter(node).filter(|child| !child.is_extra()));
+        if cpp_switch_scope(node) {
+            scopes.push(None);
+            stack.push(Step::LeaveScope);
+        }
+        if node.kind() == "declaration" {
+            for declarator in node.children_by_field_name("declarator", &mut node.walk()) {
+                if declarator_name_node(declarator).and_then(|node| node_text(node, source))
+                    == Some(name)
+                {
+                    // Prototypes and unsupported declarators also hide names.
+                    *scopes.last_mut().expect("function scope") = Some(Binding::Unknown);
+                }
+            }
+        }
+        if node.kind() == "identifier"
+            && node_text(node, source) == Some(name)
+            && let Some(owner) = cpp_binder_owner(node, |node| node.parent(), field_name_in_parent)
+        {
+            let declaration = match owner {
+                CppBinderOwner::Local(declarator) => {
+                    let owner = std::iter::successors(declarator.parent(), |node| node.parent())
+                        .find(|node| node.kind() == "declaration")
+                        .expect("local binder declaration");
+                    owner
+                        .child_by_field_name("type")
+                        .map(|type_node| CppSwitchDeclaration {
+                            type_node,
+                            declarator,
+                        })
+                }
+                CppBinderOwner::Parameter => {
+                    let owner = std::iter::successors(node.parent(), |node| node.parent())
+                        .find(|node| {
+                            matches!(
+                                node.kind(),
+                                "parameter_declaration"
+                                    | "optional_parameter_declaration"
+                                    | "variadic_parameter_declaration"
+                            )
+                        })
+                        .expect("parameter binder declaration");
+                    owner
+                        .child_by_field_name("type")
+                        .zip(owner.child_by_field_name("declarator"))
+                        .map(|(type_node, declarator)| CppSwitchDeclaration {
+                            type_node,
+                            declarator,
+                        })
+                }
+                CppBinderOwner::RangeFor(owner) => owner
+                    .child_by_field_name("type")
+                    .zip(owner.child_by_field_name("declarator"))
+                    .map(|(type_node, declarator)| CppSwitchDeclaration {
+                        type_node,
+                        declarator,
+                    }),
+                _ => None,
+            };
+            // An unknown inner binding must not fall through to a parameter.
+            *scopes.last_mut().expect("function scope") =
+                Some(declaration.map_or(Binding::Unknown, Binding::Declaration));
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push(Step::Enter(node.named_child(index).expect("named child")));
+        }
     }
-    names
+    None
+}
+
+/// Search one lexical type tier, descending into a named scope only when the
+/// written qualification selects it. Aliases are barriers, not enum evidence.
+fn cpp_switch_type_in_scope<'tree>(
+    scope: Node<'tree>,
+    path: &[String],
+    before: usize,
+    source: &str,
+) -> Option<Node<'tree>> {
+    use crate::declarations::cpp_structured_type_path;
+    let mut stack = vec![(scope, 0)];
+    let mut found = None;
+    let mut unresolved_import = None;
+    while let Some((node, component)) = stack.pop() {
+        if node.start_byte() >= before {
+            continue;
+        }
+        if node != scope {
+            if node.kind() == "using_declaration" {
+                let imports_namespace = (0..node.child_count())
+                    .any(|index| node.child(index).expect("child").kind() == "namespace");
+                let imported = first_named_child(node)
+                    .and_then(declarator_name_node)
+                    .and_then(|name| node_text(name, source));
+                if imports_namespace || imported == Some(path[component].as_str()) {
+                    unresolved_import = Some(node);
+                }
+                continue;
+            }
+            let named_type = matches!(
+                node.kind(),
+                "enum_specifier"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "namespace_definition"
+                    | "namespace_alias_definition"
+                    | "alias_declaration"
+                    | "type_definition"
+                    | "type_parameter_declaration"
+                    | "variadic_type_parameter_declaration"
+            );
+            if named_type {
+                let names = if node.kind() == "type_definition" {
+                    node.children_by_field_name("declarator", &mut node.walk())
+                        .filter_map(declarator_name_node)
+                        .filter_map(|name| cpp_structured_type_path(name, source))
+                        .collect::<Vec<_>>()
+                } else if matches!(
+                    node.kind(),
+                    "type_parameter_declaration" | "variadic_type_parameter_declaration"
+                ) {
+                    first_named_child(node)
+                        .and_then(|name| cpp_structured_type_path(name, source))
+                        .into_iter()
+                        .collect()
+                } else {
+                    node.child_by_field_name("name")
+                        .and_then(|name| {
+                            // A C++17 nested namespace has a different grammar
+                            // wrapper from a qualified type name.
+                            let mut stack = vec![name];
+                            let mut path = Vec::new();
+                            while let Some(part) = stack.pop() {
+                                if part.kind() == "nested_namespace_specifier" {
+                                    for index in (0..part.named_child_count()).rev() {
+                                        stack.push(
+                                            part.named_child(index).expect("namespace component"),
+                                        );
+                                    }
+                                } else {
+                                    path.extend(cpp_structured_type_path(part, source)?);
+                                }
+                            }
+                            Some(path)
+                        })
+                        .into_iter()
+                        .collect()
+                };
+                for name in names {
+                    if path[component..].starts_with(&name) {
+                        let next = component + name.len();
+                        if next < path.len()
+                            && let Some(body) = node.child_by_field_name("body")
+                        {
+                            stack.push((body, next));
+                        } else if found.is_none_or(|previous: Node<'_>| {
+                            previous.start_byte() < node.start_byte()
+                        }) {
+                            // An alias/forward declaration cannot supply the
+                            // rest of a qualification and must block fallback.
+                            found = Some(node);
+                        }
+                    }
+                }
+                continue;
+            }
+            if cpp_switch_scope(node)
+                || matches!(node.kind(), "function_definition" | "lambda_expression")
+            {
+                continue;
+            }
+        }
+        for index in (0..node.named_child_count()).rev() {
+            stack.push((node.named_child(index).expect("named child"), component));
+        }
+    }
+    found.or(unresolved_import)
+}
+
+fn cpp_switch_named_type<'tree>(type_node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    use crate::declarations::cpp_structured_type_path;
+    if type_node.kind() == "enum_specifier"
+        && type_node.child_by_field_name("body").is_some()
+        && type_node.child_by_field_name("name").is_some()
+    {
+        return Some(type_node);
+    }
+    if matches!(
+        type_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) && type_node.child_by_field_name("body").is_some()
+    {
+        return Some(type_node);
+    }
+    let name = if matches!(
+        type_node.kind(),
+        "enum_specifier" | "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        type_node.child_by_field_name("name")?
+    } else {
+        type_node
+    };
+    // Template arguments and dependent types require semantic resolution.
+    let mut stack = vec![name];
+    while let Some(node) = stack.pop() {
+        if !matches!(
+            node.kind(),
+            "type_identifier"
+                | "identifier"
+                | "namespace_identifier"
+                | "qualified_identifier"
+                | "scoped_identifier"
+                | "scoped_type_identifier"
+        ) {
+            return None;
+        }
+        stack.extend(named_children_iter(node).filter(|node| !node.is_extra()));
+    }
+    let path = cpp_structured_type_path(name, source)?;
+    let global = name.child(0).is_some_and(|child| child.kind() == "::");
+    for scope in std::iter::successors(type_node.parent(), |node| node.parent()) {
+        if !(cpp_switch_scope(scope)
+            || matches!(
+                scope.kind(),
+                "function_definition"
+                    | "template_declaration"
+                    | "namespace_definition"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "translation_unit"
+            ))
+            || (global && scope.kind() != "translation_unit")
+        {
+            continue;
+        }
+        if let Some(declaration) =
+            cpp_switch_type_in_scope(scope, &path, type_node.start_byte(), source)
+        {
+            return Some(declaration);
+        }
+        if !global
+            && matches!(
+                scope.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier"
+            )
+        {
+            // Inherited names and complete-class lookup can hide an outer
+            // enum even without an earlier declaration in the class body.
+            if named_children_iter(scope).any(|node| node.kind() == "base_class_clause")
+                || cpp_switch_type_in_scope(scope, &path, usize::MAX, source)
+                    .is_some_and(|declaration| declaration.start_byte() >= type_node.start_byte())
+            {
+                return None;
+            }
+        }
+        // An out-of-line definition's logical owner is not its AST parent.
+        // Resolving relative names across that boundary needs the resolver.
+        if !global
+            && (scope.kind() == "function_definition"
+                && scoped_function_definition(scope).is_some()
+                || scope
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.kind() == "qualified_identifier"))
+        {
+            return None;
+        }
+    }
+    None
+}
+
+fn cpp_switch_pointer_depth(mut declarator: Node<'_>) -> Option<usize> {
+    let mut depth = 0;
+    loop {
+        match declarator.kind() {
+            "identifier" | "field_identifier" => return Some(depth),
+            "pointer_declarator" => {
+                depth += 1;
+                declarator = declarator.child_by_field_name("declarator")?;
+            }
+            "init_declarator" => declarator = declarator.child_by_field_name("declarator")?,
+            "reference_declarator" | "parenthesized_declarator" | "attributed_declarator" => {
+                declarator = first_named_child(declarator)?
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn cpp_switch_enum_type<'tree>(switch: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut operand = condition_expression(switch)?;
+    let mut fields = Vec::new();
+    while operand.kind() == "field_expression" {
+        fields.push(operand);
+        operand = operand.child_by_field_name("argument")?;
+    }
+    if operand.kind() != "identifier" {
+        return None;
+    }
+    let mut declaration =
+        cpp_switch_local_declaration(switch, node_text(operand, source)?, source)?;
+    for field in fields.into_iter().rev() {
+        let operator = field.child_by_field_name("operator")?;
+        let expected_depth = match operator.kind() {
+            "." => 0,
+            "->" => 1,
+            _ => return None,
+        };
+        if cpp_switch_pointer_depth(declaration.declarator)? != expected_depth {
+            return None;
+        }
+        let record = cpp_switch_named_type(declaration.type_node, source)?;
+        if !matches!(
+            record.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            return None;
+        }
+        let name = node_text(field.child_by_field_name("field")?, source)?;
+        let mut member = None;
+        for field_declaration in named_children_iter(record.child_by_field_name("body")?)
+            .filter(|node| node.kind() == "field_declaration")
+        {
+            for declarator in field_declaration
+                .children_by_field_name("declarator", &mut field_declaration.walk())
+            {
+                if declarator_name_node(declarator).and_then(|name| node_text(name, source))
+                    == Some(name)
+                {
+                    member = Some(CppSwitchDeclaration {
+                        type_node: field_declaration.child_by_field_name("type")?,
+                        declarator,
+                    });
+                }
+            }
+        }
+        declaration = member?;
+    }
+    if cpp_switch_pointer_depth(declaration.declarator)? != 0 {
+        return None;
+    }
+    let enum_type = cpp_switch_named_type(declaration.type_node, source)?;
+    (enum_type.kind() == "enum_specifier").then_some(enum_type)
 }
 
 fn switch_case_names(switch: Node<'_>, source: &str) -> HashSet<String> {
@@ -554,19 +937,22 @@ fn enum_switch_is_missing_case(switch: Node<'_>, source: &str) -> bool {
     if switch_has_default(switch) {
         return false;
     }
-    let mut root = switch;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    let cases = switch_case_names(switch, source);
-    if cases.is_empty() {
+    let Some(enum_type) = cpp_switch_enum_type(switch, source) else {
+        // Unknown operand types carry no enum-completeness evidence.
         return false;
-    }
-    enum_name_sets(root, source)
-        .into_iter()
-        .filter(|declared| cases.iter().all(|name| declared.contains(name)))
-        .min_by_key(HashSet::len)
-        .is_some_and(|declared| declared.iter().any(|name| !cases.contains(name)))
+    };
+    let Some(body) = enum_type.child_by_field_name("body") else {
+        return false;
+    };
+    let declared: HashSet<_> = named_children_iter(body)
+        .filter(|node| node.kind() == "enumerator")
+        .filter_map(|node| node.child_by_field_name("name"))
+        .filter_map(|name| node_text(name, source))
+        .collect();
+    let cases = switch_case_names(switch, source);
+    !cases.is_empty()
+        && cases.iter().all(|name| declared.contains(name.as_str()))
+        && declared.iter().any(|name| !cases.contains(*name))
 }
 
 fn declarator_identifier<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
@@ -617,28 +1003,51 @@ fn numeric_literal_value(node: Node<'_>, source: &str) -> Option<i64> {
 }
 
 fn for_loop_has_small_literal_bound(loop_node: Node<'_>, source: &str) -> bool {
+    use brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression;
+
+    let Some(variable) = loop_variable(loop_node, source) else {
+        return false;
+    };
     let Some(condition) = loop_node.child_by_field_name("condition") else {
         return false;
     };
     let mut stack = vec![condition];
     while let Some(node) = stack.pop() {
-        if node.kind() == "binary_expression"
-            && let Some(operator) = node.child_by_field_name("operator")
-        {
-            let bound = match operator.kind() {
-                "<" | "<=" => node
-                    .child_by_field_name("right")
-                    .and_then(|value| numeric_literal_value(value, source)),
-                ">" | ">=" => node
-                    .child_by_field_name("left")
-                    .and_then(|value| numeric_literal_value(value, source)),
-                _ => None,
-            };
-            if bound.is_some_and(|value| (0..=1).contains(&value)) {
-                return true;
-            }
+        let node = unwrap_parenthesized_expression(node);
+        if node.kind() != "binary_expression" {
+            continue;
         }
-        stack.extend(named_children_iter(node).filter(|child| !child.is_extra()));
+        let Some(operator) = node.child_by_field_name("operator") else {
+            continue;
+        };
+        // A conjunct must hold on every iteration. A comparison nested in an
+        // OR, negation or another expression does not bound the loop.
+        if operator.kind() == "&&" {
+            stack.extend([
+                node.child_by_field_name("left").expect("binary left"),
+                node.child_by_field_name("right").expect("binary right"),
+            ]);
+            continue;
+        }
+        let operands = match operator.kind() {
+            "<" | "<=" => Some(("left", "right")),
+            ">" | ">=" => Some(("right", "left")),
+            _ => None,
+        };
+        if let Some((value_field, bound_field)) = operands
+            && let Some(value) = node
+                .child_by_field_name(value_field)
+                .map(unwrap_parenthesized_expression)
+            && value.kind() == "identifier"
+            && node_text(value, source) == Some(variable)
+            && let Some(bound) = node
+                .child_by_field_name(bound_field)
+                .map(unwrap_parenthesized_expression)
+                .and_then(|value| numeric_literal_value(value, source))
+            && (0..=1).contains(&bound)
+        {
+            return true;
+        }
     }
     false
 }
@@ -997,11 +1406,15 @@ pub fn declarator_name_node<'tree>(declarator: Node<'tree>) -> Option<Node<'tree
             | "operator_cast"
             | "primitive_type" => return Some(current),
             "qualified_identifier" => current = last_named_field_child(current, "name")?,
-            "dependent_name" | "template_function" | "template_method" | "template_type" => {
+            "dependent_name" => current = first_named_child(current)?,
+            "template_function" | "template_method" | "template_type" => {
                 current = current.child_by_field_name("name")?;
             }
             "function_declarator"
             | "pointer_declarator"
+            | "pointer_type_declarator"
+            | "macro_modifier_declarator"
+            | "variadic_declarator"
             | "array_declarator"
             | "init_declarator" => current = current.child_by_field_name("declarator")?,
             "attributed_declarator" => current = first_named_child(current)?,
@@ -1015,7 +1428,7 @@ pub fn declarator_name_node<'tree>(declarator: Node<'tree>) -> Option<Node<'tree
 
 /// Grammar steps for the shared call-callee spine. A value expression has no step.
 pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
-    use CalleeSpineStep::{Field, FieldOrOnlyChild, Name};
+    use CalleeSpineStep::{Field, FieldOrOnlyChild, Name, OnlyChild};
     match kind {
         "identifier"
         | "field_identifier"
@@ -1028,10 +1441,10 @@ pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
         "qualified_identifier"
         | "scoped_identifier"
         | "scoped_type_identifier"
-        | "dependent_name"
         | "template_function"
         | "template_method"
         | "template_type" => Some(Field("name")),
+        "dependent_name" => Some(OnlyChild),
         "field_expression" => Some(Field("field")),
         "pointer_expression" => Some(FieldOrOnlyChild("argument")),
         _ => None,
@@ -1051,7 +1464,8 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
             | "primitive_type"
             | "this" => return Some(current),
             "qualified_identifier" => current = last_named_field_child(current, "name")?,
-            "dependent_name" | "template_function" | "template_method" | "template_type" => {
+            "dependent_name" => current = first_named_child(current)?,
+            "template_function" | "template_method" | "template_type" => {
                 current = current.child_by_field_name("name")?;
             }
             "field_expression" => current = current.child_by_field_name("field")?,
@@ -1140,15 +1554,6 @@ fn function_like_macro_names(root: Node<'_>, source: &str) -> HashSet<String> {
     names
 }
 
-fn cpp_member_terminal_name<'tree>(field: Node<'tree>) -> Option<Node<'tree>> {
-    let field = if field.kind() == "dependent_name" {
-        first_named_child(field)?
-    } else {
-        field
-    };
-    expression_name_node(field)
-}
-
 /// Return the one identifier-bearing node that spells a member in a C++
 /// `field_expression`.
 ///
@@ -1170,7 +1575,7 @@ fn cpp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
     while let Some(parent) = current.parent() {
         if parent.kind() == "field_expression" {
             let field = parent.child_by_field_name("field")?;
-            return cpp_member_terminal_name(field)
+            return expression_name_node(field)
                 .filter(|name| name.id() == node.id())
                 .map(|_| OccurrenceRole::MemberPosition);
         }
@@ -1744,6 +2149,245 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
 
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: unrelated comparisons suppress alloca-in-loop"
+    )]
+    fn alloca_bound_must_constrain_loop_variable() {
+        for (condition, expected) in [
+            ("i < n && enabled < 1", true),
+            ("i < n || i < 1", true),
+            ("i < 1", false),
+            ("1 > i && enabled", false),
+        ] {
+            let source = format!(
+                "void f(int n, int enabled) {{ for (int i=0; {condition}; ++i) {{ alloca(16); }} }}"
+            );
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut actual = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "call_expression" {
+                    actual = Some(super::alloca_is_in_unbounded_loop(node, &source));
+                }
+                stack.extend(super::named_children_iter(node));
+            }
+            assert_eq!(actual, Some(expected), "{source}");
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: integer switches borrow unrelated enum cases"
+    )]
+    fn integer_switch_is_not_an_enum_switch() {
+        let source = "enum E { A, B }; void f(int value) { switch(value) { case A: break; } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut checked = false;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "switch_statement" {
+                checked = true;
+                assert!(!super::enum_switch_is_missing_case(node, source));
+            }
+            stack.extend(super::named_children_iter(node));
+        }
+        assert!(checked);
+    }
+
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: enum coverage needs scoped local declaration evidence"
+    )]
+    fn enum_switch_uses_local_type_evidence() {
+        for (source, expected) in [
+            (
+                "enum E { A,B }; void f(E e) { switch(e) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; void f() { E e=A; switch(e) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum class E { A,B }; void f(E e) { switch(e) {case E::A:break;} }",
+                vec![true],
+            ),
+            (
+                "namespace ns { enum class E { A,B }; } void f(ns::E e) { switch(e) {case ns::E::A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; struct S { E state; }; void f(S s) { switch(s.state) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; struct S { E state; }; void f() { S s; switch(s.state) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; void f(E e) { { int e=0; switch(e) {case A:break;} } switch(e) {case A:break;} }",
+                vec![false, true],
+            ),
+            (
+                "enum E { A,B }; void f(E e) { { int e=0; } switch(e) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; void f() { switch(e) {case A:break;} E e=A; }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; using Alias=E; void f(Alias e) { switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f(E e) { switch(e==A) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; E e; void f() { switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f(E &e) { switch(e) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; void f(E *e) { switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; struct S { E state; }; void f(S *s) { switch(s->state) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; struct S { int state; }; void f(S s) { switch(s.state) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; struct Inner { E state; }; struct Outer { Inner inner; }; void f(Outer s) { switch(s.inner.state) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "void f() { enum class E { A,B }; E e=E::A; switch(e) {case E::A:break;} }",
+                vec![true],
+            ),
+            (
+                "struct S { enum class E { A,B }; E state; }; void f(S s) { switch(s.state) {case S::E::A:break;} }",
+                vec![true],
+            ),
+            (
+                "namespace n { namespace m { enum class E { A,B }; } } void f(n::m::E e) { switch(e) {case n::m::E::A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; void f() { using E=int; E e=0; switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f(E e) { { int e(); switch(e) {case A:break;} } }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f(E e) { auto g=[e]() { switch(e) {case A:break;} }; }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f() { auto g=[](E e) { switch(e) {case A:break;} }; }",
+                vec![true],
+            ),
+            (
+                "namespace n::m { enum class E { A,B }; } void f(n::m::E e) { switch(e) {case n::m::E::A:break;} }",
+                vec![true],
+            ),
+            (
+                "void f() { enum E { A,B } e=A; switch(e) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; void f(E (&values)[2]) { for (E e : values) { switch(e) {case A:break;} } }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; namespace n { enum E { A,C }; } void f() { using n::E; E e; switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; namespace n { enum E { A }; void f(E); } void n::f(E e) { switch(e) {case n::A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f(E e) { switch(int e=0; e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; void f() { switch(E e=A; e) {case A:break;} }",
+                vec![true],
+            ),
+            (
+                "enum E { A,B }; template<typename E> void f(E e) { switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; template<typename... T> void f(T... e) { switch(e) {case A:break;} }",
+                vec![false],
+            ),
+            (
+                "namespace n { enum E { A,B }; } namespace m { enum E { A }; } namespace r { namespace n=m; void f(n::E e) { switch(e) {case m::A:break;} } }",
+                vec![false],
+            ),
+            (
+                "struct R { enum E { A,B }; }; struct S { enum E { A }; }; void f() { using R=S; R::E e; switch(e) {case S::A:break;} }",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; struct Base { enum E { A }; }; struct S: Base { void f(E e) { switch(e) {case A:break;} } };",
+                vec![false],
+            ),
+            (
+                "enum E { A,B }; struct S { void f() { E e; switch(e) {case A:break;} } enum E { A }; };",
+                vec![false],
+            ),
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{source}: {}",
+                tree.root_node().to_sexp()
+            );
+            let mut stack = vec![tree.root_node()];
+            let mut results = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "switch_statement" {
+                    results.push((
+                        node.start_byte(),
+                        super::enum_switch_is_missing_case(node, source),
+                    ));
+                }
+                stack.extend(super::named_children_iter(node));
+            }
+            results.sort_unstable_by_key(|(start, _)| *start);
+            assert_eq!(
+                results.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
     fn collect_cpp_structural_facts(source: &str) {
         collect_structural_rows(source);
     }
@@ -2180,6 +2824,7 @@ const char *ordinary = "http://example.test/a\n";
 const char *raw = R"(https://example.test/path)";
 const char *wide = L"wide";
 const char character = 'x';
+const char *mixed = R"(\u0041)" "\u0042";
 "#;
         let rows = collect_structural_rows(source);
         let values = rows
@@ -2196,8 +2841,83 @@ const char character = 'x';
                 Some("https://example.test/path".to_owned()),
                 None,
                 None,
+                Some(r"\u0041".to_owned()),
+                Some("B".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn cpp_numeric_string_escapes_follow_scalar_and_ascii_boundaries() {
+        // The grammar selects escape_sequence nodes; Unicode scalar validity
+        // and the portable ASCII byte policy independently decide their values.
+        let mut cases = vec![
+            (
+                r"\101\x42\u0043\U00000044".to_owned(),
+                Some("ABCD".to_owned()),
+            ),
+            (r"\177".to_owned(), Some("\u{7f}".to_owned())),
+            (r"\200".to_owned(), None),
+            (r"\377".to_owned(), None),
+            (r"\x7f".to_owned(), Some("\u{7f}".to_owned())),
+            (r"\x80".to_owned(), None),
+            (r"\x0041".to_owned(), Some("A".to_owned())),
+            (r"\x007f".to_owned(), Some("\u{7f}".to_owned())),
+            (r"\x0080".to_owned(), None),
+            (r"\xfffffffff".to_owned(), None),
+        ];
+        for scalar in [
+            0,
+            0x7f,
+            0x80,
+            0xd7ff,
+            0xd800,
+            0xdfff,
+            0xe000,
+            0x10ffff,
+            0x110000,
+            u32::MAX,
+        ] {
+            let expected = char::from_u32(scalar).map(|character| character.to_string());
+            cases.push((format!("\\U{scalar:08x}"), expected.clone()));
+            if scalar <= 0xffff {
+                cases.push((format!("\\u{scalar:04x}"), expected));
+            }
+        }
+        for (escape, expected) in cases {
+            let source = format!("const char *value = \"{escape}\";");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let mut stack = vec![tree.root_node()];
+            let mut escapes = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "escape_sequence" {
+                    escapes.push(node.byte_range());
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+            assert!(!escapes.is_empty(), "grammar did not select {source}");
+            if escape.starts_with(r"\x00") {
+                let expected_span = 21..21 + escape.len();
+                assert_eq!(
+                    escapes.as_slice(),
+                    std::slice::from_ref(&expected_span),
+                    "{source}"
+                );
+            }
+            let rows = collect_structural_rows(&source);
+            let values: Vec<_> = rows
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == NormalizedKind::StringLiteral)
+                .map(|node| node.string_value.clone())
+                .collect();
+            assert_eq!(values, vec![expected], "{source}, escapes={escapes:?}");
+        }
     }
 
     /// The callee token of a free-function call is the only occurrence a call
@@ -2302,6 +3022,136 @@ const char character = 'x';
         collect_cpp_structural_facts(
             "struct Channel { int operator[](int); int at(int i) { return this->operator[](i); } };",
         );
+    }
+}
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn expression_and_pointer_declarator_name_fields() {
+        let source = "void run() { auto p = new ns::Widget(); receiver.method<int>(); int (*callback)(int) = nullptr; int (ordinary)(int); }";
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut stack = vec![tree.root_node()];
+        let mut names = Vec::new();
+        let mut binders = Vec::new();
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "new_expression" | "field_expression") {
+                let field = if node.kind() == "new_expression" {
+                    "type"
+                } else {
+                    "field"
+                };
+                let child = node.child_by_field_name(field).unwrap();
+                names.push((
+                    node.kind(),
+                    child.kind(),
+                    expression_name_node(node).map(|n| &source[n.byte_range()]),
+                ));
+            }
+            if node.kind() == "identifier"
+                && let Some(name @ ("callback" | "ordinary")) = node_text(node, source)
+            {
+                let wrapper = if name == "callback" {
+                    "pointer_declarator"
+                } else {
+                    "parenthesized_declarator"
+                };
+                assert_eq!(node.parent().unwrap().kind(), wrapper);
+                binders.push((
+                    name,
+                    cpp_binder_owner(node, |n| n.parent(), field_name_in_parent)
+                        .is_some_and(|owner| matches!(owner, CppBinderOwner::Local(_))),
+                ));
+            }
+            stack.extend(
+                node.named_children(&mut node.walk())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        assert_eq!(
+            names,
+            [
+                ("new_expression", "qualified_identifier", Some("Widget")),
+                ("field_expression", "template_method", Some("method"))
+            ]
+        );
+        assert_eq!(binders, [("callback", true), ("ordinary", false)]);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6ec52f232835: quicksilver round 4 survivor review: dependent member names lost their terminal token"
+    )]
+    fn dependent_member_name_grammar_boundary() {
+        let source = "template<class T> void f(T receiver) { receiver.template method<int>(); }";
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut names = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "dependent_name" {
+                assert!(node.child_by_field_name("name").is_none());
+                assert_eq!(node.named_child(0).unwrap().kind(), "template_method");
+                assert_eq!(
+                    declarator_name_node(node).map(|name| &source[name.byte_range()]),
+                    Some("method")
+                );
+                assert_eq!(
+                    terminal_callee_leaf(node.parent().unwrap(), callee_spine_step)
+                        .map(|name| &source[name.byte_range()]),
+                    Some("method")
+                );
+                names.push(expression_name_node(node).map(|n| &source[n.byte_range()]));
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        assert_eq!(names, [Some("method")]);
+    }
+
+    #[test]
+    fn conditional_macro_name_fields() {
+        let source = "#if ON\n#define FIRST(x) x\n#elif ALT\n#define SECOND(x) x\n#else\n#define THIRD(x) x\n#endif\nvoid f() {}\n";
+        let tree = crate::diagnostics::parse_cpp_tree(source);
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut definitions = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "preproc_function_def" {
+                let name = node.child_by_field_name("name").unwrap();
+                definitions.push((
+                    node_text(name, source).unwrap(),
+                    node.parent().unwrap().kind(),
+                ));
+            }
+            stack.extend(
+                node.named_children(&mut node.walk())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        assert_eq!(
+            definitions,
+            [
+                ("FIRST", "preproc_if"),
+                ("SECOND", "preproc_elif"),
+                ("THIRD", "preproc_else"),
+            ]
+        );
+        let mut names: Vec<_> = function_like_macro_names(tree.root_node(), source)
+            .into_iter()
+            .collect();
+        names.sort();
+        assert_eq!(names, ["FIRST", "SECOND", "THIRD"]);
     }
 }
 
@@ -2414,5 +3264,100 @@ mod result_use_tests {
             CallResultUse::Discarded
         );
         assert!(index.at_span(source.len(), source.len()).is_err());
+    }
+
+    #[test]
+    fn result_use_grammar_boundary_sites_and_recovery() {
+        // Spellings are the independent site oracle: casts are syntax wrappers,
+        // allocations are expressions, and an ERROR ancestor invalidates a site.
+        for (source, expected) in [
+            (
+                "void run() { dynamic_cast<T*>(a()); static_cast<T*>(b()); reinterpret_cast<T*>(c()); const_cast<T*>(d()); new W(); auto p = new X(); sink(new Y()); }",
+                vec![
+                    ("a()", CallResultUse::Consumed),
+                    ("b()", CallResultUse::Consumed),
+                    ("c()", CallResultUse::Consumed),
+                    ("d()", CallResultUse::Consumed),
+                    ("new W()", CallResultUse::Discarded),
+                    ("new X()", CallResultUse::Consumed),
+                    ("sink(new Y())", CallResultUse::Discarded),
+                    ("new Y()", CallResultUse::Consumed),
+                ],
+            ),
+            (
+                "void run() { try { f(); } }",
+                vec![(
+                    "f()",
+                    CallResultUse::Open(CallResultUseOpenReason::RecoveredSyntax),
+                )],
+            ),
+        ] {
+            let tree = tree(source);
+            let mut stack = vec![tree.root_node()];
+            let mut grammar_sites = Vec::new();
+            let mut recovery_witness = false;
+            while let Some(node) = stack.pop() {
+                if matches!(node.kind(), "call_expression" | "new_expression") {
+                    grammar_sites.push(node.byte_range());
+                    if source[node.byte_range()] == *"f()" {
+                        assert!(!node.has_error());
+                        assert!(!node.parent().unwrap().is_error());
+                        let mut parent = node.parent();
+                        while let Some(ancestor) = parent {
+                            recovery_witness |= ancestor.is_error();
+                            parent = ancestor.parent();
+                        }
+                    }
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+            if source.contains("try") {
+                assert!(recovery_witness, "{}", tree.root_node().to_sexp());
+            } else {
+                assert!(!tree.root_node().has_error());
+                assert_eq!(
+                    grammar_sites.len(),
+                    12,
+                    "four cast wrappers plus eight sites"
+                );
+            }
+            let index = CppCallResultUseIndex::new(tree.root_node(), source);
+            let actual: Vec<_> = index
+                .sites()
+                .iter()
+                .map(|site| (&source[site.start_byte..site.end_byte], site.for_port(0)))
+                .collect();
+            assert_eq!(actual, expected, "{source}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6ec52f232835: quicksilver round 4 survivor review: void pointer casts falsely discarded source values"
+    )]
+    fn pointer_to_void_casts_consume_the_source_value() {
+        let source = "int* make(); void run() { auto p = (void*)make(); auto q = static_cast<void*>(make()); }";
+        let tree = tree(source);
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut type_declarators = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "type_descriptor" {
+                type_declarators.push(node.child_by_field_name("declarator").map(|n| n.kind()));
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        assert_eq!(
+            type_declarators,
+            [
+                Some("abstract_pointer_declarator"),
+                Some("abstract_pointer_declarator")
+            ]
+        );
+        let index = CppCallResultUseIndex::new(tree.root_node(), source);
+        // Each source result feeds a pointer conversion and then an initializer.
+        // Neither conversion discards a value by casting it to scalar void.
+        let uses: Vec<_> = index.sites().iter().map(|site| site.for_port(0)).collect();
+        assert_eq!(uses, [CallResultUse::Consumed, CallResultUse::Consumed]);
     }
 }

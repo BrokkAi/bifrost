@@ -464,9 +464,10 @@ const MAX_CPP_DISPATCH_PREFETCH_SITES: usize = 1024;
 pub struct CallRelationLimits {
     pub max_files: usize,
     pub max_source_bytes: usize,
-    /// Maximum retained dispatch targets for each exact call. In the batched
-    /// exact-call API this remains a per-call arm cap; the caller separately
-    /// bounds the number of submitted call sites.
+    /// Maximum dispatch targets per exact call, or syntactic incoming candidates
+    /// per incoming-call request. The batched exact-call API applies this to
+    /// each call's target arms; the incoming API applies it across selected rows
+    /// that have call syntax, before caller admission and site deduplication.
     pub max_candidates: usize,
 }
 
@@ -3891,6 +3892,15 @@ fn selected_callable_layout(
     let language = language_for_file(unit.source());
     let tree = parse_tree_for_language(unit.source(), language, &source)?;
     if let [range] = ranges.as_slice() {
+        if let Some(layout) = language_support_for_hook(
+            language,
+            "implicit_callable_parameter_layout",
+        )
+        .and_then(|support| {
+            support.implicit_callable_parameter_layout(unit, tree.root_node(), &source, range)
+        }) {
+            return Some((*range, layout));
+        }
         return formal_parameter_slots(language, tree.root_node(), &source, range)
             .map(|layout| (*range, layout));
     }

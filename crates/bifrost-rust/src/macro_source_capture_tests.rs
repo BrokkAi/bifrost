@@ -210,3 +210,29 @@ fn embedded_capture_retains_embedded_occurrence_provenance() {
                 == SourceOccurrenceProvenance::Embedded)
     );
 }
+
+#[test]
+fn grammar_transcriber_inventory_includes_primitive_tokens() {
+    let source =
+        "macro_rules! make { () => { fn generated(value: u8) -> bool { check(value) } }; }";
+    let tree = parse(source);
+    let definition = macro_definition(&tree);
+    let mut sink = PrimarySink {
+        collector: PrimarySourceFactCollector::new(source),
+    };
+    let context = sink.collector.intern_node(tree.root_node());
+    let fact = capture_macro_definition(definition, source, &mut sink, context);
+    // Primitive names are anonymous token-tree children in the released
+    // grammar, but are still names needed by replay consumers.
+    let identifiers = fact.arms[0]
+        .transcriber_identifiers
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        identifiers,
+        std::collections::BTreeSet::from(["generated", "value", "u8", "bool", "check"])
+    );
+}

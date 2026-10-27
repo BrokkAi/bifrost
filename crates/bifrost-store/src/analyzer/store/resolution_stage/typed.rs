@@ -6,6 +6,7 @@ use super::super::resolution_prepare::typed_rows::{self, TypedBodyDecoder};
 use super::super::resolution_selection::SelectedResolutionMountInventory;
 use super::super::resolution_typed::{PageOutcome, SelectedResolutionTypedSource};
 use super::super::{Result, StoreError};
+use super::StageFamily;
 use super::codec;
 use super::lexical::semantic_cells as semantic_pair;
 use crate::CancellationToken;
@@ -667,7 +668,9 @@ pub(super) fn row_semantic(row: &Row<'_>, name: &str) -> Result<SemanticId> {
 
 // A read owns only its answer. Decode the complete query before calling the
 // visitor, so early termination retains evidence from every source-known row.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn visit_stage_rows<T>(
+    required: &[StageFamily],
     selection: &SelectedResolutionMountInventory<'_>,
     sql: &str,
     parameters: &[&dyn rusqlite::ToSql],
@@ -683,6 +686,7 @@ pub(super) fn visit_stage_rows<T>(
         ));
     }
     let Some(answer) = read_stage_rows(
+        required,
         selection,
         sql,
         parameters,
@@ -968,6 +972,7 @@ pub fn visit_typed_frontier_pages(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypedFrontier>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::TypeFrontiers],
         selection,
         VISIT_TYPED_FRONTIER_PAGES_SQL,
         &[&semantic_request_json(request)],
@@ -1020,6 +1025,7 @@ fn visit_type_transfer_pages(
 ) -> Result<TypedFactReadOutcome> {
     let request = semantic_request_json(request);
     visit_stage_rows(
+        &[StageFamily::TypeTransfers],
         selection,
         sql,
         &[&request],
@@ -1042,6 +1048,7 @@ pub(in crate::analyzer::store) fn visit_type_production_pages_for_outputs(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeProduction>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::TypeProductions],
         selection,
         VISIT_TYPE_PRODUCTION_PAGES_FOR_OUTPUTS_SQL,
         &[&semantic_request_json(request)],
@@ -1061,6 +1068,7 @@ pub(in crate::analyzer::store) fn visit_type_component_pages_for_containers(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeComponent>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::TypeComponents],
         selection,
         VISIT_TYPE_COMPONENT_PAGES_FOR_CONTAINERS_SQL,
         &[&semantic_request_json(request)],
@@ -1080,6 +1088,7 @@ pub(in crate::analyzer::store) fn visit_declared_type_argument_pages_for_owners(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclaredTypeArgument>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DeclaredTypeArguments],
         selection,
         VISIT_DECLARED_TYPE_ARGUMENT_PAGES_FOR_OWNERS_SQL,
         &[&semantic_request_json(request)],
@@ -1099,6 +1108,7 @@ pub(in crate::analyzer::store) fn visit_type_argument_pages_for_applications(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeArgument>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::TypeArguments],
         selection,
         VISIT_TYPE_ARGUMENT_PAGES_FOR_APPLICATIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1118,6 +1128,7 @@ pub(in crate::analyzer::store) fn visit_generic_type_alias_parameter_pages_for_d
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericTypeAliasParameter>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::GenericTypeAliasParameters],
         selection,
         VISIT_GENERIC_TYPE_ALIAS_PARAMETER_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1139,6 +1150,7 @@ pub(in crate::analyzer::store) fn visit_generic_formal_pages_for_owners(
 ) -> Result<TypedFactReadOutcome> {
     selection.ensure_generic_formals_schema(selection.connection())?;
     visit_stage_rows(
+        &[StageFamily::GenericFormals],
         selection,
         VISIT_GENERIC_FORMAL_PAGES_FOR_OWNERS_SQL,
         &[&semantic_request_json(request)],
@@ -1157,6 +1169,7 @@ pub(in crate::analyzer::store) fn visit_generic_formal_default_pages_for_owners(
 ) -> Result<TypedFactReadOutcome> {
     selection.ensure_generic_formal_defaults_schema(selection.connection())?;
     visit_stage_rows(
+        &[StageFamily::GenericFormalDefaults],
         selection,
         VISIT_GENERIC_FORMAL_DEFAULT_PAGES_FOR_OWNERS_SQL,
         &[&semantic_request_json(request)],
@@ -1176,6 +1189,7 @@ pub(in crate::analyzer::store) fn visit_underlying_type_pages_for_definitions(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredUnderlyingType>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::UnderlyingTypes],
         selection,
         VISIT_UNDERLYING_TYPE_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1195,6 +1209,7 @@ pub(in crate::analyzer::store) fn visit_intrinsic_seed_pages_for_slots(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicSeed>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::IntrinsicSeeds],
         selection,
         VISIT_INTRINSIC_SEED_PAGES_FOR_SLOTS_SQL,
         &[&semantic_request_json(request)],
@@ -1214,6 +1229,7 @@ pub(in crate::analyzer::store) fn visit_binding_projection_pages_for_references(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBindingProjection>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::BindingProjections],
         selection,
         VISIT_BINDING_PROJECTION_PAGES_FOR_REFERENCES_SQL,
         &[&semantic_request_json(request)],
@@ -1233,6 +1249,7 @@ pub(in crate::analyzer::store) fn visit_binding_projection_pages_for_outputs(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBindingProjection>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::BindingProjections],
         selection,
         VISIT_BINDING_PROJECTION_PAGES_FOR_OUTPUTS_SQL,
         &[&semantic_request_json(request)],
@@ -1252,6 +1269,7 @@ pub(in crate::analyzer::store) fn visit_declaration_type_pages_for_definitions(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DeclarationTypes],
         selection,
         VISIT_DECLARATION_TYPE_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1271,6 +1289,7 @@ pub(in crate::analyzer::store) fn visit_declaration_type_pages_for_slots(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DeclarationTypes],
         selection,
         VISIT_DECLARATION_TYPE_PAGES_FOR_SLOTS_SQL,
         &[&semantic_request_json(request)],
@@ -1290,6 +1309,7 @@ pub(in crate::analyzer::store) fn visit_declaration_visibility_pages_for_definit
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeclarationVisibilityProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DeclarationVisibilities],
         selection,
         VISIT_DECLARATION_VISIBILITY_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1309,6 +1329,7 @@ pub(in crate::analyzer::store) fn visit_member_scope_pages_for_definitions(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::MemberScopes],
         selection,
         VISIT_MEMBER_SCOPE_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1328,6 +1349,7 @@ pub(in crate::analyzer::store) fn visit_member_owner_pages_for_definitions(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::MemberOwners],
         selection,
         VISIT_MEMBER_OWNER_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1347,6 +1369,7 @@ pub(in crate::analyzer::store) fn visit_member_owner_pages_for_owners(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberOwnerProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::MemberOwners],
         selection,
         VISIT_MEMBER_OWNER_PAGES_FOR_OWNERS_SQL,
         &[&semantic_request_json(request)],
@@ -1366,6 +1389,7 @@ pub(in crate::analyzer::store) fn visit_deferred_member_owner_pages_for_definiti
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDeferredMemberOwner>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DeferredMemberOwners],
         selection,
         VISIT_DEFERRED_MEMBER_OWNER_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1389,6 +1413,7 @@ pub(in crate::analyzer::store) fn visit_construction_requirement_pages_for_defin
     >,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::ConstructionRequirements],
         selection,
         VISIT_CONSTRUCTION_REQUIREMENT_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1408,6 +1433,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_definitions(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::Supertypes],
         selection,
         VISIT_SUPERTYPE_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1427,6 +1453,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_references(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::Supertypes],
         selection,
         VISIT_SUPERTYPE_PAGES_FOR_REFERENCES_SQL,
         &[&semantic_request_json(request)],
@@ -1446,6 +1473,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_frontiers(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::Supertypes],
         selection,
         VISIT_SUPERTYPE_PAGES_FOR_FRONTIERS_SQL,
         &[&semantic_request_json(request)],
@@ -1465,6 +1493,7 @@ pub(in crate::analyzer::store) fn visit_definition_property_gap_pages_for_defini
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DefinitionPropertyGaps],
         selection,
         VISIT_DEFINITION_PROPERTY_GAP_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1489,6 +1518,7 @@ pub fn visit_definition_property_gap_pages_for_reasons(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredDefinitionPropertyGap>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::DefinitionPropertyGaps],
         selection,
         VISIT_DEFINITION_PROPERTY_GAP_PAGES_FOR_REASONS_SQL,
         &[&semantic_request_json(request)],
@@ -1512,6 +1542,7 @@ pub(in crate::analyzer::store) fn visit_callable_signature_pages_for_definitions
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallableSignatureProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::CallableSignatures],
         selection,
         VISIT_CALLABLE_SIGNATURE_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1531,6 +1562,7 @@ pub(in crate::analyzer::store) fn visit_type_identity_observation_pages_for_refe
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypedFrontier>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::TypeFrontiers],
         selection,
         OBSERVATION_REFERENCE_SQL,
         &[&semantic_request_json(request)],
@@ -1549,6 +1581,10 @@ pub(in crate::analyzer::store) fn visit_intrinsic_seed_pages_for_type_identities
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicSeed>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[
+            StageFamily::IntrinsicSeedIdentities,
+            StageFamily::IntrinsicSeeds,
+        ],
         selection,
         INTRINSIC_IDENTITY_SQL,
         &[&semantic_request_json(request)],
@@ -1568,6 +1604,10 @@ pub(in crate::analyzer::store) fn visit_intrinsic_type_descriptor_pages_for_type
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[
+            StageFamily::IntrinsicSeedIdentities,
+            StageFamily::IntrinsicSeeds,
+        ],
         selection,
         INTRINSIC_TYPE_DESCRIPTORS_SQL,
         &[&semantic_request_json(type_identities)],
@@ -1595,6 +1635,7 @@ pub(in crate::analyzer::store) fn visit_member_scope_pages_for_heads(
     )
     .expect("node request serializes");
     visit_stage_rows(
+        &[StageFamily::MemberScopes],
         selection,
         MEMBER_SCOPE_HEAD_SQL,
         &[&keys],
@@ -1621,6 +1662,7 @@ pub(in crate::analyzer::store) fn visit_deferred_member_owner_pages_for_lookup_n
     )
     .expect("lookup request serializes");
     visit_stage_rows(
+        &[StageFamily::DeferredMemberOwners],
         selection,
         DEFERRED_LOOKUP_SQL,
         &[&keys],
@@ -1673,6 +1715,7 @@ pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_callee_refe
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallApplicabilityObligation>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::CallObligations],
         selection,
         VISIT_CALL_APPLICABILITY_PAGES_FOR_CALLEE_REFERENCES_SQL,
         &[&semantic_request_json(request)],
@@ -1691,6 +1734,7 @@ pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_gap_reasons
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallApplicabilityObligation>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
+        &[StageFamily::CallObligations],
         selection,
         VISIT_CALL_APPLICABILITY_PAGES_FOR_GAP_REASONS_SQL,
         &[&semantic_request_json(request)],
@@ -1706,7 +1750,9 @@ pub(in crate::analyzer::store) fn visit_call_applicability_pages_for_gap_reasons
 #[doc(hidden)]
 pub mod tests;
 
+#[allow(clippy::too_many_arguments)]
 fn read_stage_rows<T>(
+    required: &[StageFamily],
     selection: &SelectedResolutionMountInventory<'_>,
     sql: &str,
     parameters: &[&dyn rusqlite::ToSql],
@@ -1717,6 +1763,9 @@ fn read_stage_rows<T>(
 ) -> Result<Option<Vec<SelectedTypedRow<T>>>> {
     if cancellation.is_cancelled() {
         return Ok(None);
+    }
+    if selection.stage_read_is_empty(required)? {
+        return Ok(Some(Vec::new()));
     }
     let read =
         with_resolution_read_progress_handler(selection.connection(), cancellation, |connection| {
@@ -1766,6 +1815,7 @@ fn visit_route_rows(
 ) -> Result<TypedFactReadOutcome> {
     let mut evidence = PolledCompletionAccumulator::new(cancellation);
     let Some(routes) = read_stage_rows(
+        &[StageFamily::QualifiedRoutes],
         selection,
         sql,
         parameters,
@@ -2125,6 +2175,7 @@ pub fn visit_gap_reason_provenance_pages_for_reasons(
 ) -> Result<TypedFactReadOutcome> {
     let mut evidence = PolledCompletionAccumulator::new(cancellation);
     let Some(mut rows) = read_stage_rows(
+        &[StageFamily::Gaps],
         selection,
         GAP_REASON_PROVENANCE_SQL,
         &[&semantic_request_json(request)],

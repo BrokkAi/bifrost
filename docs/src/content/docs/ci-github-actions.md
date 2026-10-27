@@ -105,8 +105,8 @@ does not contain the CLI threshold decision. Library callers with a
 | --- | --- | --- |
 | `version` | pinned release tag | Bifrost release to install. Pin an exact tag for reproducible gates. The value `local` installs nothing: the action uses `target/release/bifrost`, then `target/debug/bifrost` from the checkout, then a `bifrost` on `PATH`. |
 | `packs-source` | pinned public source | JSON repository/version and rules/semantic descriptor pins; optional digest-bound HTTPS inventory. See [versioned external content](#versioned-external-content-v013-follow-up). |
-| `packs-token` | empty | Existing private repository read secret, restricted to trusted push or workflow-dispatch acquisition. |
-| `packs-cache` | `true` | Restore and save verified external content for this source and actual engine profile. Disabled for authenticated acquisition. |
+| `packs-token` | empty | Existing private repository read secret, restricted to trusted push or workflow-dispatch acquisition. When empty, the job's `github.token` authenticates API reads of a source outside the workflow's repository. |
+| `packs-cache` | `true` | Restore and save verified external content for this source and actual engine profile. Disabled when `packs-token` is set. |
 | `packs-offline` | `false` | Require verified cached external content without network access; a cache miss fails. |
 | `policy-packs` | `bifrost.code-smells` | Space-separated pack IDs from the selected host catalog. When unset, the default applies only if you set no `policy-ids` or `policy-categories`. |
 | `policy-ids` | empty | Space-separated policy IDs. |
@@ -270,14 +270,12 @@ contract and SARIF diagnostics.
 Each invocation clears its SARIF and diagnostic output paths before binary or
 content acquisition, so a failed acquisition cannot retain an earlier report.
 
-The initial public pin is rules `0.1.1`, descriptor SHA-256
-`6f188826fe5b4918967100d8c0816c8b230a13d4a47300497d2294390a112388`, with semantic descriptor SHA-256 `f28356cb17e85d84de3432de837f2d045e554e6d3d8d1f08018015e4960446d8`.
-That historical release targets the 0.12 engine range; it is **not qualified for
-a v0.13 scan**. Until the content owner supplies a compatible qualified successor,
-the action fails explicitly before policy execution. This follow-up does not
-alter the v0.13.0 release candidate or turn its failed SARIF run into success.
-The existing published action tags keep their original behavior until a separately
-reviewed release publishes this change.
+The default public pin is rules `0.5.1`, descriptor SHA-256
+`e607e5c360889805bf614ab05f96feda199f6ad3009d00f49158cd9f507ada6b`, with its semantic
+dependency packs `0.6.0`, descriptor SHA-256 `dd8888f763f13732ede1f05a34c2bd205dad25705b3da967e9df949c14842570`.
+Each Bifrost release requires the engine version that the action installs by
+default to admit this exact pin before the release can ship. An action tag that
+pins an older engine keeps the pin that it shipped with.
 
 Set `packs-source` to a JSON object with a trusted GitHub `repository` URL,
 exact semantic version `rules_version`, and the reviewed rules descriptor's
@@ -314,7 +312,11 @@ and archive URLs and redirects must remain on the inventory's HTTPS origin.
 Repository sources permit only their GitHub API/release URLs and redirects to
 GitHub's `release-assets.githubusercontent.com` or `objects.githubusercontent.com`
 asset hosts. Authorization is sent only to the selected repository's GitHub API,
-never to a redirect target. Credentials, query strings and fragments are rejected
+never to a redirect target. Without a credential, and always for the public
+`BrokkAi/bifrost-packs` repository, descriptors and archives come from their
+`github.com/.../releases/download/...` URLs, which GitHub's API rate limit does
+not cover. The API asset form is used only for a credentialed read of another
+repository, which may be private. Digests bind the content either way. Credentials, query strings and fragments are rejected
 in configured URLs; transient signed GitHub asset redirects are never persisted.
 
 An explicit `packs-source` takes precedence over caller-prepared roots and the
@@ -339,6 +341,23 @@ receipts never activate content and are never saved as successful content caches
 `pack-selection-id` and `pack-cache-reused` expose acquisition evidence separately
 from policy results. Missing releases, authentication/404, network, malformed,
 incompatible and unqualified content fail the action without manufacturing SARIF.
+
+### GitHub API rate limits
+
+Discovery lists the source's releases and tags through the GitHub API, then
+reads each annotated release tag once to find its commit; lightweight tags
+need no further request. Anonymous API requests share the runner IP address's quota of 60 an
+hour, which pull-request scans on hosted runners can exhaust. When `packs-token`
+is empty, the action therefore authenticates those reads with the job's
+`github.token` on every event, pull requests from forks included. The job token
+reads only the workflow's own repository and public ones, so the action uses it
+only for a source outside the workflow's repository, where it can authenticate
+public content only, and that content is still cached. The action does not send
+it with a digest-bound HTTPS mirror, which makes no API requests, or on a GitHub
+Enterprise Server, whose job token `api.github.com` does not accept.
+
+A failed acquisition prints the receipt's failure class and message, for example
+`Open-pack acquisition failed: unavailable (pack source rate limit reached)`.
 
 ### Private repositories
 

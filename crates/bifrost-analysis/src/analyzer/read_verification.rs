@@ -1036,6 +1036,7 @@ fn procedure_dispatch_call_at_relative_site(
         return Ok(None);
     };
     let mut matched_call = None;
+    let mut ordinal = 0;
     for semantic_call in procedure.semantics().call_sites() {
         if request.cancellation.is_cancelled() {
             return Err(ProcedureDispatchReadCallError::Cancelled);
@@ -1045,24 +1046,23 @@ fn procedure_dispatch_call_at_relative_site(
             source_mappings: 1,
             ..SemanticWork::default()
         });
-        let Some(mapping) = procedure.semantics().source_mapping(semantic_call.source) else {
-            return Ok(None);
-        };
-        let span = mapping.locator.anchor().span();
-        if span.start_byte() as usize != expected_start || span.end_byte() as usize != expected_end
-        {
+        if !crate::analyzer::semantic::workspace_oracle::source::call_row_has_exact_bytes(
+            procedure,
+            semantic_call,
+            expected_start,
+            expected_end,
+        ) {
             continue;
         }
-        request.budget.charge_work(SemanticWork {
-            nested_entries: 1,
-            ..SemanticWork::default()
-        });
-        let Some(candidate) = procedure.call_site_handle(semantic_call.id) else {
-            return Ok(None);
-        };
-        if matched_call.replace(candidate).is_some() {
-            return Ok(None);
+        if ordinal == expected_site.ordinal {
+            request.budget.charge_work(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            });
+            matched_call = procedure.call_site_handle(semantic_call.id);
+            break;
         }
+        ordinal += 1;
     }
     let Some(call) = matched_call else {
         return Ok(None);

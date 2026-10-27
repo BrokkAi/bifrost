@@ -3827,6 +3827,50 @@ impl fmt::Display for PathCompositionError {
 
 impl std::error::Error for PathCompositionError {}
 
+impl ResolutionCompletion {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        if let Self::Incomplete(reasons) = self {
+            reasons.charge_retained(heap);
+        }
+    }
+}
+
+impl PartialPath {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        for endpoint in [&self.start, &self.end] {
+            heap.slice(&endpoint.symbols.fixed);
+            for symbol in &endpoint.symbols.fixed {
+                if let Some(scopes) = &symbol.scopes {
+                    heap.slice(&scopes.fixed);
+                }
+            }
+            heap.slice(&endpoint.scopes.fixed);
+        }
+        heap.slice(&self.precedence);
+        heap.slice(&self.witness);
+        self.completion.charge_retained(heap);
+        if let Some(native) = &self.native_import {
+            heap.add(std::mem::size_of_val(&**native));
+            heap.slice(&native.1);
+        }
+    }
+}
+
+impl UnindexedExternalFrontier {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        heap.arc(&self.provider_path, |_, _| {});
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

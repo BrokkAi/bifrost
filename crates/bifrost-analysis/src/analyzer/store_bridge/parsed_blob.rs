@@ -1055,18 +1055,22 @@ use crate::analyzer::store::python_unit_summaries::{PythonEnvironmentPublication
 use crate::analyzer::store::resolution_publication::{
     ResolutionContentInput, ResolutionContentPublicationOutcome,
 };
-#[cfg(any(test, feature = "test-support"))]
-use brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts;
-#[cfg(any(test, feature = "test-support"))]
-use std::path::PathBuf;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub trait PythonEnvironmentPublicationEngineExt {
+    /// Publish selected membership and native inputs; return the actual revision.
+    /// Configuration and file inventories live only for this publication call.
+    fn publish_sources<A: LanguageAdapter>(
+        &self,
+        project: Arc<dyn crate::analyzer::Project>,
+        files: &std::collections::BTreeSet<ProjectFile>,
+        adapter: &A,
+    ) -> Result<i64>;
     #[allow(clippy::too_many_arguments)]
-    /// Publish one prepared selected source, then stage its file-local facts.
+    /// Publish one prepared source under an already published workspace revision.
     /// The language crate owns parsing; preparation artifacts die here.
-    fn stage_prepared_source<A: LanguageAdapter>(
+    fn publish_prepared_source<A: LanguageAdapter>(
         &self,
         file: ProjectFile,
         syntax: &PreparedSyntaxTree,
@@ -1074,14 +1078,106 @@ pub trait PythonEnvironmentPublicationEngineExt {
         adapter: &A,
         state: Arc<FileState>,
         revision: i64,
-        facts: FileResolutionFacts,
-        roots: Vec<PathBuf>,
     ) -> Result<()>;
 }
 #[cfg(any(test, feature = "test-support"))]
 impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
+    fn publish_sources<A: LanguageAdapter>(
+        &self,
+        project: Arc<dyn crate::analyzer::Project>,
+        files: &std::collections::BTreeSet<ProjectFile>,
+        adapter: &A,
+    ) -> Result<i64> {
+        use crate::analyzer::store::{WorkspaceConfigurationInput, WorkspaceFileRow};
+        let mut members = Vec::new();
+        for file in files {
+            let source = project.read_source(file)?;
+            members.push(WorkspaceFileRow {
+                rel_path: portable(file.rel_path()),
+                blob_oid: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())?,
+            });
+        }
+        let mut metadata = std::collections::BTreeSet::new();
+        WorkspaceConfigurationInput::include_native_metadata_paths(
+            project.as_ref(),
+            files,
+            Language::Python,
+            &mut metadata,
+        )?;
+        let configuration = metadata
+            .into_iter()
+            .map(|file| {
+                Ok(WorkspaceConfigurationInput::new(
+                    portable(file.rel_path()),
+                    project.read_source(&file)?.into_bytes().into_boxed_slice(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let snapshot = self.store.sync_workspace_inputs_for_workspace(
+            &self.snapshot.workspace_id,
+            "python",
+            self.snapshot.generation,
+            &members,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &configuration,
+            &[],
+            &[],
+        )?;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(
+                &crate::analyzer::parser_language_for(Language::Python).expect("Python grammar"),
+            )
+            .expect("compatible Python grammar");
+        for (file, member) in files.iter().zip(&members) {
+            let source = project.read_source(file)?;
+            let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())?;
+            if oid != member.blob_oid {
+                return Err(StoreError::new(format!(
+                    "selected Python source changed during publication: {:?}",
+                    file.rel_path()
+                )));
+            }
+            let tree = parser.parse(&source, None).expect("Python parse tree");
+            let mut parsed =
+                brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
+                    project.as_ref(),
+                    file,
+                    &source,
+                    &tree,
+                );
+            parsed.add_file_scope(file, &source);
+            let state = Arc::new(crate::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::<A>::file_state_from_parsed(
+                source.clone(), parsed, false, Some(Vec::new()), true,
+            ));
+            use brokk_bifrost_core::analyzer::prepared_syntax::{
+                PreparedSourceOrigin, PreparedSyntaxSource,
+            };
+            let syntax = PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Indexed(state.clone()),
+                tree,
+                brokk_bifrost_core::text_utils::compute_line_starts(&source),
+                brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(Language::Python),
+                PreparedSourceOrigin::Overlay,
+                None,
+            );
+            self.publish_prepared_source(
+                file.clone(),
+                &syntax,
+                oid,
+                adapter,
+                state,
+                snapshot.revision,
+            )?;
+        }
+        Ok(snapshot.revision)
+    }
     #[allow(clippy::too_many_arguments)]
-    fn stage_prepared_source<A: LanguageAdapter>(
+    fn publish_prepared_source<A: LanguageAdapter>(
         &self,
         file: ProjectFile,
         syntax: &PreparedSyntaxTree,
@@ -1089,8 +1185,6 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
         adapter: &A,
         state: Arc<FileState>,
         revision: i64,
-        facts: FileResolutionFacts,
-        roots: Vec<PathBuf>,
     ) -> Result<()> {
         let generations = [("python".to_owned(), self.snapshot.generation)]
             .into_iter()
@@ -1144,12 +1238,11 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
             )?
         };
         drop(publication_guard);
-        let ResolutionContentPublicationOutcome::Ready(content) = published else {
+        let ResolutionContentPublicationOutcome::Ready(_) = published else {
             return Err(StoreError::new(format!(
                 "native Python publication: {published:?}"
             )));
         };
-        let blob_id = content.witness().blob_id();
-        self.stage_facts(file, oid.to_string(), blob_id, facts, roots)
+        Ok(())
     }
 }

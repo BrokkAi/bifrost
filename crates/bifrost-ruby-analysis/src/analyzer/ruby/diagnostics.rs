@@ -129,7 +129,7 @@ impl RubyGemSurface for RetainedRubyGems {
         let Some(owner) = constants.unique_type(&owner_name) else {
             return RubyGemBoundary::Unpublished(self.missing_evidence(&owner_name));
         };
-        let surface = constants.constant_surface(owner);
+        let surface = constants.constant_surface(&owner);
         if surface
             .searched
             .iter()
@@ -143,7 +143,7 @@ impl RubyGemSurface for RetainedRubyGems {
             Some(detail) => RubyGemBoundary::Incomplete(
                 SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail },
             ),
-            None => RubyGemBoundary::Absent(RubyOverlayConstants::absence_domain(owner)),
+            None => RubyGemBoundary::Absent(RubyOverlayConstants::absence_domain(&owner)),
         }
     }
 

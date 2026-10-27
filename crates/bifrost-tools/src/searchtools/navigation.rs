@@ -223,8 +223,11 @@ pub struct SearchSymbolsResult {
     pub total_model_symbols: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     #[schemars(schema_with = "semantic_model_overlay_array_schema")]
-    pub model_symbols:
-        Vec<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol>,
+    pub model_symbols: Vec<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol,
+        >,
+    >,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Request patterns that are neither valid regex nor a translatable glob,
@@ -320,8 +323,11 @@ pub(crate) struct FileRankingKey {
 pub struct SymbolLocationsResult {
     pub locations: Vec<SymbolLocation>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub model_locations:
-        Vec<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol>,
+    pub model_locations: Vec<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol,
+        >,
+    >,
     pub not_found: Vec<NotFoundInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous: Vec<AmbiguousSymbol>,
@@ -614,7 +620,7 @@ pub(crate) fn search_symbols_with_cap(
                 |symbol| !authored_names.contains(&symbol.qualified_name),
             );
             complete &= model_complete;
-            let rows = matched.into_iter().cloned().collect::<Vec<_>>();
+            let rows = matched;
             (rows, total)
         })
         .unwrap_or_default();
@@ -958,7 +964,7 @@ pub fn get_symbol_locations_with_cancellation(
                 });
                 false
             } else {
-                model_locations.extend(matched.drain(..).cloned());
+                model_locations.append(&mut matched);
                 false
             }
         });
@@ -1095,7 +1101,7 @@ fn get_navigation_by_location_with_cancellation(
                         analyzer,
                         token,
                         &overlay,
-                        matched.records[0],
+                        &matched.records[0],
                     )
                 };
                 let navigation_conflict = navigation.as_ref().is_err();
@@ -1104,7 +1110,7 @@ fn get_navigation_by_location_with_cancellation(
                     Ok(None) => (
                         vec![semantic_model_definition_candidate(
                             analyzer,
-                            matched.records[0],
+                            &matched.records[0],
                         )],
                         None,
                     ),
@@ -1256,7 +1262,7 @@ fn semantic_model_navigation_candidates(
             ),
         });
     }
-    let relation = relations[0];
+    let relation = &relations[0];
     let mut modeled_target = overlay.symbols_with_id(&relation.to);
     if modeled_target.records.is_empty() {
         modeled_target = overlay.symbols_named(&relation.to);
@@ -1265,7 +1271,7 @@ fn semantic_model_navigation_candidates(
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
             return Ok(Some(vec![semantic_model_definition_candidate(
                 analyzer,
-                modeled_target.records[0],
+                &modeled_target.records[0],
             )]));
         }
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
@@ -1960,7 +1966,7 @@ pub(crate) fn render_definition_lookup(
                     brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
                         definitions.push(semantic_model_definition_candidate(
                             analyzer,
-                            matched.records[0],
+                            &matched.records[0],
                         ));
                         status = "resolved".to_string();
                     }
@@ -2531,13 +2537,13 @@ fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<Symb
     let model_targets = matched
         .records
         .iter()
-        .copied()
-        .filter(|symbol| symbol.qualified_name == target && is_model_ancestor_target(symbol));
+        .filter(|&symbol| symbol.qualified_name == target && is_model_ancestor_target(symbol))
+        .cloned();
     let mut found = false;
     let mut names = Vec::new();
     for model_symbol in model_targets {
         found = true;
-        let model_ancestors = overlay.ancestors_of(model_symbol);
+        let model_ancestors = overlay.ancestors_of(&model_symbol);
         names.extend(
             model_ancestors
                 .records
@@ -2988,7 +2994,7 @@ pub(crate) fn search_symbol_file_ranking_key(
         focus_tier,
         top2,
         top3,
-        git_tier: git_tiers.get(file).copied().unwrap_or(0),
+        git_tier: git_tiers.get(file).cloned().unwrap_or(0),
     }
 }
 

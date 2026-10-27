@@ -5,12 +5,16 @@
 use super::reverse::*;
 use super::*;
 use crate::analyzer::resolution::{
+    CompanionTypeRelation, EndpointSignature, JvmAliasProperty, LoweredMemberOwnerProperty,
     LoweredSemanticRole, ResolutionLookupSemanticRecipe, SelectedSemanticLocator,
+    SelectedTypedFactSource, StackPattern,
 };
 use crate::analyzer::store::resolution_operation::native_units;
+use brokk_bifrost_core::analyzer::common::language_for_target;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ALL_RESOLUTION_NAMESPACES, ResolutionNamespace, ResolutionSiteId,
 };
+use brokk_bifrost_core::analyzer::source_facts::{DeclarationAccessBoundary, PackageAccessRegion};
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use rusqlite::OptionalExtension;
 use std::collections::VecDeque;
@@ -21,6 +25,251 @@ const JVM_STORAGE_LANGUAGES: [(Language, &str); 3] = [
     (Language::Scala, "scala"),
 ];
 
+/// Query-local target facts; no source inventory survives the operation.
+pub struct JvmReverseTarget<'a> {
+    pub storage_language: &'a str,
+    pub semantic: SemanticId,
+    pub unit: &'a CodeUnit,
+    pub owner: Option<SemanticId>,
+    pub package: &'a str,
+    pub visibility: Option<DeclaredVisibility>,
+    pub boundary: Option<DeclarationAccessBoundary<SemanticId>>,
+}
+
+struct JvmReverseTargetAccess {
+    visibility: Option<DeclaredVisibility>,
+    owner: Option<SemanticId>,
+    boundary: Option<DeclarationAccessBoundary<SemanticId>>,
+    completion: ResolutionCompletion,
+}
+
+pub enum PeerNaming {
+    Closed,
+    WithinPackage(PackageAccessRegion),
+    Open,
+    OpenIncomplete(ResolutionIncompleteReason),
+}
+
+pub struct HierarchyRoute {
+    pub open_world: bool,
+}
+
+/// Query-owned family evidence. Routes only nominate; equivalent definitions
+/// additionally authorize a confirmed reference to the authored declaration.
+pub struct TargetFamilies {
+    pub equivalent_targets: Vec<SemanticId>,
+    pub nominations: Vec<JvmReverseFamilyRoute>,
+    pub completion: ResolutionCompletion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JvmReverseFamilyRoute {
+    pub member_name: String,
+    pub owner_segments: Vec<String>,
+}
+
+impl TargetFamilies {
+    fn empty() -> Self {
+        Self {
+            equivalent_targets: Vec::new(),
+            nominations: Vec::new(),
+            completion: ResolutionCompletion::Complete,
+        }
+    }
+}
+
+pub trait JvmReverseTargetRules {
+    fn target_families(
+        &self,
+        target: &JvmReverseTarget<'_>,
+        facts: &dyn SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> Result<TargetFamilies>;
+    fn peer_naming(&self, target: &JvmReverseTarget<'_>) -> PeerNaming;
+    fn hierarchy_route(&self, target: &JvmReverseTarget<'_>) -> Option<HierarchyRoute> {
+        (target.visibility == Some(DeclaredVisibility::Protected))
+            .then_some(HierarchyRoute { open_world: true })
+    }
+}
+
+struct JavaReverseTargetRules;
+struct KotlinReverseTargetRules;
+struct ScalaReverseTargetRules;
+
+impl JvmReverseTargetRules for JavaReverseTargetRules {
+    fn target_families(
+        &self,
+        _target: &JvmReverseTarget<'_>,
+        _facts: &dyn SelectedTypedFactSource,
+        _cancellation: &CancellationToken,
+    ) -> Result<TargetFamilies> {
+        Ok(TargetFamilies::empty())
+    }
+
+    fn peer_naming(&self, target: &JvmReverseTarget<'_>) -> PeerNaming {
+        match target.visibility {
+            Some(DeclaredVisibility::Private) => PeerNaming::Closed,
+            Some(DeclaredVisibility::PackagePrivate) => {
+                PeerNaming::WithinPackage(PackageAccessRegion::Exact(target.package.into()))
+            }
+            Some(DeclaredVisibility::Public | DeclaredVisibility::Protected) => PeerNaming::Open,
+            _ => PeerNaming::OpenIncomplete(ResolutionIncompleteReason::UnsupportedSemantic(
+                target.semantic,
+            )),
+        }
+    }
+}
+
+impl JvmReverseTargetRules for KotlinReverseTargetRules {
+    fn target_families(
+        &self,
+        target: &JvmReverseTarget<'_>,
+        facts: &dyn SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> Result<TargetFamilies> {
+        jvm_reverse_alias_families(target.semantic, facts, cancellation)
+    }
+
+    fn peer_naming(&self, target: &JvmReverseTarget<'_>) -> PeerNaming {
+        match target.visibility {
+            Some(DeclaredVisibility::Private) => PeerNaming::Closed,
+            Some(DeclaredVisibility::Public | DeclaredVisibility::Protected) => PeerNaming::Open,
+            _ => PeerNaming::OpenIncomplete(ResolutionIncompleteReason::UnsupportedSemantic(
+                target.semantic,
+            )),
+        }
+    }
+}
+
+impl JvmReverseTargetRules for ScalaReverseTargetRules {
+    fn target_families(
+        &self,
+        target: &JvmReverseTarget<'_>,
+        facts: &dyn SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> Result<TargetFamilies> {
+        let mut families = jvm_reverse_alias_families(target.semantic, facts, cancellation)?;
+        // An object's member already confirms to its authored identity. Its
+        // singleton owner is a route, never an equivalent member definition.
+        if !target.unit.is_class() || target.unit.is_synthetic() {
+            return Ok(families);
+        }
+        jvm_reverse_companion_families(
+            target.semantic,
+            facts,
+            cancellation,
+            &mut families,
+            &["apply", "unapply", "unapplySeq"],
+        )?;
+        Ok(families)
+    }
+
+    fn peer_naming(&self, target: &JvmReverseTarget<'_>) -> PeerNaming {
+        match &target.boundary {
+            Some(DeclarationAccessBoundary::Package(region)) => {
+                PeerNaming::WithinPackage(PackageAccessRegion::Enclosing(region.clone()))
+            }
+            Some(DeclarationAccessBoundary::Template(_)) => PeerNaming::Closed,
+            None => match target.visibility {
+                Some(DeclaredVisibility::Private) => PeerNaming::Closed,
+                Some(DeclaredVisibility::Public | DeclaredVisibility::Protected) => {
+                    PeerNaming::Open
+                }
+                _ => PeerNaming::OpenIncomplete(ResolutionIncompleteReason::UnsupportedSemantic(
+                    target.semantic,
+                )),
+            },
+        }
+    }
+}
+
+fn jvm_reverse_companion_families(
+    target: SemanticId,
+    facts: &dyn SelectedTypedFactSource,
+    cancellation: &CancellationToken,
+    families: &mut TargetFamilies,
+    member_names: &[&str],
+) -> Result<()> {
+    let mut companions = Vec::new();
+    let outcome = facts.visit_companion_relation_pages_for_enclosing_types(
+        TypedFactRequest::new(&[target]),
+        cancellation,
+        &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<CompanionTypeRelation>]| {
+            companions.extend(page.iter().map(|row| row.row().companion_type()));
+            Ok(!cancellation.is_cancelled())
+        }),
+    )?;
+    jvm_reverse_family_read(families, outcome, target, cancellation)?;
+    for chunk in companions.chunks(crate::analyzer::resolution::MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+        let outcome = facts.visit_member_owner_pages_for_owners(
+            TypedFactRequest::new(chunk),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<
+                LoweredMemberOwnerProperty,
+            >]| {
+                for row in page {
+                    let member = row.row();
+                    if member_names.contains(&member.member_name()) {
+                        families.equivalent_targets.push(member.definition());
+                        families.nominations.push(JvmReverseFamilyRoute {
+                            member_name: member.member_name().to_owned(),
+                            owner_segments: Vec::new(),
+                        });
+                    }
+                }
+                Ok(!cancellation.is_cancelled())
+            }),
+        )?;
+        jvm_reverse_family_read(families, outcome, target, cancellation)?;
+    }
+    Ok(())
+}
+
+fn jvm_reverse_alias_families(
+    target: SemanticId,
+    facts: &dyn SelectedTypedFactSource,
+    cancellation: &CancellationToken,
+) -> Result<TargetFamilies> {
+    let mut families = TargetFamilies::empty();
+    let outcome = facts.visit_jvm_alias_pages_for_definitions(
+        TypedFactRequest::new(&[target]),
+        cancellation,
+        &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<JvmAliasProperty>]| {
+            for row in page {
+                let alias = row.row();
+                assert_eq!(alias.definition, target);
+                families.nominations.push(JvmReverseFamilyRoute {
+                    member_name: alias.member_name.clone(),
+                    owner_segments: alias.owner_segments.clone(),
+                });
+            }
+            Ok(!cancellation.is_cancelled())
+        }),
+    )?;
+    jvm_reverse_family_read(&mut families, outcome, target, cancellation)?;
+    Ok(families)
+}
+
+fn jvm_reverse_family_read(
+    families: &mut TargetFamilies,
+    outcome: crate::analyzer::resolution::TypedFactReadOutcome,
+    target: SemanticId,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let (terminal, completion) = outcome.into_parts();
+    families.completion = families.completion.combine(&completion);
+    if cancellation.is_cancelled()
+        || terminal == crate::analyzer::resolution::TypedFactReadTerminal::Cancelled
+    {
+        families.completion = families.completion.combine(&cancelled_completion());
+    } else if terminal != crate::analyzer::resolution::TypedFactReadTerminal::Exhausted {
+        return Err(StoreError::new(format!(
+            "JVM target family read stopped before exhausting {target:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static LAST_JVM_REVERSE_CANDIDATE_PLAN: std::cell::RefCell<Vec<String>> = const {
@@ -28,7 +277,7 @@ thread_local! {
     };
 }
 
-static JAVA_REVERSE_DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
+static JVM_REVERSE_DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
             r#"
@@ -52,7 +301,7 @@ JOIN main.code_units AS units
   ON units.blob_id=link.blob_id AND units.unit_key=link.unit_key
 JOIN main.blobs AS keys ON keys.id=units.blob_id
 JOIN main.blob_meta AS meta ON meta.blob_id=units.blob_id
-WHERE mount.mount_ordinal=?1 AND mount.storage_language='java'
+WHERE mount.mount_ordinal=?1 AND mount.storage_language=?2
   AND units.in_declarations=1
   AND {complete}
 "#,
@@ -124,6 +373,7 @@ pub(crate) type JvmReverseCandidate = ReverseNomination;
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct JvmReverseCandidateSet {
+    pub equivalent_targets: Vec<SemanticId>,
     #[doc(hidden)]
     pub target: ReverseTarget,
     #[doc(hidden)]
@@ -139,6 +389,8 @@ pub struct JvmReverseCandidateSet {
 #[doc(hidden)]
 pub enum JvmReverseCandidateOutcome {
     Ready(JvmReverseCandidateSet),
+    /// This target has no identity inside the selected source inventory.
+    TargetUncovered(String),
     Unavailable(String),
     Cancelled,
 }
@@ -148,6 +400,7 @@ pub type JvmReverseConfirmedReference = ReverseOwnedReference;
 
 #[doc(hidden)]
 pub struct JvmReverseConfirmed {
+    pub equivalent_targets: Vec<SemanticId>,
     #[doc(hidden)]
     pub target: SemanticId,
     #[doc(hidden)]
@@ -165,7 +418,7 @@ pub struct JvmReverseConfirmed {
 
 impl SelectedResolutionOperation<'_, '_> {
     /// Find every selected JVM source site whose indexed lookup identity could
-    /// refer to the Java `target`, then narrow by Java declaration access.
+    /// refer to the JVM `target`, then narrow by its declaration access.
     /// Fully qualified references do not require an import, so no importer
     /// filter is applied here.
     #[doc(hidden)]
@@ -177,28 +430,41 @@ impl SelectedResolutionOperation<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(JvmReverseCandidateOutcome::Cancelled);
         }
+        let language = language_for_target(target);
+        let Some((_, target_storage_language)) = JVM_STORAGE_LANGUAGES
+            .iter()
+            .find(|(candidate, _)| *candidate == language)
+        else {
+            return Ok(JvmReverseCandidateOutcome::TargetUncovered(format!(
+                "non-JVM target: {target:?}"
+            )));
+        };
         let relative_path = crate::path_utils::rel_path_string(target.source());
         let Some(target_mount) = self
             .ready
             .inventory
-            .mount_record_for_path("java", &relative_path)?
+            .mount_record_for_path(target_storage_language, &relative_path)?
         else {
-            return Ok(JvmReverseCandidateOutcome::Unavailable(format!(
-                "Java target is outside the selected source mounts: {relative_path}"
+            return Ok(JvmReverseCandidateOutcome::TargetUncovered(format!(
+                "JVM target is outside the selected source mounts: {relative_path}"
             )));
         };
         let connection = self.ready.inventory.connection();
         let mut statement =
-            connection.prepare_cached(JAVA_REVERSE_DEFINITION_SEMANTICS_SQL.as_str())?;
+            connection.prepare_cached(JVM_REVERSE_DEFINITION_SEMANTICS_SQL.as_str())?;
         let target_semantics = statement
-            .query_map([i64::from(target_mount.ordinal().get())], |row| {
-                row.get::<_, i64>(0)
-            })?
+            .query_map(
+                rusqlite::params![
+                    i64::from(target_mount.ordinal().get()),
+                    target_storage_language
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
             .map(|key| {
                 key.map(|key| {
                     SemanticId::local(
                         target_mount.ordinal().get(),
-                        u32::try_from(key).expect("Java definition key fits u32"),
+                        u32::try_from(key).expect("JVM definition key fits u32"),
                     )
                 })
             })
@@ -213,23 +479,28 @@ impl SelectedResolutionOperation<'_, '_> {
             SelectedNativeDefinitions::Ready(rows) => rows,
             SelectedNativeDefinitions::Unavailable => {
                 return Ok(JvmReverseCandidateOutcome::Unavailable(format!(
-                    "Java target definitions are not projectable: {relative_path}"
+                    "JVM target definitions are not projectable: {relative_path}"
                 )));
             }
             SelectedNativeDefinitions::Cancelled => {
                 return Ok(JvmReverseCandidateOutcome::Cancelled);
             }
         };
-        let Some((target_semantic, _)) = target_definitions.into_iter().find(|(_, definition)| {
+        let Some((target_semantic, _)) = target_definitions.iter().find(|(_, definition)| {
             matches!(definition, SelectedNativeDefinition::Unit(unit) if unit == target)
         }) else {
-            return Ok(JvmReverseCandidateOutcome::Unavailable(format!(
-                "Java target has no selected definition identity: {target:?}"
+            return Ok(JvmReverseCandidateOutcome::TargetUncovered(format!(
+                "JVM target has no selected definition identity: {target:?}"
             )));
         };
 
-        let (visibility, owner_semantic, completion) =
-            self.java_reverse_target_access(target_semantic, target, cancellation)?;
+        let target_semantic = *target_semantic;
+        let JvmReverseTargetAccess {
+            visibility,
+            owner: owner_semantic,
+            boundary,
+            completion,
+        } = self.jvm_reverse_target_access(target_semantic, target, cancellation)?;
         if cancellation.is_cancelled() {
             return Ok(JvmReverseCandidateOutcome::Cancelled);
         }
@@ -241,24 +512,139 @@ impl SelectedResolutionOperation<'_, '_> {
         );
         let mut surfaces = Vec::new();
         let target_package = target.package_name();
-        let peer_language_inventory_open =
-            self.jvm_peer_language_may_name_target(target_package, visibility, cancellation)?;
+        let descriptor = JvmReverseTarget {
+            storage_language: target_storage_language,
+            semantic: target_semantic,
+            unit: target,
+            owner: owner_semantic,
+            package: target_package,
+            visibility,
+            boundary,
+        };
+        let rules: &dyn JvmReverseTargetRules = match *target_storage_language {
+            "java" => &JavaReverseTargetRules,
+            "kotlin" => &KotlinReverseTargetRules,
+            "scala" => &ScalaReverseTargetRules,
+            _ => unreachable!("target language checked above"),
+        };
+        let mut families =
+            rules.target_families(&descriptor, &self.ready.typed_source(), cancellation)?;
         if cancellation.is_cancelled() {
             return Ok(JvmReverseCandidateOutcome::Cancelled);
         }
-        let subclass_paths = if visibility == Some(DeclaredVisibility::Protected) {
+        // Generated Scala apply/extractor declarations project to their exact
+        // synthetic constructor bridge. Written companion methods do not
+        // become equivalent just because their name is apply or unapply.
+        for semantic in &families.equivalent_targets {
+            if !target_definitions.iter().any(|(identity, definition)| {
+                identity == semantic
+                    && matches!(definition, SelectedNativeDefinition::Unit(unit) if unit.is_function())
+            }) {
+                // Unitless/local generated members need an explicit bridge
+                // before they can be distinguished from written callables.
+                families.completion = families.completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(target_semantic),
+                ]));
+            }
+        }
+        let generated_units = target_definitions
+            .iter()
+            .filter_map(|(semantic, definition)| {
+                if !families.equivalent_targets.contains(semantic) {
+                    return None;
+                }
+                match definition {
+                    SelectedNativeDefinition::Unit(unit)
+                        if unit.is_synthetic() && unit.is_function() =>
+                    {
+                        Some(unit)
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        families.equivalent_targets = target_definitions
+            .iter()
+            .filter_map(|(semantic, definition)| match definition {
+                SelectedNativeDefinition::Unit(unit)
+                    if families.equivalent_targets.contains(semantic)
+                        && generated_units.contains(&unit) =>
+                {
+                    Some(*semantic)
+                }
+                _ => None,
+            })
+            .collect();
+        if !families.equivalent_targets.is_empty() {
+            let outcome = self.ready.typed_source().visit_member_owner_pages_for_owners(
+                TypedFactRequest::new(&[target_semantic]), cancellation,
+                &mut FactPageVisitor::new(&mut |page: &[SelectedTypedRow<LoweredMemberOwnerProperty>]| {
+                    for row in page {
+                        let member = row.row();
+                        if member.kind() == brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind::Constructor
+                            && target_definitions.iter().any(|(semantic, definition)|
+                                *semantic == member.definition() && matches!(definition,
+                                    SelectedNativeDefinition::Unit(unit) if generated_units.contains(&unit)))
+                        {
+                            families.equivalent_targets.push(member.definition());
+                        }
+                    }
+                    Ok(!cancellation.is_cancelled())
+                }),
+            )?;
+            jvm_reverse_family_read(&mut families, outcome, target_semantic, cancellation)?;
+        }
+        evidence.enumeration.record(
+            ReverseSubject::Target(target_semantic),
+            ReverseEvidenceOrigin::Nomination,
+            families.completion,
+        );
+        let mut spellings = vec![target.terminal_name().to_owned()];
+        for route in families.nominations {
+            if !spellings.contains(&route.member_name) {
+                spellings.push(route.member_name);
+            }
+            // Owner routes nominate receiver/type sites too. Only the forward
+            // binding, never an owner spelling, can admit a reference.
+            if let Some(owner) = route.owner_segments.into_iter().last()
+                && !spellings.contains(&owner)
+            {
+                spellings.push(owner);
+            }
+        }
+        let peer_naming = rules.peer_naming(&descriptor);
+        if let PeerNaming::OpenIncomplete(reason) = &peer_naming {
+            evidence.binding.record(
+                ReverseSubject::Target(target_semantic),
+                ReverseEvidenceOrigin::Access,
+                ResolutionCompletion::incomplete([*reason]),
+            );
+        }
+        let hierarchy_route = rules.hierarchy_route(&descriptor);
+        let peer_language_inventory_open = self.jvm_peer_language_may_name_target(
+            &descriptor,
+            &peer_naming,
+            hierarchy_route.as_ref(),
+            cancellation,
+        )?;
+        if cancellation.is_cancelled() {
+            return Ok(JvmReverseCandidateOutcome::Cancelled);
+        }
+        let subclass_paths = if let Some(route) = &hierarchy_route {
             // The selected Java hierarchy is a source inventory, not a closed
             // classpath universe. Even a completed source walk cannot prove
             // that no additional subtype route exists outside that universe.
-            evidence.binding.record(
-                ReverseSubject::Target(target_semantic),
-                ReverseEvidenceOrigin::Hierarchy,
-                ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::UnsupportedSemantic(
-                        owner_semantic.unwrap_or(target_semantic),
-                    ),
-                ]),
-            );
+            if route.open_world {
+                evidence.binding.record(
+                    ReverseSubject::Target(target_semantic),
+                    ReverseEvidenceOrigin::Hierarchy,
+                    ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(
+                            owner_semantic.unwrap_or(target_semantic),
+                        ),
+                    ]),
+                );
+            }
             if let Some(owner_semantic) = owner_semantic {
                 match native_units::project_native_definition_units(
                     &self.ready,
@@ -336,119 +722,123 @@ impl SelectedResolutionOperation<'_, '_> {
             HashMap::<(String, String, ResolutionSiteId), Vec<ReverseNomination>>::default();
         let mut candidate_packages = HashMap::<(String, String), Option<String>>::default();
         let lexical = self.ready.lexical_source();
-        for (semantic_language, storage_language) in JVM_STORAGE_LANGUAGES {
-            for namespace in ALL_RESOLUTION_NAMESPACES
-                .iter()
-                .filter(|namespace| **namespace != ResolutionNamespace::TypeOrValue)
-            {
-                if cancellation.is_cancelled() {
-                    return Ok(JvmReverseCandidateOutcome::Cancelled);
-                }
-                let lookup = ResolutionLookupSemanticRecipe::new(
-                    semantic_language,
-                    *namespace,
-                    target.terminal_name(),
-                )
-                .semantic(&self.ready.shared_names());
-                let Some(_identity) = lookup.shared_name_id() else {
-                    continue;
-                };
-                let input_ordinal = surfaces.len();
-                surfaces.push(lookup);
-                #[cfg(any(test, feature = "test-support"))]
-                LAST_JVM_REVERSE_CANDIDATE_PLAN.with(|last| {
-                    *last.borrow_mut() = explain_jvm_reverse_candidate_plan(
-                        connection,
-                        i64::from(_identity.get()),
+        for spelling in &spellings {
+            for (semantic_language, storage_language) in JVM_STORAGE_LANGUAGES {
+                for namespace in ALL_RESOLUTION_NAMESPACES
+                    .iter()
+                    .filter(|namespace| **namespace != ResolutionNamespace::TypeOrValue)
+                {
+                    if cancellation.is_cancelled() {
+                        return Ok(JvmReverseCandidateOutcome::Cancelled);
+                    }
+                    let lookup = ResolutionLookupSemanticRecipe::new(
+                        semantic_language,
+                        *namespace,
+                        spelling,
+                    )
+                    .semantic(&self.ready.shared_names());
+                    let Some(_identity) = lookup.shared_name_id() else {
+                        continue;
+                    };
+                    let input_ordinal = surfaces.len();
+                    surfaces.push(lookup);
+                    #[cfg(any(test, feature = "test-support"))]
+                    LAST_JVM_REVERSE_CANDIDATE_PLAN.with(|last| {
+                        *last.borrow_mut() = explain_jvm_reverse_candidate_plan(
+                            connection,
+                            i64::from(_identity.get()),
+                            storage_language,
+                            semantic_language.config_label(),
+                        )
+                        .expect("explain populated JVM reverse candidate query");
+                    });
+                    let Some(mounts) = self.jvm_reverse_candidate_mounts(
+                        lookup,
+                        input_ordinal,
                         storage_language,
                         semantic_language.config_label(),
-                    )
-                    .expect("explain populated JVM reverse candidate query");
-                });
-                let Some(mounts) = self.jvm_reverse_candidate_mounts(
-                    lookup,
-                    input_ordinal,
-                    storage_language,
-                    semantic_language.config_label(),
-                    cancellation,
-                )?
-                else {
-                    return Ok(JvmReverseCandidateOutcome::Cancelled);
-                };
-                for JvmReverseCandidateMount {
-                    ordinal,
-                    candidate_language,
-                    path,
-                    blob_id,
-                    package,
-                    has_root,
-                    sites,
-                } in mounts
-                {
-                    if package.is_none() {
-                        evidence.binding.record(
-                            ReverseSubject::Context(ReverseContextWitness::new(
-                                self, ordinal, blob_id,
-                            )),
-                            ReverseEvidenceOrigin::Access,
-                            ResolutionCompletion::incomplete([
-                                ResolutionIncompleteReason::UnsupportedSemantic(target_semantic),
-                            ]),
-                        );
-                    }
-                    candidate_packages
-                        .insert((candidate_language.clone(), path.clone()), package.clone());
+                        cancellation,
+                    )?
+                    else {
+                        return Ok(JvmReverseCandidateOutcome::Cancelled);
+                    };
+                    for JvmReverseCandidateMount {
+                        ordinal,
+                        candidate_language,
+                        path,
+                        blob_id,
+                        package,
+                        has_root,
+                        sites,
+                    } in mounts
+                    {
+                        if package.is_none() {
+                            evidence.binding.record(
+                                ReverseSubject::Context(ReverseContextWitness::new(
+                                    self, ordinal, blob_id,
+                                )),
+                                ReverseEvidenceOrigin::Access,
+                                ResolutionCompletion::incomplete([
+                                    ResolutionIncompleteReason::UnsupportedSemantic(
+                                        target_semantic,
+                                    ),
+                                ]),
+                            );
+                        }
+                        candidate_packages
+                            .insert((candidate_language.clone(), path.clone()), package.clone());
 
-                    let context = ReverseContextWitness::new(self, ordinal, blob_id);
-                    let obligation = evidence.enumeration.record(
-                        ReverseSubject::Context(context.clone()),
-                        ReverseEvidenceOrigin::Nomination,
-                        ResolutionCompletion::Complete,
-                    );
-                    if has_root {
-                        let known_sites = sites.iter().map(|(site, _)| *site).collect();
-                        let Some(import_completion) = self.jvm_reverse_import_inventory(
-                            ordinal,
-                            blob_id,
-                            lookup,
-                            target_semantic,
-                            &known_sites,
-                            cancellation,
-                        )?
-                        else {
-                            return Ok(JvmReverseCandidateOutcome::Cancelled);
-                        };
-                        evidence.enumeration.record(
+                        let context = ReverseContextWitness::new(self, ordinal, blob_id);
+                        let obligation = evidence.enumeration.record(
                             ReverseSubject::Context(context.clone()),
-                            ReverseEvidenceOrigin::Import,
-                            import_completion.clone(),
+                            ReverseEvidenceOrigin::Nomination,
+                            ResolutionCompletion::Complete,
                         );
-                    }
-                    for (site, route) in sites {
-                        candidates
-                            .entry((candidate_language.clone(), path.clone(), site))
-                            .or_default()
-                            .push(ReverseNomination {
-                                locator: SelectedSemanticLocator::new(
-                                    candidate_language.clone(),
-                                    path.clone(),
-                                    site,
-                                    LoweredSemanticRole::Reference,
-                                ),
-                                surface: Some(lookup),
-                                context: context.clone(),
-                                route,
-                                evidence: if route == ReverseNominationRoute::Root {
-                                    ReverseNominationEvidence::ImportedRoot
-                                } else {
-                                    ReverseNominationEvidence::NamedIndex
-                                },
-                                input_ordinal,
-                                binder_scope: None,
-                                obligations: vec![ReverseObligationLink {
-                                    obligation: obligation.clone(),
-                                }],
-                            });
+                        if has_root {
+                            let known_sites = sites.iter().map(|(site, _)| *site).collect();
+                            let Some(import_completion) = self.jvm_reverse_import_inventory(
+                                ordinal,
+                                blob_id,
+                                lookup,
+                                target_semantic,
+                                &known_sites,
+                                cancellation,
+                            )?
+                            else {
+                                return Ok(JvmReverseCandidateOutcome::Cancelled);
+                            };
+                            evidence.enumeration.record(
+                                ReverseSubject::Context(context.clone()),
+                                ReverseEvidenceOrigin::Import,
+                                import_completion.clone(),
+                            );
+                        }
+                        for (site, route) in sites {
+                            candidates
+                                .entry((candidate_language.clone(), path.clone(), site))
+                                .or_default()
+                                .push(ReverseNomination {
+                                    locator: SelectedSemanticLocator::new(
+                                        candidate_language.clone(),
+                                        path.clone(),
+                                        site,
+                                        LoweredSemanticRole::Reference,
+                                    ),
+                                    surface: Some(lookup),
+                                    context: context.clone(),
+                                    route,
+                                    evidence: if route == ReverseNominationRoute::Root {
+                                        ReverseNominationEvidence::ImportedRoot
+                                    } else {
+                                        ReverseNominationEvidence::NamedIndex
+                                    },
+                                    input_ordinal,
+                                    binder_scope: None,
+                                    obligations: vec![ReverseObligationLink {
+                                        obligation: obligation.clone(),
+                                    }],
+                                });
+                        }
                     }
                 }
             }
@@ -501,23 +891,26 @@ impl SelectedResolutionOperation<'_, '_> {
             let package = candidate_packages
                 .get(&(storage_language.clone(), path.clone()))
                 .and_then(Option::as_deref);
-            let include = match visibility {
-                Some(DeclaredVisibility::Public) => true,
-                Some(DeclaredVisibility::Private) => {
+            // Scala companion routes are nominated conservatively, including
+            // private and protected declarations. Forward access remains the
+            // authority; a source-mount filter cannot prove template access.
+            let include = match &peer_naming {
+                PeerNaming::Closed => {
                     storage_language == "scala"
-                        || (storage_language == "java" && path == relative_path)
+                        || (storage_language == descriptor.storage_language
+                            && path == relative_path)
                 }
-                Some(DeclaredVisibility::PackagePrivate) => {
-                    package.is_none() || package == Some(target_package)
+                PeerNaming::WithinPackage(region) => {
+                    package.is_none_or(|package| region.contains(package))
+                        || subclass_paths.contains(&(storage_language.clone(), path.clone()))
                 }
-                Some(DeclaredVisibility::Protected) => {
+                PeerNaming::Open if hierarchy_route.is_some() => {
                     storage_language == "scala"
                         || package.is_none()
                         || package == Some(target_package)
                         || subclass_paths.contains(&(storage_language.clone(), path.clone()))
                 }
-                Some(DeclaredVisibility::Internal | DeclaredVisibility::CrateOrModule) => true,
-                Some(DeclaredVisibility::Unknown) | None => true,
+                PeerNaming::Open | PeerNaming::OpenIncomplete(_) => true,
             };
             if include {
                 result.append(&mut nominations);
@@ -553,6 +946,7 @@ impl SelectedResolutionOperation<'_, '_> {
             );
         }
         Ok(JvmReverseCandidateOutcome::Ready(JvmReverseCandidateSet {
+            equivalent_targets: families.equivalent_targets,
             target: ReverseTarget {
                 semantic: target_semantic,
                 declaration: target.clone(),
@@ -572,17 +966,14 @@ impl SelectedResolutionOperation<'_, '_> {
 
     fn jvm_peer_language_may_name_target(
         &self,
-        target_package: &str,
-        visibility: Option<DeclaredVisibility>,
+        target: &JvmReverseTarget<'_>,
+        naming: &PeerNaming,
+        hierarchy_route: Option<&HierarchyRoute>,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        if matches!(visibility, Some(DeclaredVisibility::Private)) {
+        if matches!(naming, PeerNaming::Closed) {
             return Ok(false);
         }
-        let package_filter = match visibility {
-            Some(DeclaredVisibility::PackagePrivate) => Some(target_package),
-            _ => None,
-        };
         let mounts = self.mount_table().mounts()?;
         let connection = self.ready.inventory.connection();
         let mut package_statement = connection.prepare_cached(
@@ -592,7 +983,10 @@ impl SelectedResolutionOperation<'_, '_> {
              WHERE mount.mount_ordinal=?1 AND mount.storage_language=?2
                AND meta.is_complete=1",
         )?;
-        for storage_language in ["kotlin", "scala"] {
+        for (_, storage_language) in JVM_STORAGE_LANGUAGES
+            .into_iter()
+            .filter(|(_, language)| *language != target.storage_language)
+        {
             if cancellation.is_cancelled() {
                 return Ok(false);
             }
@@ -600,7 +994,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 .iter()
                 .filter(|mount| mount.storage_language() == storage_language)
             {
-                if let Some(target_package) = package_filter {
+                // Protected declarations can also be named through a
+                // subclass outside the explicit lexical package region.
+                if let PeerNaming::WithinPackage(region) = naming
+                    && hierarchy_route.is_none()
+                {
                     let package = package_statement
                         .query_row(
                             rusqlite::params![i64::from(mount.ordinal().get()), storage_language],
@@ -610,7 +1008,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .flatten();
                     if package
                         .as_deref()
-                        .is_some_and(|package| package != target_package)
+                        .is_some_and(|package| !region.contains(package))
                     {
                         continue;
                     }
@@ -1059,24 +1457,22 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(reducer.references)
     }
 
-    fn java_reverse_target_access(
+    fn jvm_reverse_target_access(
         &self,
         target: SemanticId,
         target_unit: &CodeUnit,
         cancellation: &CancellationToken,
-    ) -> Result<(
-        Option<DeclaredVisibility>,
-        Option<SemanticId>,
-        ResolutionCompletion,
-    )> {
+    ) -> Result<JvmReverseTargetAccess> {
         let facts = self.ready.typed_source();
         let mut visibility = None;
+        let mut boundary = None;
         let mut collect_visibility = |rows: &[SelectedTypedRow<
             crate::analyzer::resolution::LoweredDeclarationVisibilityProperty,
         >]| {
             for row in rows {
                 assert_eq!(row.row().definition(), target);
                 assert!(visibility.replace(row.row().visibility()).is_none());
+                boundary = row.row().boundary().cloned();
             }
             Ok(!cancellation.is_cancelled())
         };
@@ -1090,17 +1486,63 @@ impl SelectedResolutionOperation<'_, '_> {
         if terminal == crate::analyzer::resolution::TypedFactReadTerminal::Cancelled
             || cancellation.is_cancelled()
         {
-            return Ok((None, None, cancelled_completion()));
+            return Ok(JvmReverseTargetAccess {
+                visibility: None,
+                owner: None,
+                boundary: None,
+                completion: cancelled_completion(),
+            });
         }
         if terminal != crate::analyzer::resolution::TypedFactReadTerminal::Exhausted {
             return Err(StoreError::new(
-                "Java target visibility read stopped before exhausting its exact request",
+                "JVM target visibility read stopped before exhausting its exact request",
             ));
         }
         if visibility.is_none() {
             completion = completion.combine(&ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(target),
             ]));
+        }
+
+        // An invalid Scala qualifier has no boundary row. Its producer keeps
+        // access evidence on the exact definition's reverse frontier. Read
+        // that frontier before interpreting an absent qualifier as private.
+        // Java keeps its existing read shape and exact-work contract.
+        if language_for_target(target_unit) == Language::Scala
+            && boundary.is_none()
+            && matches!(
+                visibility,
+                Some(DeclaredVisibility::Private | DeclaredVisibility::Protected)
+            )
+        {
+            let lexical = self.ready.lexical_source();
+            if let Some(node) = lexical.lookup_definition_node(target, cancellation)? {
+                let request = crate::analyzer::resolution::BatchCandidateRequest::new(
+                    0,
+                    EndpointSignature::new(
+                        node,
+                        StackPattern::closed([]),
+                        StackPattern::closed([]),
+                    ),
+                );
+                let outcome = lexical.visit_reverse_candidate_match_pages(
+                    &[request],
+                    cancellation,
+                    &mut |_| Ok(!cancellation.is_cancelled()),
+                )?;
+                if outcome.branch_completions() != [ResolutionCompletion::Complete] {
+                    visibility = None;
+                    completion = completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(target),
+                    ]));
+                }
+                completion = completion.combine(outcome.unconditional_completion());
+            } else {
+                visibility = None;
+                completion = completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(target),
+                ]));
+            }
         }
 
         let mut owner = None;
@@ -1123,11 +1565,16 @@ impl SelectedResolutionOperation<'_, '_> {
         if terminal == crate::analyzer::resolution::TypedFactReadTerminal::Cancelled
             || cancellation.is_cancelled()
         {
-            return Ok((visibility, None, cancelled_completion()));
+            return Ok(JvmReverseTargetAccess {
+                visibility,
+                owner: None,
+                boundary,
+                completion: cancelled_completion(),
+            });
         }
         if terminal != crate::analyzer::resolution::TypedFactReadTerminal::Exhausted {
             return Err(StoreError::new(
-                "Java target owner read stopped before exhausting its exact request",
+                "JVM target owner read stopped before exhausting its exact request",
             ));
         }
         completion = completion.combine(&owner_completion);
@@ -1137,7 +1584,12 @@ impl SelectedResolutionOperation<'_, '_> {
                 ResolutionIncompleteReason::UnsupportedSemantic(target),
             ]));
         }
-        Ok((visibility, owner, completion))
+        Ok(JvmReverseTargetAccess {
+            visibility,
+            owner,
+            boundary,
+            completion,
+        })
     }
 
     /// Confirm grouped candidate sites with each caller's selected JVM import
@@ -1165,6 +1617,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let peer_language_inventory_open = candidates.peer_language_inventory_open;
         let mut evidence = candidates.evidence;
         let mut reducer = JvmOrdinaryReverseReducer {
+            equivalent_targets: &candidates.equivalent_targets,
             target: target_semantic,
             references: Vec::new(),
         };
@@ -1182,10 +1635,12 @@ impl SelectedResolutionOperation<'_, '_> {
             ));
         }
         let completion = jvm_reverse_completion(&evidence);
+        let references = reducer.references;
         self.ready.finish(
             JvmReverseConfirmed {
+                equivalent_targets: candidates.equivalent_targets,
                 target: target_semantic,
-                references: reducer.references,
+                references,
                 completion: completion.clone(),
                 candidate_inventory_complete,
                 peer_language_inventory_open,
@@ -1546,12 +2001,13 @@ impl ReverseFileReducer for JvmHierarchyReverseReducer {
     }
 }
 
-struct JvmOrdinaryReverseReducer {
+struct JvmOrdinaryReverseReducer<'a> {
+    equivalent_targets: &'a [SemanticId],
     target: SemanticId,
     references: Vec<JvmReverseConfirmedReference>,
 }
 
-impl ReverseFileReducer for JvmOrdinaryReverseReducer {
+impl ReverseFileReducer for JvmOrdinaryReverseReducer<'_> {
     type Answer = FactResolutionAnswer;
 
     fn binding_completion<'a>(&self, answer: &'a Self::Answer) -> &'a ResolutionCompletion {
@@ -1559,7 +2015,16 @@ impl ReverseFileReducer for JvmOrdinaryReverseReducer {
     }
 
     fn target_relation(&self, answer: &Self::Answer) -> ReverseTargetRelation {
-        jvm_reverse_target_relation(self.target, answer)
+        if answer
+            .binding()
+            .targets()
+            .iter()
+            .any(|target| self.equivalent_targets.contains(target))
+        {
+            ReverseTargetRelation::Matches
+        } else {
+            jvm_reverse_target_relation(self.target, answer)
+        }
     }
 
     fn target(&self) -> SemanticId {

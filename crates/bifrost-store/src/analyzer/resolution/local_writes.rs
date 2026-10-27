@@ -17,7 +17,7 @@ use super::batch::BatchResolutionEngine;
 use super::engine::{PreloadedFragmentSource, ResolutionQuery};
 use super::fact_lowering::{
     LoweredCandidateDirection, LoweredCoverageGap, LoweredResolutionFragment, LoweredSemanticRole,
-    LoweringCoverageFrontier, LoweringGapOrigin, gap_reason_semantic_identity,
+    LoweringCoverageFrontier, LoweringGapOrigin,
 };
 use super::local_identity::ResolutionIdentityCatalogBuilder;
 use super::model::{BindingNodeId, ResolutionCompletion};
@@ -127,7 +127,7 @@ pub(super) fn attach_local_writes<'facts>(
         })
         .expect("write attachment has an input");
     let origin = LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedPlacementBoundary);
-    let reason = identities.semantic(gap_reason_semantic_identity(first, origin));
+    let reason = identities.gap_reason(first, origin);
     let mut gaps = lexical.gaps().to_vec();
     gaps.push(LoweredCoverageGap::new(
         CanonicalHasher::new(b"bifrost-local-write-open-root:v1").finish(),
@@ -183,25 +183,29 @@ pub(super) fn attach_local_writes<'facts>(
             inputs.entry(declaration).or_default().push(write.value);
         } else {
             failed_sites.insert(write.target);
-            // An exact parameter match proves which declaration is written,
-            // but its incoming observed value is not modeled. Keep the gap at
-            // the write without marking its known static type incomplete.
-            let exact_parameter = answer.completion() == &ResolutionCompletion::Complete
+            // A parameter or field retains its declared static type even when
+            // its incoming or stored observed value is not modeled. Keep the
+            // write gap without marking the declaration's type incomplete.
+            let exact_declared_binding = answer.completion() == &ResolutionCompletion::Complete
                 && matches!(
                     answer.targets(),
                     [target]
                         if definitions.get(target).is_some_and(|site| {
-                            binders.get(site) == Some(&ResolutionBinderKind::Parameter)
+                            matches!(binders.get(site), Some(ResolutionBinderKind::Parameter | ResolutionBinderKind::Field))
                         })
                 );
-            if !exact_parameter {
+            if !exact_declared_binding {
                 // Retain incompleteness on every known alternative, without
                 // attaching the RHS to an arbitrary or conditional definition.
                 failed_sites.extend(
                     answer
                         .targets()
                         .iter()
-                        .filter_map(|target| definitions.get(target).copied()),
+                        .filter_map(|target| definitions.get(target).copied())
+                        // A field's declared type is independent of whether
+                        // this write can bind completely. Preserve that type
+                        // for every candidate field; the write stays open.
+                        .filter(|site| binders.get(site) != Some(&ResolutionBinderKind::Field)),
                 );
             }
         }
@@ -262,6 +266,9 @@ pub(super) fn attach_local_writes<'facts>(
         .map_or(0, |id| {
             id.checked_add(1).expect("local write slot IDs fit u32")
         });
+    let initializer_decides_type =
+        crate::analyzer::semantic::languages::language_knowledge(lexical.language())
+            .is_some_and(|knowledge| knowledge.inferred_local_type_is_initializer_type());
     let mut written = inputs.into_iter().collect::<Vec<_>>();
     written.sort_unstable_by_key(|(site, _)| *site);
     for (declaration, mut inputs) in written {
@@ -352,8 +359,13 @@ pub(super) fn attach_local_writes<'facts>(
                     }),
                 ));
         }
-        for index in initializations {
-            normalized.type_transfers[index].input = join;
+        // Where the initializer alone decides the static type, a write that
+        // reads the binding (`x = x + 1`) must not feed that type back into
+        // itself; the join still supplies the observed values above.
+        if !initializer_decides_type {
+            for index in initializations {
+                normalized.type_transfers[index].input = join;
+            }
         }
         // An inferred declaration without an initializer still owns its value
         // property. Writes supply that property's value without inventing an

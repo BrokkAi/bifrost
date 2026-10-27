@@ -1,18 +1,42 @@
-//! Test-support Java-target inverse references over selected JVM forward resolution.
+//! Test-support JVM-target inverse references over selected JVM forward resolution.
 //!
 //! Candidate discovery uses shared indexed reference paths, and every candidate
 //! is confirmed in its own language's selected JVM import context. Current
 //! producer and consumer coverage can keep peer-language absence explicitly open.
 
 use crate::analyzer::java::JavaAnalyzer;
+use crate::analyzer::kotlin::KotlinAnalyzer;
+use crate::analyzer::scala::ScalaAnalyzer;
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+    SelectedInverseIndexOutcome, SelectedInverseReferenceIndex, SelectedInverseReferenceProvider,
+};
+use brokk_bifrost_analysis::analyzer::structural::selected_inverse::{
+    LazySelectedInverse, SelectedInverseAdapter, SelectedInverseFailure,
+};
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
+use brokk_bifrost_core::analyzer::common::language_for_target;
+
+pub(crate) fn jvm_target_analyzer<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    target: &CodeUnit,
+) -> Option<&'a dyn IAnalyzer> {
+    match language_for_target(target) {
+        Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|a| a as &dyn IAnalyzer),
+        Language::Kotlin => {
+            resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|a| a as &dyn IAnalyzer)
+        }
+        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|a| a as &dyn IAnalyzer),
+        _ => None,
+    }
+}
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::java_reverse_rows::JvmReverseCandidateOutcome;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseCandidateOutcome;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::java_reverse_rows::JvmReverseConfirmed;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseConfirmed;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
@@ -73,6 +97,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum JavaSelectedReverseOutcome<T> {
     Ready(T),
+    /// The target is outside selected coverage; other consumers retain its detail.
+    TargetUncovered(String),
     Unavailable(String),
     Stale(String),
     Cancelled,
@@ -103,7 +129,7 @@ impl JavaSelectedInverseResolution {
 
 /// Resolve one target against selected Java source identities and contexts.
 pub fn java_selected_inverse_for(
-    java: &JavaAnalyzer,
+    java: &dyn IAnalyzer,
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> JavaSelectedReverseOutcome<EdgeDerivationResult> {
@@ -111,7 +137,8 @@ pub fn java_selected_inverse_for(
         JavaSelectedReverseOutcome::Ready(answer) => {
             JavaSelectedReverseOutcome::Ready(answer.edges)
         }
-        JavaSelectedReverseOutcome::Unavailable(reason) => {
+        JavaSelectedReverseOutcome::Unavailable(reason)
+        | JavaSelectedReverseOutcome::TargetUncovered(reason) => {
             JavaSelectedReverseOutcome::Unavailable(reason)
         }
         JavaSelectedReverseOutcome::Stale(reason) => JavaSelectedReverseOutcome::Stale(reason),
@@ -124,19 +151,50 @@ pub fn java_selected_inverse_for(
 
 pub(crate) fn java_selected_inverse_detailed_for(
     analyzer: &dyn IAnalyzer,
-    java: &JavaAnalyzer,
+    java: &dyn IAnalyzer,
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> JavaSelectedReverseOutcome<JavaSelectedInverseResolution> {
-    match java_selected_inverse_for_inner(analyzer, java, target, cancellation) {
-        Ok(outcome) => outcome,
-        Err(error) => JavaSelectedReverseOutcome::StoreError(error.to_string()),
+    let result = match language_for_target(target) {
+        Language::Java => resolve_analyzer::<JavaAnalyzer>(java)
+            .map(|a| java_selected_inverse_for_inner(analyzer, a, a.inner(), target, cancellation)),
+        Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(java).map(|a| {
+            java_selected_inverse_for_inner(
+                analyzer,
+                a,
+                a.tree_sitter_analyzer(),
+                target,
+                cancellation,
+            )
+        }),
+        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(java).map(|a| {
+            java_selected_inverse_for_inner(
+                analyzer,
+                a,
+                a.tree_sitter_analyzer(),
+                target,
+                cancellation,
+            )
+        }),
+        _ => {
+            return JavaSelectedReverseOutcome::TargetUncovered(
+                "selected inverse target is not a JVM language".into(),
+            );
+        }
+    };
+    match result {
+        Some(Ok(outcome)) => outcome,
+        Some(Err(error)) => JavaSelectedReverseOutcome::StoreError(error.to_string()),
+        None => JavaSelectedReverseOutcome::Unavailable(
+            "selected JVM target analyzer is unavailable".into(),
+        ),
     }
 }
 
-fn java_selected_inverse_for_inner(
+fn java_selected_inverse_for_inner<A: LanguageAdapter>(
     analyzer: &dyn IAnalyzer,
-    java: &JavaAnalyzer,
+    java: &dyn IAnalyzer,
+    inner: &TreeSitterAnalyzer<A>,
     target: &CodeUnit,
     cancellation: &CancellationToken,
 ) -> Result<JavaSelectedReverseOutcome<JavaSelectedInverseResolution>> {
@@ -148,54 +206,51 @@ fn java_selected_inverse_for_inner(
     // snapshot at its current generation, then let selected mounts establish
     // whether peer-language source files actually exist.
     let selected_languages = ["java", "kotlin", "scala"].map(str::to_owned);
-    let snapshots = java
-        .inner
+    let snapshots = inner
         .analyzer_store()
-        .workspace_snapshots_for_current_languages(
-            java.inner.workspace_id(),
-            &selected_languages,
-        )?;
-    let Some(_snapshot) = snapshots.get("java") else {
+        .workspace_snapshots_for_current_languages(inner.workspace_id(), &selected_languages)?;
+    let Some(_snapshot) = snapshots.get(language_for_target(target).config_label()) else {
         return Ok(JavaSelectedReverseOutcome::Unavailable(
             "the workspace has no selected Java snapshot".into(),
         ));
     };
-    let (masks, content_mounts) = match java
-        .inner
-        .selected_resolution_overlay_inputs(&snapshots, cancellation)?
-    {
-        SelectedResolutionOverlayInputsOutcome::Ready {
-            masks,
-            content_mounts,
-        } => (masks, content_mounts),
-        SelectedResolutionOverlayInputsOutcome::Unavailable(reason) => {
-            return Ok(JavaSelectedReverseOutcome::Unavailable(format!(
-                "{reason:?}"
-            )));
-        }
-        SelectedResolutionOverlayInputsOutcome::Stale(reason) => {
-            return Ok(JavaSelectedReverseOutcome::Stale(format!("{reason:?}")));
-        }
-        SelectedResolutionOverlayInputsOutcome::Cancelled => {
-            return Ok(JavaSelectedReverseOutcome::Cancelled);
-        }
-    };
-    let mut languages = vec![SelectedResolutionLanguage::new("java", Language::Java)];
-    for (storage_language, language) in [("kotlin", Language::Kotlin), ("scala", Language::Scala)] {
+    let (masks, content_mounts) =
+        match inner.selected_resolution_overlay_inputs(&snapshots, cancellation)? {
+            SelectedResolutionOverlayInputsOutcome::Ready {
+                masks,
+                content_mounts,
+            } => (masks, content_mounts),
+            SelectedResolutionOverlayInputsOutcome::Unavailable(reason) => {
+                return Ok(JavaSelectedReverseOutcome::Unavailable(format!(
+                    "{reason:?}"
+                )));
+            }
+            SelectedResolutionOverlayInputsOutcome::Stale(reason) => {
+                return Ok(JavaSelectedReverseOutcome::Stale(format!("{reason:?}")));
+            }
+            SelectedResolutionOverlayInputsOutcome::Cancelled => {
+                return Ok(JavaSelectedReverseOutcome::Cancelled);
+            }
+        };
+    let mut languages = Vec::new();
+    for (storage_language, language) in [
+        ("java", Language::Java),
+        ("kotlin", Language::Kotlin),
+        ("scala", Language::Scala),
+    ] {
         if snapshots.contains_key(storage_language) {
             languages.push(SelectedResolutionLanguage::new(storage_language, language));
         }
     }
     let input = SelectedResolutionOperationInput::new(
-        java.inner.project(),
-        java.inner.workspace_id(),
+        inner.project(),
+        inner.workspace_id(),
         &snapshots,
         &languages,
         &masks,
     )
     .with_content_mounts(content_mounts);
-    let operation = match java
-        .inner
+    let operation = match inner
         .analyzer_store()
         .open_selected_resolution_operation(input, cancellation)?
     {
@@ -212,9 +267,12 @@ fn java_selected_inverse_for_inner(
             return Ok(JavaSelectedReverseOutcome::Cancelled);
         }
     };
-    let generation = java.inner.project().analysis_generation();
+    let generation = inner.project().analysis_generation();
     let candidates = match operation.jvm_reverse_candidate_sites(target, cancellation)? {
         JvmReverseCandidateOutcome::Ready(candidates) => candidates,
+        JvmReverseCandidateOutcome::TargetUncovered(reason) => {
+            return Ok(JavaSelectedReverseOutcome::TargetUncovered(reason));
+        }
         JvmReverseCandidateOutcome::Unavailable(reason) => {
             return Ok(JavaSelectedReverseOutcome::Unavailable(reason));
         }
@@ -241,14 +299,14 @@ fn java_selected_inverse_for_inner(
             return Ok(JavaSelectedReverseOutcome::Cancelled);
         }
     };
-    if java.inner.project().analysis_generation() != generation {
+    if inner.project().analysis_generation() != generation {
         return Ok(JavaSelectedReverseOutcome::Stale(
             "Java selected reverse query crossed an analyzer generation".into(),
         ));
     }
     let answer =
         project_confirmed_references(analyzer, java, target, generation, confirmed, cancellation)?;
-    if java.inner.project().analysis_generation() != generation {
+    if inner.project().analysis_generation() != generation {
         return Ok(JavaSelectedReverseOutcome::Stale(
             "Java selected reverse projection crossed an analyzer generation".into(),
         ));
@@ -258,7 +316,7 @@ fn java_selected_inverse_for_inner(
 
 fn project_confirmed_references(
     analyzer: &dyn IAnalyzer,
-    java: &JavaAnalyzer,
+    java: &dyn IAnalyzer,
     target: &CodeUnit,
     generation: u64,
     confirmed: JvmReverseConfirmed,
@@ -287,7 +345,9 @@ fn project_confirmed_references(
             return Err(StoreError::new("Java selected reverse query was cancelled"));
         }
         let answer = reference.answer;
-        if !answer.binding().targets().contains(&confirmed.target) {
+        if !answer.binding().targets().iter().any(|semantic| {
+            *semantic == confirmed.target || confirmed.equivalent_targets.contains(semantic)
+        }) {
             continue;
         }
         let binding_target_count = answer.binding().targets().len();
@@ -298,10 +358,7 @@ fn project_confirmed_references(
             );
             continue;
         };
-        let file = ProjectFile::new(
-            java.inner.project().root(),
-            reference.locator.relative_path(),
-        );
+        let file = ProjectFile::new(java.project().root(), reference.locator.relative_path());
         if !files.contains_key(&file) {
             files.insert(
                 file.clone(),
@@ -395,107 +452,48 @@ fn push_reason(reasons: &mut Vec<EdgeIncompleteReason>, reason: EdgeIncompleteRe
     }
 }
 
-/// Generation-bound lazy facade. It retains the analyzer, not an inverse map;
-/// candidates and projected references live only for one target request.
+/// A generation-bound lazy facade retaining no workspace inverse map.
 pub struct JavaNativeSelectedReferenceIndex {
-    generation: u64,
+    index: LazySelectedInverse<JavaInverseAdapter>,
+}
+
+impl SelectedInverseReferenceIndex for JavaNativeSelectedReferenceIndex {
+    fn generation(&self) -> u64 {
+        self.index.generation()
+    }
+    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
+        self.index.inverse_for(target)
+    }
+}
+
+struct JavaInverseAdapter {
     java: Box<JavaAnalyzer>,
     projection_analyzer: Box<dyn IAnalyzer>,
-    cancellation: CancellationToken,
 }
 
-impl brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseReferenceIndex
-    for JavaNativeSelectedReferenceIndex
-{
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
-        if self.java.inner.project().analysis_generation() != self.generation {
-            return incomplete_inverse(
-                self.generation,
-                EdgeIncompleteReason::InverseIndexResolutionIncomplete,
-            );
-        }
-        match java_selected_inverse_detailed_for(
-            self.projection_analyzer.as_ref(),
-            &self.java,
-            target,
-            &self.cancellation,
-        ) {
-            JavaSelectedReverseOutcome::Ready(answer) => answer.edges,
-            JavaSelectedReverseOutcome::Unavailable(detail) => {
-                eprintln!("selected Java inverse query unavailable: {detail}");
-                incomplete_inverse(
-                    self.generation,
-                    EdgeIncompleteReason::InverseIndexTargetUncovered,
-                )
-            }
-            JavaSelectedReverseOutcome::Stale(detail) => {
-                eprintln!("selected Java inverse query stale: {detail}");
-                incomplete_inverse(
-                    self.generation,
-                    EdgeIncompleteReason::InverseIndexResolutionIncomplete,
-                )
-            }
-            JavaSelectedReverseOutcome::Cancelled => {
-                incomplete_inverse(self.generation, EdgeIncompleteReason::Cancelled)
-            }
-            JavaSelectedReverseOutcome::StoreError(detail) => {
-                eprintln!("selected Java inverse query failed: {detail}");
-                incomplete_inverse(
-                    self.generation,
-                    EdgeIncompleteReason::InverseIndexResolutionIncomplete,
-                )
-            }
-        }
-    }
-}
-
-fn incomplete_inverse(generation: u64, reason: EdgeIncompleteReason) -> EdgeDerivationResult {
-    EdgeDerivationResult {
-        edges: Vec::new(),
-        completeness: EdgeCompleteness::Incomplete {
-            reasons: vec![reason],
-        },
-        provenance: EdgeProvenance::Inverse,
-        generation,
-    }
-}
-
-pub struct JavaNativeSelectedInverseProvider;
-
-impl brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseReferenceProvider
-    for JavaNativeSelectedInverseProvider
-{
-    fn build_selected_inverse_index(
-        &self,
+impl SelectedInverseAdapter for JavaInverseAdapter {
+    fn admit(
         analyzer: &dyn IAnalyzer,
-        cancellation: Option<&CancellationToken>,
-    ) -> brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseIndexOutcome
-    {
-        use brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseIndexOutcome;
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<(u64, Self), SelectedInverseFailure> {
         let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
-            return SelectedInverseIndexOutcome::Unavailable(
+            return Err(SelectedInverseFailure::Unavailable(
                 "the workspace has no Java analyzer".into(),
-            );
+            ));
         };
-        let token = cancellation.cloned().unwrap_or_default();
-        if token.is_cancelled() {
-            return SelectedInverseIndexOutcome::Cancelled;
+        if cancellation.is_cancelled() {
+            return Err(SelectedInverseFailure::Cancelled);
         }
         if !java
             .inner
             .selected_workspace_snapshots()
             .contains_key("java")
         {
-            return SelectedInverseIndexOutcome::Unavailable(
+            return Err(SelectedInverseFailure::Unavailable(
                 "the selected Java source publication is unavailable".into(),
-            );
+            ));
         }
-        SelectedInverseIndexOutcome::Ready(Arc::new(JavaNativeSelectedReferenceIndex {
-            generation: java.inner.project().analysis_generation(),
+        Ok((java.inner.project().analysis_generation(), Self {
             java: Box::new(java.clone()),
             projection_analyzer: if let Some(multi) =
                 (analyzer as &dyn std::any::Any).downcast_ref::<brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer>()
@@ -504,8 +502,55 @@ impl brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInve
             } else {
                 Box::new(java.clone())
             },
-            cancellation: token,
         }))
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.java.inner.project().analysis_generation()
+    }
+
+    fn query(
+        &self,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Option<EdgeDerivationResult>, SelectedInverseFailure> {
+        match java_selected_inverse_detailed_for(
+            self.projection_analyzer.as_ref(),
+            self.java.as_ref(),
+            target,
+            cancellation,
+        ) {
+            JavaSelectedReverseOutcome::Ready(answer) => Ok(Some(answer.edges)),
+            JavaSelectedReverseOutcome::TargetUncovered(_) => Ok(None),
+            JavaSelectedReverseOutcome::Unavailable(detail) => {
+                Err(SelectedInverseFailure::Unavailable(detail))
+            }
+            JavaSelectedReverseOutcome::Stale(detail) => Err(SelectedInverseFailure::Stale(detail)),
+            JavaSelectedReverseOutcome::Cancelled => Err(SelectedInverseFailure::Cancelled),
+            JavaSelectedReverseOutcome::StoreError(detail) => {
+                Err(SelectedInverseFailure::StoreError(detail))
+            }
+        }
+    }
+}
+
+pub struct JavaNativeSelectedInverseProvider;
+
+impl SelectedInverseReferenceProvider for JavaNativeSelectedInverseProvider {
+    fn build_selected_inverse_index(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        cancellation: Option<&CancellationToken>,
+    ) -> SelectedInverseIndexOutcome {
+        let token = cancellation.cloned().unwrap_or_default();
+        match LazySelectedInverse::<JavaInverseAdapter>::build(analyzer, &token) {
+            Ok(index) => {
+                SelectedInverseIndexOutcome::Ready(Arc::new(JavaNativeSelectedReferenceIndex {
+                    index,
+                }))
+            }
+            Err(failure) => failure.into(),
+        }
     }
 }
 

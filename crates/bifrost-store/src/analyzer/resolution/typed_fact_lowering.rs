@@ -35,8 +35,8 @@ use crate::hash::{HashMap, HashSet};
 use super::common_fact_lowering::{LoweredDeferredMemberOwner, member_lookup_namespace};
 use super::fact_lowering::{
     LoweringGapOrigin, call_target_lookup_routes, definition_semantic,
-    definition_semantic_identity, gap_reason_semantic, gap_reason_semantic_identity, lookup_routes,
-    lookup_semantic, mounted_site_semantic, reference_node_identity, reference_semantic,
+    definition_semantic_identity, gap_reason_semantic, lookup_routes, lookup_semantic,
+    mounted_site_semantic, reference_node_identity, reference_semantic,
     reference_semantic_identity, scope_head_node, scope_head_node_identity,
     site_type_frontier_semantic, type_slot_semantic, type_slot_semantic_identity,
 };
@@ -2478,6 +2478,13 @@ impl LoweredTypedFragment {
                     transfer.rule.reference_indirection_delta(),
                     transfer.rule.value_transform(),
                 ),
+                ResolutionTypeTransferKind::IndexOperand
+                | ResolutionTypeTransferKind::ElementOperand => validate_operand_gate_transfer(
+                    source_role,
+                    transfer.rule.indirection_delta(),
+                    transfer.rule.reference_indirection_delta(),
+                    transfer.rule.value_transform(),
+                ),
                 ResolutionTypeTransferKind::ExpressionResult
                 | ResolutionTypeTransferKind::NumericPromotion
                 | ResolutionTypeTransferKind::StringConcatenation => assert!(
@@ -3608,10 +3615,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         };
         for projection in projections {
             let reference = identities.source_reference_semantic(identifier.site);
-            let coarse_gap_reason = identities.semantic(gap_reason_semantic_identity(
-                identifier.site,
-                LoweringGapOrigin::QualifiedReference,
-            ));
+            let coarse_gap_reason =
+                identities.gap_reason(identifier.site, LoweringGapOrigin::QualifiedReference);
             let route_namespace = if projection.kind.is_callable_result() {
                 ResolutionNamespace::Callable
             } else {
@@ -3833,10 +3838,10 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         };
         assert_eq!(callee_identifier.role, ResolutionIdentifierRole::Reference);
         let call_semantic = identities.semantic(call_semantic_identity(call.call));
-        let applicability_reason = identities.semantic(gap_reason_semantic_identity(
+        let applicability_reason = identities.gap_reason(
             call.callee,
             LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedCallApplicability),
-        ));
+        );
         let arguments = arguments_by_call
             .get(&call.call)
             .map(Vec::as_slice)
@@ -4604,10 +4609,8 @@ fn lower_definition_properties_with_index(
             // provenance while one invocation reaches several types.
             let gap_site = index.site(gap.site);
             let scope = gap_site.scope;
-            let reason_semantic = identities.semantic(gap_reason_semantic_identity(
-                gap.site,
-                LoweringGapOrigin::Extracted(gap.kind),
-            ));
+            let reason_semantic =
+                identities.gap_reason(gap.site, LoweringGapOrigin::Extracted(gap.kind));
             for site in &facts.sites {
                 if site.kind != ResolutionSiteKind::TypeDeclaration || site.scope != scope {
                     continue;
@@ -4683,10 +4686,8 @@ fn lower_definition_properties_with_index(
         let Some(owner) = owner else {
             continue;
         };
-        let reason_semantic = identities.semantic(gap_reason_semantic_identity(
-            gap.site,
-            LoweringGapOrigin::Extracted(gap.kind),
-        ));
+        let reason_semantic =
+            identities.gap_reason(gap.site, LoweringGapOrigin::Extracted(gap.kind));
         for frontier in index.type_frontiers(identities, gap.site) {
             property_gaps.push(LoweredDefinitionPropertyGap::new(
                 identities.source_definition_semantic(owner),
@@ -5248,6 +5249,9 @@ fn validate_output_producer_rows<Slot>(
         }
     };
     for (slot, kind) in transfers {
+        if kind.is_operand_gate() {
+            continue;
+        }
         register(
             slot,
             match kind {
@@ -5421,6 +5425,27 @@ fn validate_operand_promotion_rule(
     }
 }
 
+fn validate_operand_gate_transfer(
+    input: ResolutionTypeSlotRole,
+    delta: i64,
+    reference_delta: i64,
+    transform: TypeTransferValueTransform,
+) {
+    assert!(
+        matches!(
+            input,
+            ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+        ),
+        "operand gate requires an evaluated operand"
+    );
+    assert_eq!((delta, reference_delta), (0, 0));
+    assert_eq!(
+        transform,
+        TypeTransferValueTransform::Preserve,
+        "operand gates never transform values"
+    );
+}
+
 fn validate_transfer_roles(
     fact: ResolutionTypeTransferFact,
     input: ResolutionTypeSlotRole,
@@ -5482,6 +5507,14 @@ fn validate_transfer_roles(
             i64::from(fact.reference_indirection_delta),
             lower_value_transform(fact.value_transform),
         ),
+        ResolutionTypeTransferKind::IndexOperand | ResolutionTypeTransferKind::ElementOperand => {
+            validate_operand_gate_transfer(
+                input,
+                i64::from(fact.indirection_delta),
+                i64::from(fact.reference_indirection_delta),
+                lower_value_transform(fact.value_transform),
+            )
+        }
         ResolutionTypeTransferKind::ExpressionResult
         | ResolutionTypeTransferKind::NumericPromotion
         | ResolutionTypeTransferKind::StringConcatenation => assert!(
@@ -5701,6 +5734,9 @@ fn transfer_accepts_output_role(
         ResolutionTypeTransferKind::DeclaredType => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Initialization => ResolutionTypeSlotRole::DeclaredValue,
         ResolutionTypeTransferKind::Contextual => ResolutionTypeSlotRole::ExpressionValue,
+        ResolutionTypeTransferKind::IndexOperand | ResolutionTypeTransferKind::ElementOperand => {
+            ResolutionTypeSlotRole::ExpressionValue
+        }
         ResolutionTypeTransferKind::ExpressionResult
         | ResolutionTypeTransferKind::NumericPromotion
         | ResolutionTypeTransferKind::StringConcatenation
@@ -6116,10 +6152,7 @@ fn completion_for_gaps(
         // unrelated typed transfer, call, or signature operand.
         if kind != ResolutionGapKind::UnsupportedVisibility {
             reasons.push(ResolutionIncompleteReason::UnsupportedSemantic(
-                identities.semantic(gap_reason_semantic_identity(
-                    site,
-                    LoweringGapOrigin::Extracted(kind),
-                )),
+                identities.gap_reason(site, LoweringGapOrigin::Extracted(kind)),
             ));
         }
     }
@@ -6692,6 +6725,8 @@ const fn transfer_kind_rank(kind: ResolutionTypeTransferKind) -> u8 {
         ResolutionTypeTransferKind::ComponentCommaOkValue => 24,
         ResolutionTypeTransferKind::NumericPromotion => 18,
         ResolutionTypeTransferKind::StringConcatenation => 19,
+        ResolutionTypeTransferKind::IndexOperand => 25,
+        ResolutionTypeTransferKind::ElementOperand => 26,
     }
 }
 
@@ -6725,6 +6760,7 @@ const fn supertype_kind_rank(kind: ResolutionSupertypeKind) -> u8 {
         ResolutionSupertypeKind::GoInterfaceElement => 2,
         ResolutionSupertypeKind::ImplicitSuperclass => 3,
         ResolutionSupertypeKind::SelfType => 4,
+        ResolutionSupertypeKind::ImplicitInterfaceMembers => 5,
     }
 }
 

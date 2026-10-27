@@ -55,10 +55,12 @@ custom GitHub repository or digest-bound HTTPS mirror; IDs come from the selecte
 catalog. Invalid, absent, incompatible or unqualified content fails before the
 scan. Explicit `policy-files` remain supported with `policy-packs: ''`.
 
-The initial public rules 0.1.1 pin is historical and incompatible with v0.13;
-it must be replaced with a reviewed qualified content release before a v0.13
-product scan can pass. Availability does not qualify behavior. Existing released
-action tags retain their behavior until this change is published separately.
+With no `packs-source`, the action acquires public rules 0.5.1 and packs 0.6.0,
+a pin that the engine version it installs by default must admit before each
+release. When `packs-token` is empty, the job's `github.token` authenticates the
+GitHub API reads for a source outside the workflow's repository, so pull-request
+scans do not share the runner's anonymous rate limit. A failed acquisition prints
+the receipt's failure class and message.
 
 Use `packs-token` only for an existing secret with Contents read on the selected
 private repository in a trusted push or approved manual workflow. PR events are

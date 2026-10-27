@@ -49,6 +49,34 @@ pub(crate) struct UfcsTrait<'tree> {
     pub arguments: Option<Vec<tree_sitter::Node<'tree>>>,
 }
 
+/// Declaration identity and the implementation evidence proved at this probe.
+/// A trait declaration alone never closes its implementation set.
+pub(crate) struct SelectedMember {
+    pub owner: String,
+    extensibility: brokk_bifrost_core::analyzer::model::DispatchExtensibility,
+}
+
+impl SelectedMember {
+    pub(crate) fn proof(
+        &self,
+        member: &str,
+        parameter_count: u32,
+    ) -> brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof {
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof;
+        use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
+        match self.extensibility {
+            DispatchExtensibility::Closed => ExactExternalCallProof::rust_bound_external_member(
+                &self.owner,
+                member,
+                parameter_count,
+            ),
+            DispatchExtensibility::Open => {
+                ExactExternalCallProof::rust_trait_declaration(&self.owner, member, parameter_count)
+            }
+        }
+    }
+}
+
 /// Return the declaring owner, never the written receiver owner, of one
 /// applicable member. All collections belong to this call query only.
 #[allow(clippy::too_many_arguments)]
@@ -63,7 +91,9 @@ pub(crate) fn select<'analyzer>(
     factory: Option<&native_points::RustDefinitionOperationFactory<'analyzer>>,
     mut operation: Option<&mut SelectedResolutionOperation<'analyzer, '_>>,
     named_trait: Option<&UfcsTrait<'_>>,
-) -> Option<String> {
+    receiver_application: Option<&TypeRef>,
+) -> Option<SelectedMember> {
+    use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
     let overlay = analyzer.semantic_model_overlay()?;
     let active = analyzer.active_semantic_models()?;
     let owner = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(owner)?;
@@ -80,6 +110,19 @@ pub(crate) fn select<'analyzer>(
         .child_by_field_name("field")
         .or_else(|| callee.child_by_field_name("name"))?;
     let member = rust_node_text(terminal, source);
+    let receiver_facts = super::semantic::RustReceiverTypeFacts::from_tree(source, tree);
+    let expression = callee.child_by_field_name("value");
+    let lexical_traits = (owner.kind == SemanticModelSymbolKind::Trait)
+        .then(|| {
+            let model = super::trait_applicability::ModelApplicability::new(
+                analyzer, rust, &overlay, &active,
+            );
+            let ty = receiver_facts.declared_receiver_type(source, tree, expression?)?;
+            super::trait_applicability::lexical_receiver_traits(
+                analyzer, file, source, tree, ty, &model,
+            )
+        })
+        .flatten();
     let application = SemanticModelCallApplication::positional(parameter_count);
     let callable_on = |declaring: &SemanticModelSymbol| {
         overlay.callable_for_application(
@@ -93,24 +136,11 @@ pub(crate) fn select<'analyzer>(
             &application,
         )
     };
-    // A direct family has precedence even when incomplete or inapplicable:
-    // another trait cannot repair an uncertain inherent declaration.
-    if named_trait.is_none()
-        && overlay
-            .members_of(&owner.id)
-            .records
-            .iter()
-            .any(|record| record.name == member && symbol_kind_is_callable(record.kind))
-    {
-        let matched = callable_on(owner);
-        return callable_is_proven(&matched).then(|| owner.qualified_name.clone());
-    }
-    let candidates = overlay.callable_owners_on_surface(&active, owner, member)?;
-    if candidates.is_empty() {
-        return None;
-    }
+    // Scope must be known before certifying even an inherent family: a
+    // by-value trait method can precede an inherent borrowed-self method.
     let candidates = if let Some(named) = named_trait {
-        candidates
+        overlay
+            .callable_owners_on_surface(&active, &owner, member)?
             .into_iter()
             .filter(|candidate| candidate.owner.qualified_name == named.owner)
             .collect::<Vec<_>>()
@@ -266,17 +296,17 @@ pub(crate) fn select<'analyzer>(
                 "core" => RustPreludeCrate::Core,
                 _ => return false,
             };
-            let standard_owner = matches!(
-                candidate.qualified_name.as_str(),
-                "std.clone.Clone"
-                    | "core.clone.Clone"
-                    | "std.string.ToString"
-                    | "alloc.string.ToString"
-                    | "std.convert.From"
-                    | "core.convert.From"
-                    | "std.borrow.ToOwned"
-                    | "alloc.borrow.ToOwned"
-            );
+            let standard_owner =
+                brokk_bifrost_rust::prelude::rust_prelude_trait_module(&candidate.name)
+                    .and_then(|module| {
+                        RustOverlayCrates::new(Some(&overlay)).unique_symbol(&format!(
+                            "{}.{}.{}",
+                            prelude_crate.name(),
+                            module,
+                            candidate.name
+                        ))
+                    })
+                    .is_some_and(|symbol| symbol.id == candidate.id);
             // Method lookup retains prelude traits even when an item or import
             // shadows the trait's name for path lookup. For example, importing
             // OtherClone as Clone does not remove std::clone::Clone as a method
@@ -305,11 +335,16 @@ pub(crate) fn select<'analyzer>(
         {
             source_traits.extend(rust.get_direct_children(&namespace));
         }
-        source_traits.extend(
-            rust.declarations(file)
-                .into_iter()
-                .filter(|unit| lexical.item_bound_at(unit.identifier(), terminal.start_byte())),
-        );
+        source_traits.extend(rust.declarations(file).into_iter().filter(|unit| {
+            rust.ranges_of(unit).iter().any(|range| {
+                lexical.item_declaration_visible_at(
+                    unit.identifier(),
+                    range.start_byte,
+                    terminal.start_byte(),
+                )
+            })
+        }));
+        let mut source_rivals = Vec::new();
         for candidate in source_traits
             .into_iter()
             .filter(|candidate| candidate.is_class())
@@ -334,12 +369,215 @@ pub(crate) fn select<'analyzer>(
                         member_candidate.is_function() && member_candidate.identifier() == member
                     })
             {
-                return None;
+                source_rivals.push(candidate);
             }
         }
+        let mut applicability =
+            super::trait_applicability::ModelApplicability::new(analyzer, rust, &overlay, &active);
+        // Static and UFCS paths have no field receiver. Their explicit owner
+        // still drives the existing typed trait route (for example From::from).
+        let mut receiver_type = receiver_application
+            .cloned()
+            .or_else(|| {
+                expression
+                    .and_then(|expression| {
+                        receiver_facts.declared_receiver_type(source, tree, expression)
+                    })
+                    .and_then(|ty| applicability.receiver_type(analyzer, file, source, ty))
+            })
+            .or_else(|| {
+                super::std_types::RustTypeProof::new(analyzer)?
+                    .modeled_receiver_type(file, expression?)
+            })
+            .unwrap_or_else(|| applicability.abstract_receiver(&owner));
+        let borrowed = expression.and_then(|mut expression| {
+            while expression.kind() == "parenthesized_expression" {
+                expression = expression.named_child(0)?;
+            }
+            Some(
+                expression.kind() == "reference_expression"
+                    || receiver_facts.implicit_receiver_is_borrowed(tree, expression),
+            )
+        });
+        if borrowed == Some(true) {
+            receiver_type = crate::analyzer::semantic_model::TypeRef::ByRef {
+                element: Box::new(receiver_type),
+                reference_kind: crate::analyzer::semantic_model::TypeRefReferenceKind::Lvalue,
+            };
+        }
+        if expression.is_some()
+            && owner.kind == SemanticModelSymbolKind::Trait
+            && lexical_traits.is_none()
+        {
+            return None;
+        }
+        let mut receiver = owner;
+        let mut visited = std::collections::HashSet::new();
+        let candidates = loop {
+            if !visited.insert(receiver.id.clone()) {
+                return None;
+            }
+            let direct = overlay.members_of(&receiver.id);
+            let family = direct
+                .records
+                .iter()
+                .filter(|record| {
+                    lexical_traits.is_none()
+                        && record.name == member
+                        && symbol_kind_is_callable(record.kind)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for candidate in &source_rivals {
+                if lexical_traits.is_some()
+                    || super::trait_applicability::workspace_trait_may_apply(
+                        analyzer,
+                        rust,
+                        candidate,
+                        &receiver,
+                        &applicability,
+                    )?
+                {
+                    return None;
+                }
+            }
+            let in_scope = overlay
+                .trait_owners_with_callable_member(member)
+                .into_iter()
+                .filter(|candidate| {
+                    visible(candidate)
+                        || lexical_traits.as_ref().is_some_and(|traits| {
+                            traits.iter().any(|bound| bound.id == candidate.id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let mut has_inherent = false;
+            let mut has_trait = false;
+            for method in &family {
+                match applicability.member(method)?.implemented_trait.as_ref() {
+                    None => has_inherent = true,
+                    Some(trait_type) => {
+                        let trait_owner = applicability.owner(trait_type)?;
+                        if in_scope
+                            .iter()
+                            .any(|candidate| candidate.id == trait_owner.id)
+                        {
+                            has_trait = true;
+                        }
+                    }
+                }
+            }
+            if has_inherent && has_trait {
+                return None;
+            }
+            use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::{
+                CandidateAssessment, adapter, select_candidate_indices,
+            };
+            use brokk_bifrost_analysis::analyzer::resolution::{SemanticId, SharedNameId};
+            use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
+            let mut assessments = Vec::new();
+            for (index, candidate) in in_scope.iter().enumerate() {
+                let in_family = family.iter().any(|method| {
+                    applicability
+                        .member(method)
+                        .and_then(|fact| fact.implemented_trait.clone())
+                        .and_then(|trait_type| applicability.owner(&trait_type))
+                        .is_some_and(|trait_owner| trait_owner.id == candidate.id)
+                });
+                // Even a trait already represented in the artifact family can
+                // acquire a distinct downstream impl with a local argument.
+                let possible = if lexical_traits.is_some() {
+                    true
+                } else {
+                    applicability.additional_implementation_may_apply(
+                        &receiver,
+                        candidate,
+                        &receiver_type,
+                        || in_family || applicability.provably_absent(&receiver, candidate),
+                    )?
+                };
+                let id =
+                    SemanticId::shared_name(SharedNameId::per_request(u32::try_from(index).ok()?));
+                assessments.push(if !possible {
+                    CandidateAssessment::inapplicable(
+                        id,
+                        CallableRejectionReason::ReceiverContractMismatch,
+                    )
+                } else {
+                    CandidateAssessment::unknown(id)
+                });
+            }
+            let possible = select_candidate_indices(
+                adapter(brokk_bifrost_core::analyzer::model::Language::Rust),
+                &assessments,
+                &Default::default(),
+            );
+            if !possible.is_empty() {
+                if family.is_empty() && possible.len() == 1 {
+                    let trait_ = in_scope[possible[0]].clone();
+                    let matched = callable_on(&trait_);
+                    // Preserve the existing exact implementation route before
+                    // falling back to declaration-only evidence. Its complete
+                    // callable contract and positive hierarchy path are a
+                    // stronger claim than a trait's closed declaration list.
+                    if lexical_traits.is_none()
+                        && (!has_receiver
+                            || (callable_is_proven(&matched)
+                                && implementation_is_proven(&trait_, &matched)))
+                        && let Some(surface) =
+                            overlay.callable_owners_on_surface(&active, &receiver, member)
+                    {
+                        let reachable = surface
+                            .into_iter()
+                            .filter(|candidate| candidate.owner.id == trait_.id)
+                            .collect::<Vec<_>>();
+                        if !reachable.is_empty() {
+                            break reachable;
+                        }
+                    }
+                    if has_receiver {
+                        let self_forms_known = matched.records.iter().all(|method| {
+                            applicability.member(method).is_some_and(|fact| {
+                                matches!(fact.self_form,
+                                Some(crate::analyzer::semantic_model::RustSelfForm::Value
+                                    | crate::analyzer::semantic_model::RustSelfForm::Shared
+                                    | crate::analyzer::semantic_model::RustSelfForm::Mutable))
+                            })
+                        });
+                        return (self_forms_known && callable_is_proven(&matched)).then(|| {
+                            SelectedMember {
+                                owner: trait_.qualified_name.clone(),
+                                extensibility: DispatchExtensibility::Open,
+                            }
+                        });
+                    }
+                }
+                return None;
+            }
+            if !family.is_empty() {
+                if !has_inherent && !has_trait {
+                    return None;
+                }
+                let matched = callable_on(&receiver);
+                return callable_is_proven(&matched).then(|| SelectedMember {
+                    owner: receiver.qualified_name.clone(),
+                    extensibility: DispatchExtensibility::Closed,
+                });
+            }
+            let mut dereferenced = &receiver_type;
+            while let crate::analyzer::semantic_model::TypeRef::ByRef { element, .. } = dereferenced
+            {
+                dereferenced = element;
+            }
+            let Some(target) = applicability.deref_target(&receiver, dereferenced) else {
+                break Vec::new();
+            };
+            receiver = applicability.owner(&target)?;
+            receiver_type = target;
+        };
         candidates
             .into_iter()
-            .filter(|candidate| visible(candidate.owner))
+            .filter(|candidate| visible(&candidate.owner))
             .collect::<Vec<_>>()
     };
     let call = callee
@@ -357,7 +595,7 @@ pub(crate) fn select<'analyzer>(
         {
             continue;
         }
-        let matched = callable_on(candidate.owner);
+        let matched = callable_on(&candidate.owner);
         if !callable_is_proven(&matched) {
             return None;
         }
@@ -384,11 +622,12 @@ pub(crate) fn select<'analyzer>(
             }
         }
         if !trait_arguments.is_empty() {
-            let declarations = active.types_with_id(&candidate.owner.id);
-            let [declaration] = declarations.records.as_slice() else {
-                return None;
-            };
-            if declaration.record.type_parameters.len() != trait_arguments.len() {
+            let declaration =
+                brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                    &active,
+                    &candidate.owner,
+                )?;
+            if declaration.type_parameters.len() != trait_arguments.len() {
                 return None;
             }
             let mut applicable = true;
@@ -399,7 +638,6 @@ pub(crate) fn select<'analyzer>(
                         return None;
                     };
                     let index = declaration
-                        .record
                         .type_parameters
                         .iter()
                         .position(|parameter| parameter == name)?;
@@ -420,14 +658,23 @@ pub(crate) fn select<'analyzer>(
         }
         match &selected {
             Some(_) => return None, // More than one applicable typed impl remains ambiguous.
-            None => selected = Some(candidate.owner.qualified_name.clone()),
+            None => {
+                selected = Some(SelectedMember {
+                    owner: candidate.owner.qualified_name.clone(),
+                    extensibility: if implementation_is_proven(&candidate.owner, &matched) {
+                        DispatchExtensibility::Closed
+                    } else {
+                        DispatchExtensibility::Open
+                    },
+                })
+            }
         }
     }
     selected
 }
 
 fn callable_is_proven(
-    matched: &crate::analyzer::semantic_model::SemanticModelCallableMatch<'_>,
+    matched: &crate::analyzer::semantic_model::SemanticModelCallableMatch,
 ) -> bool {
     matched
         .records
@@ -440,4 +687,20 @@ fn callable_is_proven(
             }
             _ => false,
         }
+}
+
+fn implementation_is_proven(
+    owner: &SemanticModelSymbol,
+    matched: &crate::analyzer::semantic_model::SemanticModelCallableMatch,
+) -> bool {
+    use crate::analyzer::semantic_model::SemanticModelCompleteness;
+    debug_assert!(!matched.records.is_empty());
+    matched
+        .records
+        .iter()
+        .all(|record| record.callable_family_complete)
+        || (owner.provenance.completeness == SemanticModelCompleteness::Complete
+            && matched.records.iter().all(|record| {
+                record.provenance.completeness == SemanticModelCompleteness::Complete
+            }))
 }

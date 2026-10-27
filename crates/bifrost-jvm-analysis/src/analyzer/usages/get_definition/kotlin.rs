@@ -84,7 +84,7 @@ fn kotlin_import_target_kind(kind: SemanticModelSymbolKind) -> bool {
 
 fn kotlin_model_outcome(
     site: &ResolvedReferenceSite,
-    records: Vec<&SemanticModelSymbol>,
+    records: Vec<std::sync::Arc<SemanticModelSymbol>>,
     subject: &str,
 ) -> DefinitionLookupOutcome {
     if records.is_empty() {

@@ -19,10 +19,10 @@ name = "brokk_bifrost_jvm_analysis"
 workspace = true
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.1" }
-brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.1" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.1" }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.1" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.2" }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.2" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.2" }
 git2 = { version = "0.20.2", default-features = false }
 moka = { version = "0.12.11", features = ["sync"] }
 rayon = "1.10.0"
@@ -46,10 +46,10 @@ jclassfile = "0.6.0"
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.2", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.14.2", features = ["test-support"] }
 rusqlite = { version = "0.40.2", default-features = false, features = [
 "bundled",
 "cache",

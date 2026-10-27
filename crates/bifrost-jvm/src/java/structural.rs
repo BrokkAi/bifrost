@@ -966,6 +966,53 @@ mod plain_string_literal_tests {
             vec![Some("db.url".to_owned()), Some(String::new()), None, None,]
         );
     }
+
+    #[test]
+    fn recovered_and_nonliteral_nodes_do_not_denote_plain_strings() {
+        for source in [
+            "\"db.url",
+            "\"",
+            "class C { String s = \"db.url; }",
+            "class C { String s = \"db.url\n; }",
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_java::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            // Unterminated quotes recover as ERROR rather than string_literal
+            // in 0.23.5. Pin this grammar fact before testing the adapter.
+            assert!(tree.root_node().has_error());
+            let mut stack = vec![tree.root_node()];
+            let mut errors = 0;
+            while let Some(node) = stack.pop() {
+                if node.is_error() {
+                    errors += 1;
+                }
+                assert_ne!(
+                    node.kind(),
+                    "string_literal",
+                    "{}",
+                    tree.root_node().to_sexp()
+                );
+                assert_eq!(java_plain_string_literal(node, source), None);
+                for index in 0..node.named_child_count() {
+                    stack.push(node.named_child(index).unwrap());
+                }
+            }
+            assert!(errors > 0, "recovery was exercised");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d5886539d3ef: quicksilver round 5 survivor review: raw newlines accepted as plain Java strings"
+    )]
+    #[ignore = "finds real bug: released Java grammar accepts raw newlines in string fragments"]
+    fn raw_newline_is_not_a_java_string_literal() {
+        // JLS 3.10.5 forbids a raw line terminator in an ordinary string.
+        assert_eq!(literals("class C { String s = \"db.url\n\"; }"), vec![None]);
+    }
 }
 
 #[cfg(test)]

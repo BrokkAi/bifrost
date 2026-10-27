@@ -1,6 +1,12 @@
+mod rows;
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily;
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+use rusqlite::named_params;
+
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::parse_lower_sha256;
 
+use crate::analyzer::CallableArity;
 use crate::analyzer::semantic::SemanticLocator;
 use crate::analyzer::semantic::StableDigest;
 use crate::analyzer::semantic::authored_procedure_target_identity;
@@ -15,6 +21,7 @@ use crate::analyzer::semantic_model::CompiledNormalReturnTypeRefinement;
 use crate::analyzer::semantic_model::CompiledOperationPrecondition;
 use crate::analyzer::semantic_model::CompiledPackManifest;
 use crate::analyzer::semantic_model::CompiledProcedureSummary;
+use crate::analyzer::semantic_model::CompiledProcedureTarget;
 use crate::analyzer::semantic_model::CompiledResultContract;
 use crate::analyzer::semantic_model::CompiledResultUseObligation;
 use crate::analyzer::semantic_model::CompiledShard;
@@ -32,8 +39,8 @@ use crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader;
 use crate::analyzer::Language;
 use crate::analyzer::LanguageDialect;
 use crate::analyzer::semantic_pack_realm;
-use crate::hash::HashMap;
 use crate::hash::map_with_capacity;
+use crate::hash::{HashMap, HashSet};
 
 use brokk_bifrost_semantic::analyzer::semantic_model::runtime::*;
 use serde::Deserialize;
@@ -43,7 +50,7 @@ use std::cmp::Ordering;
 
 use std::sync::Arc;
 
-impl<'a> ActivatedProcedureSummary<'a> {
+impl ActivatedProcedureSummary {
     /// Prove that this activated record applies to the resolver-owned exact
     /// call shape. This is an applicability proof, not a consumer-specific
     /// winner selection: consumers may impose stricter conflict semantics.
@@ -65,8 +72,12 @@ impl<'a> ActivatedProcedureSummary<'a> {
                 &self.record.target.path,
                 &self.record.target.symbol,
             )
-            .is_none_or(|(owner, member)| owner != target.owner_fqn() || member != target.member())
-            || !python_artifact_applies_to_target(self.shard, target)
+            .is_none_or(|(owner, member)| {
+                (owner != target.owner_fqn()
+                    && self.matched_owner_identity.as_deref() != Some(target.owner_fqn()))
+                    || member != target.member()
+            })
+            || !python_artifact_applies_to_target(&self.shard, target)
         {
             return None;
         }
@@ -81,49 +92,45 @@ impl<'a> ActivatedProcedureSummary<'a> {
         })
     }
 
-    pub fn summary_with_id(&self, id: &str) -> Option<&'a CompiledProcedureSummary> {
-        self.payload.iter().find(|summary| summary.id == id)
-    }
-
     /// Whether this exact activated record explicitly claims that no normal
     /// continuation exists.
-    pub const fn normal_continuation_absent(&self) -> bool {
+    pub fn normal_continuation_absent(&self) -> bool {
         self.record.normal_continuation_absent
     }
 
     /// The namespaced effects the activated pack declares for this procedure
     /// (#2437), in the compiler's canonical order (sorted by id).
-    pub fn declared_effects(&self) -> &'a [CompiledDeclaredEffect] {
+    pub fn declared_effects(&self) -> &[CompiledDeclaredEffect] {
         &self.record.declared_effects
     }
 
     /// Reviewed task, synchronization, and atomic semantics for this exact
     /// procedure. Inputs are formal ports that consumers project to call-site
     /// receiver and argument values.
-    pub fn concurrency_effects(&self) -> &'a [CompiledConcurrencyEffect] {
+    pub fn concurrency_effects(&self) -> &[CompiledConcurrencyEffect] {
         &self.record.concurrency_effects
     }
 
     /// Whether this exact activated record explicitly claims that the call has
     /// no synchronization or concurrent retention effects.
-    pub const fn no_concurrency_effects(&self) -> bool {
+    pub fn no_concurrency_effects(&self) -> bool {
         self.record.no_concurrency_effects
     }
 
     /// Reviewed predicates required of this exact procedure invocation's
     /// receiver and parameters. `None` means the operation was not reviewed;
     /// `Some([])` means it was reviewed and has no input preconditions.
-    pub fn preconditions(&self) -> Option<&'a [CompiledOperationPrecondition]> {
+    pub fn preconditions(&self) -> Option<&[CompiledOperationPrecondition]> {
         self.record.preconditions.as_deref()
     }
 
     /// The reviewed relationships among this procedure's normal result ports,
     /// in deterministic ordinal order.
-    pub fn result_contracts(&self) -> &'a [CompiledResultContract] {
+    pub fn result_contracts(&self) -> &[CompiledResultContract] {
         &self.record.result_contracts
     }
 
-    pub fn result_use_obligations(&self) -> &'a [CompiledResultUseObligation] {
+    pub fn result_use_obligations(&self) -> &[CompiledResultUseObligation] {
         &self.record.result_use_obligations
     }
 
@@ -134,7 +141,7 @@ impl<'a> ActivatedProcedureSummary<'a> {
     pub fn bind_reviewed_jdk_result_use_obligations(
         &self,
         target: &UnmaterializedExternalTarget,
-    ) -> Option<&'a [CompiledResultUseObligation]> {
+    ) -> Option<&[CompiledResultUseObligation]> {
         if self.record.result_use_obligations.is_empty()
             || self.shard.manifest.language != "java"
             || self.shard.manifest.ecosystem != "jdk"
@@ -165,7 +172,7 @@ impl<'a> ActivatedProcedureSummary<'a> {
     pub fn bind_reviewed_result_use_obligations(
         &self,
         target: ReviewedObligationTarget<'_>,
-    ) -> Result<ReviewedObligationBinding<'a>, ReviewedObligationBindFailure> {
+    ) -> Result<ReviewedObligationBinding, ReviewedObligationBindFailure> {
         if self.record.result_use_obligations.is_empty() {
             return Err(ReviewedObligationBindFailure::NoObligation);
         }
@@ -219,7 +226,7 @@ impl<'a> ActivatedProcedureSummary<'a> {
             return Err(ReviewedObligationBindFailure::CallShapeMismatch);
         }
         Ok(ReviewedObligationBinding {
-            obligations: &self.record.result_use_obligations,
+            record: Arc::clone(&self.record),
             basis: target.basis,
             ordinary_heap_unchanged: self.record.ordinary_heap_unchanged,
             covers_overrides: self.record.covers_overrides,
@@ -236,7 +243,7 @@ impl<'a> ActivatedProcedureSummary<'a> {
         target: ProcedureSummaryDeclarationKey<'_>,
         evidence: &SemanticModelActivationEvidence,
         basis: ReviewedObligationBasis,
-    ) -> Result<ReviewedObligationBinding<'a>, ReviewedObligationBindFailure> {
+    ) -> Result<ReviewedObligationBinding, ReviewedObligationBindFailure> {
         if self.record.result_use_obligations.is_empty() {
             return Err(ReviewedObligationBindFailure::NoObligation);
         }
@@ -264,7 +271,7 @@ impl<'a> ActivatedProcedureSummary<'a> {
             return Err(ReviewedObligationBindFailure::CallShapeMismatch);
         }
         Ok(ReviewedObligationBinding {
-            obligations: &self.record.result_use_obligations,
+            record: Arc::clone(&self.record),
             basis,
             ordinary_heap_unchanged: self.record.ordinary_heap_unchanged,
             covers_overrides: self.record.covers_overrides,
@@ -273,31 +280,31 @@ impl<'a> ActivatedProcedureSummary<'a> {
 
     /// Outcome-sensitive predicate effects this reviewed summary attributes to
     /// its boolean normal results.
-    pub fn conditional_result_refinements(&self) -> &'a [CompiledConditionalResultRefinement] {
+    pub fn conditional_result_refinements(&self) -> &[CompiledConditionalResultRefinement] {
         &self.record.conditional_result_refinements
     }
 
     /// Outcome-sensitive one-step indirect writes attributed to this
     /// procedure's normal return.
-    pub fn conditional_indirect_writes(&self) -> &'a [CompiledConditionalIndirectWrite] {
+    pub fn conditional_indirect_writes(&self) -> &[CompiledConditionalIndirectWrite] {
         &self.record.conditional_indirect_writes
     }
 
     /// Predicates this reviewed summary establishes for actual arguments on
     /// the call's normal continuation.
-    pub fn normal_return_refinements(&self) -> &'a [CompiledNormalReturnRefinement] {
+    pub fn normal_return_refinements(&self) -> &[CompiledNormalReturnRefinement] {
         &self.record.normal_return_refinements
     }
 
     /// Reviewed class assertions this summary establishes for actual
     /// arguments on the call's normal continuation.
-    pub fn normal_return_type_refinements(&self) -> &'a [CompiledNormalReturnTypeRefinement] {
+    pub fn normal_return_type_refinements(&self) -> &[CompiledNormalReturnTypeRefinement] {
         &self.record.normal_return_type_refinements
     }
 
     /// Reviewed identity claims for a class decorator or decorator factory.
     /// Omission means that the activated summary makes no such claim.
-    pub fn class_decorator_identity(&self) -> Option<&'a CompiledClassDecoratorIdentity> {
+    pub fn class_decorator_identity(&self) -> Option<&CompiledClassDecoratorIdentity> {
         self.record.class_decorator_identity.as_ref()
     }
 
@@ -318,7 +325,7 @@ impl<'a> ActivatedProcedureSummary<'a> {
     ) -> crate::analyzer::semantic_model::SemanticModelProvenance {
         let mut provenance = crate::analyzer::store::model_provenance::activated_record_provenance(
             active,
-            self.shard,
+            &self.shard,
             &self.record.id,
         );
         provenance.completeness = match self.record.completeness {
@@ -402,14 +409,34 @@ pub struct SemanticModelActivationReport {
     pub phase_measurements: SemanticModelActivationPhaseMeasurements,
 }
 
-#[derive(Debug)]
-pub struct ActiveSemanticModelShard {
+/// A database-local key is meaningful only together with its publishing database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogShardRowIdentity {
+    pub shard_key: i64,
+    pub database: CatalogShardDatabase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogShardDatabase {
+    Durable,
+    Session,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveSemanticModelShardMetadata {
     /// The pack was selected without exact toolchain evidence.
     pub approximate: bool,
     /// Shared with the catalog's decoded-manifest memo and with every other
     /// shard of the same pack (#3101).
     pub manifest: Arc<CompiledPackManifest>,
-    pub shard: CompiledShard,
+    pub descriptor: crate::analyzer::semantic_model::CompiledShardDescriptor,
+    pub selectors: Vec<crate::analyzer::semantic_model::ActivationSelector>,
+    /// Present on catalog activations; standalone decoded test fixtures have no SQL reader.
+    pub row_store: Option<CatalogShardRowIdentity>,
+    /// Decoded shards keep their exact presence bit and debug-check it against
+    /// catalog_semantic_payload_families. Row-backed shards read that family
+    /// row: child rows cannot distinguish absent and present-empty payloads.
+    pub has_callable_values: bool,
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
     pub matched_evidence: SemanticModelActivationEvidence,
@@ -421,7 +448,29 @@ pub struct ActiveSemanticModelShard {
     pub source_rank: u8,
 }
 
+#[derive(Debug)]
+pub struct ActiveSemanticModelShard {
+    pub metadata: Arc<ActiveSemanticModelShardMetadata>,
+    pub decoded: Option<CompiledShard>,
+}
+
+/// Metadata projection never requires a decoded payload.
+impl std::ops::Deref for ActiveSemanticModelShard {
+    type Target = ActiveSemanticModelShardMetadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
 impl ActiveSemanticModelShard {
+    /// Payload readers must make their dependency on decoded data explicit.
+    pub fn decoded(&self) -> &CompiledShard {
+        self.decoded
+            .as_ref()
+            .expect("semantic-model shard payload is decoded")
+    }
+
     /// A positive declaration does not assert that its source enumerates the
     /// owner's complete member family. Behavior payloads have no TypeFact and
     /// cannot enter this declaration inventory.
@@ -467,9 +516,9 @@ pub struct ResolvedActiveSemanticModels {
     pub active_model_set_hash: String,
     #[doc(hidden)]
     pub source_reader: Option<CatalogRuntimeSourceReader>,
-    pub shards: Vec<ActiveSemanticModelShard>,
+    pub shards: Vec<Arc<ActiveSemanticModelShard>>,
     pub indexes: MatcherIndexes,
-    pub extraction_gaps: Vec<ActivePackExtractionGap>,
+    pub extraction_gaps: Vec<Arc<ActivePackExtractionGap>>,
     pub extraction_gaps_by_declaration: HashMap<String, Vec<usize>>,
     pub report: SemanticModelActivationReport,
 }
@@ -486,8 +535,218 @@ impl ResolvedActiveSemanticModels {
         &self.active_model_set_hash
     }
 
-    pub fn shards(&self) -> &[ActiveSemanticModelShard] {
-        &self.shards
+    pub fn shards(&self) -> Vec<Arc<ActiveSemanticModelShard>> {
+        self.shards.clone()
+    }
+
+    /// Project candidate names for result-contract source binding, in shard
+    /// and payload order. Callers deduplicate the projected inventory.
+    pub fn result_contract_name_inventory(
+        &self,
+    ) -> impl Iterator<Item = (String, String, bool, CallableArity)> + '_ {
+        self.shards.iter().flat_map(|shard| {
+            let rows = (shard.decoded.is_none()
+                && shard.descriptor.payload_kind
+                    == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries)
+                .then(|| {
+                    self.shard_summary_targets(
+                        shard,
+                        "SUMMARY_CONTRACT_TARGETS_BY_SHARD",
+                        statements::SUMMARY_CONTRACT_TARGETS_BY_SHARD,
+                    )
+                    .into_iter()
+                    .filter_map(|record| {
+                        let (_, member) =
+                            authored_procedure_target_identity(&record.1.path, &record.1.symbol)?;
+                        Some((
+                            shard.manifest.language.clone(),
+                            member.to_owned(),
+                            record.1.has_receiver,
+                            record.1.callable_arity(),
+                        ))
+                    })
+                    .collect()
+                });
+            query_or_posting(
+                rows,
+                shard
+                    .decoded
+                    .as_ref()
+                    .and_then(|decoded| decoded.payload().procedure_summaries())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|summary| {
+                        if summary.result_contracts.is_empty() {
+                            return None;
+                        }
+                        let (_, member) = authored_procedure_target_identity(
+                            &summary.target.path,
+                            &summary.target.symbol,
+                        )?;
+                        Some((
+                            shard.manifest.language.clone(),
+                            member.to_owned(),
+                            summary.target.has_receiver,
+                            summary.target.callable_arity(),
+                        ))
+                    }),
+            )
+        })
+    }
+
+    /// Stream the authored-target census one summary-bearing shard at a time,
+    /// in activation and canonical payload order. Present-empty summary payloads
+    /// still invoke the visitor; absent payloads do not.
+    pub fn visit_procedure_summary_targets(
+        &self,
+        mut visit: impl FnMut(&str, &str, &mut dyn Iterator<Item = (&str, &CompiledProcedureTarget)>),
+    ) {
+        for shard in &self.shards {
+            if let Some(decoded) = &shard.decoded {
+                if let Some(summaries) = decoded.payload().procedure_summaries() {
+                    let mut targets = summaries
+                        .iter()
+                        .map(|summary| (summary.id.as_str(), &summary.target));
+                    visit(
+                        &shard.manifest.content_sha256,
+                        &shard.manifest.language,
+                        &mut targets,
+                    );
+                }
+            } else if shard.descriptor.payload_kind
+                == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries
+            {
+                let records = self.shard_summary_targets(
+                    shard,
+                    "SUMMARY_TARGETS_BY_SHARD",
+                    statements::SUMMARY_TARGETS_BY_SHARD,
+                );
+                let mut targets = records.iter().map(|record| (record.0.as_str(), &record.1));
+                visit(
+                    &shard.manifest.content_sha256,
+                    &shard.manifest.language,
+                    &mut targets,
+                );
+            }
+        }
+    }
+
+    /// Close selected root IDs over same-shard dependencies in canonical payload order.
+    /// Missing IDs stay absent for the consumers' existing diagnostics. M2c's row
+    /// reader answers this query with shard-local ID lookups.
+    pub fn procedure_summary_family<'a>(
+        &self,
+        shard: &ActiveSemanticModelShard,
+        roots: impl IntoIterator<Item = &'a str>,
+    ) -> Arc<[Arc<CompiledProcedureSummary>]> {
+        if shard.decoded.is_none() {
+            let selected = self
+                .shards
+                .iter()
+                .find(|s| std::ptr::eq(s.as_ref(), shard))
+                .expect("summary shard belongs to this active set");
+            let roots = roots.into_iter().collect::<Vec<_>>();
+            return crate::analyzer::store::model_catalog::semantic_catalog_question(
+                "SUMMARY_BY_ID",
+                (&shard.row_store, &roots),
+                self.source_reader
+                    .as_ref()
+                    .expect("row-backed set has its reader")
+                    .procedure_summary_family(selected, roots.iter().copied()),
+            );
+        }
+        let payload = shard
+            .decoded()
+            .payload()
+            .procedure_summaries()
+            .expect("a selected procedure-summary shard has a summary payload");
+        let by_id = payload
+            .iter()
+            .map(|summary| (summary.id.as_str(), summary))
+            .collect::<HashMap<_, _>>();
+        let mut pending = roots
+            .into_iter()
+            .filter_map(|id| by_id.get(id).map(|summary| summary.id.as_str()))
+            .collect::<Vec<_>>();
+        let mut visited = HashSet::default();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(summary) = by_id.get(id) else {
+                continue;
+            };
+            for effect in &summary.effects {
+                match effect {
+                    crate::analyzer::semantic_model::CompiledSummaryEffect::Call {
+                        callee, ..
+                    } => pending.push(callee),
+                    crate::analyzer::semantic_model::CompiledSummaryEffect::AmbiguousCall {
+                        candidates,
+                        ..
+                    } => pending.extend(candidates.iter().map(String::as_str)),
+                    _ => {}
+                }
+            }
+        }
+        payload
+            .iter()
+            .filter(|summary| visited.contains(summary.id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Preserve the consumers' legacy whole-shard summary ordering without
+    /// retaining that whole payload in an owned summary family.
+    #[doc(hidden)]
+    pub fn procedure_summary_shard_order(&self, selected: &ActiveSemanticModelShard) -> usize {
+        if self.has_row_backed_shards() {
+            let selected = self
+                .shards
+                .iter()
+                .find(|s| std::ptr::eq(s.as_ref(), selected))
+                .expect("summary shard belongs to this active set");
+            return crate::analyzer::store::model_catalog::semantic_catalog_question(
+                "SUMMARY_SHARD_FIRST/SUMMARY_SHARD_SEQUENCE",
+                selected.row_store,
+                self.source_reader
+                    .as_ref()
+                    .expect("row-backed set has its reader")
+                    .procedure_summary_shard_order(selected, &self.shards),
+            );
+        }
+        let selected_payload = selected
+            .decoded()
+            .payload()
+            .procedure_summaries()
+            .expect("a selected procedure-summary shard has a summary payload");
+        self.shards
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .decoded()
+                    .payload()
+                    .procedure_summaries()
+                    .map(|payload| (shard, payload))
+            })
+            .filter(|(shard, payload)| {
+                shard
+                    .manifest
+                    .language
+                    .cmp(&selected.manifest.language)
+                    .then_with(|| {
+                        payload
+                            .iter()
+                            .map(|summary| (&summary.model_id, &summary.id))
+                            .cmp(
+                                selected_payload
+                                    .iter()
+                                    .map(|summary| (&summary.model_id, &summary.id)),
+                            )
+                    })
+                    .is_lt()
+            })
+            .count()
     }
 
     /// Runtime-value contracts are carried by the same activated shard as
@@ -495,10 +754,18 @@ impl ResolvedActiveSemanticModels {
     /// payload so callers retain activation and provenance evidence.
     pub fn runtime_values(
         &self,
-    ) -> impl Iterator<Item = (&RuntimeValuesPayload, &ActiveSemanticModelShard)> {
-        self.shards
-            .iter()
-            .filter_map(|shard| shard.shard.runtime_values().map(|payload| (payload, shard)))
+    ) -> impl Iterator<Item = (Arc<RuntimeValuesPayload>, Arc<ActiveSemanticModelShard>)> {
+        self.shards.iter().filter_map(|shard| {
+            let payload = match &shard.decoded {
+                Some(decoded) => decoded.runtime_values().cloned(),
+                None => self.shard_payload::<RuntimeValuesPayload>(
+                    shard,
+                    "RUNTIME_VALUES",
+                    statements::RUNTIME_VALUES,
+                ),
+            };
+            payload.map(|payload| (payload, Arc::clone(shard)))
+        })
     }
 
     /// Portable records retain their catalog shard and provenance. Catalog
@@ -508,15 +775,21 @@ impl ResolvedActiveSemanticModels {
         &self,
     ) -> impl Iterator<
         Item = (
-            &crate::analyzer::semantic_model::RuntimeContractsPayload,
-            &ActiveSemanticModelShard,
+            Arc<crate::analyzer::semantic_model::RuntimeContractsPayload>,
+            Arc<ActiveSemanticModelShard>,
         ),
     > {
         self.shards.iter().filter_map(|shard| {
-            shard
-                .shard
-                .runtime_contracts()
-                .map(|payload| (payload, shard))
+            let payload = match &shard.decoded {
+                Some(decoded) => decoded.runtime_contracts().cloned(),
+                None => self
+                    .shard_payload::<crate::analyzer::semantic_model::RuntimeContractsPayload>(
+                        shard,
+                        "RUNTIME_CONTRACTS",
+                        statements::RUNTIME_CONTRACTS,
+                    ),
+            };
+            payload.map(|payload| (payload, Arc::clone(shard)))
         })
     }
 
@@ -526,12 +799,27 @@ impl ResolvedActiveSemanticModels {
     /// callable lookup.
     pub fn collection_flows(
         &self,
-    ) -> impl Iterator<Item = (&CollectionFlowsPayload, &ActiveSemanticModelShard)> {
+    ) -> impl Iterator<Item = (Arc<CollectionFlowsPayload>, Arc<ActiveSemanticModelShard>)> {
         self.shards.iter().filter_map(|shard| {
-            shard
-                .shard
-                .collection_flows()
-                .map(|payload| (payload, shard))
+            let payload = match &shard.decoded {
+                Some(decoded) => decoded.collection_flows().cloned(),
+                None => self
+                    .has_family(shard, SemanticPayloadFamily::CollectionFlows)
+                    .then(|| {
+                        Arc::new(CollectionFlowsPayload {
+                            flows: self
+                                .shard_records(
+                                    shard,
+                                    "COLLECTION_FLOWS_BY_SHARD",
+                                    statements::COLLECTION_FLOWS_BY_SHARD,
+                                )
+                                .into_iter()
+                                .map(Arc::unwrap_or_clone)
+                                .collect(),
+                        })
+                    }),
+            };
+            payload.map(|payload| (payload, Arc::clone(shard)))
         })
     }
 
@@ -539,12 +827,56 @@ impl ResolvedActiveSemanticModels {
     /// pair exact endpoint identities with the evidence that activated them.
     pub fn deferred_yields(
         &self,
-    ) -> impl Iterator<Item = (&DeferredYieldsPayload, &ActiveSemanticModelShard)> {
+    ) -> impl Iterator<Item = (Arc<DeferredYieldsPayload>, Arc<ActiveSemanticModelShard>)> {
         self.shards.iter().filter_map(|shard| {
-            shard
-                .shard
-                .deferred_yields()
-                .map(|payload| (payload, shard))
+            let payload = match &shard.decoded {
+                Some(decoded) => decoded.deferred_yields().cloned(),
+                None => self
+                    .has_family(shard, SemanticPayloadFamily::DeferredYields)
+                    .then(|| {
+                        Arc::new(DeferredYieldsPayload {
+                            yields: self
+                                .shard_records(
+                                    shard,
+                                    "DEFERRED_YIELDS_BY_SHARD",
+                                    statements::DEFERRED_YIELDS_BY_SHARD,
+                                )
+                                .into_iter()
+                                .map(Arc::unwrap_or_clone)
+                                .collect(),
+                        })
+                    }),
+            };
+            payload.map(|payload| (payload, Arc::clone(shard)))
+        })
+    }
+
+    /// Rule enumeration is bounded by the active generator rules, not declarations.
+    pub fn generator_rules(
+        &self,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<GeneratorRule>> + '_ {
+        self.shards.iter().flat_map(|shard| {
+            let records = match &shard.decoded {
+                Some(decoded) => decoded
+                    .payload()
+                    .generator_rules()
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None if shard.descriptor.payload_kind
+                    == crate::analyzer::semantic_model::PayloadKind::GeneratorRules =>
+                {
+                    self.shard_records(shard, "RULES_BY_SHARD", statements::RULES_BY_SHARD)
+                }
+                None => Vec::new(),
+            };
+            records
+                .into_iter()
+                .map(|record| ActivatedSemanticModelRecord {
+                    record,
+                    shard: Arc::clone(shard),
+                })
         })
     }
 
@@ -552,22 +884,22 @@ impl ResolvedActiveSemanticModels {
         &self.report
     }
 
-    pub fn extraction_gaps(&self) -> &[ActivePackExtractionGap] {
-        &self.extraction_gaps
+    pub fn extraction_gaps(&self) -> Vec<Arc<ActivePackExtractionGap>> {
+        self.extraction_gaps.clone()
     }
 
-    pub fn gapped(&self, declaration: &str) -> Option<&ActivePackExtractionGap> {
+    pub fn gapped(&self, declaration: &str) -> Option<Arc<ActivePackExtractionGap>> {
         self.extraction_gaps_by_declaration
             .get(declaration)
             .and_then(|indexes| indexes.first())
-            .map(|index| &self.extraction_gaps[*index])
+            .map(|index| Arc::clone(&self.extraction_gaps[*index]))
     }
 
     pub fn gapped_member_surface(
         &self,
         owner: &str,
         member: &str,
-    ) -> Option<&ActivePackExtractionGap> {
+    ) -> Option<Arc<ActivePackExtractionGap>> {
         let member_declaration = format!("{owner}.{member}");
         self.gapped(&member_declaration)
             .or_else(|| self.gapped(owner))
@@ -577,12 +909,53 @@ impl ResolvedActiveSemanticModels {
         self.report.retained_bytes
     }
 
-    pub fn types_with_id(&self, id: &str) -> SemanticModelMatch<'_, TypeFact> {
-        self.type_match(self.indexes.types_by_id.get(id))
+    pub fn types_with_id(&self, id: &str) -> SemanticModelMatch<TypeFact> {
+        let posting = self.indexes.types_by_id.get(id);
+        if self.has_row_backed_shards() {
+            return resolve_records(self.type_question(
+                "TYPES_BY_ID",
+                statements::TYPES_BY_ID,
+                id,
+                named_params! { ":id": id },
+                posting,
+            ));
+        }
+        self.type_match(posting)
     }
 
-    pub fn types_named(&self, name: &str) -> SemanticModelMatch<'_, TypeFact> {
-        self.type_match(self.indexes.types_by_name.get(name))
+    pub fn types_named(&self, name: &str) -> SemanticModelMatch<TypeFact> {
+        let posting = self.indexes.types_by_name.get(name);
+        if self.has_row_backed_shards() {
+            let records = self.type_question(
+                "TYPES_BY_NAME",
+                statements::TYPES_BY_NAME,
+                name,
+                named_params! { ":name": name },
+                posting,
+            );
+            // Catalog names also contain terminal spellings. This raw matcher
+            // indexes only the canonical name and explicit aliases, including
+            // repeated postings when an alias repeats the canonical name.
+            return resolve_records(
+                records
+                    .into_iter()
+                    .flat_map(|r| {
+                        let count = if r.shard.decoded.is_none() {
+                            usize::from(r.record.name == name)
+                                + r.record
+                                    .aliases
+                                    .iter()
+                                    .filter(|alias| alias.as_str() == name)
+                                    .count()
+                        } else {
+                            1
+                        };
+                        std::iter::repeat_n(r, count)
+                    })
+                    .collect(),
+            );
+        }
+        self.type_match(posting)
     }
 
     /// All active postings, without rank selection or value deduplication.
@@ -592,25 +965,95 @@ impl ResolvedActiveSemanticModels {
     pub fn all_type_records_named<'a>(
         &'a self,
         name: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
-        self.all_type_records(self.indexes.types_by_name.get(name))
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+        let posting = self.indexes.types_by_name.get(name);
+        let rows = self.has_row_backed_shards().then(|| {
+            rows::distinct_addresses(
+                self.type_question(
+                    "TYPES_BY_NAME",
+                    statements::TYPES_BY_NAME,
+                    name,
+                    named_params! { ":name": name },
+                    posting,
+                )
+                .into_iter()
+                .filter(|r| {
+                    r.record.name == name || r.record.aliases.iter().any(|alias| alias == name)
+                })
+                .collect(),
+            )
+        });
+        query_or_posting(rows, self.all_type_records(posting))
     }
 
     #[doc(hidden)]
     pub fn all_type_records_with_id<'a>(
         &'a self,
         id: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
-        self.all_type_records(self.indexes.types_by_id.get(id))
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+        let posting = self.indexes.types_by_id.get(id);
+        let rows = self.has_row_backed_shards().then(|| {
+            rows::distinct_addresses(self.type_question(
+                "TYPES_BY_ID",
+                statements::TYPES_BY_ID,
+                id,
+                named_params! { ":id": id },
+                posting,
+            ))
+        });
+        query_or_posting(rows, self.all_type_records(posting))
     }
 
     fn all_type_records<'a>(
         &'a self,
         posting: Option<&'a Vec<RecordAddress>>,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<'a, TypeFact>> + 'a {
-        // Each record's aliases are indexed together, so duplicate addresses
-        // in one posting are adjacent. Distinct addresses, even equal values
-        // in different shards, are distinct contributors.
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+        self.all_records(posting, |shard, index| {
+            &shard
+                .decoded()
+                .payload()
+                .declaration_facts()
+                .expect("type posting addresses declarations")
+                .0[index]
+        })
+    }
+
+    /// #6542: extraction authority is independent of delivery/evidence rank.
+    #[doc(hidden)]
+    pub fn all_member_records_with_id<'a>(
+        &'a self,
+        id: &str,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<MemberFact>> + 'a {
+        let posting = self.indexes.members_by_id.get(id);
+        let rows = self.has_row_backed_shards().then(|| {
+            rows::distinct_addresses(self.member_question(
+                "MEMBERS_BY_ID",
+                statements::MEMBERS_BY_ID,
+                id,
+                named_params! { ":id": id },
+                posting,
+            ))
+        });
+        query_or_posting(
+            rows,
+            self.all_records(posting, |shard, index| {
+                &shard
+                    .decoded()
+                    .payload()
+                    .declaration_facts()
+                    .expect("member posting addresses declarations")
+                    .1[index]
+            }),
+        )
+    }
+
+    fn all_records<'a, T: 'a>(
+        &'a self,
+        posting: Option<&'a Vec<RecordAddress>>,
+        record: impl Fn(&'a ActiveSemanticModelShard, usize) -> &'a Arc<T> + 'a,
+    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<T>> + 'a {
+        // Aliases index adjacent copies of one address. Distinct contributors
+        // remain distinct even when their values happen to agree.
         posting
             .into_iter()
             .flat_map(|posting| {
@@ -622,13 +1065,10 @@ impl ResolvedActiveSemanticModels {
             })
             .map(move |address| {
                 let shard = &self.shards[address.shard as usize];
-                let record = &shard
-                    .shard
-                    .payload()
-                    .declaration_facts()
-                    .expect("type posting addresses declarations")
-                    .0[address.record as usize];
-                ActivatedSemanticModelRecord { record, shard }
+                ActivatedSemanticModelRecord {
+                    record: Arc::clone(record(shard, address.record as usize)),
+                    shard: Arc::clone(shard),
+                }
             })
     }
 
@@ -650,36 +1090,95 @@ impl ResolvedActiveSemanticModels {
             }
         }
         Ok(selected.is_some_and(|(_, selected)| {
-            crate::analyzer::semantic_model::type_declarations_equivalent(record, selected)
+            crate::analyzer::semantic_model::type_declarations_equivalent(record, &selected)
         }))
     }
 
-    pub fn members_with_id(&self, id: &str) -> SemanticModelMatch<'_, MemberFact> {
-        self.member_match(self.indexes.members_by_id.get(id))
+    pub fn members_with_id(&self, id: &str) -> SemanticModelMatch<MemberFact> {
+        let posting = self.indexes.members_by_id.get(id);
+        if self.has_row_backed_shards() {
+            return resolve_records(self.member_question(
+                "MEMBERS_BY_ID",
+                statements::MEMBERS_BY_ID,
+                id,
+                named_params! { ":id": id },
+                posting,
+            ));
+        }
+        self.member_match(posting)
     }
 
-    pub fn members_named(&self, owner: &str, name: &str) -> SemanticModelMatch<'_, MemberFact> {
-        self.member_match(
-            self.indexes
-                .members_by_owner_name
-                .get(owner)
-                .and_then(|names| names.get(name)),
-        )
+    pub fn members_named(&self, owner: &str, name: &str) -> SemanticModelMatch<MemberFact> {
+        let posting = self
+            .indexes
+            .members_by_owner_name
+            .get(owner)
+            .and_then(|names| names.get(name));
+        if self.has_row_backed_shards() {
+            let records = self.member_question(
+                "MEMBERS_BY_OWNER_NAME",
+                statements::MEMBERS_BY_OWNER_NAME,
+                (owner, name),
+                named_params! { ":owner": owner, ":name": name },
+                posting,
+            );
+            return resolve_records(
+                records
+                    .into_iter()
+                    .flat_map(|r| {
+                        let count = if r.shard.decoded.is_none() {
+                            usize::from(r.record.name == name)
+                                + r.record
+                                    .aliases
+                                    .iter()
+                                    .filter(|alias| alias.as_str() == name)
+                                    .count()
+                        } else {
+                            1
+                        };
+                        std::iter::repeat_n(r, count)
+                    })
+                    .collect(),
+            );
+        }
+        self.member_match(posting)
     }
 
-    pub fn relations_with_id(&self, id: &str) -> SemanticModelMatch<'_, RelationFact> {
-        self.relation_match(self.indexes.relations_by_id.get(id))
+    pub fn relations_with_id(&self, id: &str) -> SemanticModelMatch<RelationFact> {
+        let posting = self.indexes.relations_by_id.get(id);
+        if self.has_row_backed_shards() {
+            return self.relation_question(
+                "RELATIONS_BY_ID",
+                statements::RELATIONS_BY_ID,
+                id,
+                posting,
+            );
+        }
+        self.relation_match(posting)
     }
 
-    pub fn relations_from(&self, from: &str) -> SemanticModelMatch<'_, RelationFact> {
-        self.relation_match(self.indexes.relations_by_from.get(from))
+    pub fn relations_from(&self, from: &str) -> SemanticModelMatch<RelationFact> {
+        let posting = self.indexes.relations_by_from.get(from);
+        if self.has_row_backed_shards() {
+            return self.relation_question(
+                "RELATIONS_FROM",
+                statements::RELATIONS_FROM,
+                from,
+                posting,
+            );
+        }
+        self.relation_match(posting)
     }
 
-    pub fn relations_to(&self, to: &str) -> SemanticModelMatch<'_, RelationFact> {
-        self.relation_match(self.indexes.relations_by_to.get(to))
+    pub fn relations_to(&self, to: &str) -> SemanticModelMatch<RelationFact> {
+        let posting = self.indexes.relations_by_to.get(to);
+        if self.has_row_backed_shards() {
+            return self.relation_question("RELATIONS_TO", statements::RELATIONS_TO, to, posting);
+        }
+        self.relation_match(posting)
     }
 
-    pub fn rules_for(&self, trigger: RuleTriggerKey<'_>) -> SemanticModelMatch<'_, GeneratorRule> {
+    pub fn rules_for(&self, trigger: RuleTriggerKey<'_>) -> SemanticModelMatch<GeneratorRule> {
         let posting = match trigger {
             RuleTriggerKey::LanguageConstruct(value) => {
                 self.indexes.rules_by_language_construct.get(value)
@@ -696,23 +1195,61 @@ impl ResolvedActiveSemanticModels {
                 .get(owner)
                 .and_then(|names| names.get(name)),
         };
+        if self.has_row_backed_shards() {
+            let (family, key) = match trigger {
+                RuleTriggerKey::LanguageConstruct(value) => ("language-construct", value),
+                RuleTriggerKey::Annotation(value) => ("annotation", value),
+                RuleTriggerKey::MacroInvocation(value) => ("macro", value),
+                RuleTriggerKey::GeneratorInvocation(value) => ("generator", value),
+                RuleTriggerKey::ResolvedOwner(value) => ("owner", value),
+                RuleTriggerKey::ResolvedCall { owner, name } => {
+                    return self.rule_question(
+                        "RULES_BY_CALL",
+                        statements::RULES_BY_CALL,
+                        (owner, name),
+                        named_params! { ":owner": owner, ":member": name },
+                        posting,
+                    );
+                }
+            };
+            return self.rule_question(
+                "RULES_BY_TRIGGER",
+                statements::RULES_BY_TRIGGER,
+                (family, key),
+                named_params! { ":family": family, ":key": key },
+                posting,
+            );
+        }
         self.rule_match(posting)
     }
 
-    pub fn rules_with_id(&self, id: &str) -> SemanticModelMatch<'_, GeneratorRule> {
-        self.rule_match(self.indexes.rules_by_id.get(id))
+    pub fn rules_with_id(&self, id: &str) -> SemanticModelMatch<GeneratorRule> {
+        let posting = self.indexes.rules_by_id.get(id);
+        if self.has_row_backed_shards() {
+            return self.rule_question(
+                "RULES_BY_ID",
+                statements::RULES_BY_ID,
+                id,
+                named_params! { ":id": id },
+                posting,
+            );
+        }
+        self.rule_match(posting)
     }
 
     pub fn procedure_summaries_for(
         &self,
         target: ProcedureSummaryTargetKey<'_>,
-    ) -> ProcedureSummaryMatch<'_> {
+    ) -> ProcedureSummaryMatch {
         let shapes = self
             .indexes
             .procedure_summaries_by_target
             .get(semantic_pack_realm(target.language))
             .and_then(|paths| paths.get(target.path))
             .and_then(|symbols| symbols.get(target.symbol));
+        if self.has_row_backed_shards() {
+            return self.exact_summary_question(target, shapes);
+        }
         resolve_exact_procedure_postings(
             &self.shards,
             shapes,
@@ -723,22 +1260,79 @@ impl ResolvedActiveSemanticModels {
 
     /// Select an activated summary for an unmaterialized external callee by its
     /// canonical identity (#1978).
+    /// #6542: summaries use authored owner spellings, whereas structural
+    /// targets use artifact identities. Join those spellings per lookup, using
+    /// only explicit extraction aliases. No composed facts or provenance are
+    /// persisted, and the temporary postings die with this summary query.
+    fn procedure_shapes_for_member(
+        &self,
+        language: &str,
+        owner: &str,
+        member: &str,
+    ) -> Option<std::borrow::Cow<'_, ProcedureSummaryShapePostings>> {
+        let realm = semantic_pack_realm(language);
+        let owners = self.indexes.procedure_summaries_by_member.get(realm)?;
+        let direct = owners.get(owner).and_then(|members| members.get(member));
+        let mut names = std::collections::HashSet::new();
+        for declaration in self.all_type_records_named(owner) {
+            if declaration.shard.manifest.extraction.is_some()
+                && semantic_pack_realm(&declaration.shard.manifest.language) == realm
+            {
+                names.insert(declaration.record.name.clone());
+                names.extend(declaration.record.aliases.iter().cloned());
+            }
+        }
+        names.remove(owner);
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut additional = names
+            .into_iter()
+            .filter_map(|name| owners.get(&name).and_then(|members| members.get(member)))
+            .collect::<Vec<_>>();
+        if additional.is_empty() {
+            return direct.map(std::borrow::Cow::Borrowed);
+        }
+        additional.extend(direct);
+        let mut combined = ProcedureSummaryShapePostings::default();
+        for shapes in additional {
+            for (key, posting) in &shapes.fixed {
+                combined.fixed.entry(*key).or_default().extend(posting);
+            }
+            for (key, posting) in &shapes.variadic {
+                combined.variadic.entry(*key).or_default().extend(posting);
+            }
+            for (key, posting) in &shapes.variadic_by_minimum_arity {
+                combined
+                    .variadic_by_minimum_arity
+                    .entry(*key)
+                    .or_default()
+                    .extend(posting);
+            }
+            for (key, posting) in &shapes.optional_fixed {
+                combined
+                    .optional_fixed
+                    .entry(*key)
+                    .or_default()
+                    .extend(posting);
+            }
+            for (target, source) in combined
+                .raw_normal_continuation_absence_claim
+                .iter_mut()
+                .zip(shapes.raw_normal_continuation_absence_claim)
+            {
+                *target |= source;
+            }
+        }
+        Some(std::borrow::Cow::Owned(combined))
+    }
+
     pub fn procedure_summaries_for_member(
         &self,
         target: ProcedureSummaryMemberKey<'_>,
-    ) -> ProcedureSummaryMatch<'_> {
-        let shapes = self
-            .indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(target.language))
-            .and_then(|owners| owners.get(target.owner))
-            .and_then(|members| members.get(target.member));
-        resolve_applicable_procedure_postings(
-            &self.shards,
-            shapes,
-            target.has_receiver,
-            target.parameter_count,
-        )
+    ) -> ProcedureSummaryMatch {
+        self.applicable_member_summaries(target, &[target.parameter_count], |_, _| {
+            ProcedureSummaryAcceptance::Accept(None)
+        })
     }
 
     /// Select summaries for an exact unmaterialized external target, applying
@@ -748,25 +1342,22 @@ impl ResolvedActiveSemanticModels {
     pub fn procedure_summaries_for_external_target(
         &self,
         target: &UnmaterializedExternalTarget,
-    ) -> ProcedureSummaryMatch<'_> {
-        let shapes = self
-            .indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(target.language().semantic_pack_label()))
-            .and_then(|owners| owners.get(target.owner_fqn()))
-            .and_then(|members| members.get(target.member()));
+    ) -> ProcedureSummaryMatch {
+        let key = ProcedureSummaryMemberKey::new(
+            target.language().semantic_pack_label(),
+            target.owner_fqn(),
+            target.member(),
+            target.has_receiver(),
+            target.arity(),
+        );
         let mut parameter_counts = vec![target.arity()];
         if let Some(formal_count) = target.python_formal_parameter_count() {
             parameter_counts.push(formal_count);
         }
         let incomplete = std::cell::Cell::new(false);
         let rejected_artifact = std::cell::Cell::new(false);
-        let mut matched = resolve_applicable_procedure_postings_where_for_counts(
-            &self.shards,
-            shapes,
-            target.has_receiver(),
-            &parameter_counts,
-            |shard, summary| {
+        let mut matched =
+            self.applicable_member_summaries(key, &parameter_counts, |shard, summary| {
                 let artifact_applies = python_artifact_applies_to_target(shard, target);
                 let actual_to_formal = procedure_summary_actual_to_formal(shard, summary, target);
                 if python_shard_requires_distribution_artifact(shard, target) && !artifact_applies {
@@ -786,9 +1377,9 @@ impl ResolvedActiveSemanticModels {
                 } else {
                     ProcedureSummaryAcceptance::Reject
                 }
-            },
-        );
+            });
         for record in &mut matched.records {
+            record.matched_owner_identity = Some(target.owner_fqn().to_owned());
             record.matched_target_locator = Some(target.locator().clone());
             record.matched_call_arguments = target
                 .call_arguments()
@@ -807,7 +1398,7 @@ impl ResolvedActiveSemanticModels {
     pub fn procedure_summaries_for_selected_jdk_artifact(
         &self,
         target: &UnmaterializedExternalTarget,
-    ) -> ProcedureSummaryMatch<'_> {
+    ) -> ProcedureSummaryMatch {
         if !target.has_resolver_owned_call_shape()
             || target.language()
                 != crate::analyzer::semantic::SemanticLanguage::Standard(
@@ -825,23 +1416,43 @@ impl ResolvedActiveSemanticModels {
             .get(semantic_pack_realm("java"))
             .and_then(|owners| owners.get(target.owner_fqn()))
             .and_then(|members| members.get(target.member()));
-        let mut matched = resolve_applicable_procedure_postings_where(
-            &self.shards,
-            shapes,
-            target.has_receiver(),
-            target.arity(),
-            |shard, record| {
-                if shard.manifest.language == "java"
-                    && shard.manifest.ecosystem == "jdk"
-                    && shard.matching_evidence.binary_search(selected).is_ok()
-                    && !record.result_use_obligations.is_empty()
-                {
-                    ProcedureSummaryAcceptance::Accept(None)
-                } else {
-                    ProcedureSummaryAcceptance::Reject
-                }
-            },
-        );
+        let accepts = |shard: &ActiveSemanticModelShard, record: &CompiledProcedureSummary| {
+            if shard.manifest.language == "java"
+                && shard.manifest.ecosystem == "jdk"
+                && shard.matching_evidence.binary_search(selected).is_ok()
+                && !record.result_use_obligations.is_empty()
+            {
+                ProcedureSummaryAcceptance::Accept(None)
+            } else {
+                ProcedureSummaryAcceptance::Reject
+            }
+        };
+        let mut matched = if self.has_row_backed_shards() {
+            let key = ProcedureSummaryMemberKey::new(
+                "java",
+                target.owner_fqn(),
+                target.member(),
+                target.has_receiver(),
+                target.arity(),
+            );
+            resolve_procedure_records(
+                self.applicable_summary_records(
+                    key,
+                    &[target.owner_fqn().to_owned()],
+                    &[target.arity()],
+                ),
+                procedure_claims_agree,
+                accepts,
+            )
+        } else {
+            resolve_applicable_procedure_postings_where(
+                &self.shards,
+                shapes,
+                target.has_receiver(),
+                target.arity(),
+                accepts,
+            )
+        };
         for record in &mut matched.records {
             record.matched_target_locator = Some(target.locator().clone());
             record.matched_call_arguments = target
@@ -861,6 +1472,14 @@ impl ResolvedActiveSemanticModels {
         has_receiver: bool,
         parameter_count: u32,
     ) -> bool {
+        if self.has_row_backed_shards() {
+            return self.refinement_candidate_question(
+                language,
+                member,
+                has_receiver,
+                parameter_count,
+            );
+        }
         self.indexes
             .procedure_summaries_by_member
             .get(semantic_pack_realm(language))
@@ -888,23 +1507,31 @@ impl ResolvedActiveSemanticModels {
     pub fn procedure_summaries_for_declaration(
         &self,
         target: ProcedureSummaryDeclarationKey<'_>,
-    ) -> ProcedureSummaryMatch<'_> {
+    ) -> ProcedureSummaryMatch {
         let symbols = self
             .indexes
             .procedure_summaries_by_target
             .get(semantic_pack_realm(target.language))
             .and_then(|paths| paths.get(target.path));
-        let postings = symbols.into_iter().flat_map(|symbols| {
-            symbols
-                .iter()
-                .filter(move |(symbol, _)| {
-                    authored_procedure_target_identity(target.path, symbol)
-                        .is_some_and(|(_, member)| member == target.member)
-                })
-                .flat_map(move |(_, shapes)| {
-                    fixed_and_variadic_postings(shapes, target.has_receiver, target.parameter_count)
-                })
-        });
+        if self.has_row_backed_shards() {
+            return self.declaration_summary_question(target, symbols);
+        }
+        let mut symbols = symbols
+            .into_iter()
+            .flat_map(|symbols| symbols.iter())
+            .collect::<Vec<_>>();
+        // Hash buckets do not define declaration order. A symbol was first
+        // published at its earliest posting, before shape traversal.
+        symbols.sort_by_key(|(_, shapes)| summary_symbol_publication_order(shapes));
+        let postings = symbols
+            .into_iter()
+            .filter(|(symbol, _)| {
+                authored_procedure_target_identity(target.path, symbol)
+                    .is_some_and(|(_, member)| member == target.member)
+            })
+            .flat_map(|(_, shapes)| {
+                fixed_and_variadic_postings(shapes, target.has_receiver, target.parameter_count)
+            });
         resolve_procedure_postings(&self.shards, postings, procedure_declaration_claims_agree)
     }
 
@@ -915,6 +1542,11 @@ impl ResolvedActiveSemanticModels {
     /// [`Self::proves_normal_continuation_absent`] for the exact owner and
     /// actual arity before changing control flow.
     pub fn has_normal_continuation_absence_candidates(&self, language: &str) -> bool {
+        if self.has_row_backed_shards() {
+            return self
+                .absence_candidate_question(language)
+                .has_language(language);
+        }
         self.indexes
             .normal_continuation_absence_candidates
             .has_language(language)
@@ -931,10 +1563,17 @@ impl ResolvedActiveSemanticModels {
         language: &str,
         member: &str,
         has_receiver: bool,
-    ) -> &[String] {
+    ) -> Vec<String> {
+        if self.has_row_backed_shards() {
+            return self
+                .absence_candidate_question(language)
+                .owners(language, member, has_receiver)
+                .to_vec();
+        }
         self.indexes
             .normal_continuation_absence_candidates
             .owners(language, member, has_receiver)
+            .to_vec()
     }
 
     /// Whether exact active-model agreement proves that the external procedure
@@ -964,6 +1603,14 @@ impl ResolvedActiveSemanticModels {
         owner: &str,
         member: &str,
     ) -> bool {
+        if self.has_row_backed_shards() {
+            return !self
+                .summary_member_records(
+                    ProcedureSummaryMemberKey::new(language, owner, member, false, 0),
+                    &[owner.to_owned()],
+                )
+                .is_empty();
+        }
         self.indexes
             .procedure_summaries_by_member
             .get(semantic_pack_realm(language))
@@ -978,23 +1625,20 @@ impl ResolvedActiveSemanticModels {
             })
     }
 
-    fn type_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<'_, TypeFact> {
+    fn type_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<TypeFact> {
         resolve_posting(&self.shards, posting, |shard, record| {
             shard
-                .shard
+                .decoded()
                 .payload()
                 .declaration_facts()
                 .and_then(|(types, _, _)| types.get(record))
         })
     }
 
-    fn member_match(
-        &self,
-        posting: Option<&Vec<RecordAddress>>,
-    ) -> SemanticModelMatch<'_, MemberFact> {
+    fn member_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<MemberFact> {
         resolve_posting(&self.shards, posting, |shard, record| {
             shard
-                .shard
+                .decoded()
                 .payload()
                 .declaration_facts()
                 .and_then(|(_, members, _)| members.get(record))
@@ -1004,10 +1648,10 @@ impl ResolvedActiveSemanticModels {
     fn relation_match(
         &self,
         posting: Option<&Vec<RecordAddress>>,
-    ) -> SemanticModelMatch<'_, RelationFact> {
+    ) -> SemanticModelMatch<RelationFact> {
         resolve_posting(&self.shards, posting, |shard, record| {
             shard
-                .shard
+                .decoded()
                 .payload()
                 .declaration_facts()
                 .and_then(|(_, _, relations)| relations.get(record))
@@ -1017,9 +1661,9 @@ impl ResolvedActiveSemanticModels {
     fn rule_match(
         &self,
         posting: Option<&Vec<RecordAddress>>,
-    ) -> SemanticModelMatch<'_, GeneratorRule> {
+    ) -> SemanticModelMatch<GeneratorRule> {
         resolve_posting(&self.shards, posting, |shard, record| {
-            shard.shard.payload().generator_rules()?.get(record)
+            shard.decoded().payload().generator_rules()?.get(record)
         })
     }
 }
@@ -1046,7 +1690,7 @@ pub fn python_shard_requires_distribution_artifact(
 ) -> bool {
     target.language().semantic_pack_label() == "python"
         && shard.manifest.language == "python"
-        && shard.shard.activation().iter().any(|selector| {
+        && shard.selectors.as_slice().iter().any(|selector| {
             selector
                 .package
                 .as_ref()
@@ -1151,34 +1795,35 @@ pub fn procedure_summary_actual_to_formal(
 }
 
 #[derive(Debug)]
-pub struct SemanticModelMatch<'a, T> {
-    pub records: Vec<ActivatedSemanticModelRecord<'a, T>>,
+pub struct SemanticModelMatch<T> {
+    pub records: Vec<ActivatedSemanticModelRecord<T>>,
     pub disposition: SemanticModelMatchDisposition,
     pub candidates_examined: usize,
     pub fallback_candidates_examined: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ActivatedSemanticModelRecord<'a, T> {
-    pub record: &'a T,
-    pub shard: &'a ActiveSemanticModelShard,
+#[derive(Debug, Clone)]
+pub struct ActivatedSemanticModelRecord<T> {
+    pub record: Arc<T>,
+    pub shard: Arc<ActiveSemanticModelShard>,
 }
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(any(test, feature = "test-support")), non_exhaustive)]
-pub struct ActivatedProcedureSummary<'a> {
-    pub record: &'a CompiledProcedureSummary,
-    pub shard: &'a ActiveSemanticModelShard,
-    pub payload: &'a [CompiledProcedureSummary],
+pub struct ActivatedProcedureSummary {
+    pub record: Arc<CompiledProcedureSummary>,
+    pub shard: Arc<ActiveSemanticModelShard>,
     pub actual_to_formal: Option<Box<[u32]>>,
     pub matched_target_locator: Option<SemanticLocator>,
+    #[doc(hidden)]
+    pub matched_owner_identity: Option<String>,
     pub matched_call_arguments: Option<Box<[crate::analyzer::semantic::SemanticCallArgument]>>,
 }
 
 #[derive(Debug)]
-pub struct ProcedureSummaryMatch<'a> {
+pub struct ProcedureSummaryMatch {
     pub applicability: ProcedureSummaryApplicability,
-    pub records: Vec<ActivatedProcedureSummary<'a>>,
+    pub records: Vec<ActivatedProcedureSummary>,
     pub disposition: SemanticModelMatchDisposition,
     pub candidates_examined: usize,
     pub fallback_candidates_examined: usize,
@@ -1212,7 +1857,7 @@ pub struct MatcherIndexes {
 
 impl MatcherIndexes {
     pub fn build(
-        active: &[ActiveSemanticModelShard],
+        active: &[Arc<ActiveSemanticModelShard>],
         limits: SemanticModelRuntimeLimits,
         cancellation: &CancellationToken,
         report: &mut SemanticModelActivationReport,
@@ -1243,10 +1888,13 @@ impl MatcherIndexes {
         let mut guard_excluded_records = 0usize;
 
         for (shard_index, active_shard) in active.iter().enumerate() {
+            if active_shard.decoded.is_none() {
+                continue;
+            }
             let shard_index = u32::try_from(shard_index)
                 .map_err(|_| "semantic-model shard address exceeds u32".to_owned())?;
             if let Some((types, members, relations)) =
-                active_shard.shard.payload().declaration_facts()
+                active_shard.decoded().payload().declaration_facts()
             {
                 for (record_index, fact) in types.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
@@ -1345,7 +1993,7 @@ impl MatcherIndexes {
                     }
                 }
             }
-            if let Some(rules) = active_shard.shard.payload().generator_rules() {
+            if let Some(rules) = active_shard.decoded().payload().generator_rules() {
                 for (record_index, rule) in rules.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
@@ -1369,7 +2017,7 @@ impl MatcherIndexes {
                     )?;
                 }
             }
-            if let Some(summaries) = active_shard.shard.payload().procedure_summaries() {
+            if let Some(summaries) = active_shard.decoded().payload().procedure_summaries() {
                 for (record_index, summary) in summaries.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
@@ -1479,14 +2127,7 @@ impl MatcherIndexes {
         let shard_bytes = active
             .iter()
             .try_fold(0u64, |total, active_shard| {
-                total.checked_add(
-                    active_shard
-                        .manifest
-                        .shards
-                        .iter()
-                        .find(|descriptor| descriptor.shard_id == active_shard.shard.shard_id())?
-                        .raw_size,
-                )
+                total.checked_add(active_shard.descriptor.raw_size)
             })
             .ok_or_else(|| "semantic-model retained-byte accounting overflowed".to_owned())?;
         let retained_bytes = working_bytes
@@ -1500,6 +2141,135 @@ impl MatcherIndexes {
         report.retained_bytes = retained_bytes;
         report.guard_excluded_records = guard_excluded_records;
         Ok(indexes)
+    }
+}
+
+// The schema/reader integration test enumerates the actual postings, including
+// empty families. This hook never participates in product resolution.
+#[cfg(any(test, feature = "test-support"))]
+impl MatcherIndexes {
+    #[doc(hidden)]
+    pub fn parity_postings(&self) -> Vec<(&'static str, Vec<String>, &[RecordAddress])> {
+        let mut result = Vec::new();
+        for (family, map) in [
+            ("types_id", &self.types_by_id),
+            ("types_name", &self.types_by_name),
+            ("members_id", &self.members_by_id),
+            ("relations_id", &self.relations_by_id),
+            ("relations_from", &self.relations_by_from),
+            ("relations_to", &self.relations_by_to),
+            ("rules_id", &self.rules_by_id),
+            ("rules_construct", &self.rules_by_language_construct),
+            ("rules_annotation", &self.rules_by_annotation),
+            ("rules_macro", &self.rules_by_macro),
+            ("rules_generator", &self.rules_by_generator),
+            ("rules_owner", &self.rules_by_owner),
+        ] {
+            for (key, records) in map {
+                result.push((family, vec![key.clone()], records.as_slice()));
+            }
+        }
+        for (family, map) in [
+            ("members_owner_name", &self.members_by_owner_name),
+            ("rules_call", &self.rules_by_call),
+        ] {
+            for (owner, names) in map {
+                for (name, records) in names {
+                    result.push((
+                        family,
+                        vec![owner.clone(), name.clone()],
+                        records.as_slice(),
+                    ));
+                }
+            }
+        }
+        for (family, languages) in [
+            ("summaries_target", &self.procedure_summaries_by_target),
+            ("summaries_member", &self.procedure_summaries_by_member),
+        ] {
+            for (language, owners) in languages {
+                for (owner, names) in owners {
+                    for (name, shapes) in names {
+                        for (kind, postings) in [
+                            ("variadic", &shapes.variadic),
+                            ("minimum", &shapes.variadic_by_minimum_arity),
+                        ] {
+                            for ((receiver, arity), records) in postings {
+                                result.push((
+                                    family,
+                                    vec![
+                                        language.clone(),
+                                        owner.clone(),
+                                        name.clone(),
+                                        kind.into(),
+                                        u8::from(*receiver).to_string(),
+                                        arity.to_string(),
+                                    ],
+                                    records.as_slice(),
+                                ));
+                            }
+                        }
+                        for ((receiver, arity), records) in &shapes.fixed {
+                            result.push((
+                                family,
+                                vec![
+                                    language.clone(),
+                                    owner.clone(),
+                                    name.clone(),
+                                    "fixed".into(),
+                                    u8::from(*receiver).to_string(),
+                                    arity.to_string(),
+                                ],
+                                records.as_slice(),
+                            ));
+                        }
+                        for ((receiver, minimum, arity), records) in &shapes.optional_fixed {
+                            result.push((
+                                family,
+                                vec![
+                                    language.clone(),
+                                    owner.clone(),
+                                    name.clone(),
+                                    "optional".into(),
+                                    u8::from(*receiver).to_string(),
+                                    minimum.to_string(),
+                                    arity.to_string(),
+                                ],
+                                records.as_slice(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn parity_raw_absence_claims(&self) -> Vec<(String, String, String, bool)> {
+        let mut result = Vec::new();
+        for (language, owners) in &self.procedure_summaries_by_member {
+            for (owner, members) in owners {
+                for (member, shapes) in members {
+                    for receiver in [false, true] {
+                        if shapes.raw_normal_continuation_absence_claim[usize::from(receiver)] {
+                            result.push((
+                                language.clone(),
+                                owner.clone(),
+                                member.clone(),
+                                receiver,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn parity_absence_candidates(&self) -> &NormalContinuationAbsenceCandidateIndex {
+        &self.normal_continuation_absence_candidates
     }
 }
 
@@ -1517,9 +2287,12 @@ pub enum EffectiveProcedureClaims {
 }
 
 impl EffectiveProcedureClaims {
-    fn absorb(&mut self, active: &[ActiveSemanticModelShard], address: RecordAddress) {
-        let shard = &active[address.shard as usize];
-        let rank = (shard.evidence_rank, shard.source_rank);
+    fn absorb_with(
+        &mut self,
+        address: RecordAddress,
+        lookup: &impl Fn(RecordAddress) -> (Arc<CompiledProcedureSummary>, (EvidenceRank, u8)),
+    ) {
+        let (_, rank) = lookup(address);
         match *self {
             Self::Empty => {
                 *self = Self::Unique {
@@ -1539,10 +2312,7 @@ impl EffectiveProcedureClaims {
                     };
                 }
                 Ordering::Equal => {
-                    if !procedure_claims_agree(
-                        indexed_procedure_summary(active, representative),
-                        indexed_procedure_summary(active, address),
-                    ) {
+                    if !procedure_claims_agree(&lookup(representative).0, &lookup(address).0) {
                         *self = Self::Conflict { rank };
                     }
                 }
@@ -1558,52 +2328,91 @@ impl EffectiveProcedureClaims {
             Self::Conflict { .. } => {}
         }
     }
-
-    fn proves_normal_continuation_absent(self, active: &[ActiveSemanticModelShard]) -> bool {
-        matches!(
-            self,
-            Self::Unique { representative, .. }
-                if indexed_procedure_summary(active, representative).normal_continuation_absent
-        )
-    }
 }
 
 pub fn indexed_procedure_summary(
-    active: &[ActiveSemanticModelShard],
+    active: &[Arc<ActiveSemanticModelShard>],
     address: RecordAddress,
-) -> &CompiledProcedureSummary {
+) -> Arc<CompiledProcedureSummary> {
     active[address.shard as usize]
-        .shard
+        .decoded()
         .payload()
         .procedure_summaries()
         .expect("procedure-summary index address must resolve to its payload kind")
         .get(address.record as usize)
         .expect("procedure-summary index address must resolve to its record")
+        .clone()
 }
 
 pub fn absorb_procedure_posting(
     effective: &mut EffectiveProcedureClaims,
-    active: &[ActiveSemanticModelShard],
+    active: &[Arc<ActiveSemanticModelShard>],
+    posting: &[RecordAddress],
+    cancellation: &CancellationToken,
+    addresses_visited: &mut usize,
+) -> Result<(), String> {
+    absorb_procedure_posting_with(
+        effective,
+        &|address| {
+            let shard = &active[address.shard as usize];
+            (
+                indexed_procedure_summary(active, address),
+                (shard.evidence_rank, shard.source_rank),
+            )
+        },
+        posting,
+        cancellation,
+        addresses_visited,
+    )
+}
+
+fn absorb_procedure_posting_with(
+    effective: &mut EffectiveProcedureClaims,
+    lookup: &impl Fn(RecordAddress) -> (Arc<CompiledProcedureSummary>, (EvidenceRank, u8)),
     posting: &[RecordAddress],
     cancellation: &CancellationToken,
     addresses_visited: &mut usize,
 ) -> Result<(), String> {
     for &address in posting {
         poll_matcher_cancellation(cancellation, *addresses_visited)?;
-        *addresses_visited = (*addresses_visited).saturating_add(1);
-        effective.absorb(active, address);
+        *addresses_visited = addresses_visited.saturating_add(1);
+        effective.absorb_with(address, lookup);
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_normal_continuation_absence_candidates(
-    active: &[ActiveSemanticModelShard],
+    active: &[Arc<ActiveSemanticModelShard>],
     postings: &ProcedureSummaryTargetPostings,
     cancellation: &CancellationToken,
     entries: &mut usize,
     working_bytes: &mut u64,
     limits: SemanticModelRuntimeLimits,
+) -> Result<NormalContinuationAbsenceCandidateIndex, String> {
+    build_absence_candidates_with(
+        postings,
+        cancellation,
+        entries,
+        working_bytes,
+        limits,
+        &|address| {
+            let shard = &active[address.shard as usize];
+            (
+                indexed_procedure_summary(active, address),
+                (shard.evidence_rank, shard.source_rank),
+            )
+        },
+    )
+}
+
+fn build_absence_candidates_with(
+    postings: &ProcedureSummaryTargetPostings,
+    cancellation: &CancellationToken,
+    entries: &mut usize,
+    working_bytes: &mut u64,
+    limits: SemanticModelRuntimeLimits,
+    lookup: &impl Fn(RecordAddress) -> (Arc<CompiledProcedureSummary>, (EvidenceRank, u8)),
 ) -> Result<NormalContinuationAbsenceCandidateIndex, String> {
     let mut candidates = NormalContinuationAbsenceCandidateIndex::default();
     let mut addresses_visited = 0usize;
@@ -1662,9 +2471,9 @@ pub fn build_normal_continuation_absence_candidates(
                             let (_shape, posting) = variadic_postings
                                 .next()
                                 .expect("peeked variadic posting must remain available");
-                            absorb_procedure_posting(
+                            absorb_procedure_posting_with(
                                 &mut effective_variadic,
-                                active,
+                                lookup,
                                 posting,
                                 cancellation,
                                 &mut addresses_visited,
@@ -1677,15 +2486,16 @@ pub fn build_normal_continuation_absence_candidates(
                         // any already-applicable variadic posting.
                         let mut effective_at_arity = effective_variadic;
                         if let Some(posting) = shapes.fixed.get(&(has_receiver, arity)) {
-                            absorb_procedure_posting(
+                            absorb_procedure_posting_with(
                                 &mut effective_at_arity,
-                                active,
+                                lookup,
                                 posting,
                                 cancellation,
                                 &mut addresses_visited,
                             )?;
                         }
-                        if effective_at_arity.proves_normal_continuation_absent(active) {
+                        if matches!(effective_at_arity, EffectiveProcedureClaims::Unique { representative, .. } if lookup(representative).0.normal_continuation_absent)
+                        {
                             effective = true;
                             break;
                         }
@@ -1767,69 +2577,154 @@ pub fn insert_rule_trigger(
     )
 }
 
-pub fn resolve_posting<'a, T: Eq, F>(
-    shards: &'a [ActiveSemanticModelShard],
+pub fn resolve_posting<T: Eq, F>(
+    shards: &[Arc<ActiveSemanticModelShard>],
     posting: Option<&Vec<RecordAddress>>,
     mut resolve: F,
-) -> SemanticModelMatch<'a, T>
+) -> SemanticModelMatch<T>
 where
-    F: FnMut(&'a ActiveSemanticModelShard, usize) -> Option<&'a T>,
+    F: FnMut(&ActiveSemanticModelShard, usize) -> Option<&Arc<T>>,
 {
-    let Some(posting) = posting else {
-        return SemanticModelMatch {
-            records: Vec::new(),
-            disposition: SemanticModelMatchDisposition::Empty,
-            candidates_examined: 0,
-            fallback_candidates_examined: 0,
-        };
-    };
+    let posting = posting.map(Vec::as_slice).unwrap_or_default();
     let best_rank = posting
         .iter()
         .map(|address| {
             let shard = &shards[address.shard as usize];
             (shard.evidence_rank, shard.source_rank)
         })
-        .max()
-        .expect("non-empty semantic-model posting");
+        .max();
+    let candidates = posting
+        .iter()
+        .filter(|address| {
+            let shard = &shards[address.shard as usize];
+            Some((shard.evidence_rank, shard.source_rank)) == best_rank
+        })
+        .map(|address| {
+            let shard = &shards[address.shard as usize];
+            ActivatedSemanticModelRecord {
+                record: Arc::clone(
+                    resolve(shard, address.record as usize)
+                        .expect("semantic-model index address must resolve to its record kind"),
+                ),
+                shard: Arc::clone(shard),
+            }
+        });
+    resolve_ranked_records(candidates, best_rank, posting.len())
+}
+
+/// Keep decoded-only callers lazy, without allocating a result vector. The row
+/// branch already contains the ordered merge of both sources for this question.
+#[doc(hidden)]
+pub fn query_or_posting<T>(
+    rows: Option<Vec<T>>,
+    mut posting: impl Iterator<Item = T>,
+) -> impl Iterator<Item = T> {
+    let mut rows = rows.map(Vec::into_iter);
+    std::iter::from_fn(move || match &mut rows {
+        Some(rows) => rows.next(),
+        None => posting.next(),
+    })
+}
+
+/// Interleave publication-ordered answers from the two backings. Equal keys
+/// keep the decoded contributor first, matching a stable publication sort.
+#[doc(hidden)]
+pub fn merge_ordered_semantic_results<T>(
+    decoded: impl IntoIterator<Item = T>,
+    rows: impl IntoIterator<Item = T>,
+    compare: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> Vec<T> {
+    let mut decoded = decoded.into_iter().peekable();
+    let mut rows = rows.into_iter().peekable();
+    let mut result = Vec::new();
+    loop {
+        let next = match (decoded.peek(), rows.peek()) {
+            (Some(left), Some(right)) => {
+                if compare(left, right).is_le() {
+                    decoded.next()
+                } else {
+                    rows.next()
+                }
+            }
+            (Some(_), None) => decoded.next(),
+            (None, Some(_)) => rows.next(),
+            (None, None) => break,
+        };
+        result.push(next.expect("one merge input is nonempty"));
+    }
+    result
+}
+
+/// Shared evidence selection for decoded postings and query-owned catalog rows.
+#[doc(hidden)]
+pub fn resolve_records<T: Eq>(
+    candidates: Vec<ActivatedSemanticModelRecord<T>>,
+) -> SemanticModelMatch<T> {
+    let best_rank = candidates
+        .iter()
+        .map(|candidate| (candidate.shard.evidence_rank, candidate.shard.source_rank))
+        .max();
+    let candidates_examined = candidates.len();
+    resolve_ranked_records(candidates, best_rank, candidates_examined)
+}
+
+fn resolve_ranked_records<T: Eq>(
+    candidates: impl IntoIterator<Item = ActivatedSemanticModelRecord<T>>,
+    best_rank: Option<(EvidenceRank, u8)>,
+    candidates_examined: usize,
+) -> SemanticModelMatch<T> {
     let mut records = Vec::new();
-    for address in posting {
-        let shard = &shards[address.shard as usize];
-        if (shard.evidence_rank, shard.source_rank) != best_rank {
+    for candidate in candidates {
+        let shard = &candidate.shard;
+        if Some((shard.evidence_rank, shard.source_rank)) != best_rank {
             continue;
         }
-        let record = resolve(shard, address.record as usize)
-            .expect("semantic-model index address must resolve to its record kind");
+        let record = &candidate.record;
         if !records
             .iter()
-            .any(|candidate: &ActivatedSemanticModelRecord<'_, T>| {
-                candidate.record == record
+            .any(|candidate: &ActivatedSemanticModelRecord<T>| {
+                candidate.record.as_ref() == record.as_ref()
                     && !(candidate.shard.matched_evidence.ecosystem == "jdk"
                         && shard.matched_evidence.ecosystem == "jdk"
                         && candidate.shard.matched_evidence.artifact_sha256
                             != shard.matched_evidence.artifact_sha256)
             })
         {
-            records.push(ActivatedSemanticModelRecord { record, shard });
+            records.push(ActivatedSemanticModelRecord {
+                record: Arc::clone(record),
+                shard: Arc::clone(shard),
+            });
         }
     }
     SemanticModelMatch {
-        disposition: if records.len() == 1 {
-            SemanticModelMatchDisposition::Unique
-        } else {
-            SemanticModelMatchDisposition::Conflict
+        disposition: match records.len() {
+            0 => SemanticModelMatchDisposition::Empty,
+            1 => SemanticModelMatchDisposition::Unique,
+            _ => SemanticModelMatchDisposition::Conflict,
         },
         records,
-        candidates_examined: posting.len(),
+        candidates_examined,
         fallback_candidates_examined: 0,
     }
 }
 
-pub fn resolve_exact_procedure_postings<'a>(
-    shards: &'a [ActiveSemanticModelShard],
+fn summary_symbol_publication_order(shapes: &ProcedureSummaryShapePostings) -> (u32, u32) {
+    shapes
+        .fixed
+        .values()
+        .chain(shapes.variadic.values())
+        .flatten()
+        .map(|address| (address.shard, address.record))
+        .min()
+        .expect("an indexed summary symbol has a publication")
+}
+
+pub fn resolve_exact_procedure_postings(
+    shards: &[Arc<ActiveSemanticModelShard>],
     shapes: Option<&ProcedureSummaryShapePostings>,
     has_receiver: bool,
     formal_parameter_count: u32,
-) -> ProcedureSummaryMatch<'a> {
+) -> ProcedureSummaryMatch {
     let Some(shapes) = shapes else {
         return empty_procedure_match();
     };
@@ -1843,12 +2738,12 @@ pub fn resolve_exact_procedure_postings<'a>(
     )
 }
 
-pub fn resolve_applicable_procedure_postings<'a>(
-    shards: &'a [ActiveSemanticModelShard],
+pub fn resolve_applicable_procedure_postings(
+    shards: &[Arc<ActiveSemanticModelShard>],
     shapes: Option<&ProcedureSummaryShapePostings>,
     has_receiver: bool,
     actual_parameter_count: u32,
-) -> ProcedureSummaryMatch<'a> {
+) -> ProcedureSummaryMatch {
     resolve_applicable_procedure_postings_where(
         shards,
         shapes,
@@ -1858,8 +2753,8 @@ pub fn resolve_applicable_procedure_postings<'a>(
     )
 }
 
-pub fn resolve_applicable_procedure_postings_where<'a>(
-    shards: &'a [ActiveSemanticModelShard],
+pub fn resolve_applicable_procedure_postings_where(
+    shards: &[Arc<ActiveSemanticModelShard>],
     shapes: Option<&ProcedureSummaryShapePostings>,
     has_receiver: bool,
     actual_parameter_count: u32,
@@ -1867,7 +2762,7 @@ pub fn resolve_applicable_procedure_postings_where<'a>(
         &ActiveSemanticModelShard,
         &CompiledProcedureSummary,
     ) -> ProcedureSummaryAcceptance,
-) -> ProcedureSummaryMatch<'a> {
+) -> ProcedureSummaryMatch {
     resolve_applicable_procedure_postings_where_for_counts(
         shards,
         shapes,
@@ -1877,8 +2772,8 @@ pub fn resolve_applicable_procedure_postings_where<'a>(
     )
 }
 
-pub fn resolve_applicable_procedure_postings_where_for_counts<'a>(
-    shards: &'a [ActiveSemanticModelShard],
+pub fn resolve_applicable_procedure_postings_where_for_counts(
+    shards: &[Arc<ActiveSemanticModelShard>],
     shapes: Option<&ProcedureSummaryShapePostings>,
     has_receiver: bool,
     actual_parameter_counts: &[u32],
@@ -1886,7 +2781,7 @@ pub fn resolve_applicable_procedure_postings_where_for_counts<'a>(
         &ActiveSemanticModelShard,
         &CompiledProcedureSummary,
     ) -> ProcedureSummaryAcceptance,
-) -> ProcedureSummaryMatch<'a> {
+) -> ProcedureSummaryMatch {
     let Some(shapes) = shapes else {
         return empty_procedure_match();
     };
@@ -1913,9 +2808,7 @@ pub fn resolve_applicable_procedure_postings_where_for_counts<'a>(
     resolve_procedure_postings_where(shards, postings, procedure_claims_agree, accepts_record)
 }
 
-pub fn procedure_match_proves_normal_continuation_absent(
-    matched: &ProcedureSummaryMatch<'_>,
-) -> bool {
+pub fn procedure_match_proves_normal_continuation_absent(matched: &ProcedureSummaryMatch) -> bool {
     matched.disposition == SemanticModelMatchDisposition::Unique
         && matches!(
             matched.records.as_slice(),
@@ -1923,7 +2816,7 @@ pub fn procedure_match_proves_normal_continuation_absent(
         )
 }
 
-pub fn empty_procedure_match<'a>() -> ProcedureSummaryMatch<'a> {
+pub fn empty_procedure_match() -> ProcedureSummaryMatch {
     ProcedureSummaryMatch {
         applicability: ProcedureSummaryApplicability::Complete,
         records: Vec::new(),
@@ -1933,73 +2826,92 @@ pub fn empty_procedure_match<'a>() -> ProcedureSummaryMatch<'a> {
     }
 }
 
-pub fn resolve_procedure_postings<'a, 'posting>(
-    shards: &'a [ActiveSemanticModelShard],
+pub fn resolve_procedure_postings<'posting>(
+    shards: &[Arc<ActiveSemanticModelShard>],
     postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
     claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
-) -> ProcedureSummaryMatch<'a> {
+) -> ProcedureSummaryMatch {
     resolve_procedure_postings_where(shards, postings, claims_agree, |_, _| {
         ProcedureSummaryAcceptance::Accept(None)
     })
 }
 
-pub fn resolve_procedure_postings_where<'a, 'posting>(
-    shards: &'a [ActiveSemanticModelShard],
+pub fn resolve_procedure_postings_where<'posting>(
+    shards: &[Arc<ActiveSemanticModelShard>],
     postings: impl IntoIterator<Item = &'posting Vec<RecordAddress>>,
     claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
     accepts_record: impl Fn(
         &ActiveSemanticModelShard,
         &CompiledProcedureSummary,
     ) -> ProcedureSummaryAcceptance,
-) -> ProcedureSummaryMatch<'a> {
-    let mut candidates_examined = 0usize;
-    let mut best_rank = None;
-    let mut records = Vec::<ActivatedProcedureSummary<'a>>::new();
-    for posting in postings {
-        candidates_examined = candidates_examined.saturating_add(posting.len());
-        for address in posting {
+) -> ProcedureSummaryMatch {
+    let candidates = postings.into_iter().flat_map(|posting| {
+        posting.iter().map(|address| {
             let shard = &shards[address.shard as usize];
-            let payload = shard
-                .shard
+            let record = &shard
+                .decoded()
                 .payload()
                 .procedure_summaries()
-                .expect("procedure-summary index address must resolve to its payload kind");
-            let record = payload
-                .get(address.record as usize)
-                .expect("procedure-summary index address must resolve to its record");
-            let actual_to_formal = match accepts_record(shard, record) {
-                ProcedureSummaryAcceptance::Reject => continue,
-                ProcedureSummaryAcceptance::Accept(mapping) => mapping,
-            };
-            if records.iter().any(|candidate| {
-                claims_agree(candidate.record, record)
-                    && candidate.actual_to_formal == actual_to_formal
-            }) {
-                continue;
+                .expect("procedure-summary index address must resolve to its payload kind")
+                [address.record as usize];
+            ActivatedSemanticModelRecord {
+                record: Arc::clone(record),
+                shard: Arc::clone(shard),
             }
-            let rank = (shard.evidence_rank, shard.source_rank);
-            if best_rank.is_some_and(|best| rank < best) {
-                continue;
-            }
-            if best_rank.is_none_or(|best| rank > best) {
-                best_rank = Some(rank);
-                records.clear();
-            }
-            if records
-                .iter()
-                .any(|candidate| claims_agree(candidate.record, record))
-            {
-                continue;
-            }
-            records.push(ActivatedProcedureSummary {
-                record,
-                shard,
-                payload,
-                actual_to_formal,
-                matched_target_locator: None,
-                matched_call_arguments: None,
-            });
+        })
+    });
+    resolve_procedure_records(candidates, claims_agree, accepts_record)
+}
+
+/// Keep rank, duplicate claims and acceptance order identical for both backings.
+#[doc(hidden)]
+pub fn resolve_procedure_records(
+    candidates: impl IntoIterator<Item = ActivatedSemanticModelRecord<CompiledProcedureSummary>>,
+    claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
+    accepts_record: impl Fn(
+        &ActiveSemanticModelShard,
+        &CompiledProcedureSummary,
+    ) -> ProcedureSummaryAcceptance,
+) -> ProcedureSummaryMatch {
+    let mut candidates_examined = 0usize;
+    let mut best_rank = None;
+    let mut records = Vec::<ActivatedProcedureSummary>::new();
+    for candidate in candidates {
+        candidates_examined = candidates_examined.saturating_add(1);
+        let shard = candidate.shard;
+        let record = candidate.record;
+        let actual_to_formal = match accepts_record(&shard, &record) {
+            ProcedureSummaryAcceptance::Reject => continue,
+            ProcedureSummaryAcceptance::Accept(mapping) => mapping,
+        };
+        if records.iter().any(|candidate| {
+            claims_agree(&candidate.record, &record)
+                && candidate.actual_to_formal == actual_to_formal
+        }) {
+            continue;
         }
+        let rank = (shard.evidence_rank, shard.source_rank);
+        if best_rank.is_some_and(|best| rank < best) {
+            continue;
+        }
+        if best_rank.is_none_or(|best| rank > best) {
+            best_rank = Some(rank);
+            records.clear();
+        }
+        if records
+            .iter()
+            .any(|candidate| claims_agree(&candidate.record, &record))
+        {
+            continue;
+        }
+        records.push(ActivatedProcedureSummary {
+            record: Arc::clone(&record),
+            shard: Arc::clone(&shard),
+            actual_to_formal,
+            matched_target_locator: None,
+            matched_owner_identity: None,
+            matched_call_arguments: None,
+        });
     }
     ProcedureSummaryMatch {
         applicability: ProcedureSummaryApplicability::Complete,

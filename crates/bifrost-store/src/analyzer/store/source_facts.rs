@@ -1420,3 +1420,239 @@ pub(super) fn insert_source_facts_tx(
 
 #[cfg(test)]
 mod kotlin_publication_tests;
+
+#[cfg(test)]
+mod roundtrip_properties {
+    use super::super::{AnalyzerStore, decode_structural_nodes, decode_structural_roles};
+    use super::*;
+    use brokk_bifrost_core::analyzer::Range;
+    use brokk_bifrost_core::analyzer::parsed_file::{SourceImportFact, SourceImportPathFact};
+    use brokk_bifrost_core::analyzer::source_facts::{
+        SourceDeclaration, SourceFactRows, SourceOccurrence,
+    };
+    use brokk_bifrost_core::analyzer::structural::callable::CallSiteFacts;
+    use brokk_bifrost_core::analyzer::structural::facts::{
+        NormalizedNode, RoleTarget, StructuralFactRows,
+    };
+    use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+    use brokk_bifrost_core::compact_graph::CompactRows;
+
+    #[test]
+    fn source_families_roundtrip_distinct_ranges_flags_and_import_counts() {
+        let occurrence =
+            |start_byte, end_byte, start_line, end_line, provenance| SourceOccurrence {
+                range: Range {
+                    start_byte,
+                    end_byte,
+                    start_line,
+                    end_line,
+                },
+                provenance,
+            };
+        let id = SourceOccurrenceId::new;
+        let occurrences = SourceFactRows::new(
+            vec![
+                occurrence(0, 100, 1, 8, SourceOccurrenceProvenance::PrimaryNode),
+                occurrence(10, 40, 2, 4, SourceOccurrenceProvenance::ExplicitSubspan),
+                occurrence(20, 30, 3, 4, SourceOccurrenceProvenance::Embedded),
+            ],
+            vec![SourceDeclaration {
+                occurrence: id(0),
+                name: Some(id(1)),
+            }],
+        );
+        let nodes = (0..4)
+            .map(|index| NormalizedNode {
+                kind: if index == 3 {
+                    NormalizedKind::Call
+                } else {
+                    NormalizedKind::StringLiteral
+                },
+                boolean_value: None,
+                parenthesized: [Some(true), Some(false), None, None][index],
+                assignment_shape: None,
+                integer_literal_value: None,
+                duplicate_key: None,
+                is_async: None,
+                unsafe_context: None,
+                string_value: None,
+                construct: None,
+                occurrence: id(0),
+                parent: None,
+                name: Some(id(1)),
+                subtree_end: index as u32 + 1,
+                call_site: (index == 3).then(|| CallSiteFacts::unrefined().continuing()),
+            })
+            .collect();
+        let roles = [false, true]
+            .into_iter()
+            .map(|spread| RoleTarget {
+                role: Role::Kwarg,
+                spread,
+                keyword: Some(id(2)),
+                node: None,
+                occurrence: id(0),
+                name: Some(id(1)),
+            })
+            .collect();
+        let facts = ParsedSourceFacts {
+            js_ts: None,
+            php: None,
+            cpp: None,
+            go: None,
+            java: None,
+            scala: None,
+            ruby: None,
+            python: None,
+            source_bytes: 100,
+            occurrences,
+            structural: StructuralFactRows::new(
+                nodes,
+                CompactRows::from_parts(vec![0, 2, 2, 2, 2], roles),
+                CompactRows::from_parts(vec![0, 0, 0, 0, 0], vec![]),
+                vec![],
+            ),
+            native_site_occurrences: vec![],
+            native_declaration_sources: vec![],
+            declaration_visibilities: None,
+            rust_declaration_properties: vec![],
+            rust_modules: None,
+            rust_types: vec![],
+            rust_items: Default::default(),
+            imports: vec![SourceImportFact {
+                declaration: id(1),
+                target: Some(id(2)),
+                alias_occurrence: None,
+                statement: "import a.b.c".into(),
+                is_wildcard: false,
+                is_global: false,
+                is_macro_use: false,
+                identifier: Some("c".into()),
+                alias: None,
+                path: Some(SourceImportPathFact {
+                    kind: None,
+                    segments: vec!["a".into(), "b".into(), "c".into()],
+                    lexical_prefixes: vec!["outer".into(), "inner".into()],
+                    lexical_scopes: vec![id(0)],
+                }),
+            }],
+            generic_imports: vec![],
+            rust_import_contexts: vec![],
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let stored_facts = facts.clone();
+        let blob_id = store.conn.execute(move |conn| {
+            let facts = stored_facts;
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'fixture')",
+                ["1111111111111111111111111111111111111111"],
+            )
+            .unwrap();
+            let blob_id = tx.last_insert_rowid();
+            super::super::tests::roundtrip_blob_meta(&tx, blob_id, "");
+            insert_source_facts_tx(
+                None,
+                &tx,
+                blob_id,
+                &facts,
+                &[],
+                &[],
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            blob_id
+        });
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let mut conn = store.read_conn().unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            read_source_identity_rows(&tx, blob_id, 3, 1, &|| true)
+                .unwrap()
+                .unwrap(),
+            facts.occurrences
+        );
+        assert_eq!(
+            read_source_imports(&tx, blob_id, &|| true)
+                .unwrap()
+                .unwrap(),
+            facts.imports
+        );
+        let counts: (usize, usize, usize, usize) = tx.query_row(
+            "SELECT import_count, import_segment_count, import_scope_count, import_prefix_count FROM source_fact_manifests WHERE blob_id=?1",
+            [blob_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(counts, (1, 3, 1, 2));
+        for (table, expected) in [
+            ("source_imports", 1),
+            ("source_import_segments", 3),
+            ("source_import_scopes", 1),
+            ("source_import_prefixes", 2),
+        ] {
+            let count: usize = tx
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id=?1"),
+                    [blob_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "{table}");
+        }
+        let mut statement = tx.prepare("SELECT start_byte, end_byte, start_line, end_line, provenance FROM source_occurrences WHERE blob_id=?1 ORDER BY occurrence_id").unwrap();
+        let rows = statement
+            .query_map([blob_id], |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, usize>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, 100, 1, 8, "primary_node".into()),
+                (10, 40, 2, 4, "explicit_subspan".into()),
+                (20, 30, 3, 4, "embedded".into())
+            ]
+        );
+        let name_range: (usize, usize, usize, usize) = tx.query_row(
+            "SELECT name_start_byte, name_end_byte, name_start_line, name_end_line FROM source_declarations WHERE blob_id=?1",
+            [blob_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(name_range, (10, 40, 2, 4));
+        let (nodes, roles): (String, String) = tx
+            .query_row(
+                "SELECT json(nodes), json(roles) FROM source_structural_facts WHERE blob_id=?1",
+                [blob_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let nodes = decode_structural_nodes(&nodes).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.parenthesized)
+                .collect::<Vec<_>>(),
+            vec![Some(true), Some(false), None, None]
+        );
+        assert!(nodes[3].call_site.as_ref().unwrap().continues_callee_groups);
+        let roles = decode_structural_roles(&roles).unwrap();
+        assert_eq!(
+            roles.iter().map(|role| role.spread).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        for role in roles {
+            let keyword = role.keyword.unwrap();
+            let name = role.name.unwrap();
+            assert_eq!((keyword.start, keyword.end), (20, 30));
+            assert_eq!((name.start, name.end), (10, 40));
+        }
+    }
+}

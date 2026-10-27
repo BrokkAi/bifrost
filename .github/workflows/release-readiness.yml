@@ -999,6 +999,11 @@ jobs:
         if: ${{ inputs.qualify_open_content || !contains(fromJSON('["0.13.0","0.13.1"]'), needs.preflight.outputs.version) }}
         id: open-packs
         shell: bash
+        env:
+          # Public GitHub discovery otherwise shares the runner IP's anonymous
+          # quota; v0.14.1 readiness failed once with "unavailable" that way.
+          # The transport sends this token only to the selected repository's API.
+          PACK_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           receipt="${RUNNER_TEMP}/open-packs-receipt.json"

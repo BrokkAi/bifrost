@@ -763,3 +763,57 @@ impl<'a> ScalaEdgeResolver<'a> {
         )
     }
 }
+
+#[cfg(test)]
+mod cancellation_contract_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::CodeUnitIndex;
+
+    // The oracle is optional cancellation, independent of target selection:
+    // absence and a fresh token admit the same known, nonempty invocation.
+    #[test]
+    fn scala_usage_scan_without_token_runs_the_same_scan_as_an_active_token() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file(
+                "Api.scala",
+                "package app\nobject Api { def ping(): Int = 1 }\n",
+            )
+            .file(
+                "Use.scala",
+                "package app\nobject Use { def run(): Int = Api.ping() }\n",
+            )
+            .build();
+        let analyzer = ScalaAnalyzer::new(fixture.project_dyn());
+        let targets = analyzer.get_definitions("app.Api$.ping");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        let files = [fixture.file("Use.scala")].into_iter().collect();
+        let resolver = ScalaQueryResolver::try_new(&analyzer).unwrap();
+        let active = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let cancelled = brokk_bifrost_core::cancellation::CancellationToken::new();
+        cancelled.cancel();
+        let scopes = [
+            UsageScanScope::new(&files),
+            UsageScanScope::with_cancellation(&files, &active),
+            UsageScanScope::with_cancellation(&files, &cancelled),
+        ];
+        let results = scopes
+            .iter()
+            .map(|scope| {
+                let GraphUsageOutcome::Resolved(result) =
+                    resolver.find_usages(&analyzer, &targets, scope, 100)
+                else {
+                    panic!("Scala fixture must use its graph scanner");
+                };
+                result.into_either().expect("successful scan")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            results[0]
+                .iter()
+                .any(|hit| hit.snippet.contains("Api.ping()")),
+            "{results:?}"
+        );
+        assert_eq!(results[0], results[1]);
+        assert!(results[2].is_empty(), "{:?}", results[2]);
+    }
+}

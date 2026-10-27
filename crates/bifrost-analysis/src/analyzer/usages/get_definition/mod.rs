@@ -483,7 +483,8 @@ impl DefinitionLookupRequest {
 #[derive(Debug, Clone)]
 pub struct DefinitionLookupOutcome {
     /// Explicit declarations proved by an activated semantic model.
-    pub modeled_definitions: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    pub modeled_definitions:
+        Vec<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     pub status: DefinitionLookupStatus,
     pub reference: Option<ResolvedReferenceSite>,
     pub definitions: Vec<CodeUnit>,
@@ -521,7 +522,8 @@ pub struct NavigationTarget {
 #[derive(Debug, Clone)]
 pub struct NavigationLookupOutcome {
     #[doc(hidden)]
-    pub modeled_definitions: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    pub modeled_definitions:
+        Vec<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     pub status: DefinitionLookupStatus,
     #[doc(hidden)]
     pub reference: Option<ResolvedReferenceSite>,
@@ -1063,6 +1065,14 @@ impl ExactExternalCallProof {
             python_formal_slots: None,
             external_member_identity: None,
         }
+    }
+
+    /// An exact Rust trait declaration with an open implementation set.
+    #[doc(hidden)]
+    pub fn rust_trait_declaration(owner: &str, member: &str, parameter_count: u32) -> Self {
+        let mut proof = Self::rust_bound_external_member(owner, member, parameter_count);
+        proof.dispatch_extensibility = Some(DispatchExtensibility::Open);
+        proof
     }
 
     /// A call written as `crate::module::Owner::member(...)` whose leading

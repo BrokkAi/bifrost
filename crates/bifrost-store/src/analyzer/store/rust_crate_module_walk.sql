@@ -8,8 +8,8 @@
 -- relative to. The two agree for a crate root and for a `mod.rs`, and differ
 -- for every other file, which is why carrying only `module_dir` placed
 -- `#[path]` declarations in `lib.rs` and lost the identical declaration in an
--- ordinary module file. Inside an inline `mod` block both bases advance by the
--- block's name, so the inline arm sets them together.
+-- ordinary module file. An inline `mod` sets both bases to its explicit
+-- `#[path]` relative to path_dir, or advances module_dir by its name.
 --
 -- `?3` carries this crate's item-position macro decisions as a JSON array of
 -- `[blob_id, invocation_occurrence_id, decoration_cfg, no_route]`. A `mod
@@ -44,8 +44,10 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
   -- expansions of the same blob whose range holds the module's declaration.
   SELECT parent.module_path || '::' || declarations.module_name, parent.blob_id,
          scopes.ordinal, parent.rel_path, 'inline',
-         cr_join(parent.module_dir, declarations.module_name),
-         cr_join(parent.module_dir, declarations.module_name),
+         cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
+                 COALESCE(declarations.path_attribute, declarations.module_name)),
+         cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
+                 COALESCE(declarations.path_attribute, declarations.module_name)),
          CASE WHEN cr_cfg(properties.cfg_condition, ?2) <> 1
               THEN cr_cfg(properties.cfg_condition, ?2)
               WHEN EXISTS(SELECT 1 FROM source_rust_item_macro_expansions AS invocation

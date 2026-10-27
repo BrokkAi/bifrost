@@ -1368,6 +1368,7 @@ export function caller(flag: boolean) {
     };
 
     let outcome = execute(&analyzer, &query("receiver_outcome"));
+    assert_eq!(outcome.results.len(), 1, "{}", outcome.render_text());
     let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
         panic!("expected receiver outcome, got {}", outcome.render_text())
     };

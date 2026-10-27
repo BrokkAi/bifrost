@@ -225,8 +225,8 @@ impl<'a: 'selection, 'factory, 'selection, 'borrow> DefinitionBatchResolver<'a>
 
     fn release_before_store_read(&mut self) {
         // Exclusive readers own the writer mutex and must not survive a scalar
-        // lookup. Keep the scalar lifetime, including the pre-existing #6018
-        // in-memory macro-publication limitation; pooled WAL readers may reuse.
+        // lookup, whose store reads would wait for it; pooled WAL readers may
+        // reuse.
         if self
             .operation
             .as_ref()

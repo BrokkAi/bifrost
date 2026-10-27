@@ -806,7 +806,15 @@ impl<'source> RustResolutionBuilder<'source> {
                 node: owner.id(),
                 is_trait: owner.kind() == "trait_item",
             });
+        // Replay's tree ends at the invocation interior. Carry the enclosing
+        // Self owner just as expression/type macro fragments do, so replayed
+        // method receivers and Self types use the original trait/impl frontier.
+        let self_owner = self
+            .macro_fragment_self_owner(invocation, rust_tree_writes_self_path(&tree, self.source));
+        let previous_self_owner =
+            std::mem::replace(&mut self.macro_fragment_self_owner, self_owner);
         self.lower_replayed_items(tree.root_node());
+        self.macro_fragment_self_owner = previous_self_owner;
         self.embedded_declarations.clear();
         self.replayed_member_owner = None;
         self.retain_macro_fragment_tree(tree);
@@ -840,7 +848,7 @@ impl<'source> RustResolutionBuilder<'source> {
             // A nested expansion owns another occurrence map. Keep its item
             // surface explicit rather than silently treating it as empty.
             if node.kind() == "macro_invocation" {
-                let enumerated = self.lower_definition_less_item_macro_arguments(node);
+                let enumerated = self.lower_guessed_macro_arguments(node);
                 let site = self.add_site(
                     node,
                     ResolutionSiteKind::UnsupportedExpression,
@@ -954,6 +962,7 @@ impl<'source> RustResolutionBuilder<'source> {
         }
 
         if crate::declarations::rust_node_can_carry_item_attributes(node.kind()) {
+            self.lower_derive_macro_references(node);
             match rust_item_attribute_boundary(node, self.source) {
                 RustItemAttributeBoundary::SourcePreserving => {}
                 RustItemAttributeBoundary::GeneratedSurface
@@ -979,6 +988,41 @@ impl<'source> RustResolutionBuilder<'source> {
                     // names, members and impls, so absence remains open.
                     self.add_semantic_gap(node, ResolutionGapKind::GeneratedItemSurface);
                     self.lower_divan_bench_attribute_arguments(node);
+                    // Attribute heads name macros, independently of the
+                    // generated item surface. Keep their namespace separate
+                    // from a same-named ordinary function.
+                    for item in crate::syntax::outer_attributes(node) {
+                        let Some(attribute) = item.named_child(0) else {
+                            continue;
+                        };
+                        let Some(path) = attribute.named_child(0) else {
+                            continue;
+                        };
+                        if !rust_attribute_item_can_expand(item, self.source)
+                            || (path.kind() == "identifier"
+                                && matches!(
+                                    rust_node_text(path, self.source),
+                                    "cfg_attr" | "derive" | "macro_use"
+                                ))
+                        {
+                            continue;
+                        }
+                        if path.kind() == "identifier" {
+                            self.add_identifier(
+                                path,
+                                ResolutionSiteKind::MacroReference,
+                                ResolutionIdentifierRole::Reference,
+                                ResolutionNamespace::Macro,
+                                self.current_scope(),
+                            );
+                        } else {
+                            self.add_scoped_identifier(
+                                path,
+                                ResolutionSiteKind::MacroReference,
+                                ResolutionNamespace::Macro,
+                            );
+                        }
+                    }
                     // Keep the source declaration and authored items visible
                     // while retaining the local gap for generated names and
                     // member surfaces. Shared lookup discharges the name gap
@@ -1714,6 +1758,77 @@ impl<'source> RustResolutionBuilder<'source> {
         Some(output)
     }
 
+    /// Derive arguments are token-tree paths rather than scoped_identifier
+    /// nodes. Publish their original terminal tokens and reuse ordinary path
+    /// routing; selected resolution owns the macro's workspace or external target.
+    fn lower_derive_macro_references(&mut self, node: Node<'_>) {
+        for tokens in rust_item_derive_facts(node, self.source).paths {
+            // An empty final group is the optional trailing comma.
+            let Some(first) = tokens.first().copied() else {
+                continue;
+            };
+            let (anchor, path) = if first.kind() == "::" {
+                (ResolutionRootImportAnchor::Absolute, &tokens[1..])
+            } else {
+                (ResolutionRootImportAnchor::Lexical, tokens.as_slice())
+            };
+            if path.len() % 2 != 1
+                || path.iter().enumerate().any(|(position, token)| {
+                    if position % 2 == 0 {
+                        !matches!(token.kind(), "identifier" | "crate" | "self" | "super")
+                            || !name_node_has_spelling(*token)
+                            || rust_type_reference_is_self(*token, self.source)
+                    } else {
+                        token.kind() != "::"
+                    }
+                })
+            {
+                self.add_local_gap(first, ResolutionGapKind::MalformedSyntax);
+                continue;
+            }
+            let segments = path.iter().step_by(2).copied().collect::<Vec<_>>();
+            let terminal = *segments.last().expect("a derive path has a terminal");
+            if terminal.kind() != "identifier"
+                || rust_path_anchor_keyword(terminal, self.source)
+                || rust_path_segments_have_misplaced_anchor(
+                    segments.iter().copied(),
+                    self.source,
+                    false,
+                )
+            {
+                self.add_local_gap(first, ResolutionGapKind::MalformedSyntax);
+                continue;
+            }
+            let explicit_module_anchor = anchor == ResolutionRootImportAnchor::Absolute
+                || rust_path_anchor_keyword(segments[0], self.source);
+            let bare_qualified_route = segments.len() > 1 && !explicit_module_anchor;
+            let reference = if bare_qualified_route {
+                self.add_qualified_identifier(
+                    terminal,
+                    ResolutionSiteKind::MacroReference,
+                    ResolutionNamespace::Macro,
+                    self.current_scope(),
+                )
+            } else {
+                self.add_identifier(
+                    terminal,
+                    ResolutionSiteKind::MacroReference,
+                    ResolutionIdentifierRole::Reference,
+                    ResolutionNamespace::Macro,
+                    self.current_scope(),
+                )
+            };
+            self.add_root_reference_route(
+                terminal,
+                terminal,
+                reference,
+                Some(segments),
+                bare_qualified_route,
+                anchor,
+            );
+        }
+    }
+
     fn add_scoped_identifier(
         &mut self,
         node: Node<'_>,
@@ -1784,7 +1899,19 @@ impl<'source> RustResolutionBuilder<'source> {
         } else {
             self.add_qualified_identifier(name, site_kind, namespace, self.current_scope())
         };
-        self.add_root_reference_route(node, name, reference, segments, bare_qualified_route);
+        let anchor = if rust_path_is_leading_absolute(node) {
+            ResolutionRootImportAnchor::Absolute
+        } else {
+            ResolutionRootImportAnchor::Lexical
+        };
+        self.add_root_reference_route(
+            node,
+            name,
+            reference,
+            segments,
+            bare_qualified_route,
+            anchor,
+        );
         Some(reference)
     }
 
@@ -1852,6 +1979,7 @@ impl<'source> RustResolutionBuilder<'source> {
         reference: ResolutionSiteId,
         segments: Option<Vec<Node<'_>>>,
         bare_qualified_route: bool,
+        anchor: ResolutionRootImportAnchor,
     ) {
         let Some(segments) = segments else {
             self.mark_scoped_path_consumed(node);
@@ -1870,8 +1998,7 @@ impl<'source> RustResolutionBuilder<'source> {
             Some(terminal.id())
         );
         self.mark_scoped_path_consumed(node);
-        let leading_absolute = rust_path_is_leading_absolute(node);
-        let explicit_module_anchor = leading_absolute
+        let explicit_module_anchor = anchor == ResolutionRootImportAnchor::Absolute
             || segments
                 .first()
                 .is_some_and(|segment| rust_path_anchor_keyword(*segment, self.source));
@@ -1879,11 +2006,6 @@ impl<'source> RustResolutionBuilder<'source> {
             return;
         }
         let root_scope = self.nearest_root_scope();
-        let anchor = if leading_absolute {
-            ResolutionRootImportAnchor::Absolute
-        } else {
-            ResolutionRootImportAnchor::Lexical
-        };
         let first = segments[0];
         let self_prefix = bare_qualified_route && rust_type_reference_is_self(first, self.source);
         if self_prefix && segments.len() > 2 {
@@ -4495,14 +4617,6 @@ impl<'source> RustResolutionBuilder<'source> {
                 }
                 Some(reference)
             }
-            "scoped_type_identifier" | "scoped_identifier"
-                if node
-                    .child_by_field_name("path")
-                    .and_then(rust_qualified_type_path)
-                    .is_some() =>
-            {
-                self.lower_associated_type_reference(node)
-            }
             "scoped_type_identifier" | "scoped_identifier" => self.add_scoped_identifier(
                 node,
                 ResolutionSiteKind::TypeReference,
@@ -4605,14 +4719,6 @@ impl<'source> RustResolutionBuilder<'source> {
             )),
         });
         Some(output)
-    }
-
-    fn lower_associated_type_reference(&mut self, node: Node<'_>) -> Option<ResolutionSiteId> {
-        self.add_scoped_identifier(
-            node,
-            ResolutionSiteKind::TypeReference,
-            ResolutionNamespace::Type,
-        )
     }
 
     /// The type a `Self::name` lookup inside a trait body is bounded below by.
@@ -5088,30 +5194,10 @@ impl<'source> RustResolutionBuilder<'source> {
                         );
                     }
                 }
-                let mut bounds = parameter
-                    .child_by_field_name("bounds")
-                    .into_iter()
-                    .collect::<Vec<_>>();
                 let owner = parameters
                     .parent()
                     .expect("generic parameters have an item owner");
-                let mut owner_cursor = owner.walk();
-                for clause in owner
-                    .named_children(&mut owner_cursor)
-                    .filter(|child| child.kind() == "where_clause")
-                {
-                    let mut clause_cursor = clause.walk();
-                    for predicate in clause.named_children(&mut clause_cursor) {
-                        if let Some(left) = predicate.child_by_field_name("left")
-                            && left.kind() == "type_identifier"
-                            && strip_raw_identifier_prefix(rust_node_text(left, self.source))
-                                == strip_raw_identifier_prefix(rust_node_text(name, self.source))
-                            && let Some(bound) = predicate.child_by_field_name("bounds")
-                        {
-                            bounds.push(bound);
-                        }
-                    }
-                }
+                let bounds = crate::structural::rust_declared_type_bounds(owner, name, self.source);
                 // A type parameter's identity is a slot, never the parameter's
                 // own declaration: which type it stands for is decided by each
                 // use of the item, by inference the engine does not model. Its
@@ -5368,12 +5454,10 @@ impl<'source> RustResolutionBuilder<'source> {
         self.facts.type_transfers.push(ResolutionTypeTransferFact {
             input: transfer_input,
             output,
-            kind: if transfer_target.indirection == 0 && transfer_target.reference_indirection == 0
-            {
-                ResolutionTypeTransferKind::TypeIdentity
-            } else {
-                ResolutionTypeTransferKind::TypeAlias
-            },
+            kind: written_type_transfer_kind(
+                transfer_target.indirection,
+                transfer_target.reference_indirection,
+            ),
             indirection_delta: transfer_target.indirection,
             reference_indirection_delta: transfer_target.reference_indirection,
             value_transform: ResolutionTypeTransferValueTransform::Preserve,
@@ -5619,7 +5703,8 @@ impl<'source> RustResolutionBuilder<'source> {
             lowered.identity
         } else {
             // A default has no enclosing argument row to hold its deltas.
-            // Give it a written-type slot fed by the same nominal head.
+            // Like an alias target, retain a type object while adding the
+            // written reference or pointer layers to the nominal head.
             let site = self.add_site(
                 node,
                 ResolutionSiteKind::TypeReference,
@@ -5635,7 +5720,10 @@ impl<'source> RustResolutionBuilder<'source> {
             self.facts.type_transfers.push(ResolutionTypeTransferFact {
                 input: lowered.identity,
                 output,
-                kind: ResolutionTypeTransferKind::TypeIdentity,
+                kind: written_type_transfer_kind(
+                    lowered.indirection,
+                    lowered.reference_indirection,
+                ),
                 indirection_delta: lowered.indirection,
                 reference_indirection_delta: lowered.reference_indirection,
                 value_transform: ResolutionTypeTransferValueTransform::Preserve,
@@ -5708,18 +5796,17 @@ impl<'source> RustResolutionBuilder<'source> {
         ) else {
             return;
         };
-        self.declare_definition_namespace(
-            declaration,
-            ResolutionNamespace::Type,
-            HoistingClass::ScopeWide,
-        );
-        self.lower_module_body(node, Some(declaration));
+        let body = self.lower_module_body(node, None);
+        self.facts
+            .define_module(declaration, ResolutionNamespace::Type, body);
     }
 
-    fn lower_module_body(&mut self, node: Node<'_>, owner: Option<ResolutionSiteId>) {
-        let Some(body) = node.child_by_field_name("body") else {
-            return;
-        };
+    fn lower_module_body(
+        &mut self,
+        node: Node<'_>,
+        owner: Option<ResolutionSiteId>,
+    ) -> Option<ResolutionScopeId> {
+        let body = node.child_by_field_name("body")?;
         let scope = self.allocate_module_scope(
             self.item_scope(),
             owner,
@@ -5738,6 +5825,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 .is_none(),
             "one inline Rust module body owns one scope"
         );
+        Some(scope)
     }
 
     fn lower_macro_definition(
@@ -5935,7 +6023,8 @@ impl<'source> RustResolutionBuilder<'source> {
                     // An expansion made only of `impl` blocks binds no name in
                     // the module and opens only member surfaces
                     // (`UnexpandedImplMacro`).
-                    if !proofs.passthrough
+                    if !self.discharged_item_macros.contains(&node.id())
+                        && !proofs.passthrough
                         && !proofs.declares_no_item
                         && !frontier
                         && source_position != RustItemMacroSourcePosition::Other
@@ -5971,8 +6060,18 @@ impl<'source> RustResolutionBuilder<'source> {
             source_position,
             RustItemMacroSourcePosition::DirectItem | RustItemMacroSourcePosition::ItemStatement
         );
-        let enumerated = if item_position {
-            self.lower_definition_less_item_macro_arguments(node)
+        // A duplicate export has no unique transcriber authority. Parsing
+        // its input as an expression is only a guess, including when the
+        // invocation itself is in expression position.
+        let ambiguous_export = rust_unqualified_macro_invocation_name(node, self.source)
+            .or_else(|| crate::macro_matcher::crate_root_macro_invocation_name(node, self.source))
+            .is_some_and(|name| {
+                self.exported_macro_definitions
+                    .get(name)
+                    .is_some_and(Option::is_none)
+            });
+        let enumerated = if item_position || ambiguous_export {
+            self.lower_guessed_macro_arguments(node)
         } else {
             self.lower_definition_less_macro_arguments(node)
         };
@@ -6010,10 +6109,10 @@ impl<'source> RustResolutionBuilder<'source> {
         }
     }
 
-    /// Item arguments are guesses about an unsupported input grammar, even
-    /// when their expressions parse. Both primary and replayed item streams
-    /// must retain that reference uncertainty.
-    fn lower_definition_less_item_macro_arguments(&mut self, node: Node<'_>) -> bool {
+    /// Unsupported item input and ambiguous exports have no unique grammar
+    /// authority, even when their expressions parse. Both primary and replayed
+    /// fragments must retain that reference uncertainty.
+    fn lower_guessed_macro_arguments(&mut self, node: Node<'_>) -> bool {
         let guessing = self.guessing_macro_references;
         self.guessing_macro_references = true;
         let enumerated = self.lower_definition_less_macro_arguments(node);
@@ -6539,11 +6638,7 @@ impl<'source> RustResolutionBuilder<'source> {
                 else {
                     continue;
                 };
-                let typed_fragment = crate::macro_matcher::MacroTranscribedFragment {
-                    syntax_kind: "type_identifier".to_owned(),
-                    ..fragment.clone()
-                };
-                if macro_transcriber_fragment_node(&type_tree, &typed_fragment).is_none() {
+                if macro_transcriber_fragment_node(&type_tree, &fragment).is_none() {
                     continue;
                 }
                 Some(type_tree)
@@ -6564,14 +6659,14 @@ impl<'source> RustResolutionBuilder<'source> {
             let owners =
                 std::mem::replace(&mut self.declaration_owners, owner.into_iter().collect());
             if let Some(type_tree) = type_tree {
-                let typed_fragment = crate::macro_matcher::MacroTranscribedFragment {
-                    syntax_kind: "type_identifier".to_owned(),
-                    ..fragment
-                };
-                let node = macro_transcriber_fragment_node(&type_tree, &typed_fragment)
+                let node = macro_transcriber_fragment_node(&type_tree, &fragment)
                     .expect("parsed type fragment has its type identifier");
                 if !self.handled_identifiers.contains(&node.id()) {
-                    self.lower_bare_type_reference(node);
+                    if node.kind() == "scoped_type_identifier" {
+                        self.lower_qualified_type_reference(node);
+                    } else {
+                        self.lower_bare_type_reference(node);
+                    }
                 }
                 self.retain_macro_fragment_tree(type_tree);
             } else {
@@ -7049,7 +7144,8 @@ impl<'source> RustResolutionBuilder<'source> {
                     && let Some(declaration) = self.lower_capsule_module_declaration(node)
                     && let Some(body) = node.child_by_field_name("body")
                 {
-                    self.lower_module_body(node, Some(declaration));
+                    self.lower_module_body(node, Some(declaration))
+                        .expect("an inline Rust module has a body scope");
                     pending.push((body, false));
                 }
                 continue;
@@ -10229,18 +10325,6 @@ fn rust_projection_path_head(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn rust_qualified_type_path(path: Node<'_>) -> Option<Node<'_>> {
-    if path.kind() == "qualified_type" {
-        return Some(path);
-    }
-    if path.kind() != "bracketed_type" {
-        return None;
-    }
-    let mut cursor = path.walk();
-    path.named_children(&mut cursor)
-        .find(|child| child.kind() == "qualified_type")
-}
-
 fn rust_reference_impl_member_owner(mut node: Node<'_>) -> Option<Node<'_>> {
     let mut saw_reference = false;
     loop {
@@ -10742,7 +10826,7 @@ fn rust_effective_attributes<'tree>(
             && rust_node_text(attribute.path[0], source).trim() == "cfg_attr"
         {
             let arguments = attribute.arguments?;
-            let mut inner = rust_cfg_attr_inner_attributes(arguments)?;
+            let mut inner = rust_cfg_attr_inner_attributes(arguments, source)?;
             pending.extend(inner.drain(..).rev());
         } else {
             effective.push(attribute);
@@ -10808,6 +10892,7 @@ fn rust_unsafe_attribute_is_inert(arguments: Option<Node<'_>>, source: &str) -> 
 /// modeled conservatively for every possible configuration.
 fn rust_cfg_attr_inner_attributes<'tree>(
     arguments: Node<'tree>,
+    source: &str,
 ) -> Option<Vec<RustEffectiveItemAttribute<'tree>>> {
     if arguments.kind() != "token_tree" {
         return None;
@@ -10831,6 +10916,8 @@ fn rust_cfg_attr_inner_attributes<'tree>(
     if groups.len() < 2 || groups.iter().any(|group| group.is_empty()) {
         return None;
     }
+
+    crate::lexical_scope::rust_cfg_predicate_condition(groups[0], source)?;
 
     groups
         .into_iter()
@@ -11377,6 +11464,20 @@ fn validate_rust_resolution_facts(facts: &FileResolutionFacts) {
     }
 }
 
+/// The transfer kind for a written type whose nominal head gains reference
+/// or pointer layers. A type identity carries no layers, so any layer makes
+/// the transfer an alias that retains the head's type object.
+fn written_type_transfer_kind(
+    indirection: i8,
+    reference_indirection: i8,
+) -> ResolutionTypeTransferKind {
+    if indirection == 0 && reference_indirection == 0 {
+        ResolutionTypeTransferKind::TypeIdentity
+    } else {
+        ResolutionTypeTransferKind::TypeAlias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionDeclaredTypeRelationKind;
@@ -11395,6 +11496,39 @@ mod tests {
     use tree_sitter::{Node, Parser};
 
     use super::extract_rust_resolution_facts;
+
+    #[test]
+    fn grammar_attribute_expansion_boundaries() {
+        // cfg_attr is configuration dependent: every possible effective
+        // attribute must be inert to prove that it cannot generate code.
+        for (attribute, can_expand) in [
+            ("#[unsafe(no_mangle)]", false),
+            ("#[unsafe(unknown)]", true),
+            ("#[cfg_attr(flag, inline, unknown_attr)]", true),
+            ("#[cfg_attr(flag, unknown_attr, inline)]", true),
+            ("#[cfg_attr(flag, allow::inject)]", true),
+            ("#[cfg_attr(, inline)]", true),
+            ("#[cfg_attr(flag, inline,)]", false),
+            ("#[cfg_attr(flag, inline, cold)]", false),
+        ] {
+            let source = format!("{attribute} fn f() {{}}");
+            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut pending = vec![tree.root_node()];
+            let node = loop {
+                let node = pending.pop().expect("attribute in fixture");
+                if node.kind() == "attribute_item" {
+                    break node;
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            };
+            assert_eq!(
+                super::rust_attribute_item_can_expand(node, &source),
+                can_expand,
+                "{attribute}"
+            );
+        }
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -16825,6 +16959,99 @@ cfg_if::cfg_if! {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: malformed cfg_attr predicates supplied inert evidence"
+    )]
+    fn quicksilver_cfg_attr_predicate_requires_structure() {
+        for (predicate, can_expand) in [
+            ("42", true),
+            ("not()", true),
+            ("not(unix, windows)", true),
+            ("unknown(unix)", true),
+            ("all(42)", true),
+            ("unix = 42", true),
+            ("all[unix]", true),
+            ("", true),
+            ("unix", false),
+            ("feature = \"cli\"", false),
+            ("not(unix)", false),
+            ("all(unix, not(windows),)", false),
+            ("any()", false),
+            ("true", false),
+            ("false", false),
+        ] {
+            let source = format!("#[cfg_attr({predicate}, inline)] fn f() {{}}");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let mut pending = vec![tree.root_node()];
+            let attribute = loop {
+                let node = pending.pop().expect("fixture has an attribute");
+                if node.kind() == "attribute_item" {
+                    break node;
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            };
+            assert_eq!(
+                super::rust_attribute_item_can_expand(attribute, &source),
+                can_expand,
+                "{predicate}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: local wrapper names lost nominal impl owners"
+    )]
+    #[ignore = "finds real bug (#6844): local wrapper names are classified as std types before resolution"]
+    fn quicksilver_local_wrapper_impl_has_nominal_subject() {
+        for name in ["Box", "Option", "Result", "Arc", "Rc"] {
+            let source =
+                format!("struct {name}<T>(T); impl<T> {name}<T> {{ fn method(&self) {{}} }}");
+            let facts = parse_and_extract(&source);
+            let relation = facts
+                .declared_type_relations
+                .first()
+                .expect("impl relation");
+            let site = facts.type_slots[relation.subject.index()].site;
+            assert!(
+                !facts
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.site == site
+                        && gap.kind == ResolutionGapKind::UnsupportedTypeSyntax),
+                "local {name} impl subject was refused as a std wrapper"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: legal local trait impls for foreign wrappers lost their subjects"
+    )]
+    #[ignore = "finds real bug (#6844): local trait impls for foreign wrappers lose their nominal subjects"]
+    fn quicksilver_local_trait_foreign_wrapper_has_nominal_subject() {
+        let source = "trait Local { fn method(&self); } impl Local for std::boxed::Box<u8> { fn method(&self) {} }";
+        let facts = parse_and_extract(source);
+        let relation = facts
+            .declared_type_relations
+            .iter()
+            .find(|r| r.kind == ResolutionDeclaredTypeRelationKind::TraitImplementation)
+            .expect("trait impl");
+        let site = facts.type_slots[relation.subject.index()].site;
+        assert!(!facts.gaps.iter().any(|gap| gap.site == site && gap.kind == ResolutionGapKind::UnsupportedTypeSyntax),
+            "legal local trait impl subject was refused by the inherent-impl orphan rationale");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#5133: grouped tuple-field attributes shifted native positional field identities"
     )]
     fn grouped_tuple_field_attributes_do_not_shift_native_ordinals() {
@@ -17220,5 +17447,284 @@ generate_test!(Foo, self, self.bar);
             }),
             "the raw type name is a reference even when its canonical spelling is primitive-like: {facts:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_lowering_grammar_boundary {
+    use super::*;
+
+    #[test]
+    fn ownership_resolution_grammar_contract() {
+        let source = concat!(
+            "struct Widget<T>(T); type Plain = Widget<u8>; type Fish = Widget::<u8>;\n",
+            "impl Widget<u8> { fn instance(&self) {} fn associated() {} }\n",
+            "impl (u8, u8) { fn tuple_instance(&self) {} fn tuple_associated() {} }\n",
+            "trait Receiver { fn boxed(self: Box<Self>); fn static_call(); }\n",
+            "trait Bound { type Item; } fn capture<T>() -> impl Bound<Item = T> + use<T> { loop {} }\n",
+            "unsafe extern \"C\" { fn empty(); fn argument(value: u8); }\n",
+        );
+        let tree = crate::test_helpers::parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let mut pending = vec![tree.root_node()];
+        let mut type_heads = Vec::new();
+        let mut capture_return = None;
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "function_item"
+                    if node
+                        .child_by_field_name("name")
+                        .is_some_and(|name| &source[name.byte_range()] == "capture") =>
+                {
+                    capture_return = Some(
+                        node.child_by_field_name("return_type")
+                            .unwrap()
+                            .byte_range(),
+                    );
+                }
+                "type_item" => {
+                    let ty = node.child_by_field_name("type").unwrap();
+                    type_heads.push((
+                        ty.start_byte(),
+                        ty.kind(),
+                        ty.child_by_field_name("type").unwrap().kind(),
+                    ));
+                }
+                "type_binding" => {
+                    assert_eq!(
+                        node.child_by_field_name("name").unwrap().kind(),
+                        "type_identifier"
+                    );
+                    assert_eq!(
+                        node.child_by_field_name("type").unwrap().kind(),
+                        "type_identifier"
+                    );
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        type_heads.sort_unstable();
+        assert_eq!(
+            type_heads
+                .into_iter()
+                .map(|(_, kind, head)| (kind, head))
+                .collect::<Vec<_>>(),
+            [
+                ("generic_type", "type_identifier"),
+                ("generic_type", "type_identifier")
+            ]
+        );
+        let facts = extract_rust_resolution_facts(tree.root_node(), source);
+        let text = |site: ResolutionSiteId| {
+            let row = facts.sites[site.index()];
+            &source[row.start_byte..row.end_byte]
+        };
+        let mut access = facts
+            .deferred_member_owners
+            .iter()
+            .map(|member| (text(member.member), member.access))
+            .collect::<Vec<_>>();
+        access.extend(
+            facts
+                .member_owners
+                .iter()
+                .filter(|member| member.kind == ResolutionMemberKind::Method)
+                .map(|member| (text(member.member), member.access)),
+        );
+        access.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            access,
+            [
+                ("associated", ResolutionMemberAccess::Type),
+                ("boxed", ResolutionMemberAccess::Instance),
+                ("instance", ResolutionMemberAccess::Instance),
+                ("static_call", ResolutionMemberAccess::Type),
+                ("tuple_associated", ResolutionMemberAccess::Type),
+                ("tuple_instance", ResolutionMemberAccess::Instance),
+            ]
+        );
+        // Both alias spellings denote the same nominal head. A tuple impl
+        // remains unsupported, independently of receiver access syntax.
+        let nominal_projections = facts
+            .binding_projections
+            .iter()
+            .filter(|projection| {
+                projection.kind == BindingProjectionKind::TargetNominalTypeIdentity
+                    && text(projection.reference) == "Widget"
+            })
+            .count();
+        assert_eq!(nominal_projections, 3, "{facts:#?}");
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == ResolutionGapKind::UnsupportedTypeSyntax
+                    && text(gap.site) == "(u8, u8)")
+        );
+        let capture_return = capture_return.unwrap();
+        let within_return =
+            |site: ResolutionSiteId| capture_return.contains(&facts.sites[site.index()].start_byte);
+        assert!(
+            facts.type_transfers.iter().any(|transfer| transfer.kind
+                == ResolutionTypeTransferKind::TypeUnion
+                && within_return(facts.type_slots[transfer.output.index()].site)),
+            "trait return lowering ran"
+        );
+        assert!(
+            !facts.gaps.iter().any(|gap| gap.kind
+                == ResolutionGapKind::UnsupportedHierarchyTraversal
+                && within_return(gap.site)),
+            "precise captures introduce no supertype: {:?}",
+            facts
+                .gaps
+                .iter()
+                .map(|gap| (text(gap.site), gap.kind))
+                .collect::<Vec<_>>()
+        );
+        let bindings = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && text(identifier.site) == "Item"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1, "{bindings:?}");
+        assert!(
+            bindings[0].qualifier.is_some(),
+            "associated type binding selects a trait member"
+        );
+        let mut foreign_gaps = facts
+            .gaps
+            .iter()
+            .filter(|gap| matches!(text(gap.site), "empty" | "argument"))
+            .map(|gap| (text(gap.site), gap.kind))
+            .collect::<Vec<_>>();
+        foreign_gaps.sort_by_key(|(name, kind)| (*name, format!("{kind:?}")));
+        assert!(
+            foreign_gaps.iter().any(|(name, kind)| *name == "argument"
+                && *kind == ResolutionGapKind::UnsupportedCallApplicability),
+            "{foreign_gaps:?}"
+        );
+        assert!(
+            !foreign_gaps.iter().any(|(name, kind)| *name == "empty"
+                && *kind == ResolutionGapKind::UnsupportedCallApplicability),
+            "{foreign_gaps:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod qs3_resolution_contract {
+    use super::*;
+    use crate::test_helpers::{parse_rust, parse_rust_fixture};
+
+    #[test]
+    fn qs3_constructor_and_type_grammar_boundary() {
+        let source = "struct Pair<T>(T); mod api { struct Named; } macro_rules! take_type { ($t:ty) => {}; } fn f() { let Pair(x) = input; let Pair::<u8>(y) = input; let value: crate::api::Named; take_type!(crate::api::Named); } fn typed() -> crate::api::Named { loop {} }";
+        let tree = parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let parsed = parse_rust_fixture(source);
+        let facts = parsed.resolution_facts;
+        let mut pending = vec![tree.root_node()];
+        let mut constructors = Vec::new();
+        let mut types = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "tuple_struct_pattern" {
+                let mut head = node.child_by_field_name("type").unwrap();
+                if head.kind() == "generic_type" {
+                    head = head.child_by_field_name("type").unwrap();
+                }
+                constructors.push((head.start_byte(), head.end_byte()));
+                assert!(
+                    facts
+                        .sites
+                        .iter()
+                        .any(|site| site.start_byte == head.start_byte()
+                            && site.end_byte == head.end_byte()
+                            && site.kind == ResolutionSiteKind::ValueReference)
+                );
+            }
+            if node.kind() == "scoped_type_identifier"
+                && &source[node.byte_range()] == "crate::api::Named"
+            {
+                types.push(node.byte_range());
+                assert!(facts.sites.iter().any(|site| site.start_byte
+                    == node.child_by_field_name("name").unwrap().start_byte()
+                    && site.end_byte == node.end_byte()
+                    && site.kind == ResolutionSiteKind::TypeReference));
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(constructors.len(), 2);
+        assert_eq!(types.len(), 2);
+        // The captured :ty fragment has the same type role as AST annotations.
+        let named_type_references = facts
+            .sites
+            .iter()
+            .filter(|site| {
+                site.kind == ResolutionSiteKind::TypeReference
+                    && &source[site.start_byte..site.end_byte] == "Named"
+            })
+            .count();
+        assert_eq!(named_type_references, 3);
+    }
+
+    #[test]
+    fn qs3_projection_head_grammar_boundary() {
+        let source = "type A = <Service as Runner>::Output::Nested; type B = <Service as Runner>::Output<u8>::Nested; fn f() { <Service as Runner>::Output::new(); }";
+        let tree = parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut paths = Vec::new();
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "scoped_type_identifier" | "scoped_identifier")
+                && matches!(
+                    &source[node.byte_range()],
+                    "<Service as Runner>::Output::Nested"
+                        | "<Service as Runner>::Output<u8>::Nested"
+                        | "<Service as Runner>::Output::new"
+                )
+            {
+                let head = rust_projection_path_head(node).unwrap();
+                assert_eq!(head.kind(), "bracketed_type");
+                assert_eq!(&source[head.byte_range()], "<Service as Runner>");
+                paths.push(node.kind());
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "scoped_identifier",
+                "scoped_type_identifier",
+                "scoped_type_identifier"
+            ]
+        );
+    }
+
+    #[test]
+    fn qs3_empty_import_route_boundary() {
+        for (source, empty) in [
+            (
+                "use crate::{}; fn target() {} fn call() { target(); }",
+                true,
+            ),
+            ("use crate::{nested::{/*empty*/}}; fn target() {}", true),
+            ("use *; fn target() {}", false),
+        ] {
+            let parsed = parse_rust_fixture(source);
+            let gaps = &parsed.resolution_facts.gaps;
+            assert!(!gaps.is_empty(), "route classification ran: {source}");
+            let unknown_binder = gaps
+                .iter()
+                .any(|gap| matches!(gap.route(), Some(ResolutionRouteGap::UnknownBinder { .. })));
+            assert_eq!(unknown_binder, !empty, "{source}: {gaps:?}");
+        }
     }
 }

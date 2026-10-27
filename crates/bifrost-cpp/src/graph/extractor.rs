@@ -18,6 +18,7 @@ use crate::graph::hits::{
     push_type_hit_range, push_unproven_definition_hit, push_unproven_hit,
     push_unproven_reference_hit_range,
 };
+use crate::graph::namespace_alias::NamespaceQualifierBinding;
 use crate::graph::resolver::*;
 use crate::graph::syntax::{
     function_macro_replacement_span, object_macro_replacement_type_references,
@@ -393,74 +394,107 @@ fn collect_semantic_using_enums(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    struct Frame<'tree> {
+        node: Node<'tree>,
+        next_child: Option<Node<'tree>>,
+        previous_child: Option<Node<'tree>>,
+        entered: bool,
+        enters_scope: bool,
+        enters_using_enum_scope: bool,
+        fractured_function_scope: bool,
+    }
+    impl<'tree> Frame<'tree> {
+        fn new(node: Node<'tree>) -> Self {
+            Self {
+                node,
+                next_child: node.named_child(0),
+                previous_child: None,
+                entered: false,
+                enters_scope: false,
+                enters_using_enum_scope: false,
+                fractured_function_scope: false,
+            }
+        }
+    }
     if *ctx.limit_exceeded {
         return;
     }
-    let enters_scope = matches!(
-        node.kind(),
-        "compound_statement"
-            | "function_definition"
-            | "lambda_expression"
-            | "for_statement"
-            | "for_range_loop"
-            | "while_statement"
-            | "if_statement"
-    );
-    let enters_using_enum_scope = ctx.needs_using_enum_member_resolution
-        && (enters_scope
-            || matches!(
+    let mut stack = vec![Frame::new(node)];
+    while let Some(current) = stack.last_mut() {
+        let node = current.node;
+        let translation_unit = node.kind() == "translation_unit";
+        if !current.entered {
+            current.entered = true;
+            current.enters_scope = matches!(
                 node.kind(),
-                "namespace_definition" | "class_specifier" | "struct_specifier" | "union_specifier"
-            ));
-    if enters_scope {
-        ctx.bindings.enter_scope();
-        ctx.local_shadows.enter_scope();
-    }
-    if enters_using_enum_scope {
-        ctx.using_enum_owners.enter_scope();
-    }
-
-    seed_declarations(node, ctx);
-    maybe_record_hit(node, ctx);
-
-    let translation_unit = node.kind() == "translation_unit";
-    let mut fractured_function_scope = false;
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if translation_unit && fractured_function_scope && child.kind() == "ERROR" {
-            ctx.bindings.exit_scope();
-            ctx.local_shadows.exit_scope();
-            fractured_function_scope = false;
+                "compound_statement"
+                    | "function_definition"
+                    | "lambda_expression"
+                    | "for_statement"
+                    | "for_range_loop"
+                    | "while_statement"
+                    | "if_statement"
+            );
+            current.enters_using_enum_scope = ctx.needs_using_enum_member_resolution
+                && (current.enters_scope
+                    || matches!(
+                        node.kind(),
+                        "namespace_definition"
+                            | "class_specifier"
+                            | "struct_specifier"
+                            | "union_specifier"
+                    ));
+            if current.enters_scope {
+                ctx.bindings.enter_scope();
+                ctx.local_shadows.enter_scope();
+            }
+            if current.enters_using_enum_scope {
+                ctx.using_enum_owners.enter_scope();
+            }
+            seed_declarations(node, ctx);
+            maybe_record_hit(node, ctx);
         }
-        scan_node(child, ctx);
-        if *ctx.limit_exceeded {
-            break;
-        }
-        if translation_unit
+        if let Some(child) = current.previous_child.take()
+            && !*ctx.limit_exceeded
+            && translation_unit
             && macro_fractured_function(child)
             && macro_fracture_boundary(child).is_some()
         {
-            if fractured_function_scope {
+            if current.fractured_function_scope {
                 ctx.bindings.exit_scope();
                 ctx.local_shadows.exit_scope();
             }
             ctx.bindings.enter_scope();
             ctx.local_shadows.enter_scope();
             seed_fractured_function_prefix(child, ctx);
-            fractured_function_scope = true;
+            current.fractured_function_scope = true;
         }
-    }
-    if fractured_function_scope {
-        ctx.bindings.exit_scope();
-        ctx.local_shadows.exit_scope();
-    }
-
-    if enters_scope {
-        ctx.bindings.exit_scope();
-        ctx.local_shadows.exit_scope();
-    }
-    if enters_using_enum_scope {
-        ctx.using_enum_owners.exit_scope();
+        // Unwind every entered scope once the hit limit has been reached.
+        if !*ctx.limit_exceeded
+            && let Some(child) = current.next_child.take()
+        {
+            current.next_child = child.next_named_sibling();
+            if translation_unit && current.fractured_function_scope && child.kind() == "ERROR" {
+                ctx.bindings.exit_scope();
+                ctx.local_shadows.exit_scope();
+                current.fractured_function_scope = false;
+            }
+            current.previous_child = Some(child);
+            stack.push(Frame::new(child));
+            continue;
+        }
+        if current.fractured_function_scope {
+            ctx.bindings.exit_scope();
+            ctx.local_shadows.exit_scope();
+        }
+        if current.enters_scope {
+            ctx.bindings.exit_scope();
+            ctx.local_shadows.exit_scope();
+        }
+        if current.enters_using_enum_scope {
+            ctx.using_enum_owners.exit_scope();
+        }
+        stack.pop();
     }
 }
 
@@ -488,6 +522,9 @@ pub fn macro_fracture_boundary(node: Node<'_>) -> Option<usize> {
     if !matches!(
         first_orphan.kind(),
         "expression_statement"
+            | "compound_statement"
+            | "preproc_if"
+            | "preproc_ifdef"
             | "if_statement"
             | "for_statement"
             | "while_statement"
@@ -518,32 +555,29 @@ fn seed_fractured_function_prefix(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_fractured_active_path(node: Node<'_>, cutoff: usize, ctx: &mut ScanCtx<'_>) {
-    if node.start_byte() >= cutoff {
-        return;
-    }
-    let enters_scope = matches!(
-        node.kind(),
-        "compound_statement"
-            | "function_definition"
-            | "lambda_expression"
-            | "for_range_loop"
-            | "for_statement"
-            | "while_statement"
-            | "if_statement"
-            | "class_specifier"
-            | "struct_specifier"
-            | "union_specifier"
-    );
-    if enters_scope && !(node.start_byte() <= cutoff && cutoff < node.end_byte()) {
-        return;
-    }
-    seed_declarations(node, ctx);
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= cutoff {
-            break;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= cutoff {
+            continue;
         }
-        seed_fractured_active_path(child, cutoff, ctx);
+        let enters_scope = matches!(
+            node.kind(),
+            "compound_statement"
+                | "function_definition"
+                | "lambda_expression"
+                | "for_range_loop"
+                | "for_statement"
+                | "while_statement"
+                | "if_statement"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+        );
+        if enters_scope && !(node.start_byte() <= cutoff && cutoff < node.end_byte()) {
+            continue;
+        }
+        seed_declarations(node, ctx);
+        push_named_children_reversed(node, &mut stack);
     }
 }
 
@@ -558,7 +592,9 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "parameter_declaration" | "optional_parameter_declaration" => seed_typed_binding(node, ctx),
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
         "for_range_loop" => seed_range_binding(node, ctx),
-        "expression_statement" => seed_function_macro_local_binding(node, ctx),
+        "expression_statement" | "macro_type_specifier" => {
+            seed_function_macro_local_binding(node, ctx)
+        }
         "assignment_expression" => seed_function_macro_container_binding(node, ctx),
         "using_declaration" => seed_using_enum(node, ctx),
         _ => {}
@@ -1185,6 +1221,20 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             {
                 *ctx.raw_match_count += 1;
                 push_type_hit(terminal, ctx);
+            } else if ctx
+                .visibility
+                .is_physically_visible(ctx.file, &ctx.spec.target)
+                && ctx.visibility.declaration_guards_compatible_at_reference(
+                    &ctx.analyzer,
+                    ctx.file,
+                    &ctx.spec.target,
+                    terminal,
+                )
+            {
+                // The structured owner and terminal identify a candidate, but
+                // do not establish its conditional availability.
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(terminal, ctx);
             }
             return;
         }
@@ -1374,7 +1424,14 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if type_reference_components(node, ctx.source).is_some_and(|(components, global)| {
-        components.len() == 1 && !global && local_type_name_shadows(node, ctx)
+        components.len() == 1
+            && !global
+            && (local_type_name_shadows(node, ctx)
+                || ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+                    && nearer_type_name_shadows_structured_reference(node, ctx))
     }) {
         return;
     }
@@ -2078,42 +2135,6 @@ fn target_guided_nested_type_terminal_hit<'tree>(
         return Some(node);
     }
 
-    if ctx
-        .analyzer
-        .type_alias_provider()
-        .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
-        && !ctx
-            .analyzer
-            .parent_of(&ctx.spec.target)
-            .is_some_and(|owner| owner.is_class())
-        && let Some(target_owner) = target_owner.as_ref()
-        && let LexicalTypeResolution::Resolved {
-            unit, candidates, ..
-        } = resolve_type_components_lexically_at_for_target_with_scope_cache(
-            complete,
-            &owner.names,
-            owner.global,
-            &ctx.analyzer,
-            ctx.visibility,
-            &ctx.ordinary_type_imports,
-            ctx.file,
-            ctx.source,
-            target_owner,
-            false,
-            Some(&ctx.lexical_scope_cache),
-        )
-        && (ctx
-            .visibility
-            .same_template_owner_identity(&unit, target_owner)
-            || candidates.iter().any(|candidate| {
-                ctx.visibility
-                    .same_template_owner_identity(candidate, target_owner)
-            }))
-        && target_member_visible(target_owner)
-    {
-        return Some(node);
-    }
-
     let enclosing_owner = structured_enclosing_owner(node, ctx)?;
     let lexical_scope = canonical_cpp_scope_components(&enclosing_owner);
     let owner_resolution = ctx.visibility.resolve_type_components_lexically(
@@ -2685,6 +2706,25 @@ fn type_reference_components_may_name_target(node: Node<'_>, ctx: &ScanCtx<'_>) 
     let Some((components, global)) = type_reference_components(reference, ctx.source) else {
         return false;
     };
+    if !global
+        && components.len() > 1
+        && let Some(alias_type) = local_receiver_alias_type_node(reference, &components[0], ctx)
+    {
+        let Ok(Some(owner)) = resolve_receiver_type_node(alias_type, ctx) else {
+            return false;
+        };
+        let mut redirected = canonical_cpp_scope_components(&owner);
+        redirected.extend_from_slice(&components[1..]);
+        return type_reference_component_list_may_name_target(
+            &redirected,
+            true,
+            &ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            &ctx.spec.target,
+            &ctx.type_reference_component_names,
+        );
+    }
     type_reference_component_list_may_name_target(
         &components,
         global,
@@ -3875,15 +3915,15 @@ fn static_qualifier_type_scopes_for_components<'tree>(
     ctx: &ScanCtx<'_>,
 ) -> Option<Vec<Node<'tree>>> {
     if !qualified.global
-        && qualified.names.first().is_some_and(|name| {
-            name == ctx.spec.target.identifier()
-                && qualified
-                    .nodes
-                    .first()
-                    .is_some_and(|owner| local_type_name_shadows(*owner, ctx))
-        })
+        && let Some(name) = qualified.names.first()
+        && let Some(alias_type) = local_receiver_alias_type_node(node, name, ctx)
     {
-        return None;
+        return match resolve_receiver_type_node(alias_type, ctx) {
+            Ok(Some(owner)) if same_visible_symbol(&owner, &ctx.spec.target) => {
+                Some(vec![qualified.nodes[0]])
+            }
+            _ => None,
+        };
     }
     let mut matches = Vec::new();
     let mut inherited_injected_name_is_shadowed = false;
@@ -4129,12 +4169,6 @@ fn canonical_alias_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> CodeUnit {
     let structured = ctx
         .visibility
         .canonical_type_unit(&ctx.analyzer, ctx.file, candidate);
-    if let Some(canonical) = structured
-        .as_ref()
-        .filter(|canonical| !same_visible_symbol(canonical, candidate))
-    {
-        return canonical.clone();
-    }
     structured.unwrap_or_else(|| candidate.clone())
 }
 
@@ -4721,6 +4755,14 @@ fn target_guided_qualifier_type_scopes<'tree>(
     }
     let target = physically_visible_type_target(ctx)?;
     let qualified = qualified_owner_components(node, ctx.source)?;
+    if !qualified.global
+        && qualified
+            .names
+            .first()
+            .is_some_and(|name| local_receiver_alias_type_node(node, name, ctx).is_some())
+    {
+        return static_qualifier_type_scopes_for_components(node, qualified, ctx);
+    }
     // Prefer the C++ lexical tier that exactly matches a candidate's indexed
     // scope before falling back to suffix recovery.  A short unqualified
     // owner can have a same-spelled class in a nested namespace (for example
@@ -4786,6 +4828,9 @@ fn target_guided_qualifier_type_scopes<'tree>(
                 && member_alias_owner_matches_reference_for(candidate, node, ctx);
             let macro_namespace_owner_match = is_declaration_name(node)
                 && macro_namespace_scope_matches(candidate_owner, node, ctx);
+            if qualified.global && !exact_lexical_scope {
+                continue;
+            }
             if components.len() == 1
                 && candidate_components != components
                 && !exact_lexical_scope
@@ -8138,6 +8183,14 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         *ctx.raw_match_count += 1;
+        if !ctx.visibility.declaration_guards_compatible_at_reference(
+            &ctx.analyzer,
+            ctx.file,
+            &ctx.spec.target,
+            field,
+        ) {
+            return;
+        }
         let receiver = node
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"));
@@ -8145,18 +8198,31 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             receiver.map(|receiver| explicit_receiver_target_resolution(receiver, None, ctx));
         match receiver_resolution {
             Some(MethodReceiverTargetResolution::Target)
-                if !ctx.analyzer.reference_uses_c_semantics(ctx.file)
-                    || ctx.visibility.declaration_visible_at_reference(
-                        &ctx.analyzer,
-                        ctx.file,
-                        &ctx.spec.target,
-                        field,
-                    ) =>
+                if ctx.visibility.declaration_visible_at_reference(
+                    &ctx.analyzer,
+                    ctx.file,
+                    &ctx.spec.target,
+                    field,
+                ) || (!ctx.analyzer.reference_uses_c_semantics(ctx.file)
+                    && ctx.spec.target.source() == ctx.file
+                    && ctx
+                        .visibility
+                        .external_type_candidate_guard_compatible_in_context(
+                            &ctx.analyzer,
+                            ctx.file,
+                            &ctx.spec.target,
+                            field,
+                        )) =>
             {
+                // The receiver proves the C++ member owner, including fields
+                // recovered without callable activation facts. Its guard still
+                // needs implication and stability, even in the same file.
                 push_hit(field, ctx)
             }
-            Some(MethodReceiverTargetResolution::Target) => {}
-            Some(MethodReceiverTargetResolution::Missing) | None => push_unproven_hit(field, ctx),
+            Some(
+                MethodReceiverTargetResolution::Target | MethodReceiverTargetResolution::Missing,
+            )
+            | None => push_unproven_hit(field, ctx),
             Some(
                 MethodReceiverTargetResolution::NonTarget
                 | MethodReceiverTargetResolution::Ambiguous,
@@ -8419,10 +8485,11 @@ fn namespace_value_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 ///
 /// Follow the structured `scope`/`name` links rather than every ancestor, which
 /// covers all three cases with one rule.
+/// Whether `node` lies on the scope/name path of an enclosing
+/// `qualified_identifier`, which owns the complete name. The grammar nests
+/// `::A::b` and `n::A::b` as a qualified suffix `A::b`; resolving that suffix
+/// on its own would drop the leading `::` or `n::` qualifier.
 fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
-    if node.kind() == "qualified_identifier" {
-        return false;
-    }
     let mut current = node;
     while let Some(parent) = current.parent() {
         let on_name_path = ["scope", "name"].into_iter().any(|field| {
@@ -9052,6 +9119,10 @@ fn local_receiver_alias_type_node<'tree>(
         }
         if local_type_alias_name_node(current)
             .is_some_and(|alias_name| node_text(alias_name, ctx.source) == name)
+            && current
+                .parent()
+                .is_none_or(|parent| parent.kind() != "template_declaration")
+            && has_function_scope_ancestor(current)
             && local_alias_scope_contains_node(current, node)
         {
             let replace = best
@@ -9432,7 +9503,15 @@ fn receiver_owner_matches_target(
                         .visibility
                         .is_physically_visible(ctx.file, receiver_owner))
                 || visible_target_peer_matches_owner(receiver_owner, reference_byte, ctx)
-                || target_group_contains_owner_peer(receiver_owner, ctx))
+                || target_group_contains_owner_peer(receiver_owner, ctx)
+                // An identical definition of the class in a header this file
+                // includes is the target's owner too, the relation forward
+                // definition lookup crosses from the body's side (#6902).
+                || ctx.visibility.same_logical_class_definition(
+                    &ctx.analyzer,
+                    receiver_owner,
+                    target_owner,
+                ))
 }
 
 fn receiver_owner_is_known_non_target(
@@ -10392,12 +10471,20 @@ pub fn resolve_type_node_lexically(
     if indexed_scope.len() <= namespace_scope.len() {
         return resolution;
     }
-    let indexed = visibility.resolve_type_components_lexically(
-        analyzer,
-        file,
+    let indexed = resolve_type_components_in_authoritative_scope(
+        node,
         &components,
         global,
-        &indexed_scope,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        None,
+        false,
+        false,
+        false,
+        indexed_scope,
     );
     match indexed {
         LexicalTypeResolution::Resolved { ref unit, .. }
@@ -10411,6 +10498,9 @@ pub fn resolve_type_node_lexically(
     }
 }
 
+/// Resolve a type lexically, using the target to guide incomplete evidence.
+/// A lexical resolution visible in context wins over target guidance even when
+/// its unit and candidates do not include the target.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_type_node_lexically_for_target(
     node: Node<'_>,
@@ -10653,15 +10743,8 @@ pub fn resolve_type_node_lexically_for_target(
         target,
     );
     match indexed {
-        LexicalTypeResolution::Resolved {
-            ref unit,
-            ref candidates,
-            ..
-        } if (same_visible_symbol(unit, target)
-            || candidates
-                .iter()
-                .any(|candidate| same_visible_symbol(candidate, target)))
-            && visibility
+        LexicalTypeResolution::Resolved { ref unit, .. }
+            if visibility
                 .external_type_candidate_visible_in_context(analyzer, file, unit, node) =>
         {
             indexed
@@ -11142,12 +11225,7 @@ fn collect_source_using_index(
             // walk and the total cost is O(nodes + using declarations * ancestor depth).
             #[cfg(any(test, feature = "test-support"))]
             cpp.record_using_guard_context_inspection_for_test();
-            let required_guards = if callable_preprocessor_context_is_visible(node, source) {
-                Some(HashSet::default())
-            } else {
-                preprocessor_guard_environment(node, source)
-            };
-            let Some(required_guards) = required_guards else {
+            let Some(required_guards) = binding_site_guards(node, source) else {
                 let mut cursor = node.walk();
                 stack.extend(node.children(&mut cursor));
                 continue;
@@ -12552,8 +12630,77 @@ fn resolve_type_components_lexically_at_scoped(
 /// Unlike parser-derived scope, this scope must not be replaced with the
 /// queried target's namespace: doing so would let target guidance override a
 /// nearer declaration represented by the recovered syntax.
+///
+/// A qualifier that names a namespace alias in effect at `node` is rebound
+/// here, once, for forward and inverse lookup alike: the rebound name is
+/// looked up from the scope of the alias that supplies it. An ordinary name
+/// the written spelling reaches at a deeper lexical tier shadows the alias,
+/// and an alias whose target cannot be established resolves to nothing.
 #[allow(clippy::too_many_arguments)]
-fn resolve_type_components_in_authoritative_scope(
+pub(super) fn resolve_type_components_in_authoritative_scope(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+    direct_target: Option<&CodeUnit>,
+    apply_structured_prefilter: bool,
+    preserve_alias: bool,
+    allow_compatible_foreign_import: bool,
+    lexical_scope: Vec<String>,
+) -> LexicalTypeResolution {
+    let resolve = |components: &[String], global: bool, lexical_scope: Vec<String>| {
+        resolve_unaliased_type_components_in_authoritative_scope(
+            node,
+            components,
+            global,
+            analyzer,
+            visibility,
+            ordinary_type_imports,
+            file,
+            source,
+            direct_target,
+            apply_structured_prefilter,
+            preserve_alias,
+            allow_compatible_foreign_import,
+            lexical_scope,
+        )
+    };
+    let binding =
+        visibility.bind_namespace_qualifier(file, node, components, global, &lexical_scope);
+    let Some(depth) = binding.depth() else {
+        return resolve(components, global, lexical_scope);
+    };
+    if let LexicalTypeResolution::Resolved {
+        components: resolved,
+        ..
+    } = visibility.resolve_type_components_lexically(
+        analyzer,
+        file,
+        components,
+        global,
+        &lexical_scope,
+    ) && resolved.len().saturating_sub(components.len()) > depth
+    {
+        return resolve(components, global, lexical_scope);
+    }
+    match binding {
+        NamespaceQualifierBinding::Bound {
+            components,
+            global,
+            lexical_scope,
+            ..
+        } => resolve(&components, global, lexical_scope),
+        NamespaceQualifierBinding::Unresolved { .. } => LexicalTypeResolution::Ambiguous,
+        NamespaceQualifierBinding::Unaliased => unreachable!("an unaliased binding has no depth"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_unaliased_type_components_in_authoritative_scope(
     node: Node<'_>,
     components: &[String],
     global: bool,

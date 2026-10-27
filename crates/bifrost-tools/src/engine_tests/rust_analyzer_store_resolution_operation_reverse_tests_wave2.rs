@@ -145,10 +145,44 @@ mod rust_departing_wave2_root_tests {
                     "parsed declaration identity is hydrated"
                 );
 
-                // Run the pre-correction query against the very same populated
-                // production request table. This is the causal control, not the
-                // oracle for the requested declaration's expected answer.
+                // Run the pre-correction query for the same request. This is the
+                // causal control, not the oracle for the requested declaration's
+                // expected answer. It needs the request table that drove it:
+                // with #6594's json_each array the reordered joins stay bounded,
+                // so the control restores that table's schema and columns.
+                conn.execute_batch(
+                    "CREATE TEMP TABLE old_hydration_requests(
+                       mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
+                       key0          INTEGER NOT NULL CHECK(key0 >= 0),
+                       PRIMARY KEY(mount_ordinal, key0)
+                     ) WITHOUT ROWID, STRICT",
+                )
+                .expect("old request table");
+                conn.execute(
+                    "INSERT INTO temp.old_hydration_requests(mount_ordinal, key0) VALUES (?1, ?2)",
+                    rusqlite::params![caller.0.get(), caller.1.get()],
+                )
+                .expect("old request row");
                 let mut old_sql = SELECTED_DEFINITION_UNITS_SQL.to_string();
+                for (current, old) in [
+                    (
+                        "FROM json_each(?1) AS request",
+                        "FROM temp.old_hydration_requests AS request",
+                    ),
+                    (
+                        "json_extract(request.value, '$[0]')",
+                        "request.mount_ordinal",
+                    ),
+                    ("json_extract(request.value, '$[1]')", "request.key0"),
+                    (
+                        "ORDER BY request.rowid",
+                        "ORDER BY request.mount_ordinal, request.key0",
+                    ),
+                ] {
+                    assert!(old_sql.contains(current), "{current}");
+                    old_sql = old_sql.replace(current, old);
+                }
+                assert!(!old_sql.contains("json_"), "{old_sql}");
                 for table in [
                     "temp.selected_resolution_mounts",
                     "main.resolution_fragment_interiors",
@@ -170,6 +204,8 @@ mod rust_departing_wave2_root_tests {
                 assert_eq!(old_names, ["caller"]);
                 let old_steps = old.get_status(rusqlite::StatementStatus::VmStep);
                 drop(old);
+                conn.execute_batch("DROP TABLE temp.old_hydration_requests")
+                    .expect("drop old request table");
 
                 let batch = coordinates
                     .iter()

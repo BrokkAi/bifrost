@@ -80,6 +80,7 @@ pub use engine::cancelled_completion;
 
 pub(crate) use fact_resolution::{
     QualifiedMemberId, QualifiedMemberInput, QualifiedMemberProvider, TypedConstructionInput,
+    completion_without_unsupported_semantic,
 };
 
 pub(crate) use fact_source::language_identity_domain;
@@ -650,6 +651,7 @@ pub(crate) use fact_source::CompanionTypeRelation;
 pub(crate) use fact_source::DeclarationAccessDecision;
 pub(crate) use fact_source::DeclarationAccessRequest;
 pub(crate) use fact_source::DeclarationAccessRow;
+pub use fact_source::JvmAliasProperty;
 pub(crate) use fact_source::JvmDeclarationAccessRules;
 #[doc(hidden)]
 pub use fact_source::JvmImplicitRootProvider;

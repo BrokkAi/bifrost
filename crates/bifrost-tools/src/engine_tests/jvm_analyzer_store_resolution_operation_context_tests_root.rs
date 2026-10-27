@@ -193,8 +193,9 @@ mod context_path_tests {
             ordinary_stream.as_slice()
         );
 
-        // Calibrate only the existing base layers, then allow one addition into
-        // the still-partial shared output page. The second addition exhausts it.
+        // Calibrate existing base validation work. Context reader additions
+        // leave admission charges to the engine and preserve the pending page.
+        // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
         let base_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
         let empty_source =
             SelectedContextPathFragmentSource::new(&base, &base, empty, Some(&base_session));
@@ -214,25 +215,25 @@ mod context_path_tests {
         let limited = ResolutionSession::bounded(budget, None);
         let limited_source =
             SelectedContextPathFragmentSource::new(&base, &base, first, Some(&limited));
-        let mut callbacks = 0;
+        let mut offered = Vec::new();
         let exhausted = limited_source
             .visit_forward_candidate_match_pages_limited(
                 &requests,
                 page_size,
                 Some(&limited),
                 &live,
-                &mut |_| {
-                    callbacks += 1;
+                &mut |page| {
+                    offered.extend_from_slice(page);
                     Ok(true)
                 },
             )
             .unwrap();
         assert_eq!(
-            callbacks, 0,
-            "base plus one addition remains unpublished on exhaustion"
+            offered, complete_rows,
+            "identity-only context additions retain the entire stream"
         );
         assert!(
-            exhausted
+            !exhausted
                 .unconditional_completion()
                 .contains_reason(ResolutionIncompleteReason::Cancelled)
         );
@@ -490,7 +491,8 @@ mod context_path_tests {
             )
             .unwrap();
         assert_eq!(forward, [added]);
-        assert_eq!(forward_session.finish(()).work().scope_nodes, 1);
+        // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
+        assert_eq!(forward_session.finish(()).work().scope_nodes, 0);
         let reverse_session = ResolutionSession::bounded(budget, Some(&live));
         let mut reverse = Vec::new();
         relation
@@ -512,7 +514,7 @@ mod context_path_tests {
             )
             .unwrap();
         assert_eq!(reverse, [added]);
-        assert_eq!(reverse_session.finish(()).work().scope_nodes, 1);
+        assert_eq!(reverse_session.finish(()).work().scope_nodes, 0);
         let changed_completion =
             original
                 .clone()

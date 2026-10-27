@@ -697,7 +697,7 @@ impl WorkspaceSemanticOracle<'_> {
         }
         let mut matches = Vec::new();
         for (payload, shard) in active.runtime_values() {
-            for exposure in &payload.exposures {
+            for (exposure_index, exposure) in payload.exposures.iter().enumerate() {
                 if exposure.binding_name != read.root_name
                     || !exposure
                         .languages
@@ -726,16 +726,21 @@ impl WorkspaceSemanticOracle<'_> {
                 {
                     continue;
                 }
-                for behavior in &payload.behaviors {
+                for (behavior_index, behavior) in payload.behaviors.iter().enumerate() {
                     if behavior.exposure_id == exposure.exposure_id
                         && behavior.container_member == read.container
                     {
-                        matches.push((exposure, behavior, shard));
+                        matches.push((
+                            std::sync::Arc::clone(&payload),
+                            exposure_index,
+                            behavior_index,
+                            std::sync::Arc::clone(&shard),
+                        ));
                     }
                 }
             }
         }
-        let [(exposure, behavior, shard)] = matches.as_slice() else {
+        let [(payload, exposure_index, behavior_index, shard)] = matches.as_slice() else {
             result.limitations.push(if matches.is_empty() {
                 RuntimeReadLimitation::ActivationMissing
             } else {
@@ -743,6 +748,8 @@ impl WorkspaceSemanticOracle<'_> {
             });
             return Ok(());
         };
+        let exposure = &payload.exposures[*exposure_index];
+        let behavior = &payload.behaviors[*behavior_index];
         let identity = &exposure.root_identity;
         let runtime_identity_matches = identity.scheme == "csmi.runtime-global"
             && identity.scheme_version == "0.1.0"
@@ -916,7 +923,7 @@ impl WorkspaceSemanticOracle<'_> {
             active.active_model_set_hash().to_owned(),
             exposure.runtime_profile_digest.clone(),
             shard.manifest.content_sha256.clone(),
-            shard.shard.shard_id().to_owned(),
+            shard.descriptor.shard_id.as_str().to_owned(),
             exposure.exposure_id.clone(),
             behavior.behavior_id.clone(),
             shard.source_id.clone(),
@@ -949,7 +956,7 @@ impl WorkspaceSemanticOracle<'_> {
             exposure_id: exposure.exposure_id.clone(),
             behavior_id: behavior.behavior_id.clone(),
             manifest_digest: shard.manifest.content_sha256.clone(),
-            shard_id: shard.shard.shard_id().to_owned(),
+            shard_id: shard.descriptor.shard_id.as_str().to_owned(),
             activation_source: shard.source_id.clone(),
             producer: format!(
                 "{}@{}",

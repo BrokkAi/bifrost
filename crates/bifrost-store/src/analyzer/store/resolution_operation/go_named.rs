@@ -68,16 +68,6 @@ pub struct GoDemandContext {
 }
 
 impl GoDemandContext {
-    pub(crate) fn needs_demand_provider_for(&self, mount: SelectedResolutionMountOrdinal) -> bool {
-        self.import_packages
-            .keys()
-            .any(|(source, _)| *source == mount)
-            || self
-                .context_completions
-                .get(&mount)
-                .is_some_and(|completion| completion != &ResolutionCompletion::Complete)
-    }
-
     #[doc(hidden)]
     pub fn merge(&mut self, other: Self) {
         assert_eq!(
@@ -244,10 +234,13 @@ impl GoSelectedExternalImport {
     }
 }
 
-pub(crate) const SELECTED_EXTERNAL_IMPORTS: &str = r#"
+pub(crate) static SELECTED_EXTERNAL_IMPORTS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 SELECT imports.source_spelling,target.tool_import_path,target.package_name,
        target.provider_kind,target.provider_module_path,target.provider_module_version
-FROM temp.selected_go_context_source_files caller
+FROM ({}) caller
 JOIN main.go_package_instances importer
   ON importer.context_id=caller.context_id AND importer.package_id=caller.package_id
  AND ((caller.source_role='go' AND importer.for_test='')
@@ -265,11 +258,17 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
   AND NOT EXISTS (SELECT 1 FROM temp.selected_go_context_source_files files
                   WHERE files.package_id=target.package_id AND files.source_role<>'ignored')
 ORDER BY imports.source_spelling,target.tool_import_path
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
-pub(crate) const SELECTED_UNRESOLVED_IMPORTS: &str = r#"
+pub(crate) static SELECTED_UNRESOLVED_IMPORTS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 SELECT DISTINCT imports.source_spelling
-FROM temp.selected_go_context_source_files caller
+FROM ({}) caller
 JOIN main.go_package_instances importer
   ON importer.context_id=caller.context_id AND importer.package_id=caller.package_id
  AND ((caller.source_role='go' AND importer.for_test='')
@@ -287,12 +286,18 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
       AND exact.tool_import_path=imports.source_spelling
   )
 ORDER BY imports.source_spelling
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
-pub(crate) const SELECTED_IMPORT_CONTEXT_FILES: &str = r#"
+pub(crate) static SELECTED_IMPORT_CONTEXT_FILES: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 WITH RECURSIVE reachable(package_id) AS (
   SELECT caller.package_id
-  FROM temp.selected_go_context_source_files caller
+  FROM ({}) caller
   WHERE caller.context_id=?1 AND caller.file_version_id=?2 AND caller.source_role<>'ignored'
   UNION
   SELECT imports.target_package_id
@@ -328,11 +333,17 @@ SELECT rel_path, source_role FROM (
     ON selected.mount_ordinal=placed.mount_ordinal
 )
 ORDER BY rel_path, source_role
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
-pub(crate) const CALLER_SOURCE_ROLE: &str = r#"
+pub(crate) static CALLER_SOURCE_ROLE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 SELECT caller.source_role
-FROM temp.selected_go_context_source_files caller
+FROM ({}) caller
 CROSS JOIN main.go_package_instances package
   ON package.context_id=caller.context_id AND package.package_id=caller.package_id
 WHERE caller.context_id=?1 AND caller.file_version_id=?2
@@ -341,7 +352,7 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
    OR (caller.source_role='test' AND package.for_test='' AND package.complete=0
        AND NOT EXISTS(
          SELECT 1
-         FROM temp.selected_go_context_source_files selected_test
+         FROM ({}) selected_test
          JOIN main.go_package_instances selected_package
            ON selected_package.context_id=selected_test.context_id
           AND selected_package.package_id=selected_test.package_id
@@ -351,7 +362,11 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
            AND selected_package.for_test<>''
        ))
    OR (caller.source_role IN ('test','xtest') AND package.provider_provenance='source_inventory'))
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 // Import bindings of every listed mount, one statement for the whole request.
 // `?1` is a JSON array of mount ordinals. The scope-mount join keeps the read
@@ -393,13 +408,15 @@ LEFT JOIN main.source_imports i ON i.blob_id=mounted.blob_id
 // context's packages and probes the list per package. The segment subquery
 // orders by `ordinal` on the primary key, which needs no sort.
 #[doc(hidden)]
-pub const GO_FILE_IMPORT_ROWS: &str = r#"
+pub static GO_FILE_IMPORT_ROWS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r#"
 SELECT requested.value ->> 0, imports.source_spelling, imports.complete,
        json(imports.gaps), NULLIF(target.package_name,''), target.package_id,
-       mounted.semantic_language
+       mounted.semantic_language, requested.value ->> 1, requested.value ->> 2
 FROM json_each(?2) requested
 CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.mount_ordinal=requested.value ->> 0
-CROSS JOIN temp.selected_go_context_source_files caller
+CROSS JOIN ({}) caller
   ON caller.context_id=?1 AND caller.file_version_id=requested.value ->> 1
  AND caller.source_role=requested.value ->> 2
 JOIN main.go_package_instances package
@@ -409,7 +426,7 @@ JOIN main.go_package_instances package
    OR (caller.source_role='test' AND package.for_test='' AND package.complete=0
        AND NOT EXISTS(
          SELECT 1
-         FROM temp.selected_go_context_source_files selected_test
+         FROM ({}) selected_test
          JOIN main.go_package_instances selected_package
            ON selected_package.context_id=selected_test.context_id
           AND selected_package.package_id=selected_test.package_id
@@ -430,7 +447,11 @@ CROSS JOIN main.go_package_imports imports
          ORDER BY segment.ordinal))
 LEFT JOIN main.go_package_instances target
   ON target.context_id=imports.context_id AND target.package_id=imports.target_package_id
-"#;
+"#,
+        super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
+        super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+    )
+});
 
 // Which of the listed mounts import a package with the `.` alias. `?1` is a
 // JSON array of mount ordinals. Only a dot import publishes a root import path
@@ -457,22 +478,56 @@ pub(super) struct GoFileImportRow {
     pub(super) modeled_provider: Option<GoSelectedExternalImport>,
 }
 
-/// What one prepared Go file mount needs from SQL: its import bindings and
-/// the selected import rows of its source imports, by source spelling.
+/// Syntax inputs of one mounted Go file. Neither bindings nor dot aliases
+/// depend on the selected Go package context.
 #[derive(Clone, Default)]
 struct GoMountImportInputs {
     bindings: BTreeMap<SemanticId, GoImportBindingRow>,
-    imports: HashMap<String, GoFileImportRow>,
     has_dot_import: bool,
 }
 
-/// Import inputs of the Go files this one operation has prepared, filled one
-/// statement per batch and dropped with the operation. Its size is the number
-/// of files the request prepares, not the workspace.
+/// Selected import rows bind context, file version and role in addition to mount.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct GoImportAuthority {
+    mount: u32,
+    context_id: i64,
+    file_version: i64,
+    source_role: String,
+}
+
+impl GoImportAuthority {
+    pub(super) fn new(
+        mount: SelectedResolutionMountOrdinal,
+        context_id: i64,
+        file_version: i64,
+        source_role: &str,
+    ) -> Self {
+        Self {
+            mount: mount.get(),
+            context_id,
+            file_version,
+            source_role: source_role.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GoSelectedImportInputs {
+    authority: GoImportAuthority,
+    imports: HashMap<String, GoFileImportRow>,
+}
+
+/// Import inputs prepared by one operation, dropped with that operation.
+/// Syntax rows use the immutable mount (including its blob and staged facts).
+/// Selected package rows use the full SQL authority: mount, context, version,
+/// and role. Scope, staged facts and the captured model overlay belong to this
+/// operation. Size is bounded by the files times contexts/roles this request
+/// prepares, never an independently populated workspace index.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct GoImportInputCache {
     mounts: HashMap<u32, GoMountImportInputs>,
+    selected: HashMap<GoImportAuthority, GoSelectedImportInputs>,
     /// A captured absence must not fall through to a later publication.
     model_overlay: Option<Option<Arc<dyn super::SelectedModelAuthority + Send + Sync>>>,
 }
@@ -617,7 +672,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(Vec::new());
         };
         let connection = self.ready.inventory.connection();
-        let mut statement = connection.prepare_cached(SELECTED_EXTERNAL_IMPORTS)?;
+        let mut statement = connection.prepare_cached(&SELECTED_EXTERNAL_IMPORTS)?;
         let mut rows = statement.query(rusqlite::params![context_id, version])?;
         let mut imports = Vec::new();
         while let Some(row) = rows.next()? {
@@ -683,7 +738,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(Vec::new());
         };
         let connection = self.ready.inventory.connection();
-        let mut statement = connection.prepare_cached(SELECTED_UNRESOLVED_IMPORTS)?;
+        let mut statement = connection.prepare_cached(&SELECTED_UNRESOLVED_IMPORTS)?;
         let mut rows = statement.query(rusqlite::params![context_id, version])?;
         let mut imports = Vec::new();
         while let Some(row) = rows.next()? {
@@ -738,7 +793,7 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             return Ok(None);
         };
-        let mut statement = connection.prepare_cached(CALLER_SOURCE_ROLE)?;
+        let mut statement = connection.prepare_cached(&CALLER_SOURCE_ROLE)?;
         let mut rows = statement.query(rusqlite::params![context_id, version])?;
         let mut source_role = None;
         while let Some(row) = rows.next()? {
@@ -864,7 +919,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GraphFileSkipReason::Unplaced);
         };
         let ignored: bool = connection.query_row(
-            GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL,
+            GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL.as_str(),
             rusqlite::params![context_id, version],
             |row| row.get(0),
         )?;
@@ -872,7 +927,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GraphFileSkipReason::ExcludedBuildSelection);
         }
         let inventory: bool = connection.query_row(
-            GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL,
+            GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL.as_str(),
             [version],
             |row| row.get(0),
         )?;
@@ -947,13 +1002,12 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 
     #[doc(hidden)]
-    pub fn go_file_import_context_with_member_cache(
+    pub fn go_file_import_context_with_role(
         &self,
         context_id: i64,
         path: &str,
         source_role: &str,
         cancellation: &CancellationToken,
-        member_cache: &mut super::go_same_package::GoPackageMemberIndexCache,
     ) -> Result<GoPreparedImportContextOutcome> {
         if cancellation.is_cancelled() {
             return Ok(GoPreparedImportContextOutcome::Cancelled);
@@ -985,7 +1039,11 @@ impl SelectedResolutionOperation<'_, '_> {
                     .map(|overlay| overlay.active_model_set_hash().to_owned()),
             };
             if self.ready.context_identities.is_empty()
-                && let Some(cached) = self.ready.store.go_prepared_context_cache().get(&cache_key)
+                && let Some(cached) = self
+                    .ready
+                    .store
+                    .cache_budget
+                    .go_prepared_context(&cache_key)
             {
                 return Ok(Some(cached.restored_for_request(
                     &self.ready.context_identities,
@@ -1002,7 +1060,6 @@ impl SelectedResolutionOperation<'_, '_> {
                 source_role,
                 &selection,
                 cancellation,
-                member_cache,
             )? {
                 GoPreparedImportContextOutcome::Ready(context) => {
                     // The derivation already observed its inventory certificate.
@@ -1015,8 +1072,8 @@ impl SelectedResolutionOperation<'_, '_> {
                         let cache_value = Arc::new(snapshot);
                         self.ready
                             .store
-                            .go_prepared_context_cache()
-                            .insert(cache_key, cache_value);
+                            .cache_budget
+                            .insert_go_prepared_context(cache_key, cache_value);
                     }
                     Ok(Some(*context))
                 }
@@ -1035,29 +1092,11 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(outcome)
     }
 
-    #[doc(hidden)]
-    pub fn go_file_import_context_with_role(
-        &self,
-        context_id: i64,
-        path: &str,
-        source_role: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<GoPreparedImportContextOutcome> {
-        let mut member_cache = self.go_package_member_indexes.borrow_mut();
-        self.go_file_import_context_with_member_cache(
-            context_id,
-            path,
-            source_role,
-            cancellation,
-            &mut member_cache,
-        )
-    }
-
-    pub(super) fn go_import_inputs_loaded(&self, mount: SelectedResolutionMountOrdinal) -> bool {
+    pub(super) fn go_import_inputs_loaded(&self, authority: &GoImportAuthority) -> bool {
         self.go_import_inputs
             .borrow()
-            .mounts
-            .contains_key(&mount.get())
+            .selected
+            .contains_key(authority)
     }
 
     /// Whether a loaded mount has a dot import.
@@ -1072,14 +1111,17 @@ impl SelectedResolutionOperation<'_, '_> {
     /// The selected import row of a loaded mount for one source spelling.
     pub(super) fn go_import_row(
         &self,
-        mount: SelectedResolutionMountOrdinal,
+        authority: &GoImportAuthority,
         spelling: &str,
     ) -> Option<GoFileImportRow> {
         self.go_import_inputs
             .borrow()
-            .mounts
-            .get(&mount.get())
-            .and_then(|inputs| inputs.imports.get(spelling).cloned())
+            .selected
+            .get(authority)
+            .and_then(|inputs| {
+                debug_assert_eq!(&inputs.authority, authority);
+                inputs.imports.get(spelling).cloned()
+            })
     }
 
     /// Read the import bindings and selected import rows of every listed Go
@@ -1099,14 +1141,6 @@ impl SelectedResolutionOperation<'_, '_> {
             let Some(source) = self.mount_table().mount_for_path("go", path)? else {
                 continue;
             };
-            if self
-                .go_import_inputs
-                .borrow()
-                .mounts
-                .contains_key(&source.ordinal().get())
-            {
-                continue;
-            }
             let record = self
                 .ready
                 .inventory
@@ -1114,7 +1148,11 @@ impl SelectedResolutionOperation<'_, '_> {
             if let Some(version) =
                 super::go_context::go_placement_file_version(connection, &record)?
             {
-                pending.push((source.ordinal(), version, source_role));
+                let authority =
+                    GoImportAuthority::new(source.ordinal(), context_id, version, source_role);
+                if !self.go_import_inputs_loaded(&authority) {
+                    pending.push((source.ordinal(), version, source_role));
+                }
             }
         }
         self.load_go_import_inputs(context_id, &pending, cancellation)
@@ -1133,55 +1171,86 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(true);
         }
         let connection = self.ready.inventory.connection();
-        let mut loaded: HashMap<u32, GoMountImportInputs> = files
+        let syntax_files: Vec<_> = files
+            .iter()
+            .filter(|(mount, _, _)| {
+                !self
+                    .go_import_inputs
+                    .borrow()
+                    .mounts
+                    .contains_key(&mount.get())
+            })
+            .collect();
+        let mut loaded: HashMap<u32, GoMountImportInputs> = syntax_files
             .iter()
             .map(|(mount, _, _)| (mount.get(), GoMountImportInputs::default()))
             .collect();
         let mounts = serde_json::to_string(
-            &files
+            &syntax_files
                 .iter()
                 .map(|(mount, _, _)| mount.get())
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| StoreError::new(format!("Go mount request is not JSON: {error}")))?;
-        let mut statement = connection.prepare_cached(STAGED_IMPORT_BINDINGS)?;
-        let mut rows = statement.query([&mounts])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(false);
+        if !syntax_files.is_empty()
+            && !self.ready.inventory.stage_family_is_empty(
+                super::super::resolution_stage::StageFamily::GoPackageImports,
+            )?
+        {
+            let mut statement = connection.prepare_cached(STAGED_IMPORT_BINDINGS)?;
+            let mut rows = statement.query([&mounts])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(false);
+                }
+                let fact = GoImportBindingRow::staged(row)?;
+                let inputs = loaded
+                    .get_mut(&row.get::<_, u32>(8)?)
+                    .expect("Go import binding row names a requested mount");
+                if inputs
+                    .bindings
+                    .insert(fact.metadata.definition, fact)
+                    .is_some_and(|prior| prior != fact)
+                {
+                    return Err(StoreError::corrupt(
+                        "contradictory staged Go import binding metadata",
+                    ));
+                }
             }
-            let fact = GoImportBindingRow::staged(row)?;
-            let inputs = loaded
-                .get_mut(&row.get::<_, u32>(8)?)
-                .expect("Go import binding row names a requested mount");
-            if inputs
-                .bindings
-                .insert(fact.metadata.definition, fact)
-                .is_some_and(|prior| prior != fact)
-            {
-                return Err(StoreError::corrupt(
-                    "contradictory staged Go import binding metadata",
-                ));
-            }
+            drop(rows);
+            drop(statement);
         }
-        drop(rows);
-        drop(statement);
-        let mut statement = connection.prepare_cached(ORDINARY_IMPORT_BINDINGS)?;
-        let mut rows = statement.query([&mounts])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(false);
+        if !syntax_files.is_empty() {
+            let mut statement = connection.prepare_cached(ORDINARY_IMPORT_BINDINGS)?;
+            let mut rows = statement.query([&mounts])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(false);
+                }
+                let fact = GoImportBindingRow::ordinary(row)?;
+                loaded
+                    .get_mut(&row.get::<_, u32>(8)?)
+                    .expect("Go import binding row names a requested mount")
+                    .bindings
+                    .entry(fact.metadata.definition)
+                    .or_insert(fact);
             }
-            let fact = GoImportBindingRow::ordinary(row)?;
-            loaded
-                .get_mut(&row.get::<_, u32>(8)?)
-                .expect("Go import binding row names a requested mount")
-                .bindings
-                .entry(fact.metadata.definition)
-                .or_insert(fact);
+            drop(rows);
+            drop(statement);
         }
-        drop(rows);
-        drop(statement);
+        let mut selected: HashMap<_, _> = files
+            .iter()
+            .map(|(mount, version, role)| {
+                let authority = GoImportAuthority::new(*mount, context_id, *version, role);
+                (
+                    authority.clone(),
+                    GoSelectedImportInputs {
+                        authority,
+                        imports: HashMap::default(),
+                    },
+                )
+            })
+            .collect();
         let requested = serde_json::to_string(
             &files
                 .iter()
@@ -1189,7 +1258,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| StoreError::new(format!("Go file request is not JSON: {error}")))?;
-        let mut statement = connection.prepare_cached(GO_FILE_IMPORT_ROWS)?;
+        let mut statement = connection.prepare_cached(&GO_FILE_IMPORT_ROWS)?;
         let mut rows = statement.query(rusqlite::params![context_id, requested])?;
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
@@ -1208,9 +1277,15 @@ impl SelectedResolutionOperation<'_, '_> {
             } else {
                 None
             };
-            loaded
-                .get_mut(&mount)
-                .expect("Go import row names a requested mount")
+            let authority = GoImportAuthority {
+                mount,
+                context_id,
+                file_version: row.get(7)?,
+                source_role: row.get(8)?,
+            };
+            selected
+                .get_mut(&authority)
+                .expect("Go import row names a requested authority")
                 .imports
                 .insert(
                     spelling,
@@ -1225,20 +1300,24 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         drop(rows);
         drop(statement);
-        let mut statement = connection.prepare_cached(GO_DOT_IMPORT_MOUNTS)?;
-        let mut rows = statement.query([&mounts])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(false);
+        if !syntax_files.is_empty() {
+            let mut statement = connection.prepare_cached(GO_DOT_IMPORT_MOUNTS)?;
+            let mut rows = statement.query([&mounts])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(false);
+                }
+                loaded
+                    .get_mut(&row.get::<_, u32>(0)?)
+                    .expect("Go dot import row names a requested mount")
+                    .has_dot_import = true;
             }
-            loaded
-                .get_mut(&row.get::<_, u32>(0)?)
-                .expect("Go dot import row names a requested mount")
-                .has_dot_import = true;
+            drop(rows);
+            drop(statement);
         }
-        drop(rows);
-        drop(statement);
-        self.go_import_inputs.borrow_mut().mounts.extend(loaded);
+        let mut cache = self.go_import_inputs.borrow_mut();
+        cache.mounts.extend(loaded);
+        cache.selected.extend(selected);
         Ok(true)
     }
 
@@ -1259,14 +1338,12 @@ impl SelectedResolutionOperation<'_, '_> {
         let Some(selection) = self.go_context_selection(context_id, source_role)? else {
             return Ok(GoPreparedImportContextOutcome::Unavailable);
         };
-        let mut member_cache = self.go_package_member_indexes.borrow_mut();
         self.go_import_binding_context_for_selection(
             context_id,
             caller_path,
             source_role,
             &selection,
             cancellation,
-            &mut member_cache,
         )
     }
 
@@ -1277,7 +1354,6 @@ impl SelectedResolutionOperation<'_, '_> {
         source_role: &str,
         selection: &GoContextSelection,
         cancellation: &CancellationToken,
-        member_cache: &mut super::go_same_package::GoPackageMemberIndexCache,
     ) -> Result<GoPreparedImportContextOutcome> {
         let (context, package_inventory) = match self.go_package_context_for_selection(
             context_id,
@@ -1285,7 +1361,6 @@ impl SelectedResolutionOperation<'_, '_> {
             source_role,
             selection,
             cancellation,
-            member_cache,
         )? {
             GoDotImportContext::Ready { context, inventory } => (context, inventory),
             GoDotImportContext::Unavailable => {
@@ -1306,11 +1381,8 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let version = super::go_context::go_placement_file_version(connection, &record)?
             .expect("package context requires a selected placement");
-        if !self
-            .go_import_inputs
-            .borrow()
-            .mounts
-            .contains_key(&source.ordinal().get())
+        let authority = GoImportAuthority::new(source.ordinal(), context_id, version, source_role);
+        if !self.go_import_inputs_loaded(&authority)
             && !self.load_go_import_inputs(
                 context_id,
                 &[(source.ordinal(), version, source_role)],
@@ -1319,13 +1391,19 @@ impl SelectedResolutionOperation<'_, '_> {
         {
             return Ok(GoPreparedImportContextOutcome::Cancelled);
         }
-        let inputs = self
-            .go_import_inputs
-            .borrow()
+        let cache = self.go_import_inputs.borrow();
+        let inputs = cache
             .mounts
             .get(&source.ordinal().get())
-            .expect("Go import inputs were loaded for the caller mount")
+            .expect("Go syntax inputs were loaded for the caller mount")
             .clone();
+        let selected = cache
+            .selected
+            .get(&authority)
+            .expect("Go import inputs were loaded for the caller authority");
+        debug_assert_eq!(selected.authority, authority);
+        let selected = selected.clone();
+        drop(cache);
         let Some(imports) =
             super::super::source_facts::read_source_imports(connection, record.blob_id(), &|| {
                 !cancellation.is_cancelled()
@@ -1355,7 +1433,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 ));
             };
             let spelling = path.segments.join("/");
-            let selected = inputs.imports.get(&spelling);
+            let selected = selected.imports.get(&spelling);
             let import_completion = self.go_import_completion_for(
                 context_id,
                 version,
@@ -1429,12 +1507,11 @@ impl SelectedResolutionOperation<'_, '_> {
             });
         }
         let mounts = self.mount_table();
-        let Some(context) =
-            context.extend_go_import_bindings(bindings, cancellation, &|fragment| {
-                Ok(mounts
-                    .mount_for_fragment(fragment)?
-                    .map(|mount| (mount.ordinal(), mount.semantic_language())))
-            })?
+        let Some(context) = context.extend_go_import_bindings(
+            bindings,
+            cancellation,
+            &selected_mount_lookup(mounts),
+        )?
         else {
             return Ok(GoPreparedImportContextOutcome::Cancelled);
         };
@@ -1694,11 +1771,12 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         let mounts = self.mount_table();
         Ok(
-            match context.extend_root_bridges(bridges, cancellation, None, &|fragment| {
-                Ok(mounts
-                    .mount_for_fragment(fragment)?
-                    .map(|mount| (mount.ordinal(), mount.semantic_language())))
-            })? {
+            match context.extend_root_bridges(
+                bridges,
+                cancellation,
+                None,
+                &selected_mount_lookup(mounts),
+            )? {
                 Some(context) => GoDotImportContext::Ready { context, inventory },
                 None => GoDotImportContext::Cancelled,
             },
@@ -1725,11 +1803,19 @@ WHERE provider.context_id=?1 AND provider.package_id=?2
  AND (provider.source_role='go' OR (provider.source_role='test' AND package.for_test<>''))
 "#;
 
-pub(crate) const GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL: &str =
-    "SELECT EXISTS(SELECT 1 FROM temp.selected_go_context_source_files
-             WHERE context_id=?1 AND file_version_id=?2 AND source_role='ignored')";
+pub(crate) static GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"SELECT EXISTS(SELECT 1 FROM ({})
+             WHERE context_id=?1 AND file_version_id=?2 AND source_role='ignored')"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
-pub(crate) const GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL: &str = "SELECT EXISTS(SELECT 1 FROM temp.selected_go_context_source_files source
+pub(crate) static GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"SELECT EXISTS(SELECT 1 FROM ({}) source
              JOIN main.go_package_instances package USING(package_id)
              JOIN main.go_context_publications publication ON publication.context_id=source.context_id
              JOIN main.go_context_selections selection ON selection.selection_id=publication.selection_id
@@ -1737,7 +1823,10 @@ pub(crate) const GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL: &str = "SELECT EXIST
                ON selected.workspace_id=selection.workspace_id AND selected.lang=selection.lang
               AND selected.generation=selection.generation
               AND publication.valid_from<=selected.revision AND (publication.valid_until IS NULL OR selected.revision<publication.valid_until)
-             WHERE source.file_version_id=?1 AND package.provider_provenance='source_inventory')";
+             WHERE source.file_version_id=?1 AND package.provider_provenance='source_inventory')"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 pub(crate) const DOMAIN_FOR_MODULE_SQL: &str = r#"
 SELECT c.context_id, s.domain_dir, s.gowork_path,
@@ -1750,3 +1839,70 @@ WHERE m.module_dir=?6 AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
   AND s.base_profile_digest=?4 AND s.derivation_version=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
 "#;
+
+impl super::super::cache_budget::RetainedBytes for GoPreparedContextCacheKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.caller_path.capacity()
+            + self.source_role.capacity()
+            + self
+                .active_model_set_hash
+                .as_ref()
+                .map_or(0, String::capacity)
+    }
+}
+
+impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapshot {
+    fn retained_bytes(&self) -> usize {
+        let mut heap = super::super::cache_budget::RetainedHeap::default();
+        heap.add(std::mem::size_of_val(self));
+        assert!(
+            self.prepared.blueprint.is_none(),
+            "a cached context retains no request blueprint"
+        );
+        self.prepared.context.charge_retained(&mut heap);
+        heap.map(&self.shared_names);
+        let demand = &self.prepared.demand;
+        heap.map(&demand.import_packages);
+        heap.map(&demand.context_completions);
+        for completion in demand.context_completions.values() {
+            completion.charge_retained(&mut heap);
+        }
+        heap.map(&demand.modeled_imports);
+        for provider in demand.modeled_imports.values() {
+            heap.add(
+                provider.source_spelling.capacity()
+                    + provider.import_path.capacity()
+                    + provider.package_name.capacity(),
+            );
+            match &provider.provenance {
+                GoExternalPackageProvenance::GoTool {
+                    provider_kind,
+                    module_path,
+                    module_version,
+                } => {
+                    heap.add(
+                        provider_kind.capacity()
+                            + module_path.as_ref().map_or(0, String::capacity)
+                            + module_version.as_ref().map_or(0, String::capacity),
+                    );
+                }
+                GoExternalPackageProvenance::SemanticModel {
+                    symbol_id,
+                    pack_id,
+                    pack_digest,
+                    record_id,
+                } => {
+                    heap.add(
+                        symbol_id.capacity()
+                            + pack_id.capacity()
+                            + pack_digest.capacity()
+                            + record_id.capacity(),
+                    );
+                }
+            }
+        }
+        heap.map(&self.prepared.package_inventory.fragments);
+        heap.total()
+    }
+}

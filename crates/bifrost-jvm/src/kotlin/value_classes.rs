@@ -42,7 +42,8 @@ use crate::kotlin::declarations::{
 use crate::kotlin::imports::{kotlin_import_info_from_node, kotlin_import_path};
 use crate::kotlin::supertypes::{extract_kotlin_supertype_segments, kotlin_user_type_segments};
 use crate::kotlin::syntax::{
-    kotlin_binding_type_node, kotlin_declared_type_parameter_names, kotlin_parameter_default,
+    KotlinIntegerSuffix, kotlin_binding_type_node, kotlin_declared_type_parameter_names,
+    kotlin_integer_literal_value, kotlin_parameter_default,
 };
 use crate::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 
@@ -561,18 +562,65 @@ impl KotlinWrittenTypeKey {
     }
 }
 
-/// The Kotlin types a literal can have.
-///
-/// An integer literal takes the type its expected type asks for, which is why
-/// one literal answers for four widths; `1.0` and `1.0f` share one node kind,
-/// so a real literal answers for both floating widths rather than reading the
-/// suffix out of the source text.
-pub fn literal_type_names(kind: &str) -> &'static [&'static str] {
-    match kind {
-        "integer_literal" | "hex_literal" | "bin_literal" => &["Byte", "Short", "Int", "Long"],
-        "long_literal" => &["Long"],
-        "unsigned_literal" => &["UByte", "UShort", "UInt", "ULong"],
-        "real_literal" => &["Float", "Double"],
+/// The Kotlin types that can represent this literal's value and suffix.
+/// Integer literal types contain only widths that fit; real literals have
+/// exactly the type selected by their f/F suffix (or Double without one).
+pub fn literal_type_names(literal: Node<'_>, source: &str) -> &'static [&'static str] {
+    if let Some((value, suffix)) = kotlin_integer_literal_value(literal, source) {
+        return if suffix.is_unsigned() {
+            if u64::try_from(value).is_err() {
+                &[]
+            } else if suffix == KotlinIntegerSuffix::UnsignedLong {
+                &["ULong"]
+            } else if value <= u8::MAX as i128 {
+                &["UByte", "UShort", "UInt", "ULong"]
+            } else if value <= u16::MAX as i128 {
+                &["UShort", "UInt", "ULong"]
+            } else if value <= u32::MAX as i128 {
+                &["UInt", "ULong"]
+            } else {
+                &["ULong"]
+            }
+        } else if value.unsigned_abs() > i64::MAX as u128 {
+            &[]
+        } else if suffix == KotlinIntegerSuffix::Long {
+            &["Long"]
+        } else if i8::try_from(value).is_ok() {
+            &["Byte", "Short", "Int", "Long"]
+        } else if i16::try_from(value).is_ok() {
+            &["Short", "Int", "Long"]
+        } else if i32::try_from(value).is_ok() {
+            &["Int", "Long"]
+        } else {
+            &["Long"]
+        };
+    }
+    // Real literals retain their existing sign handling and f/F classification.
+    let literal = if literal.kind() == "prefix_expression" && literal.named_child_count() == 1 {
+        let operator = literal
+            .children(&mut literal.walk())
+            .find(|child| !child.is_named());
+        let operand = literal.named_child(0).expect("one prefix operand");
+        if !matches!(operator.map(|node| node.kind()), Some("+" | "-"))
+            || operand.kind() != "real_literal"
+        {
+            return &[];
+        }
+        operand
+    } else {
+        literal
+    };
+    match literal.kind() {
+        "real_literal" => {
+            let text = literal
+                .utf8_text(source.as_bytes())
+                .expect("literal belongs to source");
+            if text.ends_with(['f', 'F']) {
+                &["Float"]
+            } else {
+                &["Double"]
+            }
+        }
         "string_literal" => &["String"],
         "character_literal" => &["Char"],
         "boolean_literal" => &["Boolean"],
@@ -856,12 +904,12 @@ impl<'tree> KotlinValueClassIndex<'tree> {
                         KotlinUnderlyingMatch::Mismatched
                     };
                 }
+                let names = literal_type_names(literal, source);
+                if names.is_empty() {
+                    return KotlinUnderlyingMatch::Mismatched;
+                }
                 if formal.is_any() {
                     return KotlinUnderlyingMatch::Proven;
-                }
-                let names = literal_type_names(literal.kind());
-                if names.is_empty() {
-                    return KotlinUnderlyingMatch::Unknown;
                 }
                 let KotlinTypeHead::Foreign(formal_name) = &formal.head else {
                     return KotlinUnderlyingMatch::Mismatched;
@@ -1639,6 +1687,145 @@ mod tests {
             WalkControl::Continue
         });
         found.unwrap_or_else(|| panic!("the fixture writes a type for {name}"))
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d5886539d3ef: quicksilver round 5 on brokk-bifrost-jvm: literal carrier proofs ignored range and suffix"
+    )]
+    fn literal_carrier_proofs_respect_ranges_and_suffixes() {
+        for (carrier, literal, fits) in [
+            ("Byte", "127", true),
+            ("Byte", "128", false),
+            ("Byte", "1000", false),
+            ("Short", "32768", false),
+            ("Int", "2147483648", false),
+            ("Long", "9223372036854775808", false),
+            ("Byte", "0x80", false),
+            ("Byte", "0b1000_0000", false),
+            ("Short", "32_767", true),
+            ("Int", "1L", false),
+            ("Long", "0x7fff_ffff_ffff_ffffL", true),
+            ("Byte", "-128", true),
+            ("Byte", "-129", false),
+            ("Int", "-2147483648", true),
+            ("Long", "-9223372036854775808L", false),
+            ("UInt", "1u", true),
+            ("UByte", "256u", false),
+            ("UInt", "1uL", false),
+            ("ULong", "18446744073709551615uL", true),
+            ("ULong", "18446744073709551616uL", false),
+            ("Float", "1.0", false),
+            ("Double", "1.0f", false),
+            ("Float", "1F", true),
+            ("Double", "1.0", true),
+        ] {
+            let source = format!(
+                "import kotlin.jvm.JvmInline\n@JvmInline\nvalue class Box(val value: {carrier})\nval actual = {literal}\n"
+            );
+            let tree = parse(&source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let index = index(&tree, &source);
+            let KotlinCarrier::Unboxed(id) = index.declared_value_class("Box") else {
+                panic!("Box")
+            };
+            let mut actual = None;
+            walk_named_tree_preorder(tree.root_node(), true, |node| {
+                if node.kind() == "property_declaration" {
+                    actual = Some(node.named_child(node.named_child_count() - 1).unwrap());
+                }
+                WalkControl::Continue
+            });
+            assert_eq!(
+                index.underlying_match(id, KotlinActualEvidence::Literal(actual.unwrap()), &source),
+                if fits {
+                    KotlinUnderlyingMatch::Proven
+                } else {
+                    KotlinUnderlyingMatch::Mismatched
+                },
+                "{carrier}: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_annotation_wrappers_and_half_open_declaration_ancestry() {
+        // Annotation-first adjacency is a recovery tree. A hard declaration
+        // keyword can instead use the scanner's zero-width same-line boundary.
+        let adjacent = parse("class A{}@JvmInline() value class V(val n: Long)");
+        assert!(adjacent.root_node().has_error());
+        for source in [
+            "class A{}class B{}\n@JvmInline() value class V(val n: Long)",
+            "class A{}\n@JvmInline() value class V(val n: Long)",
+            "class A{}\n@JvmInline value class V(val n: Long)",
+            "class A { @JvmInline() value class V(val n: Long) }\n@Anno(1) class B",
+        ] {
+            let tree = parse(source);
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let index = index(&tree, source);
+            let declarations = index
+                .collect_declarations(tree.root_node(), source, &mut || false)
+                .unwrap();
+            assert!(declarations.len() >= 2);
+            for declaration in declarations {
+                let mut ancestors = Vec::new();
+                let mut parent = declaration.node.parent();
+                while let Some(node) = parent {
+                    if kotlin_class_like_kind(node).is_some() {
+                        ancestors.push(
+                            first_named_child_of_kind(node, "type_identifier")
+                                .unwrap()
+                                .utf8_text(source.as_bytes())
+                                .unwrap()
+                                .to_owned(),
+                        );
+                    }
+                    parent = node.parent();
+                }
+                ancestors.reverse();
+                assert_eq!(
+                    declaration.nesting, ancestors,
+                    "{} in {source}",
+                    declaration.name
+                );
+            }
+            let mut annotations = 0;
+            walk_named_tree_preorder(tree.root_node(), true, |node| {
+                if node.kind() == "annotation" {
+                    annotations += 1;
+                    let selected = annotation_user_types(node);
+                    assert_eq!(selected.len(), 1);
+                    let name = selected[0];
+                    assert_eq!(name.kind(), "user_type");
+                    let expected = if node
+                        .utf8_text(source.as_bytes())
+                        .unwrap()
+                        .starts_with("@Anno")
+                    {
+                        "Anno"
+                    } else {
+                        "JvmInline"
+                    };
+                    assert_eq!(name.utf8_text(source.as_bytes()).unwrap(), expected);
+                    assert_eq!(name.start_byte(), node.start_byte() + 1);
+                    assert_eq!(name.end_byte(), node.start_byte() + 1 + expected.len());
+                    assert_eq!(
+                        name.parent().unwrap().kind(),
+                        if node.utf8_text(source.as_bytes()).unwrap().contains('(') {
+                            "constructor_invocation"
+                        } else {
+                            "annotation"
+                        }
+                    );
+                }
+                WalkControl::Continue
+            });
+            assert!(annotations > 0);
+        }
     }
 
     const MONEY: &str = "package pay\n\nimport kotlin.jvm.JvmInline\n\n@JvmInline\nvalue class Money(val amount: Long)\n";

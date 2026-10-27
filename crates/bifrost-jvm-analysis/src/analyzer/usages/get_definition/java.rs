@@ -999,42 +999,10 @@ fn resolve_java_type_reference(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    // Share the intrinsic provider with native resolution after source tiers.
-    // The selected operation still checks stronger unindexed import providers.
-    #[cfg(any(test, feature = "test-support"))]
-    if brokk_bifrost_analysis::analyzer::resolution::universe::lookup(
-        Language::Java,
-        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
-        normalized,
-    )
-    .is_some()
+    if let Some(outcome) =
+        java_default_import_intrinsic(java, token, session, file, source, node, normalized)
     {
-        let prepared = java.inner().prepared_syntax(token, file);
-        let site = ResolvedReferenceSite {
-            path: file.to_string(),
-            text: normalized.to_owned(),
-            range: node_range(node),
-            focus_start_byte: node.start_byte(),
-            focus_end_byte: node.end_byte(),
-        };
-        if let BoundedResolution::Complete { value, .. } =
-            crate::analyzer::java::native_points::resolve_java_definition_bounded(
-                brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
-                    analyzer,
-                    file,
-                    source,
-                    tree: prepared.as_ref().map(|syntax| syntax.tree()),
-                    site: &site,
-                    budget:
-                        brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(
-                        ),
-                    cancellation: None,
-                },
-                || {},
-            )
-        {
-            return value;
-        }
+        return outcome;
     }
     // `java_import_boundary_for_type` fuses the unresolved-import signal with the
     // workspace-type check; its negation is the workspace-internal gate.
@@ -1047,6 +1015,128 @@ fn resolve_java_type_reference(
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     )
+}
+
+/// The `java.lang` type a simple name denotes through the implicit
+/// `import java.lang.*` (JLS 7.3), once every stronger declaration is ruled out.
+///
+/// The caller has already found no local, member or file/package/import
+/// type. What remains is a scope this resolver does not index: a type
+/// parameter with that name, a member type inherited through a supertype of an
+/// enclosing class or anonymous class (JLS 8.5), or an unindexed single-type
+/// or on-demand import. Any of these shadows `java.lang`, so each fails
+/// closed and leaves the caller's absence or boundary answer in place.
+fn java_default_import_intrinsic(
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    normalized: &str,
+) -> Option<DefinitionLookupOutcome> {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::trace;
+    if normalized.contains('.') {
+        return None;
+    }
+    let entry = brokk_bifrost_analysis::analyzer::resolution::universe::lookup(
+        Language::Java,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+        normalized,
+    )?;
+    let declares_type_parameter = |owner: Node<'_>| {
+        let Some(parameters) = owner.child_by_field_name("type_parameters") else {
+            return false;
+        };
+        let mut cursor = parameters.walk();
+        parameters
+            .named_children(&mut cursor)
+            .filter(|parameter| parameter.kind() == "type_parameter")
+            .any(|parameter| {
+                let mut cursor = parameter.walk();
+                parameter.named_children(&mut cursor).any(|child| {
+                    child.kind() == "type_identifier" && java_node_text(child, source) == normalized
+                })
+            })
+    };
+    let mut current = node;
+    while let Some(owner) = current.parent() {
+        match owner.kind() {
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => {
+                if declares_type_parameter(owner) {
+                    return None;
+                }
+                let in_body = owner
+                    .child_by_field_name("body")
+                    .is_some_and(|body| body.byte_range().contains(&node.start_byte()));
+                let mut cursor = owner.walk();
+                let has_supertype = owner.named_children(&mut cursor).any(|child| {
+                    matches!(
+                        child.kind(),
+                        "superclass" | "super_interfaces" | "extends_interfaces"
+                    )
+                });
+                if in_body && has_supertype {
+                    return None;
+                }
+            }
+            "object_creation_expression" => {
+                let mut cursor = owner.walk();
+                let anonymous_body = owner
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "class_body");
+                if anonymous_body.is_some_and(|body| body.byte_range().contains(&node.start_byte()))
+                {
+                    return None;
+                }
+            }
+            "method_declaration" | "constructor_declaration" if declares_type_parameter(owner) => {
+                return None;
+            }
+            _ => {}
+        }
+        current = owner;
+    }
+    if java_import_boundary_for_type(java, token, session, file, normalized) {
+        return None;
+    }
+    let canonical = entry.identity_spelling.to_owned();
+    let outcome = DefinitionLookupOutcome {
+        modeled_definitions: Vec::new(),
+        status: DefinitionLookupStatus::NoDefinition,
+        reference: Some(ResolvedReferenceSite {
+            path: file.to_string(),
+            text: canonical.clone(),
+            range: node_range(node),
+            focus_start_byte: node.start_byte(),
+            focus_end_byte: node.end_byte(),
+        }),
+        definitions: Vec::new(),
+        lexical_definition: None,
+        diagnostics: vec![DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "intrinsic_type_reference".into(),
+            message: format!(
+                "intrinsic type bindings have no source location: {:?}",
+                [&canonical]
+            ),
+        }],
+    };
+    if trace::recording() {
+        let rows = vec![trace::TraceCandidate::selected(
+            trace::TraceCandidateRef::Intrinsic { name: canonical },
+            Some(
+                brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier::DefaultImport,
+            ),
+        )];
+        trace::debug_assert_selection_agrees(&rows, &outcome);
+        trace::record_all(rows);
+    }
+    Some(outcome)
 }
 
 fn java_explicit_scoped_type_reference(

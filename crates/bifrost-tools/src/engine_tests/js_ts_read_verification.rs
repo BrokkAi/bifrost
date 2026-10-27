@@ -383,6 +383,97 @@ mod js_ts_extraction_tests {
         );
     }
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6638: a finally body lowered once per exit path left its calls without a replayable dispatch read"
+    )]
+    fn every_lowered_copy_of_a_finally_call_has_its_own_replayable_dispatch_read() {
+        let source = concat!(
+            "def stream(source):\n",
+            "    try:\n",
+            "        gen = iter(source)\n",
+            "    except TypeError:\n",
+            "        try:\n",
+            "            yield from gen\n",
+            "        finally:\n",
+            "            gen.close()\n",
+        );
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("stream.py", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("stream.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Python semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Python semantic artifact");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("stream")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("stream procedure");
+        let close_start = source.find("gen.close()").expect("close call");
+        let close_end = close_start + "gen.close()".len();
+        let copies = procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter_map(|call| procedure.call_site_handle(call.id))
+            .filter(|call| {
+                brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(call)
+                    .is_ok_and(|range| range.start_byte == close_start && range.end_byte == close_end)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            copies.len() >= 2,
+            "the finally body is lowered once per exit path: {copies:#?}"
+        );
+
+        let oracle = workspace.semantic_oracle_provider();
+        let mut reads = Vec::new();
+        for call in &copies {
+            let outcome = oracle
+                .resolve_call(call, &mut SemanticRequest::new(&mut budget, &cancellation))
+                .expect("close dispatch");
+            let brokk_bifrost_analysis::analyzer::semantic::DispatchReadAttribution::Attributed(
+                read,
+            ) = brokk_bifrost_analysis::analyzer::semantic::icfg::dispatch_read_attribution(
+                call, &outcome,
+            )
+            else {
+                panic!("every lowered copy has an exact dispatch read: {call:#?}")
+            };
+            assert!(
+                verify_procedure_dispatch_read(
+                    &workspace,
+                    &oracle,
+                    &read,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                ),
+                "replay finds the copy the read names: {read:#?}"
+            );
+            reads.push(read);
+        }
+        reads.sort_by_key(ReadKey::canonical_digest);
+        reads.dedup();
+        assert_eq!(reads.len(), copies.len(), "each copy asks its own question");
+    }
+    #[test]
     fn procedure_dispatch_read_rotates_for_a_different_logical_target() {
         let base = InlineTestProject::with_language(Language::TypeScript)
             .file(

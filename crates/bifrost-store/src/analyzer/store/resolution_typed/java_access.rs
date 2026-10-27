@@ -8,20 +8,20 @@ use crate::hash::{HashMap, HashSet};
 // also bounds malformed cyclic ownership without recursive Rust traversal.
 pub(in crate::analyzer::store) const ENDPOINTS: &str = r#"
 WITH RECURSIVE seeds(mount_ordinal, semantic_key, blob_id, package, owner) AS (
- SELECT request.mount_ordinal, request.key0, mount.blob_id, meta.content_package,
-        CASE semantic.semantic_role WHEN 'definition' THEN request.key0 ELSE NULLIF(site.owner, -1) END
- FROM temp.selected_resolution_typed_requests_1 AS request
+ SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'), mount.blob_id, meta.content_package,
+        CASE semantic.semantic_role WHEN 'definition' THEN json_extract(request.value, '$[1]') ELSE NULLIF(site.owner, -1) END
+ FROM json_each(?1) AS request
  CROSS JOIN temp.selected_resolution_mounts AS mount
-   ON mount.mount_ordinal=request.mount_ordinal AND mount.semantic_language='java'
+   ON mount.mount_ordinal=json_extract(request.value, '$[0]') AND mount.semantic_language='java'
  CROSS JOIN main.resolution_fragment_interiors AS interior
    ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
   AND interior.semantic_language=mount.semantic_language
   AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest
   AND interior.publication_state='complete'
  CROSS JOIN main.resolution_sites AS site
-   ON site.blob_id=mount.blob_id AND site.site=request.key0
+   ON site.blob_id=mount.blob_id AND site.site=json_extract(request.value, '$[1]')
  CROSS JOIN main.resolution_semantic_sites AS semantic
-   ON semantic.blob_id=mount.blob_id AND semantic.semantic_key=request.key0
+   ON semantic.blob_id=mount.blob_id AND semantic.semantic_key=json_extract(request.value, '$[1]')
   AND semantic.semantic_role=CASE site.role WHEN 0 THEN 'reference' ELSE 'definition' END
  CROSS JOIN main.blob_meta AS meta ON meta.blob_id=mount.blob_id AND meta.is_complete=1
 ), owners(mount_ordinal, semantic_key, blob_id, package, owner) AS (
@@ -55,7 +55,7 @@ LEFT JOIN main.resolution_member_scope_properties AS scope
 // template, which is what an absent seed owner means to the caller.
 pub(in crate::analyzer::store) const JVM_ENDPOINTS: &str = r#"
 WITH RECURSIVE seeds(mount_ordinal, semantic_key, blob_id, language, package, owner, seed_owner, semantic_role) AS (
- SELECT request.mount_ordinal, request.key0, mount.blob_id, mount.semantic_language,
+ SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'), mount.blob_id, mount.semantic_language,
         CASE WHEN mount.semantic_language='scala' THEN (
           SELECT prefix.prefix
           FROM main.source_native_declaration_bridges AS bridge
@@ -65,21 +65,21 @@ WITH RECURSIVE seeds(mount_ordinal, semantic_key, blob_id, language, package, ow
             AND bridge.source_site=CASE semantic.semantic_role WHEN 'definition' THEN site.site ELSE NULLIF(site.owner,-1) END
           ORDER BY prefix.ordinal DESC LIMIT 1
         ) ELSE meta.content_package END,
-        CASE semantic.semantic_role WHEN 'definition' THEN request.key0 ELSE NULLIF(site.owner, -1) END,
-        CASE semantic.semantic_role WHEN 'definition' THEN request.key0 ELSE NULLIF(site.owner, -1) END,
+        CASE semantic.semantic_role WHEN 'definition' THEN json_extract(request.value, '$[1]') ELSE NULLIF(site.owner, -1) END,
+        CASE semantic.semantic_role WHEN 'definition' THEN json_extract(request.value, '$[1]') ELSE NULLIF(site.owner, -1) END,
         semantic.semantic_role
- FROM temp.selected_resolution_typed_requests_1 AS request
+ FROM json_each(?1) AS request
  CROSS JOIN temp.selected_resolution_mounts AS mount
-   ON mount.mount_ordinal=request.mount_ordinal AND mount.semantic_language IN ('java','scala')
+   ON mount.mount_ordinal=json_extract(request.value, '$[0]') AND mount.semantic_language IN ('java','scala')
  CROSS JOIN main.resolution_fragment_interiors AS interior
    ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
   AND interior.semantic_language=mount.semantic_language
   AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest
   AND interior.publication_state='complete'
  CROSS JOIN main.resolution_sites AS site
-   ON site.blob_id=mount.blob_id AND site.site=request.key0
+   ON site.blob_id=mount.blob_id AND site.site=json_extract(request.value, '$[1]')
  CROSS JOIN main.resolution_semantic_sites AS semantic
-   ON semantic.blob_id=mount.blob_id AND semantic.semantic_key=request.key0
+   ON semantic.blob_id=mount.blob_id AND semantic.semantic_key=json_extract(request.value, '$[1]')
   AND semantic.semantic_role=CASE site.role WHEN 0 THEN 'reference' ELSE 'definition' END
  CROSS JOIN main.blob_meta AS meta ON meta.blob_id=mount.blob_id AND meta.is_complete=1
 ), owners(mount_ordinal, semantic_key, blob_id, language, package, owner, seed_owner, semantic_role) AS (
@@ -106,9 +106,9 @@ LEFT JOIN main.resolution_member_scope_properties AS scope
 // same query-owned owner-chain assembly as declaration endpoints. Import
 // references use their exact source import context, including file-level imports
 // with no declaration owner and sibling package blocks in one source blob.
-const SCALA_REFERENCE_ENDPOINTS: &str = r#"
+pub(in crate::analyzer::store) const SCALA_REFERENCE_ENDPOINTS: &str = r#"
 WITH seeds AS MATERIALIZED (
- SELECT request.mount_ordinal, request.key0 AS semantic_key, mount.blob_id,
+ SELECT json_extract(request.value, '$[0]') AS mount_ordinal, json_extract(request.value, '$[1]') AS semantic_key, mount.blob_id,
         bridge.declaration_id,
         COALESCE(
           (SELECT prefix.prefix
@@ -123,16 +123,16 @@ WITH seeds AS MATERIALIZED (
           (SELECT prefix FROM main.source_scala_declaration_lexical_prefixes AS prefix
            WHERE prefix.blob_id=bridge.blob_id AND prefix.declaration_id=bridge.declaration_id
            ORDER BY ordinal DESC LIMIT 1)) AS package
- FROM temp.selected_resolution_typed_requests_1 AS request
+ FROM json_each(?1) AS request
  CROSS JOIN temp.selected_resolution_mounts AS mount
-   ON mount.mount_ordinal=request.mount_ordinal AND mount.semantic_language='scala'
+   ON mount.mount_ordinal=json_extract(request.value, '$[0]') AND mount.semantic_language='scala'
  CROSS JOIN main.resolution_fragment_interiors AS interior
    ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
   AND interior.semantic_language=mount.semantic_language
   AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest
   AND interior.publication_state='complete'
  CROSS JOIN main.resolution_semantic_sites AS reference
-   ON reference.blob_id=mount.blob_id AND reference.semantic_key=request.key0 AND reference.semantic_role='reference'
+   ON reference.blob_id=mount.blob_id AND reference.semantic_key=json_extract(request.value, '$[1]') AND reference.semantic_role='reference'
  CROSS JOIN main.resolution_sites AS site ON site.blob_id=mount.blob_id AND site.site=reference.source_site
  LEFT JOIN main.resolution_semantic_sites AS owner
    ON owner.blob_id=mount.blob_id AND owner.semantic_key=NULLIF(site.owner,-1) AND owner.semantic_role='definition'
@@ -202,15 +202,14 @@ pub(super) fn read(
         if coordinates.is_empty() {
             continue;
         }
-        if !source
-            .selection
-            .replace_resolution_requests_1(coordinates.keys().copied(), cancellation)?
-        {
-            return Ok(None);
-        }
+        let requests = json_pair_array(
+            coordinates
+                .keys()
+                .map(|(mount, key)| (i64::from(mount.get()), *key)),
+        );
         let rows = source.read_statement(cancellation, |connection| {
             let mut statement = connection.prepare_cached(ENDPOINTS)?;
-            let mut rows = statement.query([])?;
+            let mut rows = statement.query([&requests])?;
             let mut found = Vec::new();
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
@@ -298,16 +297,15 @@ pub(super) fn read_jvm(
         if coordinates.is_empty() {
             continue;
         }
-        if !source
-            .selection
-            .replace_resolution_requests_1(coordinates.keys().copied(), cancellation)?
-        {
-            return Ok(None);
-        }
+        let requests = json_pair_array(
+            coordinates
+                .keys()
+                .map(|(mount, key)| (i64::from(mount.get()), *key)),
+        );
         let rows = source.read_statement(cancellation, |connection| {
             let mut found = Vec::new();
             let mut statement = connection.prepare_cached(JVM_ENDPOINTS)?;
-            let mut rows = statement.query([])?;
+            let mut rows = statement.query([&requests])?;
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
                     return Ok(None);
@@ -346,7 +344,7 @@ pub(super) fn read_jvm(
             let mut lexical_templates = Vec::new();
             if has_scala {
                 let mut statement = connection.prepare_cached(SCALA_REFERENCE_ENDPOINTS)?;
-                let mut rows = statement.query([])?;
+                let mut rows = statement.query([&requests])?;
                 while let Some(row) = rows.next()? {
                     if cancellation.is_cancelled() {
                         return Ok(None);

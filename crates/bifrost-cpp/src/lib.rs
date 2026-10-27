@@ -38,6 +38,7 @@ pub mod queries;
 pub mod raii;
 pub mod reconcile;
 pub mod structural;
+pub mod template_heads;
 pub mod test_detection;
 
 #[cfg(test)]
@@ -52,3 +53,6 @@ mod source_projection;
 
 mod knowledge;
 pub use knowledge::CppKnowledge;
+
+#[cfg(test)]
+mod grammar_test_support;

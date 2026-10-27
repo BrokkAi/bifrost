@@ -252,3 +252,17 @@ array proves that the context has no expanding attribute.
 Migration `0198-jvm-package-private-visibility.sql` rewrites legacy JVM
 inventory visibility labels from `package` to the canonical
 `package_private` label.
+
+Migration `0210-cpp-namespace-aliases.sql` publishes C++ namespace aliases as
+typed per-blob source facts: one row per definition (occurrence, name, target
+presence and global marker, enclosing block, guards as a positional JSON
+array) plus ordered target and enclosing-namespace path components. It extends
+the C++ fact-cost view and the manifest's density checks to the new rows. The
+C++ source epoch rotates with it, so blobs published before carry no alias
+rows only until they are reparsed.
+
+Migration `0211-procedure-dispatch-site-ordinal.sql` adds `site_ordinal` to the
+three tables that persist procedure-dispatch read keys. It names one call among
+the procedure's call rows at the same relative interval, which lowering can
+produce several of (a Python `finally` body per exit path). Units, summaries
+and surfaces that recorded the previous key are discarded and recomputed.

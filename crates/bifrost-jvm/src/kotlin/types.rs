@@ -381,14 +381,6 @@ fn resolve_kotlin_type_name_in_scope(
     .map(|_| KotlinTypeResolution::External)
 }
 
-pub fn kotlin_source_type_exists(
-    source: &dyn KotlinSource,
-    token: QueryToken<'_>,
-    fqn: &str,
-) -> bool {
-    kotlin_source_type_by_fqn(source, token, fqn).is_some()
-}
-
 pub fn kotlin_source_type_by_fqn<S: KotlinSource + ?Sized>(
     source: &S,
     token: QueryToken<'_>,

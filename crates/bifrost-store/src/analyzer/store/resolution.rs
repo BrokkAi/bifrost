@@ -12,16 +12,12 @@ use std::cmp::Ordering;
 
 use std::fmt::Display;
 
-use std::hash::Hash;
-
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::panic::resume_unwind;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-
-use moka::sync::Cache;
 
 use rusqlite::types::ToSqlOutput;
 use rusqlite::types::ValueRef;
@@ -59,40 +55,6 @@ use super::usize_to_i64;
 pub(crate) const NODE_CATALOG_PAYLOAD_BY_KEY_SQL: &str =
     "SELECT kind,semantic_local_key,semantic_shared_identity,target_local_key,target_boundary_key
      FROM resolution_node_catalog WHERE blob_id=?1 AND local_key=?2";
-
-/// A reusable store-scoped cache for immutable selected-resolution results.
-///
-/// Values may survive a request only because each instance has an explicit
-/// Moka entry cap. Callers remain responsible for including all selected
-/// authority in the key and for publishing only fully built values.
-#[derive(Clone)]
-pub(crate) struct BoundedResolutionCache<K, V> {
-    entries: Cache<K, V>,
-}
-
-impl<K, V> BoundedResolutionCache<K, V>
-where
-    K: Clone + Eq + Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
-    pub(crate) fn new(max_entries: u64) -> Self {
-        assert!(
-            max_entries > 0,
-            "a bounded resolution cache needs a positive cap"
-        );
-        Self {
-            entries: Cache::builder().max_capacity(max_entries).build(),
-        }
-    }
-
-    pub(crate) fn get(&self, key: &K) -> Option<V> {
-        self.entries.get(key)
-    }
-
-    pub(crate) fn insert(&self, key: K, value: V) {
-        self.entries.insert(key, value);
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PreparedResolutionValue {
@@ -817,14 +779,12 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // warm bundles from v46 lack those facts for casts and qualified
         // assignments.
         Language::Java => {
-            "resolution-bundle-java-v51-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v52-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
         Language::Go => {
             "resolution-bundle-go-v67-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10"
         }
-        Language::Cpp => {
-            "resolution-bundle-cpp-v25-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
-        }
+        Language::Cpp => "resolution-bundle-cpp-v26-opaque-guard-implication-6902-2026-10",
         Language::JavaScript => {
             "resolution-bundle-javascript-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
@@ -837,8 +797,13 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // Definitionless item macros preserve existing bindings and keep
         // argument uncertainty on guessed reference sites. Only unenumerable input
         // groups open reverse inventory (#5517).
+        // v122: a reference-typed generic default lowers as a TypeAlias transfer
+        // (#6950), and replayed trait methods take their trait's Self frontier
+        // (#6949).
+        // v123: attributed items bind item fragments in macro replay, and derive
+        // paths publish Macro-namespace reference sites (#6912).
         Language::Rust => {
-            "resolution-bundle-rust-v120-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10"
+            "resolution-bundle-rust-v123-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912"
         }
         Language::Php => {
             "resolution-bundle-php-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -855,7 +820,7 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // identity, and an abstract or opaque type alias projects itself
         // instead of publishing an unproduced identity slot (#5685).
         Language::Scala => {
-            "resolution-bundle-scala-v80-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
+            "resolution-bundle-scala-v81-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-2026-10"
         }
         Language::CSharp => {
             "resolution-bundle-csharp-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
@@ -864,7 +829,7 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
             "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v60-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
+            "resolution-bundle-kotlin-v61-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
@@ -1340,6 +1305,24 @@ pub(super) fn json_array<T: Display>(values: impl IntoIterator<Item = T>) -> Str
     out
 }
 
+/// One batch of integer pairs as a JSON array of two-element arrays.
+/// The caller owns the keys and drops this buffer after its queries finish.
+pub(super) fn json_pair_array(pairs: impl Iterator<Item = (i64, i64)>) -> String {
+    let mut out = String::from("[");
+    for (position, (first, second)) in pairs.enumerate() {
+        if position > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        out.push_str(&first.to_string());
+        out.push(',');
+        out.push_str(&second.to_string());
+        out.push(']');
+    }
+    out.push(']');
+    out
+}
+
 pub(super) fn nonnegative_i64(row: &Row<'_>, column: usize, label: &str) -> Result<i64> {
     let value = row.get::<_, i64>(column)?;
     nonnegative_i64_value(value, label)
@@ -1611,17 +1594,26 @@ fn insert_row_families(
         }
         shared_ids.push(interner.intern(tx, digest)?);
     }
-    let mut sites = tx.prepare_cached(
+    if !insert_json_rows(
+        tx,
         "INSERT INTO resolution_sites(
            blob_id, site, role, namespace, site_kind, start_byte, end_byte,
            unqualified, owner, receiver_origin, go_spelling_namespace, go_definition_namespaces, go_package_qualifier
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-    )?;
-    for row in &bundle.site_rows {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        sites.execute(rusqlite::params![
+         ) SELECT json_extract(value, '$[0]'),
+                json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'),
+                json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'),
+                json_extract(value, '$[5]'),
+                json_extract(value, '$[6]'),
+                json_extract(value, '$[7]'),
+                json_extract(value, '$[8]'),
+                json_extract(value, '$[9]'),
+                json_extract(value, '$[10]'),
+                json_extract(value, '$[11]'),
+                json_extract(value, '$[12]')
+         FROM json_each(?1)",
+        bundle.site_rows.iter().map(|row| (
             blob_id,
             row.site,
             row.role,
@@ -1635,56 +1627,120 @@ fn insert_row_families(
             row.go_spelling_namespace,
             row.go_definition_namespaces,
             row.go_package_qualifier,
-        ])?;
+        )),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    let mut statement = tx.prepare_cached(
+    let shared_id = |slot: Option<u32>| {
+        slot.map(|slot| shared_ids[usize::try_from(slot).expect("a slot fits usize")])
+    };
+    if !insert_json_rows(
+        tx,
         "INSERT INTO resolution_paths(
            blob_id, path, start_node, start_lead_local, start_lead_identity,
            start_lead_scoped, end_node, end_lead_local, end_lead_identity,
            end_lead_scoped, root_terminal, body, end_fixed_key, end_open_tail,
            activation_ordinal
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, jsonb(?12), ?13, ?14, ?15)",
-    )?;
-    let shared_id = |slot: Option<u32>| {
-        slot.map(|slot| shared_ids[usize::try_from(slot).expect("a slot fits usize")])
-    };
-    for row in &bundle.path_rows.rows {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        let root = row.root_endpoint.as_ref().map(|endpoint| {
-            let mut key = resolution_rows::RootKeyBuilder::default();
-            for (symbol, scoped) in &endpoint.symbols {
-                match symbol {
-                    resolution_rows::PathBodyToken::Int(local) => {
-                        key.push(Some(*local), None, *scoped)
+         ) SELECT json_extract(value, '$[0]'),
+                json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'),
+                json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'),
+                json_extract(value, '$[5]'),
+                json_extract(value, '$[6]'),
+                json_extract(value, '$[7]'),
+                json_extract(value, '$[8]'),
+                json_extract(value, '$[9]'),
+                json_extract(value, '$[10]'),
+                jsonb(json_extract(value, '$[11]')),
+                json_extract(value, '$[12]'),
+                json_extract(value, '$[13]'),
+                json_extract(value, '$[14]')
+         FROM json_each(?1)",
+        bundle.path_rows.rows.iter().map(|row| {
+            let root = row.root_endpoint.as_ref().map(|endpoint| {
+                let mut key = resolution_rows::RootKeyBuilder::default();
+                for (symbol, scoped) in &endpoint.symbols {
+                    match symbol {
+                        resolution_rows::PathBodyToken::Int(local) => {
+                            key.push(Some(*local), None, *scoped)
+                        }
+                        resolution_rows::PathBodyToken::Shared(slot) => {
+                            key.push(None, shared_id(Some(*slot)), *scoped)
+                        }
+                        other => unreachable!("a root symbol is an identity, not {other:?}"),
                     }
-                    resolution_rows::PathBodyToken::Shared(slot) => {
-                        key.push(None, shared_id(Some(*slot)), *scoped)
-                    }
-                    other => unreachable!("a root symbol is an identity, not {other:?}"),
                 }
+                (key.finish().0, i64::from(endpoint.open_tail))
+            });
+            debug_assert_eq!(root.is_some(), row.end_node == -1);
+            let (root_key, root_tail) = root.unzip();
+            (
+                blob_id,
+                row.path,
+                row.start_node,
+                row.start_lead_local,
+                shared_id(row.start_lead_shared),
+                i64::from(row.start_lead_scoped),
+                row.end_node,
+                row.end_lead_local,
+                shared_id(row.end_lead_shared),
+                i64::from(row.end_lead_scoped),
+                shared_id(row.root_terminal),
+                resolution_rows::render_path_body(&row.body, &shared_ids),
+                root_key,
+                root_tail,
+                row.root_import_activation.map(i64::from),
+            )
+        }),
+        cancellation,
+    )? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Transport one table's rows in insertion order, bounded by SQLite's actual
+/// connection length limit. Measure encoded bytes, rather than guessing a row
+/// count: path bodies and spellings have variable lengths. The one parameter
+/// does not grow the bound-variable count. Nothing survives this publication.
+fn insert_json_rows<R: serde::Serialize>(
+    tx: &Transaction<'_>,
+    sql: &str,
+    rows: impl Iterator<Item = R>,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    if cancellation.is_cancelled() {
+        return Ok(false);
+    }
+    let limit = usize::try_from(tx.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)?)
+        .expect("SQLite's length limit is nonnegative");
+    let mut statement = tx.prepare_cached(sql)?;
+    let mut batch = String::from("[");
+    for row in rows {
+        let row = serde_json::to_string(&row).expect("publication values serialize as JSON");
+        // Include the separating comma and closing bracket in the measurement.
+        if batch.len() > 1 && batch.len() + row.len() + 2 > limit {
+            if cancellation.is_cancelled() {
+                return Ok(false);
             }
-            (key.finish().0, i64::from(endpoint.open_tail))
-        });
-        debug_assert_eq!(root.is_some(), row.end_node == -1);
-        statement.execute(rusqlite::params![
-            blob_id,
-            row.path,
-            row.start_node,
-            row.start_lead_local,
-            shared_id(row.start_lead_shared),
-            i64::from(row.start_lead_scoped),
-            row.end_node,
-            row.end_lead_local,
-            shared_id(row.end_lead_shared),
-            i64::from(row.end_lead_scoped),
-            shared_id(row.root_terminal),
-            resolution_rows::render_path_body(&row.body, &shared_ids),
-            root.as_ref().map(|(key, _)| key),
-            root.as_ref().map(|(_, tail)| *tail),
-            row.root_import_activation.map(i64::from),
-        ])?;
+            batch.push(']');
+            statement.execute([&batch])?;
+            batch.clear();
+            batch.push('[');
+        }
+        if batch.len() > 1 {
+            batch.push(',');
+        }
+        batch.push_str(&row);
+    }
+    if cancellation.is_cancelled() {
+        return Ok(false);
+    }
+    if batch.len() > 1 {
+        batch.push(']');
+        statement.execute([&batch])?;
     }
     Ok(true)
 }
@@ -1714,35 +1770,45 @@ fn insert_gap_rows(
         }
         lookup_ids.push(interner.intern(tx, digest)?);
     }
-    let mut reasons = tx.prepare_cached(
-        "INSERT INTO resolution_gap_reasons(blob_id, reason, site, origin)
-         VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    for row in &bundle.gap_rows.reasons {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        reasons.execute(rusqlite::params![blob_id, row.reason, row.site, row.origin])?;
+    if !insert_json_rows(
+        tx,
+        "INSERT INTO resolution_gap_reasons(blob_id, reason, site, origin) SELECT json_extract(value, '$[0]'),
+                json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'),
+                json_extract(value, '$[3]')
+         FROM json_each(?1)",
+        bundle
+            .gap_rows
+            .reasons
+            .iter()
+            .map(|row| (blob_id, row.reason, row.site, row.origin)),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    let mut gaps = tx.prepare_cached(
-        "INSERT INTO resolution_gaps(blob_id, covers, subject, lookup, gap, reason)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    for row in &bundle.gap_rows.rows {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        let lookup = row.lookup.map_or(0, |slot| {
-            lookup_ids[usize::try_from(slot).expect("a slot fits usize")]
-        });
-        gaps.execute(rusqlite::params![
-            blob_id,
-            row.covers,
-            row.subject,
-            lookup,
-            row.gap,
-            row.reason,
-        ])?;
+    if !insert_json_rows(
+        tx,
+        "INSERT INTO resolution_gaps(blob_id, covers, subject, lookup, gap, reason) SELECT json_extract(value, '$[0]'),
+                json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'),
+                json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'),
+                json_extract(value, '$[5]')
+         FROM json_each(?1)",
+        bundle.gap_rows.rows.iter().map(|row| {
+            (
+                blob_id,
+                row.covers,
+                row.subject,
+                row.lookup.map_or(0, |slot| lookup_ids
+                    [usize::try_from(slot).expect("a slot fits usize")]),
+                row.gap,
+                row.reason
+            )
+        }),
+        cancellation,
+    )? {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -1781,22 +1847,19 @@ fn insert_typed_fact_rows(
         tokens.as_ref().map(|tokens| body(tokens))
     };
 
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_type_frontiers(blob_id, slot, role, identity_reference)
-         VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.type_frontiers {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.slot,
-                row.role,
-                row.identity_reference
-            ])?;
-        }
+    if !insert_json_rows(
+        tx,
+        "INSERT INTO resolution_type_frontiers(blob_id, slot, role, identity_reference) SELECT json_extract(value, '$[0]'),
+                json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'),
+                json_extract(value, '$[3]')
+         FROM json_each(?1)",
+        rows.type_frontiers
+            .iter()
+            .map(|row| (blob_id, row.slot, row.role, row.identity_reference)),
+        cancellation,
+    )? {
+        return Ok(false);
     }
     {
         let mut statement = tx.prepare_cached(
@@ -2364,6 +2427,49 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn json_publication_chunks_preserve_sqlite_values_and_rowids() {
+        let mut connection = crate::cache_db::open_in_memory_store_connection().unwrap();
+        connection.execute_batch("CREATE TABLE batched(id INTEGER PRIMARY KEY, ordinal INTEGER, body BLOB, optional TEXT, flag INTEGER);
+                                  CREATE TABLE single(id INTEGER PRIMARY KEY, ordinal INTEGER, body BLOB, optional TEXT, flag INTEGER);").unwrap();
+        let tx = connection.transaction().unwrap();
+        let text =
+            serde_json::to_string(&["quotes\" and slashes\\ and unicode \u{00e9}"; 8]).unwrap();
+        for ordinal in 0..10 {
+            tx.execute(
+                "INSERT INTO single(ordinal,body,optional,flag) VALUES(?1,jsonb(?2),?3,?4)",
+                params![ordinal, text, Option::<String>::None, ordinal % 2 == 0],
+            )
+            .unwrap();
+        }
+        // This is deliberately below the encoded batch size, above every
+        // individual row and SQL statement. Exercise the real SQLite boundary.
+        let previous = tx
+            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 1024)
+            .unwrap();
+        assert!(insert_json_rows(&tx,
+            "INSERT INTO batched(ordinal,body,optional,flag) SELECT json_extract(value,'$[0]'),jsonb(json_extract(value,'$[1]')),json_extract(value,'$[2]'),json_extract(value,'$[3]') FROM json_each(?1)",
+            (0..10).map(|ordinal| (ordinal, &text, Option::<String>::None, ordinal % 2 == 0)),
+            &CancellationToken::new()).unwrap());
+        tx.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, previous)
+            .unwrap();
+        let count: i64 = tx
+            .query_row("SELECT count(*) FROM batched", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 10, "the chunked writer must run");
+        let different: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM (SELECT * FROM single EXCEPT SELECT * FROM batched)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            different, 0,
+            "JSONB bytes, nulls, booleans and rowids are identical"
+        );
+    }
+
     fn shared_name_connection() -> Connection {
         let mut connection = crate::cache_db::open_in_memory_store_connection()
             .expect("shared-name store connection");
@@ -2395,7 +2501,7 @@ mod tests {
     fn shared_name_admission_preserves_first_ids_in_either_receipt_order() {
         for reversed in [false, true] {
             let mut connection = shared_name_connection();
-            let cache = SharedNameCache::new();
+            let cache = SharedNameCache::default();
             let table = SharedNameTable::new(cache.clone());
             let synthetic = table.interner(&connection).intern([99; 32]);
             let first = table.interner(&connection).intern([1; 32]);
@@ -2404,7 +2510,7 @@ mod tests {
             assert!(!first.is_interned());
             assert_eq!(table.interner(&connection).to_persisted(first), None);
             assert!(
-                cache.entries.get(&[1; 32]).is_none(),
+                cache.shared_name([1; 32]).is_none(),
                 "misses are request-owned"
             );
 
@@ -2442,8 +2548,8 @@ mod tests {
             let next = SharedNameTable::new(cache.clone());
             assert_eq!(next.interner(&connection).intern([1; 32]), stored_first);
             assert_eq!(next.interner(&connection).intern([2; 32]), stored_second);
-            assert_eq!(cache.entries.get(&[1; 32]), Some(stored_first));
-            assert_eq!(cache.entries.get(&[2; 32]), Some(stored_second));
+            assert_eq!(cache.shared_name([1; 32]), Some(stored_first));
+            assert_eq!(cache.shared_name([2; 32]), Some(stored_second));
             assert_eq!(table.interner(&connection).intern([1; 32]), first);
             assert!(next.admit_persisted_names(&receipt, &CancellationToken::new()));
             assert!(next.aliases.borrow().from_persisted.is_empty());
@@ -2477,7 +2583,7 @@ mod tests {
     fn shared_name_admission_cancellation_keeps_both_directions_atomic() {
         let mut connection = shared_name_connection();
         for checks in 1..=4 {
-            let table = SharedNameTable::new(SharedNameCache::new());
+            let table = SharedNameTable::new(SharedNameCache::default());
             let digests = [
                 [checks as u8; 32],
                 [checks as u8 + 10; 32],
@@ -2502,7 +2608,7 @@ mod tests {
                 );
             }
         }
-        let table = SharedNameTable::new(SharedNameCache::new());
+        let table = SharedNameTable::new(SharedNameCache::default());
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(!table.admit_persisted_names(&[], &cancelled));
@@ -2512,7 +2618,7 @@ mod tests {
     #[test]
     fn shared_name_admission_rejects_conflicts_before_installing_aliases() {
         let mut connection = shared_name_connection();
-        let table = SharedNameTable::new(SharedNameCache::new());
+        let table = SharedNameTable::new(SharedNameCache::default());
         for digest in [[1; 32], [2; 32], [3; 32]] {
             table.interner(&connection).intern(digest);
         }
@@ -2781,84 +2887,9 @@ mod tests {
     }
 }
 
-/// The store's answers to "what is this shared name's id", across requests.
-///
-/// A `resolution_identities.id` is a fact of the store: the writer interns a
-/// name once for the whole cache, an id is never reused and a name is never
-/// collected on the hot path (Decision Log, 2026-09-17), so an entry here can
-/// never go stale and nothing invalidates it. Only interned ids are held; a
-/// per-request id is one request's own and never leaves
-/// [`SharedNameTable`].
-///
-/// It is a bounded moka cache with an entry cap, which is the shape the
-/// heap-residency rule allows: it does not grow with the workspace. Stage 1a
-/// measured about 95 prepared seeks per definition request on tract, one per
-/// distinct name that request mints from a spelling; the names repeat across
-/// requests, so the seek belongs to the store and not to the request.
-#[derive(Clone, Debug)]
+/// A shared handle to the store's one weighted cache budget.
 #[doc(hidden)]
-pub struct SharedNameCache {
-    entries: Cache<[u8; 32], SharedNameId>,
-    /// What this cache has allocated, as the heap pin's own counter sees it.
-    ///
-    /// The reverse-request heap pin measures a request's growth with an
-    /// allocator counter and subtracts the byte-capped caches, because a cache
-    /// with an explicit cap is the one structure allowed to hold an entry per
-    /// file. This is that subtraction for this cache, measured rather than
-    /// estimated: moka's per-entry cost is its own and an entry's 36 bytes of
-    /// payload do not predict it.
-    #[cfg(any(test, feature = "test-support"))]
-    allocated: Arc<std::sync::atomic::AtomicI64>,
-}
-
-impl SharedNameCache {
-    /// How many names the cache holds.
-    ///
-    /// Tract's whole `resolution_identities` table is 22,350 rows, so this cap
-    /// holds every name of a workspace of that size and still bounds a larger
-    /// one; an entry is a 32-byte digest and a `u32`.
-    const ENTRIES: u64 = 65_536;
-
-    #[doc(hidden)]
-    pub fn new() -> Self {
-        Self {
-            entries: Cache::builder().max_capacity(Self::ENTRIES).build(),
-            #[cfg(any(test, feature = "test-support"))]
-            allocated: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        }
-    }
-
-    /// What this cache has allocated on this thread since it was built.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn allocated_bytes(&self) -> i64 {
-        self.allocated.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Run one cache operation, charging what it allocates to this cache.
-    fn charged<T>(&self, operation: impl FnOnce(&Cache<[u8; 32], SharedNameId>) -> T) -> T {
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            operation(&self.entries)
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            let before = super::resolution_operation::heap_pin_bytes();
-            let result = operation(&self.entries);
-            self.allocated.fetch_add(
-                super::resolution_operation::heap_pin_bytes() - before,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            result
-        }
-    }
-}
-
-impl Default for SharedNameCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub type SharedNameCache = super::cache_budget::StoreCacheBudget;
 
 /// One request's answers to "what is this shared name's id".
 ///
@@ -2943,7 +2974,7 @@ impl SharedNameTable {
             "the store cache holds only committed IDs"
         );
         self.remember_identity(digest, request);
-        self.cache.charged(|entries| entries.insert(digest, stored));
+        self.cache.insert_shared_name(digest, stored);
     }
 
     /// Admit one blob's complete committed shared-name membership.
@@ -3074,7 +3105,7 @@ impl SharedNameInterner for StoreSharedNames<'_> {
         if let Some(&id) = self.table.ids.borrow().get(&digest) {
             return id;
         }
-        if let Some(id) = self.table.cache.charged(|entries| entries.get(&digest)) {
+        if let Some(id) = self.table.cache.shared_name(digest) {
             debug_assert!(id.is_interned(), "the store's cache holds only store facts");
             self.table.remember_identity(digest, id);
             return id;
@@ -3093,9 +3124,7 @@ impl SharedNameInterner for StoreSharedNames<'_> {
                 let id = SharedNameId::interned(id);
                 // An interned id is a fact of the store and is never reused,
                 // so the store keeps the answer for the next request.
-                self.table
-                    .cache
-                    .charged(|entries| entries.insert(digest, id));
+                self.table.cache.insert_shared_name(digest, id);
                 id
             }
             None => {

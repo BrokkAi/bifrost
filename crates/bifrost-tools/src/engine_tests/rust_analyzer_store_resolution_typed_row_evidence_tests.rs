@@ -86,14 +86,13 @@ mod rust_departing_row_evidence_tests_tests {
                 .unwrap();
             assert_eq!(keys.len(), 64);
             for arity in [1, 64] {
-                assert!(
-                    selection
-                        .replace_resolution_requests_1(
-                            keys[..arity].iter().copied(),
-                            &CancellationToken::new()
-                        )
-                        .unwrap()
-                );
+                let requests = serde_json::to_string(
+                    &keys[..arity]
+                        .iter()
+                        .map(|(mount, key)| (mount.get(), *key))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
                 for (name, outer, corpus) in [
                     (
                         "generic_parameter_declarations",
@@ -137,12 +136,13 @@ mod rust_departing_row_evidence_tests_tests {
                         "{state:?} {name}: {plan:?}"
                     );
                 }
-                let query = pinned("generic_parameter_declarations");
+                let mut query = pinned("generic_parameter_declarations");
+                query.params = vec![rusqlite::types::Value::Text(requests.clone())];
                 let read = |sql: &str| {
                     let mut rows: Vec<(i64, i64)> = conn
                         .prepare(sql)
                         .unwrap()
-                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .query_map([&requests], |row| Ok((row.get(0)?, row.get(1)?)))
                         .unwrap()
                         .collect::<rusqlite::Result<_>>()
                         .unwrap();

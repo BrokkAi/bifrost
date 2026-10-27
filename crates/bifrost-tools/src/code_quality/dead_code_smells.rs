@@ -1905,6 +1905,24 @@ fn prove_native_candidates(
         }
         return Vec::new();
     }
+    // A source that admission refused may reference any candidate: an
+    // explained exclusion still leaves every candidate's inbound edges unknown.
+    let excluded = match provider.excluded_sources(analyzer) {
+        Ok(excluded) => excluded
+            .into_iter()
+            .map(|(file, reason)| format!("{} ({reason})", rel_path_string(&file)))
+            .collect::<Vec<_>>(),
+        Err(error) => vec![format!("source admission refusals unavailable: {error}")],
+    };
+    if !excluded.is_empty() {
+        for candidate in candidates {
+            skipped.push(format!(
+                "`{}`: source admission refused files that may reference it: {excluded:?}; evidence is inconclusive",
+                candidate.fq_name(),
+            ));
+        }
+        return Vec::new();
+    }
     // Admission is the analyzed listing: only a published file can contribute
     // an edge, and the preflight above has already reported any that cannot.
     // This proof reads only the edges into the candidates, so a file the

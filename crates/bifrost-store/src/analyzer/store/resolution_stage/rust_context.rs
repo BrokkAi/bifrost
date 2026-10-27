@@ -37,6 +37,10 @@ pub fn visit_rust_reference_context_pages(
 ) -> Result<TypedFactReadOutcome> {
     let request = semantic_request_json(references);
     visit_stage_rows(
+        &[
+            super::StageFamily::ReferenceContexts,
+            super::StageFamily::SemanticCoordinates,
+        ],
         selection,
         REFERENCES_SQL,
         &[&request],

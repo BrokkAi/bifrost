@@ -197,18 +197,7 @@ impl RustCargoConfiguration {
     /// the flags every target's build sets are in it.
     pub fn cfg_atoms(&self, directory: &Path) -> BTreeSet<String> {
         let levels = self.levels(directory);
-        let mut targets = match merged(levels.iter().filter_map(|(_, file)| file.build("target"))) {
-            Some(toml::Value::Array(items)) => items
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            Some(toml::Value::String(target)) => vec![target],
-            _ => Vec::new(),
-        };
-        if targets.is_empty() {
-            targets.push(HOST_TRIPLE.to_string());
-        }
+        let targets = self.build_targets(directory);
         let mut atoms = BTreeSet::from(["test".to_string(), "debug_assertions".to_string()]);
         if let [target] = targets.as_slice() {
             let target_atoms = target_cfg_atoms(target);
@@ -222,6 +211,46 @@ impl RustCargoConfiguration {
                 .expect("several targets");
             atoms.extend(flags);
         }
+        atoms
+    }
+
+    fn build_targets(&self, directory: &Path) -> Vec<String> {
+        let levels = self.levels(directory);
+        let mut targets = match merged(levels.iter().filter_map(|(_, file)| file.build("target"))) {
+            Some(toml::Value::Array(items)) => items
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(toml::Value::String(target)) => vec![target],
+            _ => Vec::new(),
+        };
+        if targets.is_empty() {
+            targets.push(HOST_TRIPLE.to_string());
+        }
+        targets
+    }
+
+    /// Target dependency tables follow the configured build targets. If the
+    /// targets disagree, one placement cannot prove whether the edge is active.
+    pub(crate) fn dependency_predicate(&self, directory: &Path, key: &str) -> Option<bool> {
+        let mut outcomes = self
+            .build_targets(directory)
+            .into_iter()
+            .map(|target| target_dependency_predicate(&target, key));
+        let first = outcomes.next().expect("a build has a target")?;
+        outcomes
+            .all(|outcome| outcome == Some(first))
+            .then_some(first)
+    }
+
+    /// Host-only units use the host cfg set even for a configured cross build.
+    pub(crate) fn host_cfg_atoms(&self, directory: &Path) -> BTreeSet<String> {
+        let levels = self.levels(directory);
+        let target_atoms = target_cfg_atoms(HOST_TRIPLE);
+        let mut atoms = BTreeSet::from(["test".to_string(), "debug_assertions".to_string()]);
+        atoms.extend(rustflag_cfg_atoms(&levels, HOST_TRIPLE, &target_atoms));
+        atoms.extend(target_atoms);
         atoms
     }
 
@@ -407,6 +436,23 @@ fn rustflags(value: Option<toml::Value>) -> Vec<String> {
             .collect(),
         Some(toml::Value::String(flags)) => flags.split_whitespace().map(str::to_string).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Cargo dependency-table selection for host-only units. Like Cargo,
+/// this ignores test/feature cfgs and evaluates target predicates only.
+pub(crate) fn host_dependency_predicate(key: &str) -> Option<bool> {
+    target_dependency_predicate(HOST_TRIPLE, key)
+}
+
+fn target_dependency_predicate(target: &str, key: &str) -> Option<bool> {
+    if key.starts_with("cfg(") {
+        let atoms = target_cfg_atoms(target);
+        Expression::parse(key)
+            .ok()?
+            .eval(|predicate| cfg_key_predicate(predicate, &atoms))
+    } else {
+        Some(key == target)
     }
 }
 

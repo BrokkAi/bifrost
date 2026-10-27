@@ -421,6 +421,26 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 206,
         sql: include_str!("../migrations/cache/0206-go-domain-contexts.sql"),
     },
+    CacheMigration {
+        version: 207,
+        sql: include_str!("../migrations/cache/0207-native-visibility-definition-kinds.sql"),
+    },
+    CacheMigration {
+        version: 208,
+        sql: include_str!("../migrations/cache/0208-workspace-source-refusals.sql"),
+    },
+    CacheMigration {
+        version: 209,
+        sql: include_str!("../migrations/cache/0209-python-environment-source-inputs.sql"),
+    },
+    CacheMigration {
+        version: 210,
+        sql: include_str!("../migrations/cache/0210-cpp-namespace-aliases.sql"),
+    },
+    CacheMigration {
+        version: 211,
+        sql: include_str!("../migrations/cache/0211-procedure-dispatch-site-ordinal.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -446,8 +466,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    49, 146, 248, 104, 56, 34, 140, 212, 135, 115, 127, 253, 91, 56, 45, 53, 111, 136, 203, 131,
-    20, 187, 120, 165, 159, 203, 200, 126, 36, 0, 28, 16,
+    78, 32, 64, 210, 167, 158, 101, 42, 223, 223, 171, 254, 248, 247, 46, 198, 246, 58, 7, 130, 95,
+    16, 117, 219, 122, 130, 151, 227, 249, 154, 64, 147,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -693,12 +713,24 @@ pub fn open_in_memory_store_connection() -> rusqlite::Result<Connection> {
 }
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+    let template_dir = crate::sqlite_template::template_dir();
+    open_unified_connection_with_template_dir(db_path, template_dir.as_deref())
+}
+
+/// [`open_unified_connection`] with the store-template directory as an
+/// argument. A test that asserts what a fresh store looks like passes its own
+/// empty directory: in the machine template directory, a template that another
+/// run published would satisfy the test without running the fresh-build path.
+fn open_unified_connection_with_template_dir(
+    db_path: &Path,
+    template_dir: Option<&Path>,
+) -> Result<Connection> {
     disable_sqlite_memory_statistics();
     {
         let _scope = crate::profiling::scope("cache_db.validate_filesystem");
         validate_writable_cache_filesystem(db_path)?;
     }
-    open_unified_connection_unclassified(db_path).map_err(|error| {
+    open_unified_connection_unclassified(db_path, template_dir).map_err(|error| {
         match cache_write_denial(db_path) {
             Some(denied) => cache_permission_denied_message(db_path, &denied),
             None => error,
@@ -837,7 +869,10 @@ fn cache_permission_denied_message(db_path: &Path, denied: &Path) -> String {
     )
 }
 
-fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
+fn open_unified_connection_unclassified(
+    db_path: &Path,
+    template_dir: Option<&Path>,
+) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     // Project-layout preparation can migrate the tracked `.bifrost/.gitignore`.
     // Serialize it separately from the database open: the cache directory may
@@ -886,8 +921,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     }
     let seeded = {
         let _scope = crate::profiling::scope("cache_db.seed_from_template");
-        let template_dir = crate::sqlite_template::template_dir();
-        seed_new_store_from_template(&db_path, template_dir.as_deref())?
+        seed_new_store_from_template(&db_path, template_dir)?
     };
     let mut conn = {
         let _scope = crate::profiling::scope("cache_db.sqlite_open");
@@ -2864,16 +2898,18 @@ mod tests {
     use crate::cache_gc::PlannerStatisticsState;
 
     #[test]
-    fn a_store_seeded_from_the_template_matches_a_store_built_by_the_schema() {
+    fn a_store_seeded_from_the_template_matches_a_store_opened_without_one() {
         let temp = tempfile::tempdir().unwrap();
         // The template builders open with SQLITE_OPEN_NOFOLLOW, which rejects a
         // symlink anywhere in the path, and production passes canonical paths.
         // macOS temp directories live under /var -> /private/var (#4604).
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let template_dir = root.join("templates");
-        let reference = root.join("reference.db");
-        std::fs::File::create(&reference).unwrap();
-        build_fresh_store(&reference).unwrap();
+        // The reference never touches a template: the ordinary open configures
+        // and migrates the new file itself. It gets its own directory so that
+        // the open's neighbour-store import and cleanup see nothing else.
+        let reference = root.join("untemplated").join(cache_db_file_name());
+        drop(open_unified_connection_with_template_dir(&reference, None).unwrap());
 
         // The first store builds and publishes the template; the second copies it.
         let first = root.join("first.db");
@@ -2921,6 +2957,16 @@ mod tests {
             )
         };
         let expected = describe(&reference);
+        // Fixed values, so that a defect both paths share still fails: 32 KiB
+        // pages, incremental auto-vacuum, WAL.
+        assert_eq!(
+            expected.0[..3],
+            [
+                Value::Integer(32 * 1024),
+                Value::Integer(2),
+                Value::Text("wal".to_owned())
+            ]
+        );
         assert_eq!(expected.1, CURRENT_SCHEMA_OBJECTS_SHA256);
         for seeded in [&first, &second] {
             assert_eq!(describe(seeded), expected, "{}", seeded.display());
@@ -4561,10 +4607,16 @@ mod tests {
     #[test]
     #[hardwon("#5664: Go summary retirement left members and containers orphaned during upgrades")]
     fn go_domain_migration_withdraws_v1_contexts_and_summary_rows() {
+        // #6291: later compatible migrations must not move this regression's
+        // starting schema past 0206 or replace the Go upgrade it exercises.
+        let go_domain_migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 206)
+            .expect("Go domain migration remains in the compatible chain");
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS
             .iter()
-            .filter(|migration| migration.version < CURRENT_MIGRATION_VERSION)
+            .filter(|migration| migration.version < go_domain_migration.version)
         {
             conn.execute_batch(migration.sql).unwrap();
         }
@@ -4590,8 +4642,7 @@ mod tests {
         validate_foreign_keys(&conn).unwrap();
         // Match migrate(): historical DDL cannot rely on cascading FK actions.
         conn.pragma_update(None, "foreign_keys", false).unwrap();
-        conn.execute_batch(POST_BASELINE_MIGRATIONS.last().unwrap().sql)
-            .unwrap();
+        conn.execute_batch(go_domain_migration.sql).unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         for table in [
             "go_context_selections",
@@ -4892,7 +4943,7 @@ mod tests {
         "#5141: semantic language was incorrectly constrained to the owner blob dialect"
     )]
     fn class_set_storage_identity_migration_preserves_owned_rows_and_constraints() {
-        let mut conn = create_current_baseline_without_migration();
+        let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS
             .iter()
             .filter(|migration| migration.version < 193)
@@ -4945,7 +4996,17 @@ mod tests {
         ))
         .unwrap();
 
-        migrate(&mut conn).unwrap();
+        // Migration 211 discards every class-set summary and surface, so the
+        // rows this test follows stop at the chain before it. As in `migrate`,
+        // a rebuilt parent must not cascade into its children.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| (193..211).contains(&migration.version))
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         for (table, key, id) in [
             ("class_set_finding_free_root_results", "result_id", 42),
@@ -5039,7 +5100,6 @@ mod tests {
             [ts_blob_id],
         )
         .unwrap();
-        assert!(current_schema_is_valid(&conn).unwrap());
         validate_foreign_keys(&conn).unwrap();
         conn.execute("DELETE FROM blobs WHERE id = ?1", [ts_blob_id])
             .unwrap();
@@ -5060,6 +5120,13 @@ mod tests {
             );
         }
         validate_foreign_keys(&conn).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 211)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -7307,15 +7374,22 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
+        // An empty template directory, so one of the openers builds the store
+        // rather than every opener copying a template another run published.
+        let template_dir = temp.path().join("templates");
         let barrier = Arc::new(Barrier::new(OPENERS));
         let results = thread::scope(|scope| {
             let handles = (0..OPENERS)
                 .map(|_| {
                     let barrier = Arc::clone(&barrier);
                     let db_path = db_path.clone();
+                    let template_dir = template_dir.as_path();
                     scope.spawn(move || {
                         barrier.wait();
-                        let conn = open_unified_connection(&db_path)?;
+                        let conn = open_unified_connection_with_template_dir(
+                            &db_path,
+                            Some(template_dir),
+                        )?;
                         if cache_migration_version(&conn)? != CURRENT_MIGRATION_VERSION {
                             return Err("concurrent opener observed an old schema version".into());
                         }
@@ -7495,8 +7569,13 @@ mod tests {
     fn fresh_cache_store_uses_cache_page_size() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
+        // An empty template directory, so this open builds the store and
+        // publishes the template instead of copying one another run published.
+        let template_dir = temp.path().join("templates");
 
-        let conn = open_unified_connection(&db_path).unwrap();
+        let conn =
+            open_unified_connection_with_template_dir(&db_path, Some(&template_dir)).unwrap();
+        assert!(template_dir.join(STORE_TEMPLATE.file_name()).is_file());
 
         assert_eq!(connection_page_size(&conn), CACHE_PAGE_SIZE_BYTES);
         assert_eq!(

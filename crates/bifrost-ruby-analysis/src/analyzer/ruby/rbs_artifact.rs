@@ -468,6 +468,8 @@ fn project_constant(
     };
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),
@@ -826,6 +828,8 @@ fn project_type(
         }
     }
     types.push(TypeFact {
+        implemented_traits_complete: false,
+        generic_trait_impls_complete: false,
         jvm_inventory: None,
         type_parameter_defaults: Vec::new(),
         implemented_traits: Vec::new(),

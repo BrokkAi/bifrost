@@ -208,6 +208,7 @@ pub fn compile_pack(
     let mut total_raw = 0u64;
     for shard in &normalized.shards {
         let compiled = CompiledShard {
+            extraction: normalized.extraction.clone(),
             schema_version: normalized.schema_version,
             pack_id: normalized.pack_id.clone(),
             pack_version: normalized.version.clone(),
@@ -221,10 +222,10 @@ pub fn compile_pack(
             license: normalized.license.clone(),
             completeness: normalized.completeness,
             safety: normalized.safety.clone(),
-            runtime_values: shard.runtime_values.clone(),
-            runtime_contracts: shard.runtime_contracts.clone(),
-            collection_flows: shard.collection_flows.clone(),
-            deferred_yields: shard.deferred_yields.clone(),
+            runtime_values: shard.runtime_values.clone().map(std::sync::Arc::new),
+            runtime_contracts: shard.runtime_contracts.clone().map(std::sync::Arc::new),
+            collection_flows: shard.collection_flows.clone().map(std::sync::Arc::new),
+            deferred_yields: shard.deferred_yields.clone().map(std::sync::Arc::new),
             conditional_type_refinements: shard.conditional_type_refinements.clone(),
             callable_values: shard.callable_values.clone(),
             cpp_portability: normalized.cpp_portability.clone(),
@@ -294,6 +295,7 @@ pub fn compile_pack(
     }
 
     let mut manifest = CompiledPackManifest {
+        extraction: normalized.extraction.clone(),
         schema_version: normalized.schema_version,
         pack_id: normalized.pack_id,
         version: normalized.version,
@@ -647,17 +649,17 @@ fn compile_payload(
             members,
             relations,
         } => CompiledPayload::DeclarationFacts {
-            types: types.clone(),
-            members: members.clone(),
-            relations: relations.clone(),
+            types: types.iter().cloned().map(std::sync::Arc::new).collect(),
+            members: members.iter().cloned().map(std::sync::Arc::new).collect(),
+            relations: relations.iter().cloned().map(std::sync::Arc::new).collect(),
         },
         AuthoredPayload::GeneratorRules { rules } => CompiledPayload::GeneratorRules {
-            rules: rules.clone(),
+            rules: rules.iter().cloned().map(std::sync::Arc::new).collect(),
         },
         AuthoredPayload::ProcedureSummaries { summaries } => CompiledPayload::ProcedureSummaries {
             summaries: summaries
                 .iter()
-                .map(|summary| compile_procedure_summary(pack_id, summary))
+                .map(|summary| compile_procedure_summary(pack_id, summary).map(std::sync::Arc::new))
                 .collect::<Result<Vec<_>, _>>()?,
         },
     })
@@ -1022,5 +1024,66 @@ mod callable_values_normalization_tests {
                 .iter()
                 .all(|diagnostic| diagnostic.details.is_some())
         );
+    }
+}
+
+#[cfg(test)]
+mod extraction_contract_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{
+        ArtifactExtraction, ArtifactExtractionKind, DecodeLimits, decode_manifest,
+        decode_shard_for_manifest,
+    };
+
+    #[test]
+    fn extraction_is_producer_only_and_part_of_both_semantic_identities() {
+        let source = include_bytes!("../../../tests/fixtures/extraction-contract.json");
+        let mut pack: AuthoredSemanticModelPack = serde_json::from_slice(source).unwrap();
+        pack.schema_version = 19;
+        pack.compatibility.bifrost = None;
+        let curated = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let claim =
+            ArtifactExtraction::source_set(ArtifactExtractionKind::JdkJmodSet, &"a".repeat(64));
+        pack.extraction = Some(claim.clone());
+        let produced = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        assert_ne!(
+            curated.manifest.semantic_sha256,
+            produced.manifest.semantic_sha256
+        );
+        assert_ne!(
+            curated.shards[0].descriptor.semantic_sha256,
+            produced.shards[0].descriptor.semantic_sha256
+        );
+        let manifest = decode_manifest(&produced.manifest_bytes, &DecodeLimits::default()).unwrap();
+        assert_eq!(manifest.extraction, Some(claim.clone()));
+        let shard = decode_shard_for_manifest(
+            &manifest,
+            &produced.shards[0].descriptor,
+            &produced.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(shard.extraction, Some(claim.clone()));
+        let mut mismatched = manifest.clone();
+        mismatched.extraction = None;
+        let error = decode_shard_for_manifest(
+            &mismatched,
+            &produced.shards[0].descriptor,
+            &produced.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("envelope"), "{error}");
+        let mut authored: serde_json::Value = serde_json::from_slice(source).unwrap();
+        authored["extraction"] = serde_json::to_value(claim).unwrap();
+        let diagnostics = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&authored).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{diagnostics:?}").contains("extraction"));
+        pack.schema_version = 18;
+        assert!(compile_pack(&pack, &CompilerOptions::default()).is_err());
     }
 }

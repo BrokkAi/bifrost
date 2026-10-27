@@ -85,29 +85,6 @@ pub trait PythonEnvironmentSurface {
     fn attribute_boundary(&self, owner_path: &str, member: &str) -> PythonEnvironmentBoundary;
 }
 
-/// An environment that has acquired nothing. Every boundary is unknown, which
-/// is the honest answer for an analyzer no host has activated packs on.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnacquiredPythonEnvironment;
-
-impl PythonEnvironmentSurface for UnacquiredPythonEnvironment {
-    fn module_boundary(&self, _module_path: &str) -> PythonEnvironmentBoundary {
-        unknown_boundary()
-    }
-
-    fn attribute_boundary(&self, _owner_path: &str, _member: &str) -> PythonEnvironmentBoundary {
-        unknown_boundary()
-    }
-}
-
-fn unknown_boundary() -> PythonEnvironmentBoundary {
-    PythonEnvironmentBoundary::Incomplete(
-        SemanticDiagnosticIncompleteReason::missing_dependency_discovery(
-            BoundaryStatus::ExternalUnknown,
-        ),
-    )
-}
-
 /// Collect Python semantic diagnostics and the proof behind each one.
 pub fn collect_python_semantic_diagnostics(
     py: &dyn PythonSource,
@@ -433,7 +410,7 @@ impl PythonDiagnosticCollector<'_> {
                 );
             }
             "except_clause" => {
-                self.seed_except_alias(node, scopes);
+                Self::seed_except_alias(node, self.source, scopes);
                 brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
                     node,
                     stack,
@@ -503,31 +480,11 @@ impl PythonDiagnosticCollector<'_> {
         }
     }
 
-    fn seed_except_alias(&self, node: Node<'_>, scopes: &mut ScopeStack) {
-        if let Some(alias) = node.child_by_field_name("alias") {
-            collect_bound_identifiers(alias, self.source, scopes);
-            return;
-        }
-        let mut identifiers = Vec::new();
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            if current.kind() == "identifier" {
-                let text = node_text(current, self.source).trim();
-                if !text.is_empty() {
-                    identifiers.push(text.to_string());
-                }
-                continue;
-            }
-            let mut cursor = current.walk();
-            for child in current.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        if identifiers.len() >= 2
-            && let Some(alias) = identifiers.into_iter().next()
-        {
-            scopes.declare(alias);
-        }
+    fn seed_except_alias(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
+        // The modern grammar puts `as_pattern.alias` inside the value field.
+        // Search alias fields on the clause and its direct children, never the
+        // handler body or the exception-type expression.
+        collect_alias_children(node, source, scopes);
     }
 
     fn seed_comprehension_targets(&self, node: Node<'_>, scopes: &mut ScopeStack) {
@@ -736,6 +693,13 @@ fn dynamic_surface_reasons(
 fn has_module_getattr(source: &str, root: Node<'_>) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor).any(|child| {
+        let child = if child.kind() == "decorated_definition" {
+            child
+                .child_by_field_name("definition")
+                .expect("decorated definition has a definition")
+        } else {
+            child
+        };
         child.kind() == "function_definition"
             && child
                 .child_by_field_name("name")
@@ -835,7 +799,9 @@ fn is_declaration_identifier(node: Node<'_>) -> bool {
         "function_definition" | "class_definition" => parent
             .child_by_field_name("name")
             .is_some_and(|name| same_node(name, node)),
-        "parameters" | "list_splat_pattern" | "dictionary_splat_pattern" => true,
+        "parameters" | "lambda_parameters" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            true
+        }
         "default_parameter" | "typed_parameter" | "typed_default_parameter" => parent
             .child_by_field_name("name")
             .is_some_and(|name| contains_node(name, node)),
@@ -873,8 +839,28 @@ fn is_attribute_identifier(node: Node<'_>) -> bool {
 fn is_pattern_identifier(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if parent.kind().contains("pattern") {
-            return true;
+        // Pattern-shaped nodes also wrap evaluated expressions, notably a
+        // with manager and exception type. Only the binding field suppresses
+        // reads; receiver/index/call operands are evaluated even in a target.
+        match parent.kind() {
+            "as_pattern" => {
+                return parent
+                    .child_by_field_name("alias")
+                    .is_some_and(|alias| contains_node(alias, node));
+            }
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                return parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| contains_node(left, node));
+            }
+            "list_splat_pattern" | "dictionary_splat_pattern" => return true,
+            "call"
+            | "attribute"
+            | "subscript"
+            | "function_definition"
+            | "class_definition"
+            | "lambda" => return false,
+            _ => {}
         }
         current = parent;
     }
@@ -998,6 +984,7 @@ pub fn is_python_builtin_or_constant(name: &str) -> bool {
             | "format"
             | "frozenset"
             | "getattr"
+            | "globals"
             | "hasattr"
             | "hash"
             | "help"
@@ -1060,4 +1047,187 @@ pub fn is_python_builtin_or_constant(name: &str) -> bool {
             | "unicode"
             | "xrange"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: lambda parameter declarations were judged as reads"
+    )]
+    fn qs6_lexical_binder_grammar_boundary() {
+        for (source, spelling, declaration, pattern) in [
+            ("def run(self): pass\n", "self", true, false),
+            ("identity = lambda local: 1\n", "local", true, false),
+            ("def run(*args): pass\n", "args", true, true),
+            ("with manager() as alias: pass\n", "alias", false, true),
+            ("result = missing, *items\n", "missing", false, false),
+            ("missing, *items = source\n", "missing", false, true),
+            ("result = (missing, items)\n", "missing", false, false),
+        ] {
+            let tree = crate::declarations::parse_python_tree(source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let mut pending = vec![tree.root_node()];
+            let mut found = false;
+            while let Some(node) = pending.pop() {
+                if node.kind() == "identifier" && node_text(node, source) == spelling {
+                    assert_eq!(
+                        is_declaration_identifier(node),
+                        declaration,
+                        "{source}: {}",
+                        tree.root_node().to_sexp()
+                    );
+                    assert_eq!(
+                        is_pattern_identifier(node),
+                        pattern,
+                        "{source}: {}",
+                        tree.root_node().to_sexp()
+                    );
+                    found = true;
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            assert!(found);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: globals builtin reference was falsely absent"
+    )]
+    fn qs6_cpython_builtin_inventory() {
+        // Independent oracle: CPython 3.8.10 dir(builtins), excluding
+        // implementation metadata dunders. Module constants and Python 2
+        // additions are specified separately below.
+        let names = "ArithmeticError AssertionError AttributeError BaseException BlockingIOError BrokenPipeError BufferError BytesWarning ChildProcessError ConnectionAbortedError ConnectionError ConnectionRefusedError ConnectionResetError DeprecationWarning EOFError Ellipsis EnvironmentError Exception False FileExistsError FileNotFoundError FloatingPointError FutureWarning GeneratorExit IOError ImportError ImportWarning IndentationError IndexError InterruptedError IsADirectoryError KeyError KeyboardInterrupt LookupError MemoryError ModuleNotFoundError NameError None NotADirectoryError NotImplemented NotImplementedError OSError OverflowError PendingDeprecationWarning PermissionError ProcessLookupError RecursionError ReferenceError ResourceWarning RuntimeError RuntimeWarning StopAsyncIteration StopIteration SyntaxError SyntaxWarning SystemError SystemExit TabError TimeoutError True TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError UnicodeError UnicodeTranslateError UnicodeWarning UserWarning ValueError Warning ZeroDivisionError __debug__ __import__ abs all any ascii bin bool breakpoint bytearray bytes callable chr classmethod compile complex copyright credits delattr dict dir divmod enumerate eval exec exit filter float format frozenset getattr globals hasattr hash help hex id input int isinstance issubclass iter len license list locals map max memoryview min next object oct open ord pow print property quit range repr reversed round set setattr slice sorted staticmethod str sum super tuple type vars zip";
+        for name in names.split_whitespace().chain([
+            "__annotations__",
+            "__builtins__",
+            "__doc__",
+            "__file__",
+            "__loader__",
+            "__name__",
+            "__package__",
+            "__spec__",
+            "apply",
+            "basestring",
+            "buffer",
+            "cmp",
+            "coerce",
+            "execfile",
+            "intern",
+            "long",
+            "raw_input",
+            "reduce",
+            "reload",
+            "unichr",
+            "unicode",
+            "xrange",
+        ]) {
+            assert!(
+                is_python_builtin_or_constant(name),
+                "missing builtin {name}"
+            );
+            assert!(
+                !is_python_builtin_or_constant(&format!("{name}_")),
+                "invented builtin {name}_"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: decorated module __getattr__ was missed"
+    )]
+    fn qs6_dynamic_surface_grammar_matrix() {
+        for (source, dynamic) in [
+            ("", false),
+            ("value = 1\n", false),
+            ("value = 1\ndef __getattr__(name): return None\n", true),
+            ("@decorate\ndef __getattr__(name): return None\n", true),
+            (
+                "class C:\n def __getattr__(self, name): return None\n",
+                false,
+            ),
+            ("globals()['injected'] = 1\nprint(injected)\n", true),
+        ] {
+            let tree = crate::declarations::parse_python_tree(source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let reasons = dynamic_surface_reasons(&[], &[], source, tree.root_node());
+            assert_eq!(!reasons.is_empty(), dynamic, "{source}: {reasons:?}");
+        }
+    }
+
+    #[test]
+    #[hardwon("83a867bd9573: exception alias seeding selected handler-body identifiers")]
+    fn qs6_exception_and_with_alias_fields_seed_only_binders() {
+        let source = "# \u{e9}\ntry:\n    work()\nexcept Error as err:\n    body(observed)\ntry:\n    work()\nexcept (One, Two) as other:\n    body(observed)\nwith manager() as value, other_manager() as (left, right):\n    body(value)\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut pending = vec![tree.root_node()];
+        let mut seen = Vec::new();
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "except_clause" | "with_item") {
+                let mut scopes = ScopeStack::default();
+                if node.kind() == "except_clause" {
+                    PythonDiagnosticCollector::seed_except_alias(node, source, &mut scopes);
+                } else {
+                    collect_alias_children(node, source, &mut scopes);
+                }
+                let expected: &[&str] = match node.kind() {
+                    "except_clause" if node_text(node, source).starts_with("except Error") => {
+                        &["err"]
+                    }
+                    "except_clause" => &["other"],
+                    _ if node_text(node, source).starts_with("manager()") => &["value"],
+                    _ => &["left", "right"],
+                };
+                let pattern = node.child_by_field_name("value").unwrap();
+                assert_eq!(pattern.kind(), "as_pattern");
+                let alias = pattern.child_by_field_name("alias").unwrap();
+                assert_eq!(alias.kind(), "as_pattern_target");
+                let spelling = if expected == ["left", "right"] {
+                    "(left, right)"
+                } else {
+                    expected[0]
+                };
+                let start = source.find(&format!("as {spelling}")).unwrap() + 3;
+                assert_eq!(alias.byte_range(), start..start + spelling.len());
+                assert_eq!(node_text(alias, source), spelling);
+                for name in [
+                    "err",
+                    "other",
+                    "value",
+                    "left",
+                    "right",
+                    "Error",
+                    "One",
+                    "Two",
+                    "body",
+                    "manager",
+                    "other_manager",
+                    "observed",
+                ] {
+                    assert_eq!(
+                        scopes.contains(name),
+                        expected.contains(&name),
+                        "{name}: {}",
+                        node.to_sexp()
+                    );
+                }
+                seen.push(node.kind());
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(
+            seen.iter().filter(|&&kind| kind == "except_clause").count(),
+            2
+        );
+        assert_eq!(seen.iter().filter(|&&kind| kind == "with_item").count(), 2);
+    }
 }

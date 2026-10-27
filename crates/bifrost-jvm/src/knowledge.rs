@@ -6,13 +6,24 @@ use brokk_bifrost_core::analyzer::fq_name::SegmentKind;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
 use brokk_bifrost_core::analyzer::language_knowledge::ParserFlavor;
+use brokk_bifrost_core::analyzer::resolution_facts::IntrinsicTypeKind;
 use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 
 /// Java syntax and static language rules.
 pub struct JavaKnowledge;
 
 impl LanguageKnowledge for JavaKnowledge {
-    fn numeric_promotion(&self, operands: &[Option<&str>]) -> Option<&'static str> {
+    fn factory_name_node<'t>(&self, call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+        if call.kind() != "method_invocation" {
+            return None;
+        }
+        call.child_by_field_name("name")
+    }
+
+    fn numeric_promotion(
+        &self,
+        operands: &[Option<&str>],
+    ) -> Option<(IntrinsicTypeKind, &'static str)> {
         // JLS 5.6.1/5.6.2: unbox, then promote byte/short/char to int;
         // otherwise double, float and long dominate in that order.
         // JLS 15.22.2 also admits the all-boolean bitwise case.
@@ -40,15 +51,17 @@ impl LanguageKnowledge for JavaKnowledge {
             rank = rank.max(next);
         }
         if booleans != 0 {
-            return (booleans == operands.len()).then_some("boolean");
+            return (booleans == operands.len())
+                .then_some((IntrinsicTypeKind::Primitive, "boolean"));
         }
-        match rank {
-            1 => Some("int"),
-            2 => Some("long"),
-            3 => Some("float"),
-            4 => Some("double"),
-            _ => None,
-        }
+        let name = match rank {
+            1 => "int",
+            2 => "long",
+            3 => "float",
+            4 => "double",
+            _ => return None,
+        };
+        Some((IntrinsicTypeKind::Primitive, name))
     }
 
     fn string_concatenation_operand(&self, operands: &[Option<&str>]) -> Option<usize> {
@@ -82,7 +95,43 @@ impl LanguageKnowledge for KotlinKnowledge {
         Language::Kotlin
     }
 
+    fn numeric_promotion(
+        &self,
+        operands: &[Option<&str>],
+    ) -> Option<(IntrinsicTypeKind, &'static str)> {
+        // The built-in `plus`, `minus`, `times`, `div` and `rem` operators of
+        // kotlin.Byte, Short, Int, Long, Float and Double return the widest
+        // operand type, with Byte and Short widened to Int. Char, Boolean,
+        // unsigned and user types have other or no operator members, so they
+        // leave the result open.
+        let mut rank = 0;
+        for operand in operands {
+            let next = match (*operand)? {
+                "kotlin.Byte" | "kotlin.Short" | "kotlin.Int" => 1,
+                "kotlin.Long" => 2,
+                "kotlin.Float" => 3,
+                "kotlin.Double" => 4,
+                _ => return None,
+            };
+            rank = rank.max(next);
+        }
+        let name = match rank {
+            1 => "kotlin.Int",
+            2 => "kotlin.Long",
+            3 => "kotlin.Float",
+            4 => "kotlin.Double",
+            _ => return None,
+        };
+        Some((IntrinsicTypeKind::LanguageBuiltin, name))
+    }
+
     fn call_may_apply_value(&self) -> bool {
+        true
+    }
+
+    // Kotlin spec, local property declarations: a `val` or `var` without a
+    // written type takes its initializer's type; assignments must conform.
+    fn inferred_local_type_is_initializer_type(&self) -> bool {
         true
     }
 

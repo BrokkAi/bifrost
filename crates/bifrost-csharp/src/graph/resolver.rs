@@ -1,3 +1,4 @@
+use crate::declarations::csharp_callable_parameter_type_nodes;
 use crate::graph::CSharpGraphSource;
 use crate::graph::extractor::member_access_name;
 use crate::graph_support::{self, CSharpSource};
@@ -21,7 +22,7 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_covers;
 use brokk_bifrost_core::analyzer::tree_walk::{
     child_by_field_or_named_child_of_kinds, first_named_child_of_kind, named_children_iter,
-    push_named_children_reversed,
+    node_for_exact_range, push_named_children_reversed,
 };
 pub(super) use brokk_bifrost_core::analyzer::usages::common::same_node;
 
@@ -973,16 +974,6 @@ fn forward_type_declarations_for_fq_name_in_session(
     })
 }
 
-fn forward_class_unit_for_fq_name_in_session(
-    csharp: &dyn CSharpSource,
-    fqn: &str,
-    session: &ResolutionSession,
-) -> Option<CodeUnit> {
-    unique_type_candidate(forward_type_declarations_for_fq_name_in_session(
-        csharp, fqn, session,
-    ))
-}
-
 fn using_aliases_for_file_in_session(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
@@ -1732,28 +1723,6 @@ fn resolve_member_type_fq_name(
     })
 }
 
-fn resolve_member_type_fq_name_in_session(
-    csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    owner: &CodeUnit,
-    type_text: &str,
-    session: &ResolutionSession,
-) -> Option<String> {
-    let nested_fq_name = if owner.package_name().is_empty() {
-        format!("{}${type_text}", owner.short_name())
-    } else {
-        format!(
-            "{}.{}${type_text}",
-            owner.package_name(),
-            owner.short_name()
-        )
-    };
-    forward_class_unit_for_fq_name_in_session(csharp, &nested_fq_name, session)
-        .map(|unit| unit.fq_name())
-        .or_else(|| resolve_type_fq_name_in_session(csharp, token, file, type_text, session))
-}
-
 /// The member invoked by a C# invocation and its structured receiver.
 #[derive(Clone, Copy)]
 pub struct CSharpInvocationMember<'tree> {
@@ -1855,72 +1824,62 @@ pub fn resolve_call_argument_owners(
     }
 }
 
-fn callable_parameter_type_text(
-    metadata: &[SignatureMetadata],
-    parameter_index: usize,
-) -> Option<&str> {
-    metadata
+/// Run `read` on the written type of each parameter of the callable `method`,
+/// indexed as the persisted parameter facts are, with the source text of the
+/// file that declares it.
+///
+/// A parameter's type is a name written in the scope of its own declaration:
+/// the namespaces around it and the `using` directives of each. The persisted
+/// parameter facts keep only the spelling, so the scope is read back from the
+/// declaring file's tree. The text is the one the analyzer indexed, which is
+/// the text `method`'s recorded ranges refer to. All parameters share one parse
+/// because a caller that checks several arguments would otherwise parse the
+/// file once per argument. `None` when that file cannot be read or parsed, or
+/// no recorded range of `method` is a declaration in it.
+pub fn with_callable_parameter_type_nodes<R>(
+    csharp: &dyn CSharpSource,
+    method: &CodeUnit,
+    read: impl FnOnce(&str, &[Option<Node<'_>>]) -> R,
+) -> Option<R> {
+    let source = csharp.indexed_source(method.source())?;
+    let tree = crate::preprocessor::parse_csharp(&source)?;
+    let root = tree.root_node();
+    let declaration = csharp
+        .ranges_of(method)
         .iter()
-        .find_map(|metadata| metadata.callable_parameter_types())
-        .and_then(|types| types.get(parameter_index))
-        .map(String::as_str)
+        .find_map(|range| node_for_exact_range(root, range))?;
+    Some(read(
+        &source,
+        &csharp_callable_parameter_type_nodes(declaration),
+    ))
 }
 
-/// Resolve a callable parameter's declared type in the callable's declaring
-/// type scope. The caller has already chosen the method candidate; this helper
-/// only reads its recorded parameter spelling and resolves that spelling where
-/// the declaration lives.
+/// Resolve a callable's parameter type for the usage scan, in the scope of the
+/// callee's own declaration. The caller has already chosen the method
+/// candidate. The type is looked up the way a type written at that declaration
+/// is looked up everywhere else (see [`resolve_type_fq_name_at`]), so a global
+/// type outranks a compilation-unit `using` and a type of unproven compilation
+/// membership is not a resolution (#6472).
 pub fn callable_parameter_type_fq_name(
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
     method: &CodeUnit,
     parameter_index: usize,
 ) -> Option<String> {
-    let metadata = csharp.signature_metadata(method);
-    let type_text = callable_parameter_type_text(&metadata, parameter_index)?;
-    let owner = csharp.parent_of(method)?;
-    resolve_member_type_fq_name(csharp, token, method.source(), &owner, type_text, true)
-}
-
-/// Forward-definition counterpart to [`callable_parameter_type_fq_name`].
-pub fn callable_parameter_type_fq_name_for_forward(
-    csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    method: &CodeUnit,
-    parameter_index: usize,
-) -> Option<String> {
-    let metadata = csharp.signature_metadata(method);
-    let type_text = callable_parameter_type_text(&metadata, parameter_index)?;
-    let owner = csharp.parent_of(method)?;
-    resolve_member_type_fq_name(csharp, token, method.source(), &owner, type_text, false)
-}
-
-/// Budgeted forward counterpart to [`callable_parameter_type_fq_name`].
-pub fn callable_parameter_type_fq_name_in_session(
-    csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    method: &CodeUnit,
-    parameter_index: usize,
-    session: &ResolutionSession,
-) -> Option<String> {
-    let metadata =
-        session.query_limited_rows(|limit| csharp.signature_metadata_limited(method, limit));
-    if !session.observe_cancellation() {
-        return None;
-    }
-    let type_text = callable_parameter_type_text(&metadata, parameter_index)?;
-    let owner = session.query(|| csharp.parent_of(method)).flatten()?;
-    if !session.observe_cancellation() {
-        return None;
-    }
-    resolve_member_type_fq_name_in_session(
-        csharp,
-        token,
-        method.source(),
-        &owner,
-        type_text,
-        session,
-    )
+    with_callable_parameter_type_nodes(csharp, method, |source, type_nodes| {
+        let type_node = type_nodes.get(parameter_index).copied().flatten()?;
+        let class_ranges = ClassRangeIndex::build(csharp, method.source());
+        resolve_type_fq_name_at(
+            csharp,
+            token,
+            method.source(),
+            &class_ranges,
+            &reference_type_text(type_node, source),
+            type_node,
+            source,
+        )
+    })
+    .flatten()
 }
 
 fn resolve_structured_method_return_type_fq_name_in_session(
@@ -2714,26 +2673,6 @@ pub fn resolve_type_fq_name(
         return Some(target);
     }
     forward_class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name())
-}
-
-fn resolve_type_fq_name_in_session(
-    csharp: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    reference: &str,
-    session: &ResolutionSession,
-) -> Option<String> {
-    let normalized = normalize_type_text(reference);
-    if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
-        return Some(canonical.to_string());
-    }
-    let candidates =
-        visible_type_candidates_in_session(csharp, token, file, &normalized, true, session);
-    if graph_support::logical_type_count(&candidates) == 1 {
-        return graph_support::first_logical_type_fqn(&candidates);
-    }
-    forward_class_unit_for_fq_name_in_session(csharp, &normalized, session)
-        .map(|unit| unit.fq_name())
 }
 
 fn resolve_usage_type_fq_name(

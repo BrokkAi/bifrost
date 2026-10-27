@@ -49,7 +49,8 @@ use brokk_bifrost_rust::usage::ModuleKey as RustModuleKey;
 use brokk_bifrost_rust::usage::RustPathIdentity;
 use brokk_bifrost_rust::usage::direct_import_scope_for_module_with_identity;
 
-/// Bump when the Rust summary's normalized rows or read set changes.
+/// Bump when normalized rows change without a changed input digest. New keyed
+/// reads already rotate summaries through their input digest.
 // Version 18 keeps scoped ambiguity out of member name-inventory obligations.
 // Version 19 adds the published binding-authority rows to the surface digest.
 // Version 20 separates module inventories from binding gaps at colliding paths.
@@ -804,7 +805,8 @@ const STAGE_DEPENDENCY_EDGES_SQL: &str = "INSERT OR IGNORE INTO temp.unit_summar
     JOIN temp.rust_unit_summary_units AS child ON child.crate_key = dependencies.dependency_crate_key
     GROUP BY owner.unit_id, child.unit_id";
 
-const UNIT_SQL: &str = "SELECT units.topology_id, topologies.crate_key, units.label
+const UNIT_SQL: &str =
+    "SELECT units.topology_id, topologies.crate_key, units.label, topologies.topology_digest
     FROM temp.rust_unit_summary_units AS units
     JOIN main.rust_crate_topologies AS topologies ON topologies.topology_id = units.topology_id
     WHERE units.unit_id = ?1";
@@ -1322,9 +1324,10 @@ impl UnitSummaryLanguage for RustUnitSummaries {
         snapshot: &WorkspaceSnapshotId,
         unit_id: i64,
     ) -> Result<UnitInputs> {
-        let (topology_id, unit_key, label): (i64, Vec<u8>, String) = conn
-            .prepare_cached(UNIT_SQL)?
-            .query_row([unit_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let (topology_id, unit_key, label, topology_digest): (i64, Vec<u8>, String, Vec<u8>) =
+            conn.prepare_cached(UNIT_SQL)?.query_row([unit_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
         let unit_key = digest_from_row(unit_key)?;
         let mut members = Vec::new();
         {
@@ -1345,7 +1348,17 @@ impl UnitSummaryLanguage for RustUnitSummaries {
             [],
             |row| row.get(0),
         )?;
-        let reads = read_rows(conn, snapshot, &producer_epoch)?;
+        let mut reads = read_rows(conn, snapshot, &producer_epoch)?;
+        // The summary consumes the crate topology, so its digest is a read.
+        // It covers the crate derivation version, which changes derived
+        // exports and gaps without changing any source or placement, and the
+        // implicit host target's cfg atoms, which have no configuration-file
+        // OID.
+        reads.push(UnitRead {
+            kind: "context_publication",
+            key_digest: read_key("rust-crate-topology", None),
+            digest: digest_from_row(topology_digest)?,
+        });
 
         let mut dependencies = Vec::new();
         let mut dependency_names = Vec::new();

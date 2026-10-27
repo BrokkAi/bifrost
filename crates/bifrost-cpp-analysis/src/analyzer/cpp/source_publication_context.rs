@@ -32,6 +32,87 @@ fn node_parts(node: &CppGuardNode) -> (i64, Option<&str>, Option<bool>, &[usize]
     }
 }
 
+fn guard_node(
+    kind: i64,
+    text: Option<String>,
+    constant: Option<i64>,
+    mut children: Vec<usize>,
+) -> Result<CppGuardNode> {
+    if text.is_some() != matches!(kind, 0 | 1 | 3 | 4 | 6 | 7 | 8 | 9)
+        || constant.is_some() != (kind == 5)
+        || (!matches!(kind, 2 | 10 | 11) && !children.is_empty())
+    {
+        return Err(StoreError::new("invalid C++ guard node payload"));
+    }
+    Ok(match kind {
+        0 => CppGuardNode::Defined(text.unwrap()),
+        1 => CppGuardNode::Undefined(text.unwrap()),
+        2 => {
+            if children.len() != 1 {
+                return Err(StoreError::new("invalid C++ Boolean guard child"));
+            }
+            CppGuardNode::Boolean(children.pop().unwrap())
+        }
+        3 => CppGuardNode::Expression(text.unwrap()),
+        4 => CppGuardNode::NegatedExpression(text.unwrap()),
+        5 => CppGuardNode::Constant(strict_bool(constant.unwrap(), "C++ guard constant")?),
+        6 => CppGuardNode::Truthy(text.unwrap()),
+        7 => CppGuardNode::Falsy(text.unwrap()),
+        8 => CppGuardNode::Opaque(text.unwrap()),
+        9 => CppGuardNode::NegatedOpaque(text.unwrap()),
+        10 => CppGuardNode::All(children),
+        11 => CppGuardNode::Any(children),
+        _ => return Err(StoreError::new("invalid C++ guard node kind")),
+    })
+}
+
+/// The positional JSON column form of a guard set that a reader takes whole:
+/// `[roots, nodes]`, each node `[kind, payload]` with the relational guard-node
+/// kind codes. The payload is the guard text, the constant, or the children.
+pub(crate) fn guard_set_json(set: &CppGuardSet) -> String {
+    assert!(set.valid(), "invalid primary C++ guard arena");
+    let nodes = set
+        .nodes
+        .iter()
+        .map(|node| {
+            let (kind, text, constant, children) = node_parts(node);
+            let payload = match (text, constant) {
+                (Some(text), _) => serde_json::Value::from(text),
+                (None, Some(constant)) => serde_json::Value::from(constant),
+                (None, None) => serde_json::Value::from(children),
+            };
+            serde_json::json!([kind, payload])
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!([set.roots, nodes]).to_string()
+}
+
+pub(crate) fn guard_set_from_json(text: &str) -> Result<CppGuardSet> {
+    let invalid = || StoreError::new("invalid C++ guard set JSON");
+    let (roots, nodes): (Vec<usize>, Vec<(i64, serde_json::Value)>) =
+        serde_json::from_str(text).map_err(|_| invalid())?;
+    let nodes = nodes
+        .into_iter()
+        .map(|(kind, payload)| match payload {
+            serde_json::Value::String(text) => guard_node(kind, Some(text), None, Vec::new()),
+            serde_json::Value::Bool(constant) => {
+                guard_node(kind, None, Some(i64::from(constant)), Vec::new())
+            }
+            children => guard_node(
+                kind,
+                None,
+                None,
+                serde_json::from_value(children).map_err(|_| invalid())?,
+            ),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let set = CppGuardSet::new(nodes, roots);
+    if !set.valid() {
+        return Err(invalid());
+    }
+    Ok(set)
+}
+
 pub(crate) fn cost(facts: &CppSourceFacts) -> (usize, usize) {
     let mut rows = facts.declarations.len();
     let mut bytes = 0usize;
@@ -224,34 +305,8 @@ pub(crate) fn read(
             let kind: i64 = row.get(3)?;
             let text: Option<String> = row.get(4)?;
             let constant: Option<i64> = row.get(5)?;
-            let mut children = edges.remove(&(key.0, key.1, id)).unwrap_or_default();
-            if text.is_some() != matches!(kind, 0 | 1 | 3 | 4 | 6 | 7 | 8 | 9)
-                || constant.is_some() != (kind == 5)
-                || (!matches!(kind, 2 | 10 | 11) && !children.is_empty())
-            {
-                return Err(StoreError::new("invalid C++ guard node payload"));
-            }
-            let node = match kind {
-                0 => CppGuardNode::Defined(text.unwrap()),
-                1 => CppGuardNode::Undefined(text.unwrap()),
-                2 => {
-                    if children.len() != 1 {
-                        return Err(StoreError::new("invalid C++ Boolean guard child"));
-                    }
-                    CppGuardNode::Boolean(children.pop().unwrap())
-                }
-                3 => CppGuardNode::Expression(text.unwrap()),
-                4 => CppGuardNode::NegatedExpression(text.unwrap()),
-                5 => CppGuardNode::Constant(strict_bool(constant.unwrap(), "C++ guard constant")?),
-                6 => CppGuardNode::Truthy(text.unwrap()),
-                7 => CppGuardNode::Falsy(text.unwrap()),
-                8 => CppGuardNode::Opaque(text.unwrap()),
-                9 => CppGuardNode::NegatedOpaque(text.unwrap()),
-                10 => CppGuardNode::All(children),
-                11 => CppGuardNode::Any(children),
-                _ => return Err(StoreError::new("invalid C++ guard node kind")),
-            };
-            set.nodes.push(node);
+            let children = edges.remove(&(key.0, key.1, id)).unwrap_or_default();
+            set.nodes.push(guard_node(kind, text, constant, children)?);
         }
     );
     rows!(

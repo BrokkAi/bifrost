@@ -369,7 +369,8 @@ impl JdkJmodSetPackProducer {
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: Some(AuthoredSemanticModelPack {
-                schema_version:
+                extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
+schema_version:
                     brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),

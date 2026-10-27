@@ -736,11 +736,18 @@ fn execute_plan_node(
                         && !child_diagnostics.iter().any(|diagnostic| {
                             diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
                         });
+                    // A seed-narrowed except is one unit of a whole execution
+                    // whose minuend can be non-empty in another file. That
+                    // execution evaluates the subtrahends over this file too,
+                    // so the unit must, or its summed work and diagnostics
+                    // would understate the whole run's.
                     let ends_operator = complete_prefix
                         && !child.cancelled
                         && child.rows.is_empty()
                         && (*op == SetOperator::Intersect
-                            || (*op == SetOperator::Except && index == 0));
+                            || (*op == SetOperator::Except
+                                && index == 0
+                                && state.scope.seed_files().is_none()));
                     branch_diagnostics.push(child_diagnostics);
                     if child.cancelled {
                         push_operator_termination(

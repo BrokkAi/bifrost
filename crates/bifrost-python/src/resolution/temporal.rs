@@ -53,6 +53,16 @@ pub(super) fn timing(
 }
 
 pub(super) fn finish(p: &mut Producer<'_, '_>, scopes: &[Scope<'_>]) {
+    let write_points = p
+        .facts
+        .binding_event_timings
+        .iter()
+        .filter_map(|timing| {
+            let event = p.facts.binding_events[timing.event as usize];
+            (event.kind == ResolutionBindingEventKind::Assign)
+                .then_some((event.target, timing.commit_byte))
+        })
+        .collect::<HashMap<_, _>>();
     for identifier in &p.facts.identifiers {
         if identifier.role != ResolutionIdentifierRole::Reference {
             continue;
@@ -74,7 +84,12 @@ pub(super) fn finish(p: &mut Producer<'_, '_>, scopes: &[Scope<'_>]) {
             .push(ResolutionBindingObservationFact {
                 reference: identifier.site,
                 execution_scope: site.scope,
-                point_byte: site.start_byte,
+                // A write token denotes the binding it establishes, rather
+                // than a read of the binding visible before its RHS executes.
+                point_byte: write_points
+                    .get(&identifier.site)
+                    .copied()
+                    .unwrap_or(site.start_byte),
                 kind: if deferred {
                     ResolutionBindingObservationKind::Deferred
                 } else {

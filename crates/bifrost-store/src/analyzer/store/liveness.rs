@@ -1190,6 +1190,46 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
     use git2::{IndexAddOption, ObjectType};
 
+    #[test]
+    fn git_snapshots_distinguish_disk_validation_from_unsaved_overlay_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        commit_all(&repo, "init");
+        let disk = project_file(temp.path(), "disk.rs");
+        let unsaved = project_file(temp.path(), "unsaved.rs");
+        let bytes = b"fn disk() {}\n";
+        std::fs::write(disk.abs_path(), bytes).unwrap();
+        let disk_oid = Oid::hash_object(ObjectType::Blob, bytes).unwrap();
+        let overlay_oid = Oid::hash_object(ObjectType::Blob, b"unsaved buffer").unwrap();
+        let liveness = Liveness::new(repo).unwrap();
+        liveness
+            .refresh_overlay([
+                LivePathEntry::filesystem(disk.clone(), disk_oid),
+                LivePathEntry::overlay(unsaved.clone(), overlay_oid),
+            ])
+            .unwrap();
+        let snapshot = liveness.snapshot().unwrap();
+        assert!(snapshot.has_overlay_paths());
+        assert_eq!(snapshot.overlay_files(), std::slice::from_ref(&unsaved));
+        assert!(snapshot.is_overlay_path(&unsaved));
+        assert!(!snapshot.is_overlay_path(&disk));
+        assert_eq!(snapshot.validated_oid_for_path(&disk), Some(disk_oid));
+        assert_eq!(snapshot.validated_oid_for_path(&unsaved), Some(overlay_oid));
+        assert!(snapshot.validate([&disk, &unsaved].into_iter()).is_empty());
+        std::fs::write(disk.abs_path(), "changed to a different length").unwrap();
+        std::fs::write(unsaved.abs_path(), "unrelated disk bytes").unwrap();
+        assert_eq!(snapshot.validated_oid_for_path(&disk), None);
+        assert_eq!(snapshot.validated_oid_for_path(&unsaved), Some(overlay_oid));
+        assert_eq!(snapshot.validate([&disk, &unsaved].into_iter()), vec![disk]);
+        liveness.remove_overlay_paths([unsaved.clone()]);
+        let next = liveness.snapshot().unwrap();
+        assert!(!next.has_overlay_paths());
+        assert!(!next.is_overlay_path(&unsaved));
+        assert!(snapshot.has_overlay_paths());
+        assert!(snapshot.is_overlay_path(&unsaved));
+    }
+
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
         ProjectFile::new(root.canonicalize().unwrap(), PathBuf::from(rel))
     }
@@ -1841,5 +1881,361 @@ mod tests {
             refreshed.get(&file),
             Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
         );
+    }
+
+    fn oid_set(snapshot: &LiveSnapshot) -> BTreeSet<Oid> {
+        snapshot.oids().collect()
+    }
+
+    /// Overlays are added and then removed on a real Git working tree. After
+    /// each step the snapshot's blob set and overlay list must equal what the
+    /// test wrote: removing an overlay must bring back the committed blob of a
+    /// tracked file and drop an unsaved file entirely, even though the Git
+    /// index did not change between the two snapshots.
+    #[test]
+    fn removing_overlays_restores_the_index_view() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn a_disk() {}\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+        let a = project_file(temp.path(), "a.rs");
+        let b = project_file(temp.path(), "b.rs");
+        let unsaved = project_file(temp.path(), "unsaved.rs");
+        let a_disk = Oid::hash_object(ObjectType::Blob, b"fn a_disk() {}\n").unwrap();
+        let a_buffer = Oid::hash_object(ObjectType::Blob, b"fn a_buffer() {}\n").unwrap();
+        let b_disk = Oid::hash_object(ObjectType::Blob, b"fn b() {}\n").unwrap();
+        let unsaved_buffer = Oid::hash_object(ObjectType::Blob, b"fn unsaved() {}\n").unwrap();
+
+        let liveness = Liveness::new(repo).unwrap();
+        let initial = liveness.snapshot().unwrap();
+        assert_eq!(oid_set(&initial), BTreeSet::from([a_disk]));
+        assert!(initial.overlay_files().is_empty());
+
+        liveness
+            .refresh_overlay([
+                LivePathEntry::overlay(a.clone(), a_buffer),
+                LivePathEntry::filesystem(b.clone(), b_disk),
+                LivePathEntry::overlay(unsaved.clone(), unsaved_buffer),
+            ])
+            .unwrap();
+        let overlaid = liveness.snapshot().unwrap();
+        assert_eq!(
+            oid_set(&overlaid),
+            BTreeSet::from([a_buffer, b_disk, unsaved_buffer]),
+            "the replaced committed blob of a.rs must leave the live OID set"
+        );
+        assert_eq!(overlaid.overlay_files(), &[a.clone(), unsaved.clone()]);
+        assert!(overlaid.paths_for_oid(a_disk).is_empty());
+
+        // A removal that names no overlay path is not a change.
+        liveness.remove_overlay_paths([project_file(temp.path(), "never-overlaid.rs")]);
+        assert!(Arc::ptr_eq(&overlaid, &liveness.snapshot().unwrap()));
+
+        liveness.remove_overlay_paths([a.clone(), unsaved.clone()]);
+        let restored = liveness.snapshot().unwrap();
+        assert_eq!(oid_set(&restored), BTreeSet::from([a_disk, b_disk]));
+        assert!(restored.overlay_files().is_empty());
+        assert_eq!(restored.oid_for_path(&a), Some(a_disk));
+        assert!(!restored.is_overlay_path(&a));
+        assert_eq!(restored.oid_for_path(&unsaved), None);
+        assert_eq!(restored.oid_for_path(&b), Some(b_disk));
+    }
+
+    /// The accessor hands out the scan that `oids_for_files` took, never takes
+    /// one itself, and stops handing it out once it is invalidated.
+    #[test]
+    fn taken_startup_identity_is_the_scan_the_handle_took() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "init");
+        let a = project_file(temp.path(), "a.rs");
+        let committed = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+
+        let liveness = Liveness::new(repo).unwrap();
+        assert!(liveness.taken_startup_identity().is_none());
+        assert!(
+            liveness.taken_startup_identity().is_none(),
+            "asking for the scan must not take one"
+        );
+
+        liveness.oids_for_files(std::slice::from_ref(&a)).unwrap();
+        let first = liveness
+            .taken_startup_identity()
+            .expect("oids_for_files takes the startup scan");
+        let resolved = first
+            .resolve_with_metadata(&liveness.repo.lock().unwrap(), &["a.rs".to_string()])
+            .unwrap();
+        assert_eq!(resolved.get("a.rs").map(|entry| entry.oid), Some(committed));
+        liveness.oids_for_files(std::slice::from_ref(&a)).unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &liveness.taken_startup_identity().unwrap()
+        ));
+
+        liveness.invalidate_startup_oids();
+        assert!(liveness.taken_startup_identity().is_none());
+        liveness.oids_for_files(std::slice::from_ref(&a)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &first,
+            &liveness.taken_startup_identity().unwrap()
+        ));
+    }
+}
+
+/// `LivePathMap` against a small reference model.
+///
+/// The model is a plain map from file to (blob, overlay provenance) plus a map
+/// from file to its additional storage-language mounts. It has no generation
+/// counter and no memoized snapshot, so a missed generation bump, a mount that
+/// outlives its path, or a dropped removal step in the real map shows up as a
+/// difference from the model. A snapshot is taken after every operation, which
+/// is what makes a stale memoized snapshot observable.
+#[cfg(test)]
+mod live_path_map_properties {
+    use super::*;
+    use git2::ObjectType;
+    use proptest::prelude::*;
+
+    /// Files 0..3 exist on disk; file 3 never does.
+    const FILES: usize = 4;
+    const MISSING_FILE: usize = 3;
+    const OIDS: usize = 3;
+    const LANGS: [&str; 2] = ["mount-a", "mount-b"];
+    const PRIMARY_LANG: &str = "primary";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Filesystem,
+        FilesystemHashed,
+        Overlay,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Refresh(Vec<(usize, usize, Kind)>),
+        ReplaceAll(Vec<(usize, usize, Kind)>),
+        Remove(Vec<usize>),
+        ReplaceMounts(usize, Vec<usize>),
+        Fork,
+        ForkFromSnapshot,
+    }
+
+    fn kind() -> impl Strategy<Value = Kind> {
+        prop_oneof![
+            Just(Kind::Filesystem),
+            Just(Kind::FilesystemHashed),
+            Just(Kind::Overlay)
+        ]
+    }
+
+    fn entries() -> impl Strategy<Value = Vec<(usize, usize, Kind)>> {
+        prop::collection::vec((0..FILES, 0..OIDS, kind()), 0..5)
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => entries().prop_map(Op::Refresh),
+            2 => entries().prop_map(Op::ReplaceAll),
+            3 => prop::collection::vec(0..FILES, 0..3).prop_map(Op::Remove),
+            3 => (0..LANGS.len(), prop::collection::vec(0..FILES, 0..4))
+                .prop_map(|(lang, files)| Op::ReplaceMounts(lang, files)),
+            1 => Just(Op::Fork),
+            1 => Just(Op::ForkFromSnapshot),
+        ]
+    }
+
+    #[derive(Default)]
+    struct Model {
+        paths: std::collections::BTreeMap<usize, (usize, bool)>,
+        mounts: std::collections::BTreeMap<usize, BTreeSet<usize>>,
+    }
+
+    impl Model {
+        /// The state a refreshed entry has, or `None` when the map must drop
+        /// the path: a stat-checked filesystem identity for a missing file.
+        fn state(trust: bool, file: usize, oid: usize, kind: Kind) -> Option<(usize, bool)> {
+            match kind {
+                Kind::Filesystem if !trust && file == MISSING_FILE => None,
+                Kind::Filesystem | Kind::FilesystemHashed => Some((oid, false)),
+                Kind::Overlay => Some((oid, true)),
+            }
+        }
+
+        fn apply(&mut self, trust: bool, op: &Op) {
+            match op {
+                Op::Refresh(entries) => {
+                    for &(file, oid, kind) in entries {
+                        match Self::state(trust, file, oid, kind) {
+                            Some(state) => {
+                                self.paths.insert(file, state);
+                            }
+                            None => {
+                                self.paths.remove(&file);
+                                self.mounts.remove(&file);
+                            }
+                        }
+                    }
+                }
+                Op::ReplaceAll(entries) => {
+                    self.paths = entries
+                        .iter()
+                        .filter_map(|&(file, oid, kind)| {
+                            Self::state(trust, file, oid, kind).map(|state| (file, state))
+                        })
+                        .collect();
+                    let paths = &self.paths;
+                    self.mounts.retain(|file, _| paths.contains_key(file));
+                }
+                Op::Remove(files) => {
+                    for file in files {
+                        self.paths.remove(file);
+                        self.mounts.remove(file);
+                    }
+                }
+                Op::ReplaceMounts(lang, files) => {
+                    for mounts in self.mounts.values_mut() {
+                        mounts.remove(lang);
+                    }
+                    self.mounts.retain(|_, mounts| !mounts.is_empty());
+                    for file in files {
+                        if self.paths.contains_key(file) {
+                            self.mounts.entry(*file).or_default().insert(*lang);
+                        }
+                    }
+                }
+                Op::Fork | Op::ForkFromSnapshot => {}
+            }
+        }
+    }
+
+    fn live_entry(file: ProjectFile, oid: Oid, kind: Kind) -> LivePathEntry {
+        match kind {
+            Kind::Filesystem => LivePathEntry::filesystem(file, oid),
+            Kind::FilesystemHashed => LivePathEntry::filesystem_hashed(file, oid),
+            Kind::Overlay => LivePathEntry::overlay(file, oid),
+        }
+    }
+
+    fn check(map: &LivePathMap, model: &Model, files: &[ProjectFile], oids: &[Oid], step: usize) {
+        let snapshot = map.snapshot();
+        let expected_files = model
+            .paths
+            .keys()
+            .map(|&file| files[file].clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            map.files().into_iter().collect::<BTreeSet<_>>(),
+            expected_files,
+            "step {step}: files"
+        );
+        assert_eq!(
+            snapshot.oids().collect::<BTreeSet<_>>(),
+            model
+                .paths
+                .values()
+                .map(|&(oid, _)| oids[oid])
+                .collect::<BTreeSet<_>>(),
+            "step {step}: live oids"
+        );
+        let expected_overlays = model
+            .paths
+            .iter()
+            .filter(|(_, (_, overlay))| *overlay)
+            .map(|(&file, _)| files[file].clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot.overlay_files(),
+            expected_overlays.as_slice(),
+            "step {step}: overlay files"
+        );
+        for (index, file) in files.iter().enumerate() {
+            assert_eq!(
+                snapshot.oid_for_path(file),
+                model.paths.get(&index).map(|&(oid, _)| oids[oid]),
+                "step {step}: oid of file {index}"
+            );
+            for (lang_index, lang) in LANGS.iter().enumerate() {
+                let expected = model
+                    .mounts
+                    .get(&index)
+                    .is_some_and(|mounts| mounts.contains(&lang_index));
+                assert_eq!(
+                    snapshot.is_mounted_under(file, PRIMARY_LANG, lang),
+                    expected,
+                    "step {step}: file {index} mounted under {lang}"
+                );
+            }
+        }
+        for (oid_index, oid) in oids.iter().enumerate() {
+            let mut actual = snapshot.paths_for_oid(*oid).to_vec();
+            actual.sort();
+            let expected = model
+                .paths
+                .iter()
+                .filter(|(_, (oid, _))| *oid == oid_index)
+                .map(|(&file, _)| files[file].clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "step {step}: paths of oid {oid_index}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn live_path_map_matches_reference_model(
+            trust in any::<bool>(),
+            ops in prop::collection::vec(op(), 1..24),
+        ) {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let files = (0..FILES)
+                .map(|index| {
+                    let rel = format!("f{index}.rs");
+                    if index != MISSING_FILE {
+                        std::fs::write(root.join(&rel), format!("fn f{index}() {{}}\n")).unwrap();
+                    }
+                    ProjectFile::new(root.clone(), PathBuf::from(rel))
+                })
+                .collect::<Vec<_>>();
+            let oids = (0..OIDS)
+                .map(|index| {
+                    Oid::hash_object(ObjectType::Blob, format!("blob {index}").as_bytes()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut map = if trust {
+                LivePathMap::trust_filesystem_generation()
+            } else {
+                LivePathMap::default()
+            };
+            let mut model = Model::default();
+            for (step, op) in ops.iter().enumerate() {
+                let entries = |entries: &[(usize, usize, Kind)]| {
+                    entries
+                        .iter()
+                        .map(|&(file, oid, kind)| live_entry(files[file].clone(), oids[oid], kind))
+                        .collect::<Vec<_>>()
+                };
+                match op {
+                    Op::Refresh(list) => map.refresh(entries(list)),
+                    Op::ReplaceAll(list) => map.replace_all(entries(list)),
+                    Op::Remove(list) => map.remove(list.iter().map(|&file| files[file].clone())),
+                    Op::ReplaceMounts(lang, list) => map.replace_additional_mounts(
+                        LANGS[*lang],
+                        list.iter().map(|&file| files[file].clone()),
+                    ),
+                    Op::Fork => map = map.fork(),
+                    Op::ForkFromSnapshot => map = map.fork_from_snapshot(map.snapshot()),
+                }
+                model.apply(trust, op);
+                check(&map, &model, &files, &oids, step);
+            }
+        }
     }
 }

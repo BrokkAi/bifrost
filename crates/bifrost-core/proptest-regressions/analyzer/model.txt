@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d673e9c43f3c258d637df8a468d5ba30cc811b24b87eea28ee094994a20e3a6b # shrinks to [a, b, c] = [CodeUnit { source: ProjectFile { root: "/workspace", rel_path: "src/A.java" }, kind: Class, fq: FqName { segments: [SegmentId(4)] }, package_segment_count: 0, package_name: "", short_name: "a", signature: None, synthetic: false }, CodeUnit { source: ProjectFile { root: "/workspace", rel_path: "src/A.java" }, kind: Class, fq: FqName { segments: [SegmentId(4)] }, package_segment_count: 0, package_name: "", short_name: "a", signature: None, synthetic: false }, CodeUnit { source: ProjectFile { root: "/workspace", rel_path: "src/A.java" }, kind: Function, fq: FqName { segments: [SegmentId(4)] }, package_segment_count: 0, package_name: "", short_name: "a", signature: None, synthetic: false }]

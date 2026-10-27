@@ -127,6 +127,7 @@ fn python_module_mutation_hazard_bounded(
 /// Native producers reuse the same selected-node hazard classification. This
 /// retains unknown lexical binders during parsing rather than reparsing a file
 /// to certify a later builtin lookup. Global directives have binding events.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn python_module_dynamic_write_candidate(node: Node<'_>, source: &str) -> bool {
     matches!(
         python_module_mutation_hazard_bounded(node, source, || true),
@@ -633,7 +634,9 @@ fn module_globals_write_call_bounded(
             method
                 .utf8_text(source.as_bytes())
                 .ok()
-                .is_some_and(|name| matches!(name, "update" | "setdefault" | "pop" | "clear"))
+                .is_some_and(|name| {
+                    matches!(name, "update" | "setdefault" | "pop" | "popitem" | "clear")
+                })
         }) && object.is_some_and(|object| is_module_mapping_call(object, source))
         {
             return Some(true);
@@ -749,6 +752,129 @@ mod tests {
     ) -> Option<&'a str> {
         let range = facts.initializer_range(name)?;
         source.get(range.start_byte..range.end_byte)
+    }
+
+    #[test]
+    fn qs6_initializer_range_grammar_boundary() {
+        for source in [
+            "value = 1\n",
+            "value = (\n 1,\n 2\n)\n",
+            "value = '''a\nb'''\n",
+            "# \u{e9}\r\nvalue = (\r\n 1\r\n)\r\n",
+        ] {
+            let tree = crate::declarations::parse_python_tree(source).unwrap();
+            let root = tree.root_node();
+            let mut cursor = root.walk();
+            let statement = root
+                .named_children(&mut cursor)
+                .find(|n| n.kind() == "expression_statement")
+                .unwrap();
+            let rhs = statement
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("right")
+                .unwrap();
+            let range = module_facts(source).initializer_range("value").unwrap();
+            assert_eq!(
+                (
+                    range.start_byte,
+                    range.end_byte,
+                    range.start_line,
+                    range.end_line
+                ),
+                (
+                    rhs.start_byte(),
+                    rhs.end_byte(),
+                    rhs.start_position().row + 1,
+                    rhs.end_position().row + 1
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn qs6_module_binding_and_mutation_shapes() {
+        // Object stores do not rebind the receiver or index names.
+        for target in [
+            "item",
+            "(item, other)",
+            "container.attr",
+            "container[index]",
+        ] {
+            let source =
+                format!("container = factory()\nindex = 0\nwith manager() as {target}:\n pass\n");
+            let facts = module_facts(&source);
+            assert_eq!(
+                initializer(&facts, &source, "container"),
+                Some("factory()"),
+                "{target}"
+            );
+            assert_eq!(initializer(&facts, &source, "index"), Some("0"), "{target}");
+            assert_eq!(
+                facts.module_binds_name("item"),
+                target == "item" || target == "(item, other)"
+            );
+        }
+        for mapping in ["globals", "vars"] {
+            for (call, mutates) in [
+                ("update(value=2)", true),
+                ("setdefault('value', 2)", true),
+                ("pop('value')", true),
+                ("clear()", true),
+                ("get('value')", false),
+            ] {
+                let source = format!("value = 1\n{mapping}().{call}\n");
+                assert_eq!(
+                    module_facts(&source).initializer_range("value").is_none(),
+                    mutates,
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: popitem can delete a module binding"
+    )]
+    fn qs6_popitem_invalidates_initializer() {
+        let source = "value = 1\nglobals().popitem()\n";
+        assert!(module_facts(source).initializer_range("value").is_none());
+    }
+
+    #[test]
+    fn qs6_final_cancellation_boundary() {
+        for source in [
+            "value = 1\nvalue\n",
+            "value = 1\ndef change():\n global value\n value = 2\nvalue\n",
+        ] {
+            let tree = crate::declarations::parse_python_tree(source).unwrap();
+            let root = tree.root_node();
+            let reference = root
+                .named_child(root.named_child_count() - 1)
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            let facts = PythonModuleMutationFacts::collect_bounded(root, source, || true).unwrap();
+            let mut parent_count = 0;
+            let mut current = reference;
+            while let Some(parent) = current.parent() {
+                parent_count += 1;
+                current = parent;
+            }
+            // Independent AST ancestry gives entry plus parent admissions.
+            // The next callback must refuse publication even with no hazards.
+            let mut remaining: usize = 1 + parent_count;
+            assert_eq!(
+                facts.binding_unmutated_at_bounded(root, "value", reference, || {
+                    let admitted = remaining > 0;
+                    remaining = remaining.saturating_sub(1);
+                    admitted
+                }),
+                None
+            );
+        }
     }
 
     #[test]

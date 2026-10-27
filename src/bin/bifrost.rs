@@ -470,20 +470,7 @@ fn run_prepare_open_packs(args: &[String]) -> Result<CliRunResult, String> {
     remove_prepare_output(&receipt_path)?;
     remove_prepare_output(&env_path)?;
     let executable_sha256 = executable_sha256()?;
-    let request_result = match request_path.as_ref() {
-        Some(_) if env::var_os("PACK_SOURCE").is_some_and(|value| !value.is_empty()) => Err(
-            brokk_bifrost_semantic_packs::download::OpenPackError::Configuration(
-                "PACK_SOURCE cannot be combined with --request-path".to_owned(),
-            ),
-        ),
-        Some(path) => {
-            let request_bytes = fs::read(path).map_err(|error| {
-                format!("cannot read request file `{}`: {error}", path.display())
-            })?;
-            brokk_bifrost_semantic_packs::download::parse_pack_request(&request_bytes)
-        }
-        None => brokk_bifrost_semantic_packs::download::default_pack_request(),
-    };
+    let request_result = pack_command_request(request_path.as_deref())?;
     let (request, selection_result) = match request_result {
         Ok(request) => {
             let selection = brokk_bifrost_semantic_packs::download::prepare_pack_request_at(
@@ -546,29 +533,34 @@ fn run_prepare_open_packs(args: &[String]) -> Result<CliRunResult, String> {
         let failure_class = outcome["failure"]["class"]
             .as_str()
             .expect("failed acquisition outcome has a failure class");
-        println!("Open-pack acquisition failed: {failure_class}");
+        let failure_message = outcome["failure"]["message"]
+            .as_str()
+            .expect("failed acquisition outcome has a failure message");
+        println!("Open-pack acquisition failed: {failure_class} ({failure_message})");
         Ok(CliRunResult::Exit(1))
     }
 }
 
 /// Print the outcome of selecting a request's releases without acquiring them:
 /// exit 0 when the engine admits one, 1 with the typed failure otherwise.
+/// Without `--request-path`, the request is the one `prepare-open-packs`
+/// derives from `PACK_SOURCE`, or the public default.
 fn run_pack_admission(args: &[String]) -> Result<CliRunResult, String> {
-    let usage = "usage: bifrost pack-admission --cache-dir DIR --request-path FILE";
-    let [cache_flag, cache_dir, request_flag, request_path] = args else {
-        return Err(usage.to_owned());
+    let usage = "usage: bifrost pack-admission --cache-dir DIR [--request-path FILE]";
+    let (cache_dir, request_path) = match args {
+        [cache_flag, cache_dir] if cache_flag == "--cache-dir" => (cache_dir, None),
+        [cache_flag, cache_dir, request_flag, request_path]
+            if cache_flag == "--cache-dir" && request_flag == "--request-path" =>
+        {
+            (cache_dir, Some(request_path))
+        }
+        _ => return Err(usage.to_owned()),
     };
-    if cache_flag != "--cache-dir"
-        || request_flag != "--request-path"
-        || cache_dir.is_empty()
-        || request_path.is_empty()
-    {
+    if cache_dir.is_empty() || request_path.is_some_and(String::is_empty) {
         return Err(usage.to_owned());
     }
-    let request_bytes = fs::read(request_path)
-        .map_err(|error| format!("cannot read request file `{request_path}`: {error}"))?;
     let profile = brokk_bifrost::open_pack_engine_profile();
-    let request = brokk_bifrost_semantic_packs::download::parse_pack_request(&request_bytes);
+    let request = pack_command_request(request_path.map(Path::new))?;
     let result = match &request {
         Ok(request) => brokk_bifrost_semantic_packs::download::admit_pack_request_at(
             &profile,
@@ -590,6 +582,34 @@ fn run_pack_admission(args: &[String]) -> Result<CliRunResult, String> {
             .map_err(|error| format!("cannot encode pack admission outcome: {error}"))?
     );
     Ok(CliRunResult::Exit(if admitted { 0 } else { 1 }))
+}
+
+/// The request a pack command acts on: the `--request-path` file, otherwise the
+/// one `PACK_SOURCE` selects or the public default. A file that cannot be read
+/// is a usage error; a request error is the command's typed outcome.
+fn pack_command_request(
+    request_path: Option<&Path>,
+) -> Result<
+    Result<
+        brokk_bifrost_semantic_packs::download::PackRequest,
+        brokk_bifrost_semantic_packs::download::OpenPackError,
+    >,
+    String,
+> {
+    Ok(match request_path {
+        Some(_) if env::var_os("PACK_SOURCE").is_some_and(|value| !value.is_empty()) => Err(
+            brokk_bifrost_semantic_packs::download::OpenPackError::Configuration(
+                "PACK_SOURCE cannot be combined with --request-path".to_owned(),
+            ),
+        ),
+        Some(path) => {
+            let request_bytes = fs::read(path).map_err(|error| {
+                format!("cannot read request file `{}`: {error}", path.display())
+            })?;
+            brokk_bifrost_semantic_packs::download::parse_pack_request(&request_bytes)
+        }
+        None => brokk_bifrost_semantic_packs::download::default_pack_request(),
+    })
 }
 
 fn executable_sha256() -> Result<String, String> {

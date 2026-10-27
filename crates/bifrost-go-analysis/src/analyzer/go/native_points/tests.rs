@@ -2117,6 +2117,73 @@ func use(s Service) { _ = s.ID }
     );
 }
 
+const REFUSED_SIBLING_CALLER: &str = r#"package consumer
+
+type C struct { ID string }
+type B struct { C }
+type A struct { ID string }
+type Service struct { A; B }
+func use(s Service) { _ = s.ID }
+"#;
+
+/// An ordinary same-package file whose one long line makes source admission
+/// refuse it. It is not indexed, so its `ID` method is invisible, yet it would
+/// shadow the promoted field.
+fn refused_package_member_fixture() -> crate::inline_project::BuiltInlineTestProject {
+    let refused = format!(
+        "package consumer\n\nfunc (Service) ID() {{}}\n\nvar blob = `{}`\n",
+        "A".repeat(20_000)
+    );
+    InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(PROVIDER, "package vocabulary; type Item struct {}")
+        .file(CALLER, REFUSED_SIBLING_CALLER)
+        .file("consumer/refused.go", refused.as_str())
+        .build()
+}
+
+fn assert_refused_member_keeps_frontier_open(outcome: &DefinitionLookupOutcome) {
+    assert_eq!(
+        outcome.status,
+        DefinitionLookupStatus::Incomplete,
+        "the refused same-package method could shadow the promoted field: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "go-package-incomplete"),
+        "the refused file must keep the structured package frontier open: {outcome:?}"
+    );
+}
+
+#[test]
+#[hardwon("#6650: a package member refused by source admission left same-package lookups complete")]
+fn go_native_point_keeps_frontier_open_for_refused_package_file() {
+    let fixture = refused_package_member_fixture();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    let outcome = resolve_last(&analyzer, &fixture, CALLER, REFUSED_SIBLING_CALLER, "ID");
+    assert_refused_member_keeps_frontier_open(&outcome);
+}
+
+#[test]
+#[hardwon(
+    "#6650: the tool context renamed the gap of an unselected member, hiding it from lookups"
+)]
+fn go_native_point_keeps_frontier_open_for_refused_package_file_in_tool_context() {
+    if !go_toolchain_available() {
+        eprintln!(
+            "the tool-published context needs a Go toolchain; the toolless test covers the inventory"
+        );
+        return;
+    }
+    let fixture = refused_package_member_fixture();
+    let analyzer = GoAnalyzer::new(fixture.project_dyn());
+    crate::analyzer::go::activate_go_tool_context_for_test(&fixture, &analyzer);
+    let outcome = resolve_last(&analyzer, &fixture, CALLER, REFUSED_SIBLING_CALLER, "ID");
+    assert_refused_member_keeps_frontier_open(&outcome);
+}
+
 #[test]
 fn go_native_point_reports_shared_promoted_field_paths_as_ambiguous() {
     let source = r#"package consumer
@@ -3232,7 +3299,11 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
     // The local value join follows both the options initializer and the
     // applyOptions write, including receiver arguments and defaults. Keep an
     // exact work pin so repeated expansion of that frontier remains visible.
-    let expected_resolution_rounds = 131;
+    // The `options options[K, V]` field type resolves to the type directly
+    // since #6925 kept field names out of type-syntax lookup.
+    // Import-free point requests now use demand scheduling too. Keep its
+    // work pinned alongside the exact method-value answer below.
+    let expected_resolution_rounds = 107;
     assert_eq!(default_work.resolution_rounds, expected_resolution_rounds);
     let wide_method_value = resolve_at(
         method_value_start,

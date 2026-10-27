@@ -221,3 +221,89 @@ mod tests {
         );
     }
 }
+
+/// Lookups against linear-search references. Spans start in a narrow range so
+/// that sites often share a start byte, as the calls of a method chain
+/// `f().g()` do at `(0, 3)` and `(0, 7)`, and often nest.
+#[cfg(test)]
+mod result_use_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const USES: [CallResultUse; 3] = [
+        CallResultUse::Discarded,
+        CallResultUse::Consumed,
+        CallResultUse::IntentionalDiscard(IntentionalDiscardKind::GoBlankAssignment),
+    ];
+
+    fn span() -> impl Strategy<Value = (usize, usize)> {
+        (0usize..4, 0usize..6).prop_map(|(start, length)| (start, start + length))
+    }
+
+    /// Overrides with distinct ordinals in `0..6`, in generated order.
+    fn overrides() -> impl Strategy<Value = Vec<CallResultUseFact>> {
+        proptest::collection::btree_map(0u32..6, 0usize..USES.len(), 0..6)
+            .prop_map(|uses| {
+                uses.into_iter()
+                    .map(|(result_ordinal, use_index)| CallResultUseFact {
+                        result_ordinal,
+                        result_use: USES[use_index],
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .prop_shuffle()
+    }
+
+    proptest! {
+        #[test]
+        fn for_port_matches_a_linear_search(
+            default in 0usize..USES.len(),
+            overrides in overrides(),
+        ) {
+            let site = CallResultUseSite::new(0, 1, USES[default])
+                .with_overrides(overrides.clone());
+            for ordinal in 0u32..8 {
+                let expected = overrides
+                    .iter()
+                    .find(|fact| fact.result_ordinal == ordinal)
+                    .map_or(USES[default], |fact| fact.result_use);
+                prop_assert_eq!(site.for_port(ordinal), expected, "port {}", ordinal);
+            }
+        }
+
+        #[test]
+        fn at_span_matches_exact_spans_only(
+            spans in proptest::collection::vec(span(), 0..8),
+            queries in proptest::collection::vec(span(), 0..8),
+        ) {
+            // Each site carries an override at its own index, so equal sites
+            // are the same site.
+            let sites: Vec<CallResultUseSite> = spans
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, end))| {
+                    CallResultUseSite::new(start, end, CallResultUse::Consumed).with_overrides(
+                        vec![CallResultUseFact {
+                            result_ordinal: index as u32,
+                            result_use: CallResultUse::Discarded,
+                        }],
+                    )
+                })
+                .collect();
+            let index = CallResultUseIndex::new(sites.clone());
+            for (start, end) in spans.iter().chain(&queries).copied() {
+                let matches: Vec<&CallResultUseSite> = sites
+                    .iter()
+                    .filter(|site| (site.start_byte, site.end_byte) == (start, end))
+                    .collect();
+                let expected = match matches.as_slice() {
+                    [] => Err(CallResultUseOpenReason::MissingCall),
+                    [site] => Ok(*site),
+                    _ => Err(CallResultUseOpenReason::AmbiguousCall),
+                };
+                prop_assert_eq!(index.at_span(start, end), expected, "span {:?}", (start, end));
+            }
+        }
+    }
+}

@@ -35,6 +35,7 @@ pub(super) struct ReadKeyColumns {
     pub(super) start_byte: Option<i64>,
     pub(super) end_byte: Option<i64>,
     pub(super) digest: Option<Vec<u8>>,
+    pub(super) site_ordinal: Option<i64>,
 }
 
 impl ReadKeyColumns {
@@ -53,6 +54,7 @@ impl ReadKeyColumns {
             start_byte: None,
             end_byte: None,
             digest: None,
+            site_ordinal: None,
         };
         match key {
             ReadKey::File {
@@ -115,6 +117,7 @@ impl ReadKeyColumns {
                         columns.subject = Some(procedure.as_bytes().to_vec());
                         columns.start_byte = Some(site.start_byte as i64);
                         columns.end_byte = Some(site.end_byte as i64);
+                        columns.site_ordinal = Some(site.ordinal as i64);
                     }
                     LookupQuestion::Summary { identity } => {
                         columns.subject = Some(identity.as_bytes().to_vec());
@@ -151,8 +154,8 @@ impl ReadKeyColumns {
 /// Rebuild one read key from normalized columns and verify its stored digest.
 ///
 /// `row` must select `key_digest`, `kind`, `family`, `languages`, `rel_path`,
-/// `name`, `index_key`, `blob_oid`, `subject`, `start_byte`, `end_byte`, and
-/// `digest`, in that order. Comparing the rebuilt key's canonical digest with
+/// `name`, `index_key`, `blob_oid`, `subject`, `start_byte`, `end_byte`,
+/// `digest`, and `site_ordinal`, in that order. Comparing the rebuilt key's canonical digest with
 /// `key_digest` turns column fidelity into a checked store invariant.
 pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     let key_digest = row.get::<_, Vec<u8>>(0)?;
@@ -167,6 +170,7 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     let start_byte = row.get::<_, Option<i64>>(9)?;
     let end_byte = row.get::<_, Option<i64>>(10)?;
     let digest = row.get::<_, Option<Vec<u8>>>(11)?;
+    let site_ordinal = row.get::<_, Option<i64>>(12)?;
 
     let missing = |column: &str| StoreError::new(format!("read key `{kind}` has no {column}"));
     let key = match kind.as_str() {
@@ -198,8 +202,8 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                     rel_path: Box::from(rel_path.as_str()),
                 },
                 (Some(rel_path), None, Some(subject), Some(start), Some(end)) => {
-                    match lookup_kind {
-                        LookupKind::Dispatch => LookupQuestion::CallSite {
+                    match (lookup_kind, site_ordinal) {
+                        (LookupKind::Dispatch, None) => LookupQuestion::CallSite {
                             rel_path: Box::from(rel_path.as_str()),
                             artifact: decode_digest(&subject, "call site artifact")?,
                             site: CallSiteLocator {
@@ -207,17 +211,20 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                                 end_byte: end as usize,
                             },
                         },
-                        LookupKind::ProcedureDispatch => LookupQuestion::ProcedureCallSite {
-                            rel_path: Box::from(rel_path.as_str()),
-                            procedure: decode_digest(&subject, "procedure lineage")?,
-                            site: ProcedureCallSiteLocator {
-                                start_byte: start as usize,
-                                end_byte: end as usize,
-                            },
-                        },
-                        other => {
+                        (LookupKind::ProcedureDispatch, Some(ordinal)) => {
+                            LookupQuestion::ProcedureCallSite {
+                                rel_path: Box::from(rel_path.as_str()),
+                                procedure: decode_digest(&subject, "procedure lineage")?,
+                                site: ProcedureCallSiteLocator {
+                                    start_byte: start as usize,
+                                    end_byte: end as usize,
+                                    ordinal: ordinal as usize,
+                                },
+                            }
+                        }
+                        (other, ordinal) => {
                             return Err(StoreError::new(format!(
-                                "lookup kind `{}` cannot carry a call-site question",
+                                "lookup kind `{}` cannot carry a call-site question with site ordinal {ordinal:?}",
                                 other.stable_label()
                             )));
                         }
@@ -443,7 +450,7 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         connection
             .query_row(
-                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12",
+                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13",
                 params![
                     columns.key_digest.as_slice(),
                     columns.kind,
@@ -457,6 +464,7 @@ mod tests {
                     columns.start_byte,
                     columns.end_byte,
                     columns.digest,
+                    columns.site_ordinal,
                 ],
                 |row| {
                     decode_read_key(row).map_err(|error| {

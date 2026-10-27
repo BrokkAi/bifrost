@@ -78,3 +78,8 @@ Current history:
 - `0020-semantic-model-schema-v16.sql`: admits semantic-model schema 16 with
   exact runtime return-class sets while preserving earlier pack rows, child
   rows, indexes, triggers, and mutation epochs.
+
+- `0025-semantic-row-questions.sql`: republishes shard markers at index version 3
+  with exact callable-values payload presence and adds indexed, generated
+  procedure-summary IDs for shard-local dependency queries. Existing artifacts
+  and validation certificates survive; reconciliation rebuilds the derived rows.

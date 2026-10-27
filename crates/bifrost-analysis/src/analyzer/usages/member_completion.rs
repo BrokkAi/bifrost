@@ -125,7 +125,7 @@ pub fn complete_members(
         {
             incomplete = true;
         } else {
-            let owner = owners.records[0];
+            let owner = &owners.records[0];
             if owner.language == "go"
                 && owner.kind == SemanticModelSymbolKind::Module
                 && owner.owner_id.is_none()
@@ -155,7 +155,7 @@ pub fn complete_members(
             incomplete = true;
             continue;
         }
-        let owner = owners.records[0];
+        let owner = &owners.records[0];
         let namespace_owner = owner.kind == SemanticModelSymbolKind::Module;
         let members = overlay.members_of(&owner_id);
         incomplete |= owner.provenance.completeness != SemanticModelCompleteness::Complete
@@ -164,20 +164,14 @@ pub fn complete_members(
                 member.provenance.completeness != SemanticModelCompleteness::Complete
                     || member.provenance.ambiguous
             });
-        modeled.extend(
-            members
-                .records
-                .into_iter()
-                .filter(|member| {
-                    member.externally_visible()
-                        && if namespace_owner {
-                            member.is_static()
-                        } else {
-                            member.has_receiver()
-                        }
-                })
-                .cloned(),
-        );
+        modeled.extend(members.records.into_iter().filter(|member| {
+            member.externally_visible()
+                && if namespace_owner {
+                    member.is_static()
+                } else {
+                    member.has_receiver()
+                }
+        }));
     }
 
     sort_units(&mut workspace);
@@ -208,11 +202,11 @@ pub fn complete_members(
     }
 }
 
-fn semantic_candidate(symbol: SemanticModelSymbol) -> MemberCompletionCandidate {
+fn semantic_candidate(symbol: std::sync::Arc<SemanticModelSymbol>) -> MemberCompletionCandidate {
     MemberCompletionCandidate::SemanticModel {
-        name: symbol.name,
+        name: symbol.name.clone(),
         kind: symbol.kind,
-        signature: symbol.signature,
+        signature: symbol.signature.clone(),
     }
 }
 

@@ -95,10 +95,10 @@ use std::sync::Arc;
 /// boundary. A summary that declares an input escape also closes the caller's
 /// argument-evaluation gap: the external body is absent, but the reviewed
 /// summary accounts for the value crossing that boundary.
-pub(crate) fn complete_external_summary<'a>(
-    oracle: &'a WorkspaceSemanticOracle<'_>,
+pub(crate) fn complete_external_summary(
+    oracle: &WorkspaceSemanticOracle<'_>,
     dispatch: &DispatchResult,
-) -> Option<&'a CompiledProcedureSummary> {
+) -> Option<std::sync::Arc<CompiledProcedureSummary>> {
     let [boundary] = dispatch.boundaries() else {
         return None;
     };
@@ -117,15 +117,15 @@ pub(crate) fn complete_external_summary<'a>(
             let [selected] = matched.records.as_slice() else {
                 return None;
             };
-            selected.record
+            std::sync::Arc::clone(&selected.record)
         }
         SemanticModelMatchDisposition::Conflict => {
             let (first, rest) = matched.records.split_first()?;
             (!rest.is_empty()
                 && rest
                     .iter()
-                    .all(|other| compiled_flow_claims_agree(other.record, first.record)))
-            .then_some(first.record)?
+                    .all(|other| compiled_flow_claims_agree(&other.record, &first.record)))
+            .then(|| std::sync::Arc::clone(&first.record))?
         }
         SemanticModelMatchDisposition::Empty => return None,
     };
@@ -178,8 +178,8 @@ pub(crate) fn modeled_external_call_gap_discharges_value(
     let Some(summary) = summary else {
         return Ok(false);
     };
-    let preserves = complete_external_summary_preserves_receiver(summary, call_row, value);
-    let escapes = complete_external_summary_escapes_value(summary, call_row, value);
+    let preserves = complete_external_summary_preserves_receiver(&summary, call_row, value);
+    let escapes = complete_external_summary_escapes_value(&summary, call_row, value);
     Ok(preserves || escapes)
 }
 

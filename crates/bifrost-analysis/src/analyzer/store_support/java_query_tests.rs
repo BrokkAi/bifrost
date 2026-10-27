@@ -15,7 +15,7 @@ use git2::{ObjectType, Oid};
 use crate::analyzer::store::WorkspacePackageFileRow;
 #[cfg(test)]
 #[cfg(not(test))]
-use crate::analyzer::store::resolution_operation::java_reverse_rows::{
+use crate::analyzer::store::resolution_operation::jvm_reverse_rows::{
     JvmReverseCandidateOutcome, JvmReverseConfirmed,
 };
 use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
@@ -136,6 +136,7 @@ pub fn publish_shared_jvm_consumer<A: LanguageAdapter>(
             &[],
             &[],
             configuration,
+            &[],
             &[],
         )
         .unwrap();

@@ -76,9 +76,9 @@ pub(crate) mod jvm_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::store::WorkspacePackageFileRow;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::java_reverse_rows::JvmReverseCandidateOutcome;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseCandidateOutcome;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::java_reverse_rows::JvmReverseConfirmed;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseConfirmed;
 
     #[test]
     fn selected_java_import_token_provenance_survives_remount() {
@@ -235,6 +235,7 @@ pub(crate) mod jvm_extraction_tests {
                 &[],
                 &configuration,
                 &[],
+                &[],
             )
             .unwrap();
         let scala_snapshot = store
@@ -255,6 +256,7 @@ pub(crate) mod jvm_extraction_tests {
                 &[],
                 &[],
                 &configuration,
+                &[],
                 &[],
             )
             .unwrap();
@@ -727,6 +729,7 @@ pub(crate) mod jvm_extraction_tests {
                 &[],
                 &configuration,
                 &[],
+                &[],
             )
             .unwrap();
         let peer_snapshot = store
@@ -747,6 +750,7 @@ pub(crate) mod jvm_extraction_tests {
                 &[],
                 &[],
                 &configuration,
+                &[],
                 &[],
             )
             .unwrap();
@@ -915,6 +919,7 @@ pub(crate) mod jvm_extraction_tests {
                 &[],
                 &[],
                 configuration,
+                &[],
                 &[],
             )
             .unwrap();

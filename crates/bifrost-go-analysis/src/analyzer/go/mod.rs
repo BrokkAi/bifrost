@@ -452,6 +452,172 @@ pub(crate) fn go_import_binding_pairs(
         .collect()
 }
 
+#[cfg(test)]
+fn activate_go_tool_context_for_test(
+    fixture: &crate::inline_project::BuiltInlineTestProject,
+    analyzer: &GoAnalyzer,
+) -> i64 {
+    use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome;
+
+    use brokk_bifrost_analysis::analyzer::store::go_package_context::profile_digest;
+
+    let snapshot = analyzer.selected_snapshot_for_test().unwrap();
+    let store = analyzer.inner.analyzer_store();
+    let cancellation = CancellationToken::new();
+    let GoInputObservationOutcome::Ready(before) = store
+        .observe_go_context_inputs(&snapshot, analyzer.project(), &cancellation)
+        .unwrap()
+    else {
+        panic!("fixture Go inputs must be selected");
+    };
+    let mut discovery = crate::analyzer::go::dependency_discovery::discover_go_packages(
+        &analyzer.inner.analyzer_config().go,
+        analyzer.project(),
+        &brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default(),
+        Some(&cancellation),
+    )
+    .canonical
+    .expect("Go tool discovery must publish the fixture context");
+    // The root convenience discovery omits domain metadata; publication
+    // needs the exact main modules just as production reconciliation does.
+    discovery.domain = brokk_bifrost_go::package_discovery::go_discovery_domains(
+        fixture.root(),
+        &[(
+            std::path::PathBuf::from("go.mod"),
+            std::fs::read_to_string(fixture.root().join("go.mod")).unwrap(),
+        )],
+    )
+    .unwrap()
+    .pop()
+    .expect("one fixture domain");
+    let profile = profile_digest(&discovery);
+    let GoInputObservationOutcome::Ready(after) = store
+        .observe_go_context_inputs(&snapshot, analyzer.project(), &cancellation)
+        .unwrap()
+    else {
+        panic!("fixture Go inputs must remain selected");
+    };
+    let GoContextPublicationOutcome::Published(context) = store
+        .publish_go_package_context(
+            snapshot.clone(),
+            fixture.root().to_path_buf(),
+            None,
+            &before,
+            &after,
+            discovery,
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("Go tool publication must succeed");
+    };
+    assert!(analyzer.activate_native_context_profile(&snapshot, profile));
+    reconcile_go_summaries_for_test(analyzer, context.context_id);
+    context.context_id
+}
+
+#[cfg(test)]
+fn reconcile_go_summaries_for_test(analyzer: &GoAnalyzer, context_id: i64) {
+    let snapshot = analyzer
+        .selected_snapshot_for_test()
+        .expect("selected Go snapshot");
+    let profile = analyzer
+        .context_profile_for_test()
+        .expect("selected Go native context profile");
+    let report = analyzer
+        .inner
+        .analyzer_store()
+        .reconcile_unit_summaries(
+            &snapshot,
+            brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
+                context_id,
+                profile,
+            },
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        )
+        .expect("reconcile summaries for the selected Go native context");
+    assert!(
+        report.failed.is_empty(),
+        "selected Go native summary derivation must succeed: {:?}",
+        report.failed
+    );
+}
+
+#[cfg(test)]
+fn build_constrained_sibling_fixture_for_test(
+    caller_source: &str,
+) -> Option<(crate::inline_project::BuiltInlineTestProject, GoAnalyzer)> {
+    if !std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("build-constrained sibling regression requires Go discovery");
+        return None;
+    }
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/workerprofile\n\ngo 1.22\n")
+        .file("service.go", caller_source)
+        .file("service_linux.go", "package workerprofile\n\ntype Service struct{}\nfunc (s *Service) Run() { active() }\nfunc active() {}\n")
+        .file("service_windows.go", "package workerprofile\n\ntype Service struct{}\nfunc (s *Service) Run() { ignored() }\nfunc ignored() {}\n")
+        .build();
+    let mut config = AnalyzerConfig::default();
+    config.go.dependency_discovery.goos = Some("linux".into());
+    config.go.dependency_discovery.goarch = Some("amd64".into());
+    let analyzer = GoAnalyzer::new_with_config(fixture.project_dyn(), config);
+    persist_live_go_sources_for_test(&analyzer);
+    let context_id = activate_go_tool_context_for_test(&fixture, &analyzer);
+    let roles = analyzer
+        .inner
+        .analyzer_store()
+        .read_conn()
+        .unwrap()
+        .prepare("SELECT DISTINCT files.source_role FROM go_package_files files JOIN go_package_instances packages USING(package_id) WHERE packages.context_id=?1 AND files.rel_path=?2")
+        .unwrap()
+        .query_map(rusqlite::params![context_id, "service_windows.go"], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        roles,
+        ["ignored"],
+        "Go discovery excluded the sibling: {roles:?}"
+    );
+    for path in ["service_linux.go", "service_windows.go"] {
+        assert!(
+            analyzer
+                .declarations(&fixture.file(path))
+                .iter()
+                .any(|unit| unit.identifier() == "Run"),
+            "both sibling declarations must exist in the source inventory: {path}"
+        );
+    }
+    Some((fixture, analyzer))
+}
+
+/// Reproduce a complete package publication containing an unselected saved sibling.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn mark_go_package_complete_for_test(analyzer: &GoAnalyzer, import_path: &'static str) {
+    let snapshot = analyzer
+        .selected_snapshot_for_test()
+        .expect("selected Go snapshot");
+    let profile = analyzer
+        .context_profile_for_test()
+        .expect("selected Go profile");
+    let store = analyzer.inner.analyzer_store();
+    let context = store
+        .selected_go_context(&snapshot, &profile)
+        .expect("read selected Go context")
+        .expect("selected Go context");
+    brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::mark_go_package_complete_for_test(
+        store, context.context_id, import_path,
+    ).expect("mark selected package complete");
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn persist_live_go_sources_for_test(analyzer: &GoAnalyzer) {
@@ -596,20 +762,12 @@ impl GoAnalyzer {
     ) -> Option<brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason>
 {
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::GraphFileSkipReason;
-        let target = &self.inner.analyzer_config().go.dependency_discovery;
-        let host_os = match std::env::consts::OS {
-            "macos" => "darwin",
-            other => other,
-        };
-        let host_arch = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            "x86" => "386",
-            other => other,
-        };
-        let goos = target.goos.as_deref().unwrap_or(host_os);
-        let goarch = target.goarch.as_deref().unwrap_or(host_arch);
-        if !brokk_bifrost_go::packages::source_filename_matches_target(file, goos, goarch) {
+        let build = self.selected_build_configuration();
+        if !brokk_bifrost_go::packages::source_filename_matches_target(
+            file,
+            &build.goos,
+            &build.goarch,
+        ) {
             return Some(GraphFileSkipReason::ExcludedBuildSelection);
         }
         if let Some(root) = self.workspace_path_index().unnamed_module_root(file) {
@@ -618,6 +776,15 @@ impl GoAnalyzer {
             });
         }
         None
+    }
+
+    #[doc(hidden)]
+    pub fn selected_build_configuration(
+        &self,
+    ) -> brokk_bifrost_go::package_discovery::GoBuildConfiguration {
+        brokk_bifrost_go::package_discovery::host_build_configuration(
+            &self.inner.analyzer_config().go.dependency_discovery,
+        )
     }
 
     pub(crate) fn update_all_with_progress(
@@ -667,7 +834,7 @@ impl GoAnalyzer {
         match self
             .inner
             .analyzer_store()
-            .go_contexts_for_file(snapshot, &base, path)
+            .go_owner_context_for_file(snapshot, &base, path)
         {
             Ok(mut contexts) => {
                 assert!(
@@ -946,9 +1113,23 @@ impl GoAnalyzer {
             self.memo_caches
                 .workspace_path_index_build_count
                 .fetch_add(1, Ordering::Relaxed);
-            packages::GoWorkspacePathIndex::build(self.project(), |file| {
-                self.package_clause_of(file)
-            })
+            // Without the recorded refusals, a refused file is an unexplained
+            // missing clause and the index stays incomplete.
+            let refused = self
+                .inner
+                .selected_source_admission_refusals()
+                .unwrap_or_else(|error| {
+                    self.inner.record_store_error(error);
+                    Vec::new()
+                })
+                .into_iter()
+                .map(|(file, _)| file)
+                .collect();
+            packages::GoWorkspacePathIndex::build(
+                self.project(),
+                |file| self.package_clause_of(file),
+                &refused,
+            )
         })
     }
 
@@ -1015,6 +1196,17 @@ impl GoAnalyzer {
         } else {
             None
         }
+    }
+
+    /// Go sources that source admission refused at the selected revision,
+    /// with the recorded reason. [`Self::graph_inventory_complete`] accepts
+    /// them as explained exclusions, so a consumer that claims completeness
+    /// or proves absence of references must account for them.
+    pub(crate) fn graph_source_exclusions(
+        &self,
+    ) -> Result<Vec<(ProjectFile, String)>, brokk_bifrost_analysis::analyzer::store::StoreError>
+    {
+        self.inner.selected_source_admission_refusals()
     }
 
     #[doc(hidden)]
@@ -1561,6 +1753,8 @@ impl IAnalyzer for GoAnalyzer {
     ) -> Option<std::sync::Arc<brokk_bifrost_core::gitblob::WorkingTreeIdentity>> {
         self.inner.working_tree_identity()
     }
+
+    brokk_bifrost_analysis::forward_query_read_ledger!();
 
     fn begin_query(
         &self,
@@ -2853,6 +3047,14 @@ impl LanguageEdgePass for GoEdgePass {
     /// a complete graph the pass cannot produce. Restricting the *report* is
     /// still right: the failure names the request's own Go files rather than
     /// every analyzed file, so a caller reads the files it asked about.
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer)
+            .map_or_else(|| Ok(Vec::new()), GoAnalyzer::graph_source_exclusions)
+    }
+
     fn input_failure(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2917,7 +3119,21 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
-        ready_preflight(analyzer, Language::Go, "Go")
+        // A source that admission refused can reference any candidate, so its
+        // missing references are not proof of absence.
+        let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+            return ready_preflight(analyzer, Language::Go, "Go");
+        };
+        match go.graph_source_exclusions() {
+            Ok(excluded) if excluded.is_empty() => ready_preflight(analyzer, Language::Go, "Go"),
+            Ok(_) => DeadCodeBulkPreflight::Unavailable(
+                "a Go source refused by source admission may reference any candidate",
+            ),
+            Err(error) => {
+                go.inner.record_store_error(error);
+                DeadCodeBulkPreflight::Unavailable("Go source admission refusals were unavailable")
+            }
+        }
     }
 
     /// Module-level variables count as callers as well as declarations: a package-level
@@ -3191,20 +3407,13 @@ mod dependency_packs {
             input_digest: None,
             failure: None,
             packages: Vec::new(),
-            goos: config
-                .go
-                .dependency_discovery
-                .goos
-                .clone()
-                .unwrap_or_else(|| base_environment.goos.clone()),
-            goarch: config
-                .go
-                .dependency_discovery
-                .goarch
-                .clone()
-                .unwrap_or_else(|| base_environment.goarch.clone()),
+            build_configuration:
+                crate::analyzer::go::dependency_discovery::selected_build_configuration(
+                    &config.go.dependency_discovery,
+                    &base_environment.goos,
+                    &base_environment.goarch,
+                ),
             environment: base_environment.clone(),
-            build_tags: config.go.dependency_discovery.build_tags.clone(),
             workspace_patterns: config.go.dependency_discovery.workspace_patterns.clone(),
             vendor: false,
         };
@@ -3265,9 +3474,9 @@ mod dependency_packs {
                         environment.gowork=if domain.gowork_path.is_empty(){"off".into()}else{project.root().join(&domain.gowork_path).to_string_lossy().into_owned()};
                         let mut canonical=GoPackageDiscovery {
                             domain:domain.clone(),input_digest:Some(*input_digest),failure:None,packages:Vec::new(),
-                            goos:config.go.dependency_discovery.goos.clone().unwrap_or_else(||environment.goos.clone()),
-                            goarch:config.go.dependency_discovery.goarch.clone().unwrap_or_else(||environment.goarch.clone()),
-                            environment,build_tags:config.go.dependency_discovery.build_tags.clone(),
+                            build_configuration:crate::analyzer::go::dependency_discovery::selected_build_configuration(
+                                &config.go.dependency_discovery,&environment.goos,&environment.goarch),
+                            environment,
                             workspace_patterns:config.go.dependency_discovery.workspace_patterns.clone(),vendor:false,
                         };
                         let profile=profile_digest(&canonical);
@@ -3358,6 +3567,7 @@ mod dependency_packs {
                 };
                 let selected_snapshot = snapshot.clone();
                 let profile = profile_digest(&canonical);
+                let mut input_change = None;
                 let publication = match (snapshot.clone(), before.clone()) {
                     (Some(snapshot), Some(GoInputObservationOutcome::Ready(before))) => {
                         let expected =
@@ -3378,7 +3588,8 @@ mod dependency_packs {
                                     canonical,
                                     cancellation,
                                 )?,
-                            GoInputObservationOutcome::InputsChanged => {
+                            GoInputObservationOutcome::InputsChanged(change) => {
+                                input_change = Some(change);
                                 GoContextPublicationOutcome::InputsChanged
                             }
                             GoInputObservationOutcome::Cancelled => {
@@ -3388,6 +3599,10 @@ mod dependency_packs {
                     }
                     (_, Some(GoInputObservationOutcome::Cancelled)) => {
                         GoContextPublicationOutcome::Cancelled
+                    }
+                    (_, Some(GoInputObservationOutcome::InputsChanged(change))) => {
+                        input_change = Some(change);
+                        GoContextPublicationOutcome::InputsChanged
                     }
                     _ => GoContextPublicationOutcome::InputsChanged,
                 };
@@ -3459,11 +3674,21 @@ mod dependency_packs {
                         discovered.semantic_packs.complete = false;
                     }
                     GoContextPublicationOutcome::InputsChanged => {
+                        // Without the first disagreement, the refusal was the
+                        // before/after comparison or the publication's head check.
+                        let message = format!(
+                            "Go source or configuration no longer matches the selected revision ({}); native package context was not published",
+                            input_change.map_or_else(
+                                || "inputs changed while discovery ran".to_owned(),
+                                |change| format!("{change:?}")
+                            )
+                        );
+                        eprintln!("go.native_context_inputs_changed: domain {domain:?}: {message}");
                         discovered.semantic_packs.complete = false;
                         discovered.semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
                     severity: brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
                     code: "go.native_context_inputs_changed".into(), dependency_id:None, location:None,
-                    message:"Go source or configuration no longer matches the selected revision; native package context was not published".into(),
+                    message,
                 });
                     }
                 }

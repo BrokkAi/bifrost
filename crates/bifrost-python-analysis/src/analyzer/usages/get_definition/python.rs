@@ -441,7 +441,7 @@ fn python_class_symbol_from_binding(
     analyzer: &dyn IAnalyzer,
     binding: &crate::analyzer::python::runtime_binding::PythonDefiningBinding,
     provider: &crate::analyzer::python::runtime_binding::PythonRuntimeProviderProof,
-) -> Result<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol, String> {
+) -> Result<Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol>, String> {
     if binding.value_identity().is_some() {
         return python_module_value_symbol_from_binding(analyzer, binding, provider);
     }
@@ -482,17 +482,18 @@ fn python_class_symbol_from_binding(
             modeled.disposition
         ));
     }
-    let symbol = modeled.records[0];
+    let symbol = modeled.records[0].clone();
     let active_models = active_snapshot.active_models();
     let mut matching_declarations = Vec::new();
-    for shard in active_models.shards().iter().filter(|shard| {
+    let shards = active_models.shards();
+    for shard in shards.iter().filter(|shard| {
         shard.manifest.content_sha256 == binding.model_manifest_sha256()
             && shard
                 .matching_evidence
                 .iter()
                 .any(|evidence| evidence == provider.evidence())
     }) {
-        let Some((types, _, _)) = shard.shard.payload().declaration_facts() else {
+        let Some((types, _, _)) = shard.decoded().payload().declaration_facts() else {
             continue;
         };
         for declaration in types
@@ -526,7 +527,7 @@ fn python_class_symbol_from_binding(
             .map(|(shard, declaration)| {
                 (
                     shard.manifest.content_sha256.as_str(),
-                    shard.shard.shard_id(),
+                    shard.descriptor.shard_id.as_str(),
                     shard.source_id.as_str(),
                     declaration.id.as_str(),
                 )
@@ -553,7 +554,7 @@ fn python_class_symbol_from_binding(
         || symbol.provenance.record_id != native_declaration.id
         || symbol.provenance.activation.status != "active"
         || symbol.provenance.activation.source_id != native_shard.source_id
-        || !python_model_symbol_matches_provider(symbol, provider.evidence())
+        || !python_model_symbol_matches_provider(&symbol, provider.evidence())
     {
         return Err(format!(
             "native Python class identity does not match the checked model publication: {}",
@@ -567,7 +568,7 @@ fn python_module_value_symbol_from_binding(
     analyzer: &dyn IAnalyzer,
     binding: &crate::analyzer::python::runtime_binding::PythonDefiningBinding,
     provider: &crate::analyzer::python::runtime_binding::PythonRuntimeProviderProof,
-) -> Result<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol, String> {
+) -> Result<Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol>, String> {
     use brokk_bifrost_analysis::analyzer::semantic_model::{
         Locator, MemberKind, SemanticModelOriginKind, SemanticModelProof, SemanticModelSymbolKind,
         TypeKind,
@@ -606,17 +607,18 @@ fn python_module_value_symbol_from_binding(
             modeled.disposition
         ));
     }
-    let symbol = modeled.records[0];
+    let symbol = modeled.records[0].clone();
     let active_models = active_snapshot.active_models();
     let mut matching_declarations = Vec::new();
-    for shard in active_models.shards().iter().filter(|shard| {
+    let shards = active_models.shards();
+    for shard in shards.iter().filter(|shard| {
         shard.manifest.content_sha256 == binding.model_manifest_sha256()
             && shard
                 .matching_evidence
                 .iter()
                 .any(|evidence| evidence == provider.evidence())
     }) {
-        let Some((types, members, _)) = shard.shard.payload().declaration_facts() else {
+        let Some((types, members, _)) = shard.decoded().payload().declaration_facts() else {
             continue;
         };
         for member in members
@@ -664,7 +666,7 @@ fn python_module_value_symbol_from_binding(
             .map(|(shard, member)| {
                 (
                     shard.manifest.content_sha256.as_str(),
-                    shard.shard.shard_id(),
+                    shard.descriptor.shard_id.as_str(),
                     shard.source_id.as_str(),
                     member.id.as_str(),
                 )
@@ -692,7 +694,7 @@ fn python_module_value_symbol_from_binding(
         || symbol.provenance.record_id != native_declaration.id
         || symbol.provenance.activation.status != "active"
         || symbol.provenance.activation.source_id != native_shard.source_id
-        || !python_model_symbol_matches_provider(symbol, provider.evidence())
+        || !python_model_symbol_matches_provider(&symbol, provider.evidence())
     {
         return Err(format!(
             "native Python module-value identity does not match the checked model publication: {}",

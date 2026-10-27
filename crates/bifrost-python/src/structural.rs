@@ -44,8 +44,9 @@ use crate::bindings::{
 };
 use crate::imports::python_import_bindings_from_tree;
 use crate::syntax::{
-    expression_name_node, python_deferred_annotation_identifier_ranges,
-    python_keyword_argument_label, python_node_is_in_annotation, python_plain_string_literal,
+    expression_name_node, python_conditional_expression_operands,
+    python_deferred_annotation_identifier_ranges, python_keyword_argument_label,
+    python_node_is_in_annotation, python_plain_string_literal,
 };
 
 #[derive(Debug, Default)]
@@ -62,28 +63,6 @@ fn python_first_named_operand(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| !child.is_extra())
-}
-
-/// The test operand of a Python conditional expression (`value if test else
-/// alternative`).
-///
-/// The grammar leaves `conditional_expression` without fields, so its operands
-/// can only be selected positionally. Skipping extras is required: a backslash
-/// line continuation before `else` otherwise appears as a fourth named child
-/// and trips the operand-count check (#4797).
-fn python_conditional_expression_test(node: Node<'_>) -> Node<'_> {
-    assert_eq!(node.kind(), "conditional_expression");
-    let mut cursor = node.walk();
-    let operands: Vec<Node<'_>> = node
-        .named_children(&mut cursor)
-        .filter(|child| !child.is_extra())
-        .collect();
-    assert_eq!(
-        operands.len(),
-        3,
-        "conditional expression operands: {node:?}"
-    );
-    operands[1]
 }
 
 pub(crate) fn python_parenthesized_expression_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -303,7 +282,10 @@ fn python_string_key_value(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() == "concatenated_string" {
         let mut value = String::new();
         let mut cursor = node.walk();
-        for part in node.named_children(&mut cursor) {
+        for part in node
+            .named_children(&mut cursor)
+            .filter(|part| !part.is_extra())
+        {
             if part.kind() != "string" {
                 return None;
             }
@@ -965,7 +947,10 @@ fn python_collect_all_members(
         return ReadableSurface::No;
     }
     let mut cursor = value.walk();
-    for element in value.named_children(&mut cursor) {
+    for element in value
+        .named_children(&mut cursor)
+        .filter(|element| !element.is_extra())
+    {
         match python_plain_string_literal(element, source) {
             Some(text) => {
                 members.push(PythonExportMember {
@@ -1171,6 +1156,10 @@ fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts
                         }
                         continue;
                     };
+                    if expression.kind() == "assignment" {
+                        members.clear();
+                        readable = ReadableSurface::Yes;
+                    }
                     let extends = expression.kind() == "assignment"
                         || expression
                             .child_by_field_name("operator")
@@ -1766,7 +1755,10 @@ impl StructuralSpec for PythonStructuralSpec {
                 // extras (`comment`, `line_continuation`) can be interleaved
                 // between them, so select among the operands (#4797).
                 let test = if node.kind() == "conditional_expression" {
-                    Some(python_conditional_expression_test(node))
+                    Some(
+                        python_conditional_expression_operands(node)
+                            .expect("conditional expression operands")[1],
+                    )
                 } else {
                     node.child_by_field_name("condition")
                 };
@@ -1911,6 +1903,185 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: __all__ replacement retained old exports"
+    )]
+    fn qs6_all_replacement_and_extension() {
+        for (source, expected) in [
+            ("__all__ = ['old']\n__all__ = ['new']\n", vec!["new"]),
+            (
+                "__all__ = ['old']\n__all__ += ['new']\n",
+                vec!["old", "new"],
+            ),
+            ("__all__ = computed\n__all__ = ['new']\n", vec!["new"]),
+        ] {
+            let tree = parse_python(source);
+            let facts = python_source_export_facts(tree.root_node(), source);
+            assert_eq!(
+                facts
+                    .exports
+                    .iter()
+                    .map(|e| e.exported_name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(facts.complete, "{source}: {facts:?}");
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: named extras made literal exports and concatenations unreadable"
+    )]
+    fn qs6_literal_extras_grammar_boundary() {
+        let source =
+            "__all__ = [\n 'first', # comment\n 'second',\n]\nVALUE = ('a' # comment\n 'b')\n";
+        let tree = parse_python(source);
+        assert!(!tree.root_node().has_error());
+        let facts = python_source_export_facts(tree.root_node(), source);
+        assert!(facts.complete, "{facts:?}");
+        assert_eq!(
+            facts
+                .exports
+                .iter()
+                .map(|e| e.exported_name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let concat = node_of_kind(tree.root_node(), "concatenated_string").unwrap();
+        assert_eq!(
+            python_string_key_value(concat, source).as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn qs6_structural_literal_grammar_matrix() {
+        // Expected values follow CPython ast literal values; f/named-escape
+        // strings remain unsupported rather than inventing a decoded value.
+        for (literal, expected) in [
+            (r#""{{key}}""#, Some("{{key}}")),
+            (r#""{key}""#, Some("{key}")),
+            (r#"f"{{key}}""#, None),
+            (r#"f"plain""#, None),
+            (r#"f"{key}""#, None),
+            (r#""\N{LATIN CAPITAL LETTER A}""#, None),
+            (r#""A""#, Some("A")),
+            (
+                r#""\n{LATIN CAPITAL LETTER A}""#,
+                Some("\n{LATIN CAPITAL LETTER A}"),
+            ),
+        ] {
+            let source = format!("value = {literal}\n");
+            let tree = parse_python(&source);
+            let node = node_of_kind(tree.root_node(), "string").unwrap();
+            assert_eq!(
+                python_string_key_value(node, &source).as_deref(),
+                expected,
+                "{literal}"
+            );
+        }
+        for (rhs, kind, count, starred) in [
+            ("[1, 2]", AssignmentSequenceKind::List, 2, false),
+            ("(1, 2)", AssignmentSequenceKind::Tuple, 2, false),
+            ("1, 2", AssignmentSequenceKind::Tuple, 2, false),
+            ("[1, *items]", AssignmentSequenceKind::List, 1, true),
+            ("(1, *items)", AssignmentSequenceKind::Tuple, 1, true),
+        ] {
+            let source = format!("a, *b = {rhs}\n");
+            let tree = parse_python(&source);
+            let assignment = node_of_kind(tree.root_node(), "assignment").unwrap();
+            assert_eq!(
+                python_assignment_value_shape(assignment.child_by_field_name("right").unwrap()),
+                Some((kind, count, starred)),
+                "{rhs}"
+            );
+        }
+        for (value, constant) in [
+            ("((True))", true),
+            ("(False)", true),
+            ("((None))", true),
+            ("-None", false),
+            ("-1", true),
+            ("f'{value}'", false),
+        ] {
+            let source = format!("left == {value}\n");
+            let tree = parse_python(&source);
+            let comparison = node_of_kind(tree.root_node(), "comparison_operator").unwrap();
+            let operand = comparison.named_child(1).unwrap();
+            assert_eq!(python_comparison_constant(operand), constant, "{value}");
+        }
+    }
+
+    #[test]
+    fn qs6_source_export_namespace_shapes() {
+        for (statement, dynamic) in [
+            ("", false),
+            (
+                "import sys as runtime\nsetattr(runtime.modules[__name__], 'late', 1)\n",
+                true,
+            ),
+            ("setattr(__import__(__name__), 'late', 1)\n", true),
+            (
+                "import sys as runtime\nalias = runtime.modules[__name__]\nsetattr(alias, 'late', 1)\n",
+                true,
+            ),
+            ("globals()['late'] = 1\n", true),
+        ] {
+            let source = format!("__all__ = ['late']\n{statement}");
+            let tree = parse_python(&source);
+            let facts = python_source_export_facts(tree.root_node(), &source);
+            assert_eq!(facts.definitions_complete, !dynamic, "{source}");
+            assert!(
+                matches!(
+                    facts.exports[0].local_definition,
+                    SourceExportLocalDefinition::Unknown
+                ) == dynamic,
+                "{facts:?}"
+            );
+            if !dynamic {
+                assert!(matches!(
+                    facts.exports[0].local_definition,
+                    SourceExportLocalDefinition::Undefined
+                ));
+            }
+        }
+        let source = "__all__ =\n";
+        let tree = parse_python(source);
+        assert!(!python_source_export_facts(tree.root_node(), source).definitions_complete);
+    }
+
+    #[test]
+    fn qs6_binding_kind_grammar_inventory() {
+        let source = "def run(parameter):\n scalar = 1\n left, right = (1, 2)\n for loop in ():\n  pass\n values = [comp for comp in ()]\n";
+        let tree = parse_python(source);
+        let mut pending = vec![tree.root_node()];
+        let mut found = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" {
+                let text = node_source_text(node, source);
+                if text == "comp" && node.parent().unwrap().kind() != "for_in_clause" {
+                    continue;
+                }
+                if let Some(expected) = match text {
+                    "parameter" => Some(BindingKind::Parameter),
+                    "scalar" | "left" | "right" => Some(BindingKind::Local),
+                    "loop" | "comp" => Some(BindingKind::LoopVariable),
+                    _ => None,
+                } {
+                    let activation =
+                        python_binding_activation(node, node_range(tree.root_node())).unwrap();
+                    assert_eq!(activation.kind, expected, "{text}: {}", node.to_sexp());
+                    found.push(text);
+                }
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(found.len(), 6);
+    }
+
+    #[test]
     fn missing_python_all_value_is_incomplete_after_parser_recovery() {
         let source = "__all__ =\n";
         let mut parser = tree_sitter::Parser::new();
@@ -1992,7 +2163,8 @@ mod tests {
             let conditional = node_of_kind(root, "conditional_expression").unwrap_or_else(|| {
                 panic!("{case}: no conditional expression in {}", root.to_sexp())
             });
-            let test = python_conditional_expression_test(conditional);
+            let test = python_conditional_expression_operands(conditional)
+                .expect("conditional expression operands")[1];
             assert_eq!(test.kind(), "identifier", "{case}");
             assert_eq!(
                 test.utf8_text(source.as_bytes()).unwrap(),
@@ -2121,6 +2293,112 @@ class DomainNameValidator(RegexValidator):
                 "{}",
                 tree.root_node().to_sexp()
             );
+        }
+    }
+    #[test]
+    fn qs6_flat_import_paths_follow_grammar_fields_and_byte_ranges() {
+        let source = "# \u{e9}\nimport alpha.beta.gamma as alias\nfrom alpha.beta import gamma\nalpha.beta\n";
+        let tree = parse_python(source);
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let import = root.named_child(1).unwrap();
+        assert_eq!(import.kind(), "import_statement");
+        let aliased = import.child_by_field_name("name").unwrap();
+        assert_eq!(aliased.kind(), "aliased_import");
+        let dotted = aliased.child_by_field_name("name").unwrap();
+        assert_eq!(dotted.kind(), "dotted_name");
+        let tokens = PYTHON_STRUCTURAL_SPEC.path_segment_tokens(dotted);
+        let start = source.find("alpha").unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|node| (node.kind(), node.byte_range()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("identifier", start..start + 5),
+                ("identifier", start + 6..start + 10),
+                ("identifier", start + 11..start + 16)
+            ]
+        );
+        for token in tokens {
+            assert_eq!(
+                PYTHON_STRUCTURAL_SPEC.qualified_path_root(token),
+                Some(dotted)
+            );
+        }
+        let alias = aliased.child_by_field_name("alias").unwrap();
+        assert_eq!(node_source_text(alias, source), "alias");
+        assert!(PYTHON_STRUCTURAL_SPEC.qualified_path_root(alias).is_none());
+        let from = root.named_child(2).unwrap();
+        let module = from.child_by_field_name("module_name").unwrap();
+        assert_eq!(module.kind(), "dotted_name");
+        assert_eq!(
+            PYTHON_STRUCTURAL_SPEC
+                .path_segment_tokens(module)
+                .iter()
+                .map(|n| node_source_text(*n, source))
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        let attribute = root.named_child(3).unwrap().named_child(0).unwrap();
+        assert_eq!(attribute.kind(), "attribute");
+        assert!(
+            PYTHON_STRUCTURAL_SPEC
+                .path_segment_tokens(attribute)
+                .is_empty()
+        );
+        assert!(
+            PYTHON_STRUCTURAL_SPEC
+                .qualified_path_root(attribute.child_by_field_name("attribute").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn qs6_syntactic_reexports_obey_redundant_aliases_and_all_membership() {
+        for (all, listed, ordinary) in [
+            ("", Some(RouteHopKind::Import), Some(RouteHopKind::Import)),
+            (
+                "__all__ = ['z']\n",
+                Some(RouteHopKind::ReExport),
+                Some(RouteHopKind::Import),
+            ),
+            ("__all__ = dynamic()\n", None, None),
+        ] {
+            let source = format!(
+                "# \u{e9}\nimport a.b\nimport x as x\nfrom x import y as y\nfrom x import y as z\nfrom x import *\n{all}"
+            );
+            let tree = parse_python(&source);
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{}", root.to_sexp());
+            let surface = PYTHON_STRUCTURAL_SPEC.curated_export_surface(root, &source);
+            for (index, field, expected) in [
+                (1, "name", ordinary),
+                (2, "name", Some(RouteHopKind::ReExport)),
+                (3, "name", Some(RouteHopKind::ReExport)),
+                (4, "name", listed),
+                (5, "module_name", Some(RouteHopKind::ReExport)),
+            ] {
+                let clause = root
+                    .named_child(index)
+                    .unwrap()
+                    .child_by_field_name(field)
+                    .unwrap();
+                let name = if clause.kind() == "aliased_import" {
+                    clause.child_by_field_name("name").unwrap()
+                } else {
+                    clause
+                };
+                assert_eq!(name.kind(), "dotted_name");
+                let token = name.named_child(0).unwrap();
+                assert_eq!(token.kind(), "identifier");
+                assert_eq!(
+                    PYTHON_STRUCTURAL_SPEC.indirection_relation(token, &source, &surface),
+                    expected,
+                    "{}",
+                    clause.to_sexp()
+                );
+            }
         }
     }
 }

@@ -1,7 +1,6 @@
 //! JVM source contexts admitted only when a selected endpoint reaches them.
 use super::demand::{
-    ClosedForwardSource, ClosedRelations, DemandProvider, LanguageContextPreparation,
-    LanguageRootDiscovery,
+    ClosedForwardSource, ClosedRelations, LanguageContextPreparation, LanguageRootDiscovery,
 };
 use super::demand_closure::{BaseEligibility, ClosureWitness, Read};
 use super::jvm_context::{
@@ -18,12 +17,12 @@ use crate::analyzer::resolution::{
     binding_origin_rank, language_implicit_root_providers,
     language_implicit_root_providers_in_namespace,
 };
-use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+use brokk_bifrost_core::analyzer::resolution_facts::{BindingProjectionKind, ResolutionGapKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct JvmBindingPrecedence {
     // Match shared path precedence: binding origin before lexical depth.
-    rank: u32,
+    pub(super) rank: u32,
     depth: u32,
 }
 
@@ -1801,7 +1800,102 @@ impl JvmDemandState<'_, '_, '_> {
                 .local_key()
                 .expect("a selected Scala reference has a local site"),
         );
-        let ResolutionCompletion::Incomplete(reasons) = completion else {
+        let mut observed = completion.clone();
+        let mut type_references = BTreeSet::from([reference]);
+        if jvm_prefix_defers_member_selection(language) {
+            // A selected qualified type proves the package/type alternatives
+            // along its structured qualifier chain, even though those gaps
+            // are also copied onto the terminal's typed frontier.
+            let typed = self.operation.ready.typed_source();
+            let mut pending = vec![reference];
+            let mut slots = BTreeSet::new();
+            while let Some(current) = pending.pop() {
+                let mut qualifiers = Vec::new();
+                let mut current_slots = Vec::new();
+                let read = typed.visit_binding_projection_pages_for_references(
+                    TypedFactRequest::new(&[current]),
+                    self.cancellation,
+                    &mut FactPageVisitor::new(&mut |page| {
+                        current_slots.extend(
+                            page.iter()
+                                .map(|row| row.row())
+                                .filter(|row| {
+                                    matches!(
+                                        row.kind(),
+                                        BindingProjectionKind::TargetTypeIdentity
+                                            | BindingProjectionKind::TargetNominalTypeIdentity
+                                    )
+                                })
+                                .map(|row| row.output_slot()),
+                        );
+                        Ok(true)
+                    }),
+                )?;
+                if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
+                    return Ok(None);
+                }
+                if current_slots.is_empty() {
+                    continue;
+                }
+                slots.extend(current_slots);
+                let read = typed.visit_qualified_route_pages_for_references(
+                    TypedFactRequest::new(&[current]),
+                    self.cancellation,
+                    &mut FactPageVisitor::new(&mut |page| {
+                        qualifiers.extend(page.iter().map(|row| row.row().qualifier_slot()));
+                        Ok(true)
+                    }),
+                )?;
+                if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
+                    return Ok(None);
+                }
+                qualifiers.sort_unstable();
+                qualifiers.dedup();
+                for chunk in qualifiers.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+                    let read = typed.visit_binding_projection_pages_for_outputs(
+                        TypedFactRequest::new(chunk),
+                        self.cancellation,
+                        &mut FactPageVisitor::new(&mut |page| {
+                            for row in page {
+                                let row = row.row();
+                                if matches!(
+                                    row.kind(),
+                                    BindingProjectionKind::TargetTypeIdentity
+                                        | BindingProjectionKind::TargetNominalTypeIdentity
+                                ) && type_references.insert(row.reference())
+                                {
+                                    pending.push(row.reference());
+                                }
+                            }
+                            Ok(true)
+                        }),
+                    )?;
+                    if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
+                        return Ok(None);
+                    }
+                }
+                if self.cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+            }
+            let slots = slots.into_iter().collect::<Vec<_>>();
+            for chunk in slots.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+                let read = typed.visit_type_frontier_completion_pages(
+                    TypedFactRequest::new(chunk),
+                    self.cancellation,
+                    &mut FactPageVisitor::new(&mut |page| {
+                        for row in page {
+                            observed = observed.combine(row.completion());
+                        }
+                        Ok(true)
+                    }),
+                )?;
+                if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
+                    return Ok(None);
+                }
+            }
+        }
+        let ResolutionCompletion::Incomplete(reasons) = &observed else {
             return Ok(Some((reference, Vec::new(), completion.clone())));
         };
         let semantics = reasons
@@ -1848,14 +1942,24 @@ impl JvmDemandState<'_, '_, '_> {
                 continue;
             };
             if row.fragment() == fragment
-                && row.source_site() == source_site
-                && crate::analyzer::resolution::jvm_terminal_type_gap_origin_is_safe(
-                    language,
-                    row.fragment(),
-                    row.source_site(),
-                    row.origin(),
-                    reference,
-                )
+                && ((row.source_site() != source_site
+                    && jvm_prefix_defers_member_selection(language)
+                    && row.origin()
+                        == LoweringGapOrigin::Extracted(ResolutionGapKind::AmbiguousQualifiedType)
+                    && type_references.contains(
+                        &crate::analyzer::resolution::fact_lowering::site_semantic(
+                            fragment,
+                            row.source_site(),
+                        ),
+                    ))
+                    || (row.source_site() == source_site
+                        && crate::analyzer::resolution::jvm_terminal_type_gap_origin_is_safe(
+                            language,
+                            row.fragment(),
+                            row.source_site(),
+                            row.origin(),
+                            reference,
+                        )))
             {
                 retired.push(semantic);
             }
@@ -2094,7 +2198,41 @@ pub(super) fn jvm_demand_storage_language(storage_language: &str) -> bool {
     matches!(storage_language, "java" | "kotlin" | "scala")
 }
 
+/// Inputs for one caller file's shared JVM forward operation.
+#[doc(hidden)]
+pub struct JvmForwardOperationContext<'a> {
+    pub storage_language: &'a str,
+    pub blueprint: &'a SelectedFactOperationBlueprint,
+    pub caller_path: &'a str,
+    pub import_gaps: &'a [JvmImportContextGap],
+    pub lexical: &'a dyn BatchResolutionFragmentSource,
+    pub typed: &'a dyn SelectedTypedFactSource,
+    pub cancellation: &'a CancellationToken,
+    pub session: &'a ResolutionSession,
+}
+
 impl SelectedResolutionOperation<'_, '_> {
+    #[doc(hidden)]
+    pub fn stage_jvm_reference_batches(
+        &self,
+        context: JvmForwardOperationContext<'_>,
+        maximum_batch_size: usize,
+        sink: &mut dyn FnMut(&FactReferenceBatchAnswer) -> Result<()>,
+    ) -> Result<FactResolutionBatchSummary> {
+        self.with_jvm_forward_operation(
+            context.storage_language,
+            context.blueprint,
+            context.lexical,
+            context.typed,
+            context.caller_path,
+            Some(context.import_gaps),
+            context.cancellation,
+            context.session,
+            None,
+            |operation| operation.stage_all_reference_batches(maximum_batch_size, sink),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn with_jvm_forward_operation<T>(
         &self,
@@ -2148,26 +2286,18 @@ impl SelectedResolutionOperation<'_, '_> {
             selected_import_gap,
             pending_registration: None,
         };
-        // Production always uses the shared closure protocol.
-        let provider = DemandProvider::new(super::demand_closure::SharedDemand {
-            source_closures: HashMap::default(),
-            rules: JvmRules::new(language),
-            arena: &arena,
-            paths: &paths,
-            ready: &self.ready,
-            base: lexical,
-            session,
-            cancellation,
-            completion: &ResolutionCompletion::Complete,
-        });
-        blueprint.with_demand_operation(
-            &source,
+        self.with_shared_forward_operation(
+            JvmRules::new(language),
+            &arena,
             &paths,
+            &source,
+            blueprint,
             lexical,
             typed,
-            provider,
+            Some(&self.jvm_context_blueprints),
             cancellation,
             session,
+            None,
             run,
         )
     }
@@ -2243,35 +2373,30 @@ impl JvmDemandState<'_, '_, '_> {
         else {
             return Ok(None);
         };
-        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = self
-            .operation
-            .collect_jvm_blueprint_in_session(context, self.cancellation, self.session)?
-        else {
-            return Ok(None);
-        };
-        let key = JvmProviderRegistrationKey {
-            mount,
-            scope: self.operation.ready.inventory.scope_identity(),
-            stage_epoch: self.operation.ready.inventory.staged_read_epoch(),
-        };
-        if matches!(
-            self.operation
-                .jvm_context_registrations
-                .borrow_mut()
-                .register(key, &blueprint, |cells| self
-                    .operation
-                    .ready
-                    .register_context_cells_in_session(
-                        &blueprint,
-                        cells,
-                        self.cancellation,
-                        self.session,
-                    ),)?,
-            ContextRegistrationOutcome::Cancelled
-        ) {
-            return Ok(None);
-        }
-        Ok(Some(blueprint))
+        self.operation.ready.publish_prepared_context(
+            context,
+            self.cancellation,
+            self.session,
+            Some(&self.operation.jvm_context_blueprints),
+            |blueprint| {
+                let key = JvmProviderRegistrationKey {
+                    mount,
+                    scope: self.operation.ready.inventory.scope_identity(),
+                    stage_epoch: self.operation.ready.inventory.staged_read_epoch(),
+                };
+                self.operation
+                    .jvm_context_registrations
+                    .borrow_mut()
+                    .register(key, blueprint, |cells| {
+                        self.operation.ready.register_context_cells_in_session(
+                            blueprint,
+                            cells,
+                            self.cancellation,
+                            self.session,
+                        )
+                    })
+            },
+        )
     }
 }
 
@@ -2589,6 +2714,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             ..
         }) = &source.qualified
             && (member_start.is_some()
+                || (language == Language::Java && prefix_reference.is_some())
                 || (prefix_reference.is_none()
                     && *owner_continued
                     && *anchor == ResolutionRootImportAnchor::Lexical))
@@ -3005,6 +3131,18 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     state.terminal_reasons.iter().copied(),
                 ));
             }
+            // A declaration-backed external package route settles Java's
+            // package-or-type alternative without claiming source navigation
+            // targets or closing its member inventory.
+            if complete && let Some(owner) = authority.external_nominal {
+                // Carry the positive declaration identity through the existing
+                // selected-route channel. A boolean nominal marker cannot
+                // authorize retiring gaps on an answer without source targets.
+                exact.merge(
+                    DemandClosureDischarges::exact(state.terminal_reasons.iter().copied())
+                        .with_selected_targets([owner]),
+                );
+            }
             // Java's name classification leaves terminal target and absence
             // authority to typed member resolution.
             if complete && !jvm_prefix_defers_member_selection(state.reader.language) {
@@ -3133,18 +3271,6 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             .insert(prefix.key, selected_evidence);
         Ok(Some(completion))
     }
-    fn compile_publication(
-        &mut self,
-        _: &super::demand_closure::RootFrame,
-        _: &ReadySelectedResolution<'_, '_>,
-        contexts: crate::analyzer::resolution::SelectedResolutionContextInputs,
-        session: &ResolutionSession,
-        cancellation: &CancellationToken,
-    ) -> Result<SelectedFactOperationBlueprintConstruction> {
-        self.state
-            .operation
-            .collect_jvm_blueprint_in_session(contexts, cancellation, session)
-    }
     fn register_publication(
         &mut self,
         frame: &super::demand_closure::RootFrame,
@@ -3212,6 +3338,7 @@ pub mod shared_contract;
 struct JvmSourceAuthority {
     complete: bool,
     prefix: Option<SemanticId>,
+    external_nominal: Option<SemanticId>,
 }
 
 struct JvmSourceState {
@@ -3244,6 +3371,7 @@ impl JvmSourceState {
             authority: RefCell::new(JvmSourceAuthority {
                 complete: true,
                 prefix,
+                external_nominal: None,
             }),
             material: RefCell::new(HashMap::default()),
             observations: RefCell::new(Vec::new()),
@@ -3404,14 +3532,16 @@ impl super::demand_closure::RouteRules<super::demand_closure::ClosureTag>
                 .observations
                 .borrow_mut()
                 .extend(rows.observations);
-            if !rows.exports.is_empty() {
+            if !rows.exports.is_empty() || rows.external_owner.is_some() {
                 self.state.authority.borrow_mut().complete &= rows.complete;
                 return Ok(Some(super::demand_closure::RouteEdgeTier {
                     edges: rows
                         .exports
                         .into_iter()
-                        .map(|row| super::demand_closure::RouteLocation::Owner {
-                            definition: row.declaration,
+                        .map(|row| row.declaration)
+                        .chain(rows.external_owner)
+                        .map(|definition| super::demand_closure::RouteLocation::Owner {
+                            definition,
                             scope: None,
                         })
                         .collect(),
@@ -3668,6 +3798,15 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
             .extend(rows.observations);
         let mut authority = self.state.authority.borrow_mut();
         authority.complete &= rows.complete;
+        if let Some(owner) = rows.external_owner {
+            assert!(
+                authority
+                    .external_nominal
+                    .is_none_or(|selected| selected == owner),
+                "one qualified package route selects one external type identity"
+            );
+            authority.external_nominal = Some(owner);
+        }
         let mut exports = Vec::new();
         for row in rows.exports {
             let SelectedRootPathHalf::Export {

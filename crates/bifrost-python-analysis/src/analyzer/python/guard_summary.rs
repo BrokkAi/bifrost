@@ -392,7 +392,10 @@ fn external_predicate_refinement(
         {
             evidence.push((0usize, semantics, PredicateTarget::Annotation(target)));
         }
-        for fact in overlay.conditional_type_refinements_for(symbol) {
+        let facts = overlay
+            .conditional_type_refinements_for(symbol)
+            .collect::<Vec<_>>();
+        for fact in &facts {
             if !fact.is_complete() {
                 return None;
             }
@@ -673,11 +676,14 @@ fn predicate_target_class(
     )
 }
 
-fn predicate_target_symbol<'overlay, 'target>(
-    overlay: &'overlay SemanticModelOverlay,
+fn predicate_target_symbol<'target>(
+    overlay: &SemanticModelOverlay,
     callable: &SemanticModelSymbol,
     target: PredicateTarget<'target>,
-) -> Option<(&'overlay SemanticModelSymbol, PredicateArguments<'target>)> {
+) -> Option<(
+    std::sync::Arc<SemanticModelSymbol>,
+    PredicateArguments<'target>,
+)> {
     let (name, id, arguments) = match target {
         PredicateTarget::Annotation(reference) if reference.contains_unknown() => return None,
         PredicateTarget::Annotation(TypeRef::Named {
@@ -728,7 +734,7 @@ fn predicate_target_symbol<'overlay, 'target>(
     if symbol.kind != SemanticModelSymbolKind::Class || symbol.provenance.ambiguous {
         return None;
     }
-    Some((*symbol, arguments))
+    Some((std::sync::Arc::clone(symbol), arguments))
 }
 
 /// The external module member a callee names, proved through this file's

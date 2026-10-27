@@ -2327,14 +2327,8 @@ pub fn confirm_rust_reverse_references(
     let _timing = crate::profiling::scope("rust_selected::reverse_confirm_blob");
     #[cfg(any(test, feature = "test-support"))]
     operation.attach_active_reverse_sql_work_trace();
-    // Each site keeps the accumulating allowance it had as its own request.
-    // Batching sites must change what the reverse pays, not what it is
-    // allowed to prove.
-    let sites = locators.len().max(1);
-    let mut budget =
+    let budget =
         brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default();
-    budget.max_summary_expansions = budget.max_summary_expansions.saturating_mul(sites);
-    budget.max_scope_nodes = budget.max_scope_nodes.saturating_mul(sites);
     let answer = operation.confirm_rust_references_for_caller_bounded(
         root,
         locators,
@@ -2790,6 +2784,34 @@ struct RustReverseQueries<'a, 'store, 'input> {
 }
 
 impl RustReverseQueries<'_, '_, '_> {
+    /// Answer on the operation's own connection, taking it back from the
+    /// callback first and lending it again afterwards. `stopped` is the
+    /// answer when the wait for the connection is cancelled, or when another
+    /// store user changed the selection's rows while the callback had the
+    /// connection, which makes the operation stale.
+    fn on_own_connection<T>(
+        &mut self,
+        stopped: T,
+        answer: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        match self
+            .selected
+            .ready
+            .inventory
+            .reclaim_writer(self.cancellation)?
+        {
+            SelectedResolutionRevalidationOutcome::Current => {}
+            SelectedResolutionRevalidationOutcome::Cancelled => return Ok(stopped),
+            SelectedResolutionRevalidationOutcome::Stale(reason) => {
+                self.stale = Some(reason);
+                return Ok(stopped);
+            }
+        }
+        let answer = answer(self)?;
+        self.selected.ready.inventory.lend_writer()?;
+        Ok(answer)
+    }
+
     /// Record why a target has no selected definition, and return it. The
     /// enclosing operation reports it as its outcome.
     fn missing_definition_unit(&mut self, target: &CodeUnit) -> SelectedResolutionUnavailable {
@@ -4016,12 +4038,10 @@ impl RustReverseQueries<'_, '_, '_> {
     }
 }
 
-impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
-    fn analysis_generation(&self) -> u64 {
-        self.selected.ready.analysis_generation
-    }
-
-    fn candidate_sets(
+/// The answers, on the operation's own connection. The callback reaches them
+/// through the trait implementation below.
+impl RustReverseQueries<'_, '_, '_> {
+    fn held_candidate_sets(
         &mut self,
         targets: &[CodeUnit],
     ) -> Result<Option<Vec<RustReverseCandidateSet>>> {
@@ -4038,21 +4058,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
             }
         }
     }
-    fn rust_cfg_activation_for_caller_under_site_cfg(
-        &mut self,
-        caller: &std::path::Path,
-        condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
-        cancellation: &CancellationToken,
-    ) -> Result<
-        Option<(
-            brokk_bifrost_rust::selected_context::RustSelectedActivation,
-            bool,
-        )>,
-    > {
-        self.selected
-            .rust_cfg_activation_for_caller_under_site_cfg(caller, condition, cancellation)
-    }
-    fn references_to(
+    fn held_references_to(
         &mut self,
         targets: &[CodeUnit],
         candidates: &[RustReverseCandidateSet],
@@ -4905,7 +4911,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
         Ok(SelectedRustReverseBatchOutcome::Ready(results))
     }
 
-    fn resolve_references(
+    fn held_resolve_references(
         &mut self,
         references: &[SemanticId],
     ) -> Result<Option<Vec<ReferenceResolution>>> {
@@ -5006,6 +5012,60 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
             SelectedResolutionOperationOutcome::Cancelled(_) => Ok(None),
         }
     }
+}
+
+/// The callback's view of the operation. On the in-memory fallback the
+/// operation's reader is the store's only connection, and the callback reads
+/// the store between queries: its projection asks the analyzer for parents,
+/// sources and structural facts. So the operation lends that connection to
+/// the callback, and takes it back only while it answers (#6018).
+impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
+    fn analysis_generation(&self) -> u64 {
+        self.selected.ready.analysis_generation
+    }
+
+    fn candidate_sets(
+        &mut self,
+        targets: &[CodeUnit],
+    ) -> Result<Option<Vec<RustReverseCandidateSet>>> {
+        self.on_own_connection(None, |queries| queries.held_candidate_sets(targets))
+    }
+
+    fn rust_cfg_activation_for_caller_under_site_cfg(
+        &mut self,
+        caller: &std::path::Path,
+        condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<(
+            brokk_bifrost_rust::selected_context::RustSelectedActivation,
+            bool,
+        )>,
+    > {
+        self.on_own_connection(None, |queries| {
+            queries
+                .selected
+                .rust_cfg_activation_for_caller_under_site_cfg(caller, condition, cancellation)
+        })
+    }
+
+    fn references_to(
+        &mut self,
+        targets: &[CodeUnit],
+        candidates: &[RustReverseCandidateSet],
+        request: RustReverseRequest,
+    ) -> Result<SelectedRustReverseBatchOutcome> {
+        self.on_own_connection(SelectedRustReverseBatchOutcome::Cancelled, |queries| {
+            queries.held_references_to(targets, candidates, request)
+        })
+    }
+
+    fn resolve_references(
+        &mut self,
+        references: &[SemanticId],
+    ) -> Result<Option<Vec<ReferenceResolution>>> {
+        self.on_own_connection(None, |queries| queries.held_resolve_references(references))
+    }
 
     #[cfg(any(test, feature = "test-support"))]
     fn definition_mount_read_count(&self) -> usize {
@@ -5060,10 +5120,12 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
             #[cfg(any(test, feature = "test-support"))]
             definition_mounts: HashSet::default(),
         };
+        queries.selected.ready.inventory.lend_writer()?;
         let result = run(&mut queries)?;
         let unavailable = queries.unavailable.take();
         let stale = queries.stale.take();
         drop(queries);
+        self.ready.inventory.end_writer_loan()?;
         self.ready.inventory.with_owned_temp_write(|connection| {
             connection.execute(CLEAR_GAP_CANDIDATE_SITES_SQL, [])?;
             Ok(())

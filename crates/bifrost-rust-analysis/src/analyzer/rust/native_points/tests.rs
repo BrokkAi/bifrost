@@ -51,7 +51,7 @@ fn incomplete_binding_diagnostics_do_not_depend_on_operation_ordinals() {
             Reason::ReceiverBudgetExhausted(SemanticId::operation_local(unknown)),
             Reason::UnsupportedSemantic(SemanticId::context_local(context)),
         ]);
-        describe_incomplete_binding(&completion, &names)
+        describe_incomplete_binding(&completion, &names, &BTreeMap::new())
     };
 
     // Earlier demands change both the ordinals and their relative ordering.
@@ -62,10 +62,10 @@ fn incomplete_binding_diagnostics_do_not_depend_on_operation_ordinals() {
         after,
         concat!(
             "receiver_budget_exhausted(runtime semantic), ",
-            "unsupported_semantic(SemanticId#1:181), ",
             "unsupported_semantic(runtime semantic), ",
             "unsupported_semantic(runtime semantic, left), ",
-            "unsupported_semantic(runtime semantic, right)"
+            "unsupported_semantic(runtime semantic, right), ",
+            "unsupported_semantic(semantic)"
         )
     );
 }

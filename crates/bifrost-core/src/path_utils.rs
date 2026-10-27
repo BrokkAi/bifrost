@@ -181,8 +181,78 @@ pub fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{percent_decode, workspace_rel_path, workspace_relative_slash_path};
+    use super::{
+        contains_glob_syntax, is_windows_absolute_path, normalize_relative_path_from,
+        percent_decode, workspace_rel_path, workspace_relative_slash_path,
+    };
     use std::path::{Path, PathBuf};
+
+    /// The spellings that decide a rev:path split (`C:\x` is a path, not rev
+    /// `C`) and a workspace-escape check: only a drive letter, a colon, and a
+    /// separator make a drive-absolute path.
+    #[test]
+    fn is_windows_absolute_path_distinguishes_windows_path_forms() {
+        for absolute in ["C:\\", "C:/", "c:\\dir\\f.rs", "Z:/dir/f.rs", "C:\\a:b"] {
+            assert!(is_windows_absolute_path(absolute), "rejected {absolute:?}");
+        }
+        for other in [
+            "",
+            "C",
+            "C:",
+            "C:foo",
+            "C:foo\\bar",
+            "\\\\server\\share\\f.rs",
+            "//server/share/f.rs",
+            "\\\\?\\C:\\f.rs",
+            "/C:/f.rs",
+            "./C:/f.rs",
+            "1:/f.rs",
+            "src/main.rs",
+        ] {
+            assert!(!is_windows_absolute_path(other), "accepted {other:?}");
+        }
+    }
+
+    #[test]
+    fn contains_glob_syntax_recognizes_each_metacharacter() {
+        for glob in ["*", "src/**/*.rs", "a?c", "[ab]", "dir/[", "trail*"] {
+            assert!(contains_glob_syntax(glob), "missed {glob:?}");
+        }
+        for literal in [
+            "",
+            "src/main.rs",
+            "a{b,c}",
+            "a!b",
+            "dir\\file",
+            "na\u{ef}ve",
+        ] {
+            assert!(!contains_glob_syntax(literal), "flagged {literal:?}");
+        }
+    }
+
+    /// Climbing above the base is the escape the function exists to reject,
+    /// but climbing back down to the base itself is allowed.
+    #[test]
+    fn normalize_relative_path_from_rejects_escape_and_anchors() {
+        let base = Path::new("a/b");
+        assert_eq!(
+            normalize_relative_path_from(base, Path::new("../c")),
+            Some(PathBuf::from("a").join("c")),
+        );
+        assert_eq!(
+            normalize_relative_path_from(base, Path::new("../..")),
+            Some(PathBuf::new()),
+        );
+        assert_eq!(
+            normalize_relative_path_from(base, Path::new("../../..")),
+            None
+        );
+        assert_eq!(normalize_relative_path_from(base, Path::new("/abs")), None);
+        assert_eq!(
+            normalize_relative_path_from(Path::new(""), Path::new("./x/./y")),
+            Some(PathBuf::from("x").join("y")),
+        );
+    }
 
     #[test]
     fn workspace_relative_slash_path_joins_components() {
@@ -248,9 +318,11 @@ mod path_properties {
     use proptest::prelude::*;
 
     use super::{
-        has_drive_letter_prefix, normalize_pattern, path_suffix_key, path_suffix_keys,
-        percent_decode, workspace_rel_path,
+        contains_glob_syntax, has_drive_letter_prefix, is_windows_absolute_path, normalize_pattern,
+        normalize_relative_path_from, path_suffix_key, path_suffix_keys, percent_decode,
+        rel_path_string, workspace_rel_path,
     };
+    use crate::analyzer::ProjectFile;
 
     fn literal(value: &str) -> Just<String> {
         Just(value.to_string())
@@ -494,6 +566,116 @@ mod path_properties {
 
 
 
+
+        /// A drive letter, a colon, and either separator spell a Windows
+        /// drive-absolute path whatever follows; any other third character, a
+        /// non-letter drive, or a missing third character does not. The
+        /// oracle is the spelling the generator built, not the predicate.
+        #[test]
+        fn is_windows_absolute_path_follows_the_spelling(
+            drive in "[A-Za-z]",
+            separator in prop_oneof![literal("/"), literal("\\")],
+            tail in any::<String>(),
+            not_separator in any::<char>().prop_filter("separator", |c| *c != '/' && *c != '\\'),
+            not_a_drive in "[0-9 ._~-]",
+        ) {
+            let absolute = format!("{drive}:{separator}{tail}");
+            let wrong_separator = format!("{drive}:{not_separator}{tail}");
+            let wrong_drive = format!("{not_a_drive}:{separator}{tail}");
+            let rooted = format!("{separator}{drive}:{separator}{tail}");
+            let bare = format!("{drive}:");
+            prop_assert!(is_windows_absolute_path(&absolute), "{absolute:?}");
+            prop_assert!(!is_windows_absolute_path(&wrong_separator), "{wrong_separator:?}");
+            prop_assert!(!is_windows_absolute_path(&wrong_drive), "{wrong_drive:?}");
+            prop_assert!(!is_windows_absolute_path(&bare), "{bare:?}");
+            prop_assert!(!is_windows_absolute_path(&rooted), "{rooted:?}");
+            if is_windows_absolute_path(&tail) {
+                prop_assert!(has_drive_letter_prefix(&tail), "absolute without drive: {tail:?}");
+            }
+        }
+
+        /// A string drawn from an alphabet without `*`, `?`, `[` has no glob
+        /// syntax; planting one metacharacter anywhere makes it glob syntax;
+        /// and the predicate distributes over concatenation.
+        #[test]
+        fn contains_glob_syntax_tracks_planted_metacharacters(
+            left in "[a-zA-Z0-9_./ \\\\{}!-]{0,8}",
+            right in "[a-zA-Z0-9_./ \\\\{}!-]{0,8}",
+            meta in prop_oneof![literal("*"), literal("?"), literal("[")],
+            a in any::<String>(),
+            b in any::<String>(),
+        ) {
+            let plain = format!("{left}{right}");
+            let planted = format!("{left}{meta}{right}");
+            let concatenated = format!("{a}{b}");
+            prop_assert!(!contains_glob_syntax(&plain), "{plain:?}");
+            prop_assert!(contains_glob_syntax(&planted), "{planted:?}");
+            prop_assert_eq!(
+                contains_glob_syntax(&concatenated),
+                contains_glob_syntax(&a) || contains_glob_syntax(&b),
+            );
+        }
+
+        /// `rel_path_string` is the slash-joined spelling of the relative path
+        /// components, with no backslash, for any component names.
+        #[test]
+        fn rel_path_string_joins_components_with_slashes(
+            components in prop::collection::vec(
+                prop_oneof![safe_component(), literal("na\u{ef}ve.rs"), literal("with space")],
+                1..6,
+            ),
+        ) {
+            let rel: PathBuf = components.iter().collect();
+            let file = ProjectFile::new(std::env::temp_dir(), rel);
+            let rendered = rel_path_string(&file);
+            prop_assert_eq!(&rendered, &components.join("/"));
+            prop_assert!(!rendered.contains('\\'));
+        }
+
+        /// `normalize_relative_path_from` against a stack-machine reference:
+        /// names push, `.` is skipped, `..` pops and fails on an empty stack
+        /// (the base counts as already on the stack, so `..` may consume it
+        /// but not go past it). An accepted result is a fixed point when
+        /// normalized again against the empty base.
+        #[test]
+        fn normalize_relative_path_from_matches_a_stack_reference(
+            base in prop::collection::vec("[a-z]{1,2}", 0..4),
+            tokens in prop::collection::vec(
+                prop_oneof![
+                    3 => "[a-z]{1,2}",
+                    1 => literal("."),
+                    2 => literal(".."),
+                ],
+                0..8,
+            ),
+        ) {
+            let mut stack = base.clone();
+            let mut escaped = false;
+            for token in &tokens {
+                match token.as_str() {
+                    "." => {}
+                    ".." => {
+                        if stack.pop().is_none() {
+                            escaped = true;
+                            break;
+                        }
+                    }
+                    name => stack.push(name.to_string()),
+                }
+            }
+            let expected = (!escaped).then(|| stack.iter().collect::<PathBuf>());
+
+            let base_path: PathBuf = base.iter().collect();
+            let path: PathBuf = tokens.iter().collect();
+            let actual = normalize_relative_path_from(&base_path, &path);
+            prop_assert_eq!(&actual, &expected, "base {:?} path {:?}", base_path, path);
+            if let Some(result) = actual {
+                prop_assert_eq!(
+                    normalize_relative_path_from(Path::new(""), &result),
+                    Some(result.clone()),
+                );
+            }
+        }
 
         /// Structure of the keys for any path: non-empty, strictly shortening,
         /// and each a component-boundary suffix of the one before it.

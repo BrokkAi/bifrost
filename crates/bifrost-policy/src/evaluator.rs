@@ -596,9 +596,16 @@ impl DefaultPolicyEvaluator<'_> {
             ));
         }
         match &policy.definition().analysis {
-            PolicyAnalysis::Match { .. } => {
-                evaluate_match_policy(policy, context, &host_budget, execution_scope)
-            }
+            PolicyAnalysis::Match { .. } => evaluate_match_policy(
+                policy,
+                context,
+                &host_budget,
+                execution_scope
+                    .is_none()
+                    .then_some(self.subject_batch)
+                    .flatten(),
+                execution_scope,
+            ),
             PolicyAnalysis::Assertion { spec } => evaluate_assertion_policy(
                 policy,
                 spec,
@@ -874,6 +881,7 @@ fn evaluate_match_policy(
     policy: &LoadedPolicy,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    subject_batch: Option<&SubjectQueryBatch<'_>>,
     execution_scope: Option<CodeQueryExecutionScope<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     // An evaluation that holds an incremental context has units to reuse and a
@@ -895,15 +903,18 @@ fn evaluate_match_policy(
         },
         None => match context.incremental {
             Some(incremental) => {
-                evaluate_match_policy_by_unit(policy, incremental, context, budget)
+                evaluate_match_policy_by_unit(policy, incremental, context, budget, subject_batch)
             }
-            None => evaluate_match_policy_candidates(
-                policy,
-                context.analyzer,
-                context.workspace,
-                budget,
-                context.cancellation,
-            ),
+            None => match subject_batch {
+                Some(batch) => shared_match_candidates(policy, batch, context, budget),
+                None => evaluate_match_policy_candidates(
+                    policy,
+                    context.analyzer,
+                    context.workspace,
+                    budget,
+                    context.cancellation,
+                ),
+            },
         },
     };
     assemble_match_run(
@@ -2463,17 +2474,24 @@ fn evaluate_match_policy_by_unit(
     incremental: &PolicyIncrementalContext<'_>,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    subject_batch: Option<&SubjectQueryBatch<'_>>,
 ) -> EvaluatedMatchPolicy {
     let mut attempt = UnitAttempt::default();
     let policy_id = policy.definition().metadata.id.clone();
-    let (evaluated, reason) =
-        match sliced_match_candidates(policy, incremental, context, budget, &mut attempt) {
-            Ok(evaluated) => (evaluated, None),
-            Err(reason) => (
-                widened_match_candidates(policy, context, budget),
-                Some(reason),
-            ),
-        };
+    let (evaluated, reason) = match sliced_match_candidates(
+        policy,
+        incremental,
+        context,
+        budget,
+        subject_batch,
+        &mut attempt,
+    ) {
+        Ok(evaluated) => (evaluated, None),
+        Err(reason) => (
+            widened_match_candidates(policy, context, budget, subject_batch),
+            Some(reason),
+        ),
+    };
     let run = attempt.into_run(policy_id, reason);
     note_incremental_run(&run, incremental);
     incremental.record_run(run);
@@ -2514,6 +2532,7 @@ fn sliced_match_candidates(
     incremental: &PolicyIncrementalContext<'_>,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    subject_batch: Option<&SubjectQueryBatch<'_>>,
     attempt: &mut UnitAttempt,
 ) -> Result<EvaluatedMatchPolicy, WidenReason> {
     let query = match match_policy_query(policy) {
@@ -2535,6 +2554,7 @@ fn sliced_match_candidates(
         cancellation: context.cancellation,
         limits,
         workspace_files: &workspace_files,
+        subject_batch,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget);
     let sliced = sliced_query_units(
@@ -2574,6 +2594,7 @@ fn widened_match_candidates(
     policy: &LoadedPolicy,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    subject_batch: Option<&SubjectQueryBatch<'_>>,
 ) -> EvaluatedMatchPolicy {
     let query = match match_policy_query(policy) {
         Ok(query) => query,
@@ -2583,14 +2604,30 @@ fn widened_match_candidates(
         Ok(executable) => executable,
         Err(refusal) => return refusal.into_run(budget),
     };
-    let product = execute_code_query_unit(
-        context.analyzer,
-        context.workspace,
-        &executable,
-        budget.query_limits(),
-        context.cancellation,
-        CodeQueryExecutionScope::whole_workspace(),
-    );
+    let execute = || {
+        execute_code_query_unit(
+            context.analyzer,
+            context.workspace,
+            &executable,
+            budget.query_limits(),
+            context.cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        )
+    };
+    // Another widened consumer of the same selector runs this same execution,
+    // so the batch keeps its whole-workspace unit under no seed file.
+    let shared = subject_batch.and_then(|batch| {
+        batch.query_units(
+            &executable,
+            context.analyzer,
+            context.workspace,
+            budget.query_limits(),
+        )
+    });
+    let product = match shared {
+        Some(shared) => shared.execute(None, context.analyzer, context.cancellation, execute),
+        None => execute(),
+    };
     let mut items = Vec::with_capacity(product.rows.len());
     let mut evidence = Vec::with_capacity(product.rows.len());
     for row in product.rows {
@@ -2657,6 +2694,39 @@ pub(crate) fn evaluate_match_policy_candidates(
         query,
         budget,
         cancellation,
+    )
+}
+
+/// Evaluate a match policy without units from the batch's one whole execution
+/// of its selector.
+///
+/// The batch executes exactly what `evaluate_match_query_candidates` does --
+/// the eager whole-workspace execution, projected into unit rows -- so the
+/// adapted candidates are the same whichever consumer executed it.
+fn shared_match_candidates(
+    policy: &LoadedPolicy,
+    batch: &SubjectQueryBatch<'_>,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+) -> EvaluatedMatchPolicy {
+    let query = match match_policy_query(policy) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_run(budget),
+    };
+    let executable = match executable_match_query(query, budget) {
+        Ok(executable) => executable,
+        Err(refusal) => return refusal.into_run(budget),
+    };
+    let rows = batch.execute(&executable, context, budget);
+    adapt_match_execution(
+        &policy.definition().metadata.id,
+        rows.items.clone(),
+        rows.evidence.clone(),
+        &rows.diagnostics,
+        rows.completion.clone(),
+        rows.truncated,
+        rows.work,
+        budget,
     )
 }
 
@@ -3052,10 +3122,6 @@ fn adapt_query_diagnostics(
         if diagnostic.code == CodeQueryDiagnosticCode::BroadQuery {
             continue;
         }
-        if diagnostics.len() >= max_diagnostics {
-            truncated = true;
-            break;
-        }
         truncated |= diagnostic.related.len() > max_related;
         match adapt_query_diagnostic(diagnostic, max_related) {
             Ok(diagnostic) => diagnostics.push(diagnostic),
@@ -3068,6 +3134,15 @@ fn adapt_query_diagnostics(
             }
         }
     }
+    // The run keeps the set of diagnostics it raised, not the first ones it
+    // raised. Producers repeat one diagnostic per site: on flask one call
+    // binding message repeats hundreds of times, so capping the raw list
+    // filled every retention slot with copies, reported the run as over its
+    // retention budget and dropped the distinct causes that came later
+    // (#6638). Deduplicating before the cap makes the retained list, and the
+    // truncation, a function of the set of diagnostics alone; past the cap the
+    // set folds by reason family, as the report does (#2356).
+    truncated |= normalize_policy_diagnostics_bounded(&mut diagnostics, max_diagnostics);
     AdaptedQueryDiagnostics {
         diagnostics,
         truncated,

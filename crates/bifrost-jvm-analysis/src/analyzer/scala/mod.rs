@@ -2210,6 +2210,8 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.working_tree_identity()
     }
 
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     fn begin_query(
         &self,
         context: &Arc<brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext>,
@@ -2890,7 +2892,15 @@ impl LanguageSupport for ScalaSupport {
     fn reference_graph_backend(
         &self,
     ) -> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
-        brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(&ScalaEdgePass)
+        if super::jvm::native_graph::native_jvm_graph_selected() {
+            brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Native(
+                &super::jvm::native_graph::JVM_NATIVE_GRAPH,
+            )
+        } else {
+            brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(
+                &ScalaEdgePass,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3087,6 +3097,65 @@ mod overlay_usage_tests {
     use brokk_bifrost_core::analyzer::project::OverlayProject;
 
     use brokk_bifrost_core::analyzer::project::TestProject;
+
+    /// The producer/SQLite boundary preserves written parent order, including
+    /// swapped mixins. Read SQL ordinals as well as rehydrated source facts.
+    #[test]
+    fn scala_written_parent_order_survives_source_publication() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file("Parents.scala", "class C[A] extends Base[A] with Left[A] with Right[A]\nclass D[A] extends Base[A] with Right[A] with Left[A]\n")
+            .build();
+        let analyzer = ScalaAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("Parents.scala");
+        let facts = analyzer.canonical_source_facts(&file).unwrap();
+        let mut expected = Vec::new();
+        for (name, parents) in [
+            ("C", ["Base", "Left", "Right"]),
+            ("D", ["Base", "Right", "Left"]),
+        ] {
+            let unit = analyzer
+                .get_definitions(name)
+                .into_iter()
+                .find(|unit| unit.is_class())
+                .unwrap();
+            let declaration = facts
+                .for_unit(&unit)
+                .find(|fact| fact.generic_owner.is_some())
+                .unwrap();
+            let actual = declaration
+                .generic_owner
+                .as_ref()
+                .unwrap()
+                .supertypes
+                .iter()
+                .map(|parent| parent.segments.join("."))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, parents, "{name}");
+            for (ordinal, parent) in parents.into_iter().enumerate() {
+                expected.push((declaration.declaration.index(), ordinal, parent.to_string()));
+            }
+        }
+        expected.sort();
+        let conn = analyzer.inner.store_context.store.read_conn().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT p.declaration_id, p.ordinal, s.segment FROM source_scala_generic_supertypes p
+             JOIN source_scala_type_expression_segments s
+               ON s.blob_id=p.blob_id AND s.expression_id=p.expression_id
+             WHERE s.ordinal=0 ORDER BY p.declaration_id,p.ordinal"
+        ).unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, expected);
+    }
 
     #[test]
     fn canonical_declaration_properties_follow_overlay_content_without_mutating_disk_snapshot() {

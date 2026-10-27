@@ -94,3 +94,51 @@ fn a_command_line_macro_name_is_unjudged_rather_than_resolved() {
         report.outcomes()
     );
 }
+
+#[test]
+fn compile_configurations_agree_on_forward_and_defined_type_evidence() {
+    // A forward declaration and a body both introduce Type, but only the body
+    // proves a definition site. Different compile contexts must retain that
+    // disagreement rather than report an unconditionally resolved type.
+    let source = "#include \"types.hpp\"\nType* value;\n";
+    for (left, right, status) in [
+        (
+            "struct Type;",
+            "struct Type {};",
+            SemanticDiagnosticReportStatus::Incomplete,
+        ),
+        (
+            "struct Type;",
+            "struct Type;",
+            SemanticDiagnosticReportStatus::Complete,
+        ),
+        (
+            "struct Type {};",
+            "struct Type {};",
+            SemanticDiagnosticReportStatus::Complete,
+        ),
+    ] {
+        let database = r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","left","-c","src/main.cpp"]},{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","right","-c","src/main.cpp"]}]"#;
+        let (_temp, analyzer, file) = analyzer_fixture(&[
+            ("src/main.cpp", source),
+            ("compile_commands.json", database),
+            ("left/types.hpp", left),
+            ("right/types.hpp", right),
+        ]);
+        let report = collect_cpp_semantic_diagnostics(&analyzer, &file, source);
+        assert_eq!(
+            report.status(),
+            status,
+            "{left} / {right}: {:#?}",
+            report.outcomes()
+        );
+        assert!(!report.outcomes().is_empty(), "Type was actually judged");
+        assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
+        assert_eq!(
+            has_incomplete_reason(&report, |reason| matches!(reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("disagree about type `Type`"))),
+            status == SemanticDiagnosticReportStatus::Incomplete
+        );
+    }
+}

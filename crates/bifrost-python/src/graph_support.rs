@@ -21,16 +21,14 @@ use brokk_bifrost_core::analyzer::usages::model::{
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::bindings::{python_direct_scope_bindings_bounded, python_executable_scope_children};
 use crate::declarations::{
-    collect_python_identifiers, module_code_unit, parse_python_tree, python_base_origin_node,
-    python_declared_import_root, python_import_root, python_project_module_components,
-    python_repeated_root_extension_dir,
+    module_code_unit, parse_python_tree, python_base_origin_node, python_declared_import_root,
+    python_import_root, python_project_module_components, python_repeated_root_extension_dir,
 };
 use crate::imports::{
     PythonImportDetails, python_import_details, python_namespace_binding_module,
@@ -102,15 +100,6 @@ pub trait PythonSource:
 /// the export/importer walks needs it; the index build itself must not.
 pub trait PythonUsageSource: PythonSource {
     fn usage_index(&self) -> Arc<PythonUsageIndex>;
-}
-
-pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
-    let Some(tree) = parse_python_tree(source) else {
-        return BTreeSet::new();
-    };
-    let mut identifiers = HashSet::default();
-    collect_python_identifiers(tree.root_node(), source, &mut identifiers);
-    identifiers.into_iter().collect()
 }
 
 /// Keep only the candidates an absolute import written in `importer` can mean.
@@ -1008,7 +997,7 @@ pub fn compute_export_index_of(
                 .ranges(code_unit)
                 .iter()
                 .map(|range| range.start_byte)
-                .min()
+                .max()
                 .unwrap_or(usize::MAX)
         },
         &mut events,
@@ -1036,7 +1025,7 @@ pub fn export_index_from_file_facts(
                 .into_iter()
                 .flatten()
                 .map(|range| range.start_byte)
-                .min()
+                .max()
                 .unwrap_or(usize::MAX)
         },
         &mut events,

@@ -73,6 +73,52 @@ preserves source order, cancellation and work accounting; each language supplies
 projection, transfer and failure semantics. Initialization consumers continue to
 require real establishments and complete relevant evidence.
 
+### Java expression results
+
+A Java expression that evaluates operands gives its result a value relation
+from them or a scoped gap, never neither. A result with no producer would let a
+tainted operand vanish while the run still reported complete evidence.
+
+A parenthesized expression hands its operand on unchanged, as a local copy
+plus the identity assignment. Every other cast, whether a reference cast, a
+narrowing, a boxing or an unboxing, derives its result from the operand with a
+language-defined flow, which claims dependence and not identity, as Kotlin and
+C/C++ do. The flow is published after the cast's check, so a
+`ClassCastException` or an unboxing `NullPointerException` does not
+manufacture a normal result. Only a primitive cast that is an identity or a
+widening of a binding keeps the local copy. An `instanceof` test, an embedded
+string expression and a dimension expression derive their result the same way,
+and an `instanceof` boolean follows the comparison operators.
+
+A value-position `&&` or `||` is its left operand when that operand decides the
+outcome and its right operand otherwise, so each way out carries one flow. The
+left operand is lowered as control flow, and a nested short-circuit,
+conditional or parenthesized operand has no value of its own; the leaves that
+can decide it feed the result. Each switch-expression rule, and each `yield`,
+copies its operand into the value of the switch expression it completes. The
+copy precedes any `finally` on the way out, because Java evaluates the operand
+first. A `yield` finds its switch through the target of its completion route,
+not through the enclosing syntax, so a `yield` inside a nested switch
+statement reaches the right expression.
+
+A fresh `new T[n]` is an allocation whose length derives from its dimension
+expressions. An array initializer is an allocation whose element `i` is stored
+as if by `array[i] = element`, at the same canonical index value a later
+`array[i]` read uses, so a constant-index read finds the store and returning or
+passing the whole array carries its elements. An initializer stores at most 1024
+elements. The rest leave a write-only gap that a consumer discharges when
+nothing reads or publishes the array.
+
+Some parts stay open on purpose. A string template keeps the flow of its
+embedded expressions and carries a `Calls` gap, because the processor call is
+not lowered. A pattern variable bound by `instanceof` or a record pattern has
+no lowered binding, so a bare reference to its name that resolves to no local or
+parameter carries a gap. The test itself carries none, and an unreferenced
+binder adds none. The missing-`yield` gap is emitted only when the last
+statement of a rule block or statement group is not provably a `yield` or
+`throw` on every path, since a block that can complete normally is a
+compile-time error.
+
 ### Semantic rows and file windows (#5113)
 
 Between converted RQL steps, semantic rows carry references: workspace file,

@@ -3951,6 +3951,11 @@ impl Hash for CodeUnit {
 }
 
 impl Ord for CodeUnit {
+    /// Display order first (rendered package and short name, kind, source,
+    /// signature, synthetic), then the structured name, so `cmp` returns
+    /// `Equal` exactly when `==` holds. Two names can render identically yet
+    /// differ in segment kinds or segment boundaries; without the structured
+    /// tie-break a `BTreeSet<CodeUnit>` merged such units.
     fn cmp(&self, other: &Self) -> Ordering {
         self.package_name()
             .cmp(other.package_name())
@@ -3959,6 +3964,31 @@ impl Ord for CodeUnit {
             .then_with(|| self.0.source.cmp(&other.0.source))
             .then_with(|| self.0.signature.cmp(&other.0.signature))
             .then_with(|| self.0.synthetic.cmp(&other.0.synthetic))
+            .then_with(|| {
+                if self.0.fq == other.0.fq {
+                    return Ordering::Equal;
+                }
+                // `SegmentId` values follow process-local interning order, so
+                // compare the interned text and kind instead. The interner
+                // holds one id per (text, kind) pair, which makes this order
+                // agree with `FqName` equality.
+                self.0
+                    .fq
+                    .resolved_segments()
+                    .map(|(text, kind)| (text, kind.hash_tag()))
+                    .cmp(
+                        other
+                            .0
+                            .fq
+                            .resolved_segments()
+                            .map(|(text, kind)| (text, kind.hash_tag())),
+                    )
+            })
+            .then_with(|| {
+                self.0
+                    .package_segment_count
+                    .cmp(&other.0.package_segment_count)
+            })
     }
 }
 
@@ -5178,6 +5208,420 @@ mod structured_type_identity_tests {
         );
     }
 
+    /// The encodings a persisted structured type identity can arrive in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Wire {
+        /// Bincode: every sequence and string announces its length before its
+        /// elements, so the decoder can reject it from the length prefix.
+        Bincode,
+        /// JSON as the store writes it: a struct is an object, and no
+        /// sequence announces its length.
+        JsonMap,
+        /// JSON with a struct written as an array of its fields.
+        JsonSeq,
+    }
+
+    const BINCODE_AND_JSON: &[Wire] = &[Wire::Bincode, Wire::JsonMap];
+    const NAME_WIRES: &[Wire] = &[Wire::Bincode, Wire::JsonMap, Wire::JsonSeq];
+
+    enum Expect {
+        Decodes,
+        /// Rejected, and the error names the bound that stopped decoding.
+        Rejected(&'static str),
+        /// Rejected. Only the sequence forms read the lexical scope against
+        /// the budget the path left, so only their error names the bound; the
+        /// map form rejects the whole name after reading it.
+        RejectedNamingBoundInSeqForm(&'static str),
+    }
+
+    /// Decodes and returns whether the decoded value equals the encoded one.
+    type DecodeCase = Box<dyn Fn(Wire) -> Result<bool, String>>;
+
+    fn encode<T: Serialize>(wire: Wire, value: &T) -> Vec<u8> {
+        match wire {
+            Wire::Bincode => bincode::serialize(value).expect("bincode encode"),
+            Wire::JsonMap | Wire::JsonSeq => serde_json::to_vec(value).expect("json encode"),
+        }
+    }
+
+    fn decode_seed<'de, S: DeserializeSeed<'de>>(
+        wire: Wire,
+        bytes: &'de [u8],
+        seed: S,
+    ) -> Result<S::Value, String> {
+        match wire {
+            Wire::Bincode => {
+                use bincode::Options;
+                // The options `bincode::serialize` and `bincode::deserialize` use.
+                bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .allow_trailing_bytes()
+                    .deserialize_seed(seed, bytes)
+                    .map_err(|error| error.to_string())
+            }
+            Wire::JsonMap | Wire::JsonSeq => {
+                let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+                let value = seed
+                    .deserialize(&mut deserializer)
+                    .map_err(|error| error.to_string())?;
+                deserializer.end().map_err(|error| error.to_string())?;
+                Ok(value)
+            }
+        }
+    }
+
+    fn component_bounds() -> BoundedStructuredTypeNameComponentsSeed {
+        BoundedStructuredTypeNameComponentsSeed {
+            max_components: MAX_STRUCTURED_TYPE_NAME_COMPONENTS,
+            max_string_bytes: MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES,
+        }
+    }
+
+    fn components_case(components: Vec<String>) -> DecodeCase {
+        Box::new(move |wire| {
+            let bytes = encode(wire, &components);
+            decode_seed(wire, &bytes, component_bounds()).map(|decoded| decoded == components)
+        })
+    }
+
+    fn string_case(value: String) -> DecodeCase {
+        Box::new(move |wire| {
+            let bytes = encode(wire, &value);
+            let seed = BoundedStructuredTypeStringSeed {
+                max_bytes: MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES,
+            };
+            decode_seed(wire, &bytes, seed).map(|decoded| decoded == value)
+        })
+    }
+
+    fn node_ids_case(count: usize) -> DecodeCase {
+        let ids = vec![StructuredTypeNodeId(0); count];
+        Box::new(move |wire| {
+            let bytes = encode(wire, &ids);
+            decode_seed(
+                wire,
+                &bytes,
+                std::marker::PhantomData::<BoundedStructuredTypeNodeIds>,
+            )
+            .map(|decoded| decoded.0 == ids)
+        })
+    }
+
+    fn identity_case(nodes: Vec<StructuredTypeNode>) -> DecodeCase {
+        let root = StructuredTypeNodeId(u32::try_from(nodes.len() - 1).expect("bounded root"));
+        let wire_value = StructuredTypeIdentityWire {
+            nodes: BoundedStructuredTypeNodes(nodes),
+            root,
+        };
+        Box::new(move |wire| {
+            let bytes = encode(wire, &wire_value);
+            decode_seed(
+                wire,
+                &bytes,
+                std::marker::PhantomData::<StructuredTypeIdentity>,
+            )
+            .map(|decoded| decoded.nodes == wire_value.nodes.0 && decoded.root == root)
+        })
+    }
+
+    fn name_case(path: Vec<String>, lexical_scope: Vec<String>) -> DecodeCase {
+        // Not a `StructuredTypeName`: the over-cap inputs cannot be built.
+        #[derive(Serialize)]
+        struct NameFields {
+            path: Vec<String>,
+            lexical_scope: Vec<String>,
+            absolute: bool,
+        }
+        let fields = NameFields {
+            path,
+            lexical_scope,
+            absolute: true,
+        };
+        Box::new(move |wire| {
+            let bytes = match wire {
+                Wire::Bincode | Wire::JsonMap => encode(wire, &fields),
+                Wire::JsonSeq => encode(
+                    wire,
+                    &(&fields.path, &fields.lexical_scope, fields.absolute),
+                ),
+            };
+            decode_seed(wire, &bytes, std::marker::PhantomData::<StructuredTypeName>).map(
+                |decoded| {
+                    decoded.path == fields.path
+                        && decoded.lexical_scope == fields.lexical_scope
+                        && decoded.absolute
+                },
+            )
+        })
+    }
+
+    fn named(component: String) -> StructuredTypeNode {
+        StructuredTypeNode::Named(
+            StructuredTypeName::new(vec![component], Vec::new(), false).expect("valid name"),
+        )
+    }
+
+    fn repeated(count: usize, component: &str) -> Vec<String> {
+        vec![component.to_string(); count]
+    }
+
+    #[test]
+    fn bounded_decoders_accept_each_cap_and_reject_one_more() {
+        const COMPONENTS: usize = MAX_STRUCTURED_TYPE_NAME_COMPONENTS;
+        const BYTES: usize = MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES;
+        const NODES: usize = MAX_STRUCTURED_TYPE_IDENTITY_NODES;
+        const EDGES: usize = MAX_STRUCTURED_TYPE_IDENTITY_EDGES;
+        let text = |byte: &str, len: usize| byte.repeat(len);
+        let pointer_chain = |len: usize| {
+            let mut nodes = vec![named("Leaf".to_string())];
+            for index in 1..len {
+                nodes.push(StructuredTypeNode::Pointer(StructuredTypeNodeId(
+                    u32::try_from(index - 1).expect("bounded index"),
+                )));
+            }
+            nodes
+        };
+        // A generic node costs one edge for its base plus one per argument.
+        let generic_with_arguments = |arguments: usize| {
+            vec![
+                named("Leaf".to_string()),
+                StructuredTypeNode::Generic {
+                    base: StructuredTypeNodeId(0),
+                    arguments: vec![StructuredTypeNodeId(0); arguments],
+                },
+            ]
+        };
+        // Each name is within the cap by itself; the cap is on their total.
+        let two_names_totaling = |second_len: usize| {
+            vec![
+                named(text("a", BYTES / 2)),
+                named(text("b", second_len)),
+                StructuredTypeNode::Map {
+                    key: StructuredTypeNodeId(0),
+                    value: StructuredTypeNodeId(1),
+                },
+            ]
+        };
+
+        let cases: Vec<(&str, &[Wire], Expect, DecodeCase)> = vec![
+            (
+                "components at the component cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                components_case(repeated(COMPONENTS, "a")),
+            ),
+            (
+                "components one over the component cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("component cap"),
+                components_case(repeated(COMPONENTS + 1, "a")),
+            ),
+            (
+                "components totaling the byte cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                components_case(vec![text("a", BYTES - 1), "b".to_string()]),
+            ),
+            (
+                "components one byte over the byte cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("string-byte cap"),
+                components_case(vec![text("a", BYTES - 1), "bb".to_string()]),
+            ),
+            (
+                "string at the byte cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                string_case(text("s", BYTES)),
+            ),
+            (
+                "string one byte over the byte cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("string-byte cap"),
+                string_case(text("s", BYTES + 1)),
+            ),
+            (
+                "generic arguments at the edge cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                node_ids_case(EDGES),
+            ),
+            (
+                "generic arguments one over the edge cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("edge cap"),
+                node_ids_case(EDGES + 1),
+            ),
+            (
+                "identity at the node cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                identity_case(pointer_chain(NODES)),
+            ),
+            (
+                "identity one over the node cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("node cap"),
+                identity_case(pointer_chain(NODES + 1)),
+            ),
+            (
+                "identity at the edge cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                identity_case(generic_with_arguments(EDGES - 1)),
+            ),
+            (
+                "identity one over the edge cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("edge cap"),
+                identity_case(generic_with_arguments(EDGES)),
+            ),
+            (
+                "identity names totaling the byte cap",
+                BINCODE_AND_JSON,
+                Expect::Decodes,
+                identity_case(two_names_totaling(BYTES - BYTES / 2)),
+            ),
+            (
+                "identity names one byte over the byte cap",
+                BINCODE_AND_JSON,
+                Expect::Rejected("string-byte cap"),
+                identity_case(two_names_totaling(BYTES - BYTES / 2 + 1)),
+            ),
+            (
+                "name path at the component cap",
+                NAME_WIRES,
+                Expect::Decodes,
+                name_case(repeated(COMPONENTS, "a"), Vec::new()),
+            ),
+            (
+                "name path one over the component cap",
+                NAME_WIRES,
+                Expect::Rejected("component cap"),
+                name_case(repeated(COMPONENTS + 1, "a"), Vec::new()),
+            ),
+            (
+                "name path and lexical scope sharing the component cap",
+                NAME_WIRES,
+                Expect::Decodes,
+                name_case(repeated(1, "a"), repeated(COMPONENTS - 1, "s")),
+            ),
+            (
+                "name path and lexical scope one over the shared component cap",
+                NAME_WIRES,
+                Expect::RejectedNamingBoundInSeqForm("component cap"),
+                name_case(repeated(1, "a"), repeated(COMPONENTS, "s")),
+            ),
+            (
+                "name lexical scope alone over the component cap",
+                NAME_WIRES,
+                Expect::Rejected("component cap"),
+                name_case(repeated(1, "a"), repeated(COMPONENTS + 1, "s")),
+            ),
+            (
+                "name path and lexical scope sharing the byte cap",
+                NAME_WIRES,
+                Expect::Decodes,
+                name_case(vec![text("a", BYTES - 1)], vec!["s".to_string()]),
+            ),
+            (
+                "name path and lexical scope one byte over the shared byte cap",
+                NAME_WIRES,
+                Expect::RejectedNamingBoundInSeqForm("string-byte cap"),
+                name_case(vec![text("a", BYTES - 1)], vec!["ss".to_string()]),
+            ),
+            (
+                "name components keep surrounding whitespace",
+                NAME_WIRES,
+                Expect::Decodes,
+                name_case(vec![" Service\t".to_string()], vec!["\nouter ".to_string()]),
+            ),
+        ];
+
+        for (label, wires, expect, decode) in &cases {
+            for &wire in *wires {
+                let result = decode(wire);
+                match expect {
+                    Expect::Decodes => assert_eq!(
+                        result,
+                        Ok(true),
+                        "{label} over {wire:?} must decode to the encoded value"
+                    ),
+                    Expect::Rejected(bound) => {
+                        let error = result.expect_err(label);
+                        assert!(
+                            error.contains(bound),
+                            "{label} over {wire:?} must fail on the {bound}: {error}"
+                        );
+                    }
+                    Expect::RejectedNamingBoundInSeqForm(bound) => {
+                        let error = result.expect_err(label);
+                        assert!(
+                            wire == Wire::JsonMap || error.contains(bound),
+                            "{label} over {wire:?} must fail on the {bound}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // A format that streams a string's bytes without announcing how many
+        // there are reaches the per-byte check instead of the length check.
+        for (len, decodes) in [(BYTES, true), (BYTES + 1, false)] {
+            let bytes = text("s", len).into_bytes();
+            let unannounced = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(
+                bytes.iter().copied().filter(|_| true),
+            );
+            let decoded = BoundedStructuredTypeStringSeed { max_bytes: BYTES }
+                .deserialize(unannounced)
+                .map_err(|error| error.to_string());
+            if decodes {
+                assert_eq!(decoded.as_deref().map(str::len), Ok(len));
+            } else {
+                let error = decoded.expect_err("unannounced string over the byte cap");
+                assert!(error.contains("string-byte cap"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn structured_name_map_form_rejects_duplicate_and_unknown_fields() {
+        let valid = r#"{"path":["A"],"lexical_scope":["S"],"absolute":true}"#;
+        let decoded: StructuredTypeName = serde_json::from_str(valid).expect("valid map form");
+        assert_eq!(
+            decoded,
+            StructuredTypeName::new(vec!["A".to_string()], vec!["S".to_string()], true).unwrap()
+        );
+
+        for (json, error_fragment) in [
+            (
+                r#"{"path":["A"],"path":["B"],"lexical_scope":[],"absolute":false}"#,
+                "duplicate field `path`",
+            ),
+            (
+                r#"{"path":["A"],"lexical_scope":[],"lexical_scope":[],"absolute":false}"#,
+                "duplicate field `lexical_scope`",
+            ),
+            (
+                r#"{"path":["A"],"lexical_scope":[],"absolute":false,"absolute":true}"#,
+                "duplicate field `absolute`",
+            ),
+            (
+                r#"{"extra":["A"],"lexical_scope":[],"absolute":false}"#,
+                "unknown field `extra`",
+            ),
+            (
+                r#"{"path":["A"],"lexical_scope":[],"absolute":false,"extra":1}"#,
+                "unknown field `extra`",
+            ),
+        ] {
+            let error = serde_json::from_str::<StructuredTypeName>(json)
+                .expect_err(json)
+                .to_string();
+            assert!(error.contains(error_fragment), "{json}: {error}");
+        }
+    }
+
     #[test]
     fn rerooted_map_identities_compare_by_reachable_shape() {
         let service =
@@ -5245,6 +5689,282 @@ mod structured_type_identity_tests {
         let named = named_builder.finish(named_id).unwrap();
         assert_eq!(projected, named);
         assert_eq!(hash(&projected), hash(&named));
+    }
+}
+
+#[cfg(test)]
+mod structured_type_identity_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A plain recursive type shape. The generator builds identities from it,
+    /// and its derived equality is the oracle for every identity operation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Tree {
+        Named {
+            path: Vec<String>,
+            lexical_scope: Vec<String>,
+            absolute: bool,
+        },
+        EmptyInterface,
+        Pointer(Box<Tree>),
+        Reference(Box<Tree>),
+        RvalueReference(Box<Tree>),
+        Array(Box<Tree>),
+        Slice(Box<Tree>),
+        Map(Box<Tree>, Box<Tree>),
+        Generic(Box<Tree>, Vec<Tree>),
+    }
+
+    const WRAPPER_KINDS: u8 = 5;
+
+    fn wrap(kind: u8, inner: Tree) -> Tree {
+        let inner = Box::new(inner);
+        match kind {
+            0 => Tree::Pointer(inner),
+            1 => Tree::Reference(inner),
+            2 => Tree::RvalueReference(inner),
+            3 => Tree::Array(inner),
+            4 => Tree::Slice(inner),
+            _ => unreachable!("wrapper kind {kind}"),
+        }
+    }
+
+    /// A small alphabet, so that independently generated trees often share
+    /// shapes and names and the equality checks see both outcomes.
+    fn tree() -> impl Strategy<Value = Tree> {
+        let component = || prop_oneof![Just("A".to_string()), Just("B".to_string())];
+        let leaf = prop_oneof![
+            4 => (
+                proptest::collection::vec(component(), 1..=2),
+                proptest::collection::vec(Just("m".to_string()), 0..=1),
+                any::<bool>(),
+            )
+                .prop_map(|(path, lexical_scope, absolute)| Tree::Named {
+                    path,
+                    lexical_scope,
+                    absolute,
+                }),
+            1 => Just(Tree::EmptyInterface),
+        ];
+        leaf.prop_recursive(4, 24, 3, |inner| {
+            prop_oneof![
+                (0..WRAPPER_KINDS, inner.clone()).prop_map(|(kind, tree)| wrap(kind, tree)),
+                (inner.clone(), inner.clone())
+                    .prop_map(|(key, value)| Tree::Map(Box::new(key), Box::new(value))),
+                (inner.clone(), proptest::collection::vec(inner, 0..3))
+                    .prop_map(|(base, arguments)| Tree::Generic(Box::new(base), arguments)),
+            ]
+        })
+    }
+
+    /// Pairs that are equal, independent, or differ only in their outer
+    /// wrapper (for example `*T` against `&T`).
+    fn tree_pair() -> impl Strategy<Value = (Tree, Tree)> {
+        prop_oneof![
+            tree().prop_map(|tree| (tree.clone(), tree)),
+            (tree(), tree()),
+            (tree(), 0..WRAPPER_KINDS, 0..WRAPPER_KINDS)
+                .prop_map(|(tree, left, right)| (wrap(left, tree.clone()), wrap(right, tree))),
+            (tree(), tree(), 0..WRAPPER_KINDS)
+                .prop_map(|(left, right, kind)| (wrap(kind, left), wrap(kind, right))),
+        ]
+    }
+
+    fn push(builder: &mut StructuredTypeIdentityBuilder, tree: &Tree) -> StructuredTypeNodeId {
+        match tree {
+            Tree::Named {
+                path,
+                lexical_scope,
+                absolute,
+            } => builder
+                .named(
+                    StructuredTypeName::new(path.clone(), lexical_scope.clone(), *absolute)
+                        .expect("generated name is valid"),
+                )
+                .expect("named node"),
+            Tree::EmptyInterface => builder.empty_interface().expect("empty interface"),
+            Tree::Pointer(inner) => {
+                let inner = push(builder, inner);
+                builder.pointer(inner).expect("pointer")
+            }
+            Tree::Reference(inner) => {
+                let inner = push(builder, inner);
+                builder.reference(inner).expect("reference")
+            }
+            Tree::RvalueReference(inner) => {
+                let inner = push(builder, inner);
+                builder.rvalue_reference(inner).expect("rvalue reference")
+            }
+            Tree::Array(inner) => {
+                let inner = push(builder, inner);
+                builder.array(inner).expect("array")
+            }
+            Tree::Slice(inner) => {
+                let inner = push(builder, inner);
+                builder.slice(inner).expect("slice")
+            }
+            Tree::Map(key, value) => {
+                let key = push(builder, key);
+                let value = push(builder, value);
+                builder.map(key, value).expect("map")
+            }
+            Tree::Generic(base, arguments) => {
+                let base = push(builder, base);
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| push(builder, argument))
+                    .collect();
+                builder.generic(base, arguments).expect("generic")
+            }
+        }
+    }
+
+    fn build(tree: &Tree) -> StructuredTypeIdentity {
+        let mut builder = StructuredTypeIdentityBuilder::default();
+        let root = push(&mut builder, tree);
+        builder.finish(root).expect("generated identity")
+    }
+
+    /// Reads an identity back into a tree through the public view interface.
+    fn expand(identity: &StructuredTypeIdentity, id: StructuredTypeNodeId) -> Tree {
+        let child = |id| Box::new(expand(identity, id));
+        match identity.view(id).expect("reachable node is in the arena") {
+            StructuredTypeNodeView::Named(name) => Tree::Named {
+                path: name.path().to_vec(),
+                lexical_scope: name.lexical_scope().to_vec(),
+                absolute: name.is_absolute(),
+            },
+            StructuredTypeNodeView::EmptyInterface => Tree::EmptyInterface,
+            StructuredTypeNodeView::Pointer(inner) => Tree::Pointer(child(inner)),
+            StructuredTypeNodeView::Reference(inner) => Tree::Reference(child(inner)),
+            StructuredTypeNodeView::RvalueReference(inner) => Tree::RvalueReference(child(inner)),
+            StructuredTypeNodeView::Array(inner) => Tree::Array(child(inner)),
+            StructuredTypeNodeView::Slice(inner) => Tree::Slice(child(inner)),
+            StructuredTypeNodeView::Map { key, value } => Tree::Map(child(key), child(value)),
+            StructuredTypeNodeView::Generic { base, arguments } => Tree::Generic(
+                child(base),
+                arguments
+                    .iter()
+                    .map(|argument| expand(identity, *argument))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn expand_root(identity: &StructuredTypeIdentity) -> Tree {
+        expand(identity, identity.root_id())
+    }
+
+    fn hash(identity: &StructuredTypeIdentity) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        identity.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Every generated identity survives the bincode cache encoding and
+        /// the serde_json store encoding: the decoded value equals the
+        /// original, hashes the same, and still reads back as the generated
+        /// tree. The container, map-key and generic-argument projections and
+        /// the nominal name select the parts the tree itself names.
+        #[test]
+        fn identity_round_trips_and_reads_back_as_its_generated_tree(tree in tree()) {
+            let identity = build(&tree);
+            prop_assert_eq!(&expand_root(&identity), &tree);
+            prop_assert_eq!(&identity, &identity.clone());
+
+            let from_bincode: StructuredTypeIdentity =
+                bincode::deserialize(&bincode::serialize(&identity).expect("bincode encode"))
+                    .expect("bincode decode");
+            let from_json: StructuredTypeIdentity =
+                serde_json::from_str(&serde_json::to_string(&identity).expect("json encode"))
+                    .expect("json decode");
+            for decoded in [&from_bincode, &from_json] {
+                prop_assert_eq!(decoded, &identity);
+                prop_assert_eq!(hash(decoded), hash(&identity));
+                prop_assert_eq!(&expand_root(decoded), &tree);
+            }
+
+            let element = match &tree {
+                Tree::Array(element) | Tree::Slice(element) | Tree::Map(_, element) => {
+                    Some(element.as_ref())
+                }
+                _ => None,
+            };
+            prop_assert_eq!(
+                identity
+                    .clone()
+                    .into_container_element_with(|| true)
+                    .map(|projected| expand_root(&projected)),
+                element.cloned()
+            );
+            let key = match &tree {
+                Tree::Map(key, _) => Some(key.as_ref().clone()),
+                _ => None,
+            };
+            prop_assert_eq!(
+                identity
+                    .clone()
+                    .into_map_key_with(|| true)
+                    .map(|projected| expand_root(&projected)),
+                key
+            );
+            let single_argument = match &tree {
+                Tree::Generic(_, arguments) if arguments.len() == 1 => Some(arguments[0].clone()),
+                _ => None,
+            };
+            prop_assert_eq!(
+                identity
+                    .clone()
+                    .into_single_generic_argument_with(|| true)
+                    .map(|projected| expand_root(&projected)),
+                single_argument
+            );
+
+            let mut current = &tree;
+            let nominal = loop {
+                match current {
+                    Tree::Named {
+                        path,
+                        lexical_scope,
+                        absolute,
+                    } => break Some((path.clone(), lexical_scope.clone(), *absolute)),
+                    Tree::Pointer(inner)
+                    | Tree::Reference(inner)
+                    | Tree::RvalueReference(inner)
+                    | Tree::Generic(inner, _) => current = inner,
+                    _ => break None,
+                }
+            };
+            prop_assert_eq!(
+                identity.nominal_name().map(|name| (
+                    name.path().to_vec(),
+                    name.lexical_scope().to_vec(),
+                    name.is_absolute()
+                )),
+                nominal
+            );
+        }
+
+        /// Identity equality, bounded structural equality and hash agree with
+        /// equality of the generated trees.
+        #[test]
+        fn identity_equality_matches_tree_equality((left, right) in tree_pair()) {
+            let left_identity = build(&left);
+            let right_identity = build(&right);
+            let trees_equal = left == right;
+            prop_assert_eq!(left_identity == right_identity, trees_equal);
+            prop_assert_eq!(
+                left_identity.structurally_eq_with(&right_identity, || true),
+                Some(trees_equal)
+            );
+            if trees_equal {
+                prop_assert_eq!(hash(&left_identity), hash(&right_identity));
+            }
+        }
     }
 }
 
@@ -5410,6 +6130,72 @@ mod project_file_identity_tests {
         }
     }
 
+    /// The root interner keeps a one-entry cache per thread. Alternating roots
+    /// on one thread must still give each file the root it was built with, and
+    /// the same relative path under two roots must stay two files. The oracle
+    /// is the input roots.
+    #[test]
+    fn alternating_roots_on_one_thread_keep_each_files_own_root() {
+        let root_a = absolute_test_root("intern-alternation-a");
+        let root_b = absolute_test_root("intern-alternation-b");
+
+        let first_a = ProjectFile::new(root_a.clone(), "a.rs");
+        let b = ProjectFile::new(root_b.clone(), "a.rs");
+        let second_a = ProjectFile::new(root_a.clone(), "a.rs");
+
+        assert_eq!(first_a.root(), root_a.as_path());
+        assert_eq!(b.root(), root_b.as_path());
+        assert_eq!(second_a.root(), root_a.as_path());
+        assert_eq!(b.abs_path(), root_b.join("a.rs"));
+        assert_ne!(first_a, b);
+        assert_ne!(second_a, b);
+        assert_eq!(first_a, second_a);
+    }
+
+    /// Un-normalized spellings of a root or a relative path must build the
+    /// same file as the normalized spelling, or one file splits into several
+    /// map and cache keys. `.` and `..` survive `Path` equality, so these rows
+    /// fail unless construction normalizes them. The oracle is the fixed
+    /// lexically normalized root and relative path.
+    #[test]
+    fn unnormalized_spellings_build_the_normalized_file() {
+        use crate::analyzer::project::{FileSetProject, Project};
+
+        let root = absolute_test_root("spelling-root");
+        let expected_rel = Path::new("src").join("b.rs");
+        let expected = ProjectFile::new(root.clone(), expected_rel.clone());
+        let spellings = [
+            (root.clone(), PathBuf::from("./src/b.rs")),
+            (root.clone(), PathBuf::from("src/a/../b.rs")),
+            (root.clone(), PathBuf::from("src/./b.rs")),
+            (root.clone(), PathBuf::from("src//b.rs")),
+            (root.join("x").join(".."), PathBuf::from("src/b.rs")),
+            (root.join("."), PathBuf::from("./src/b.rs")),
+            (
+                PathBuf::from(format!("{}/", root.display())),
+                PathBuf::from("src/b.rs"),
+            ),
+        ];
+        for (root_spelling, rel_spelling) in spellings {
+            let file = ProjectFile::new(root_spelling.clone(), rel_spelling.clone());
+            let context = format!("{root_spelling:?} + {rel_spelling:?}");
+            assert_eq!(file.root(), root.as_path(), "{context}");
+            assert_eq!(file.rel_path(), expected_rel.as_path(), "{context}");
+            assert_eq!(file, expected, "{context}");
+            assert_eq!(hash_of(&file), hash_of(&expected), "{context}");
+            assert_eq!(
+                expected.with_rel_path(rel_spelling.clone()),
+                expected,
+                "{context}"
+            );
+
+            let listed = FileSetProject::new(root_spelling.clone(), [rel_spelling.clone()])
+                .all_files()
+                .unwrap();
+            assert_eq!(listed, BTreeSet::from([expected.clone()]), "{context}");
+        }
+    }
+
     fn hash_of(file: &ProjectFile) -> u64 {
         let mut hasher = DefaultHasher::new();
         file.hash(&mut hasher);
@@ -5471,6 +6257,7 @@ mod owner_scope_tests {
 #[cfg(test)]
 mod declaration_id_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn declaration_id_excludes_the_absolute_workspace_root() {
@@ -5535,6 +6322,125 @@ mod declaration_id_tests {
         assert_ne!(package_unit.declaration_id(), type_unit.declaration_id());
     }
 
+    /// `decl:v1` ids are persisted and public, so their values are pinned,
+    /// not only compared with each other. Each expected id was computed
+    /// outside Rust (Python `hashlib.sha256` over the documented
+    /// `CanonicalHasher` framing of language, path, kind label, segment kinds
+    /// and texts, package segment count, signature, and synthetic flag). A
+    /// change to any line needs a new identity version, not a re-bless.
+    #[test]
+    fn declaration_ids_match_pinned_v1_values() {
+        let root = absolute_test_root("workspace");
+        let java = ProjectFile::new(root.clone(), "src/Widget.java");
+        let interner = segment_interner();
+        let three_segments = FqName::new()
+            .with_pushed(interner.intern("example", SegmentKind::Package))
+            .with_pushed(interner.intern("Widget", SegmentKind::Type))
+            .with_pushed(interner.intern("run", SegmentKind::Member));
+        let units = [
+            CodeUnit::new(java.clone(), CodeUnitType::Class, "example", "Widget"),
+            CodeUnit::new(java.clone(), CodeUnitType::Function, "example", "run"),
+            CodeUnit::new(java.clone(), CodeUnitType::Field, "example", "count"),
+            CodeUnit::new(java.clone(), CodeUnitType::Module, "example", "util"),
+            CodeUnit::new(java.clone(), CodeUnitType::Macro, "example", "LOG"),
+            CodeUnit::new(java.clone(), CodeUnitType::FileScope, "", "src/Widget.java"),
+            CodeUnit::new(java.clone(), CodeUnitType::Class, "", "Widget"),
+            CodeUnit::with_signature(
+                java.clone(),
+                CodeUnitType::Function,
+                "example.Widget",
+                "run",
+                Some("(int)".to_string()),
+                false,
+            ),
+            CodeUnit::with_signature(
+                java.clone(),
+                CodeUnitType::Function,
+                "example.Widget",
+                "run",
+                Some("(int)".to_string()),
+                true,
+            ),
+            CodeUnit::file_scope(ProjectFile::new(root, "src/lib.rs")),
+            CodeUnit::from_fq(
+                java.clone(),
+                CodeUnitType::Function,
+                three_segments.clone(),
+                0,
+                None,
+                false,
+            ),
+            CodeUnit::from_fq(java, CodeUnitType::Function, three_segments, 2, None, false),
+        ];
+        let rendered = units
+            .iter()
+            .map(|unit| {
+                let segments = unit
+                    .fq()
+                    .segments()
+                    .iter()
+                    .map(|segment| {
+                        let (text, kind) = interner.resolve(*segment);
+                        format!("{}:{text}", kind.name())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    "{} [{segments}] package={} synthetic={} {}",
+                    unit.kind().identity_label(),
+                    unit.package_segment_count(),
+                    unit.is_synthetic(),
+                    unit.declaration_site_id(0, 0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            "class [Package:example Type:Widget] package=1 synthetic=false decl:v1:cd9221ad9fdb5cdd3465d26665c1e50da6c923f3b888f4f49296a8c0a90e9341:0-0",
+            "function [Package:example Member:run] package=1 synthetic=false decl:v1:5da473d9b6a519526cbf9f394cb53b03a7df5c71044f2082cfba688ea17d387f:0-0",
+            "field [Package:example Member:count] package=1 synthetic=false decl:v1:f2e93fc13965d2cc21da9eb09e2069211cf57ebd17ee6dca37474ec895a561f4:0-0",
+            "module [Package:example Package:util] package=1 synthetic=false decl:v1:2ccfe1afef1d3ca6fc9a98863e73adbe56c04c0dd24bbae6a6839e59cade87e0:0-0",
+            "macro [Package:example Member:LOG] package=1 synthetic=false decl:v1:ff8c1917af557cfe9691c68d0cf4b779ee8053a5a143edacdec44e51c092f5c0:0-0",
+            "file_scope [Path:src/Widget.java] package=0 synthetic=false decl:v1:9b55b4d400bd60d12071af316bde7f62d4e08512d9cbe935e6b9899405f005e0:0-0",
+            "class [Type:Widget] package=0 synthetic=false decl:v1:0e2d1413dc1034483a06d01bde9a08f944a08a5f9fb4f9fb954a05095a294135:0-0",
+            "function [Package:example.Widget Member:run] package=1 synthetic=false decl:v1:4a1c3e8b3427cd00d99b418f95d16d21118cafcb546d8402a338b32b8c4e29e6:0-0",
+            "function [Package:example.Widget Member:run] package=1 synthetic=true decl:v1:012dfc134d11b13f03e8128a9d19f2563008f2618b042a6d2e087181018ba0b2:0-0",
+            "file_scope [Path:src/lib.rs] package=0 synthetic=true decl:v1:c56b489532184e1962e261f7b193799fdd9c98a7faeafe2b819355aa4224ab27:0-0",
+            "function [Package:example Type:Widget Member:run] package=0 synthetic=false decl:v1:cf3b169fec98e5c1f7b23ee2509ce5b99c1500c08c2d003103ad6514920afd20:0-0",
+            "function [Package:example Type:Widget Member:run] package=2 synthetic=false decl:v1:9c928334e0ed861c185780a69ac9e1afd910cc1749238d45573c84653c6dcdd8:0-0",
+        ];
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    #[hardwon("91550be61936: CodeUnit Ord merged units that Eq distinguishes")]
+    fn units_that_render_alike_but_differ_in_segment_kinds_stay_distinct_in_order() {
+        let file = ProjectFile::new(absolute_test_root("workspace"), "src/Widget.java");
+        let interner = segment_interner();
+        let unit_with_tail_kind = |kind| {
+            let fq = FqName::new()
+                .with_pushed(interner.intern("example", SegmentKind::Package))
+                .with_pushed(interner.intern("Widget", kind));
+            CodeUnit::from_fq(file.clone(), CodeUnitType::Class, fq, 1, None, false)
+        };
+        let package_unit = unit_with_tail_kind(SegmentKind::Package);
+        let type_unit = unit_with_tail_kind(SegmentKind::Type);
+        assert_eq!(
+            (package_unit.package_name(), package_unit.short_name()),
+            (type_unit.package_name(), type_unit.short_name()),
+            "the pair must collide on every rendered ordering key"
+        );
+
+        assert_ne!(package_unit, type_unit);
+        assert_ne!(package_unit.cmp(&type_unit), Ordering::Equal);
+        assert_eq!(
+            package_unit.cmp(&type_unit),
+            type_unit.cmp(&package_unit).reverse()
+        );
+        let set: BTreeSet<CodeUnit> = [package_unit.clone(), type_unit.clone()].into();
+        assert_eq!(set.len(), 2, "{set:?}");
+        assert!(set.contains(&package_unit) && set.contains(&type_unit));
+    }
+
     #[test]
     fn declaration_site_id_is_the_declaration_id_plus_exact_byte_span() {
         let unit = CodeUnit::with_signature(
@@ -5555,6 +6461,135 @@ mod declaration_id_tests {
             unit.declaration_site_id(12, 47),
             unit.declaration_site_id(52, 87)
         );
+    }
+}
+
+#[cfg(test)]
+mod codeunit_identity_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// One generated unit. Every field draws from a tiny domain so that equal
+    /// and near-equal pairs are common.
+    #[derive(Debug, Clone)]
+    struct UnitSpec {
+        kind: CodeUnitType,
+        segments: Vec<(&'static str, SegmentKind)>,
+        package_segment_count: usize,
+        signature: Option<&'static str>,
+        synthetic: bool,
+    }
+
+    fn unit_spec() -> impl Strategy<Value = UnitSpec> {
+        let segment = (
+            prop::sample::select(vec!["a", "b"]),
+            prop::sample::select(SegmentKind::ALL.to_vec()),
+        );
+        (
+            prop::sample::select(CodeUnitType::ALL.to_vec()),
+            prop::collection::vec(segment, 1..=3),
+            0_usize..3,
+            prop::sample::select(vec![None, Some("(a)"), Some("(b)")]),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(kind, segments, package_segment_count, signature, synthetic)| {
+                    let package_segment_count = package_segment_count.min(segments.len() - 1);
+                    UnitSpec {
+                        kind,
+                        segments,
+                        package_segment_count,
+                        signature,
+                        synthetic,
+                    }
+                },
+            )
+    }
+
+    /// A base spec and a second spec that is the base with at most one field
+    /// redrawn, so pairs that differ in exactly one identity field are common.
+    fn spec_pair() -> impl Strategy<Value = (UnitSpec, UnitSpec)> {
+        (unit_spec(), unit_spec(), 0_usize..6).prop_map(|(base, fresh, field)| {
+            let mut other = base.clone();
+            match field {
+                0 => {}
+                1 => other.kind = fresh.kind,
+                2 => {
+                    // Keep the length so the package boundary stays valid.
+                    other.segments = base
+                        .segments
+                        .iter()
+                        .zip(fresh.segments.iter().cycle())
+                        .map(|(_, segment)| *segment)
+                        .collect();
+                }
+                3 => {
+                    other.package_segment_count =
+                        fresh.package_segment_count.min(base.segments.len() - 1)
+                }
+                4 => other.signature = fresh.signature,
+                _ => other.synthetic = fresh.synthetic,
+            }
+            (base, other)
+        })
+    }
+
+    fn anchor() -> impl Strategy<Value = Option<PackageAnchor>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(PackageAnchor::CrateRoot)),
+            (0_u8..3).prop_map(|pop| Some(PackageAnchor::OwnModule { pop })),
+        ]
+    }
+
+    fn build(file: &ProjectFile, spec: &UnitSpec, anchor: Option<PackageAnchor>) -> CodeUnit {
+        let interner = segment_interner();
+        let fq = spec
+            .segments
+            .iter()
+            .fold(FqName::new(), |fq, (text, kind)| {
+                fq.with_pushed(interner.intern(text, *kind))
+            });
+        let unit = CodeUnit::from_fq(
+            file.clone(),
+            spec.kind,
+            fq,
+            spec.package_segment_count,
+            spec.signature.map(str::to_string),
+            spec.synthetic,
+        );
+        match anchor {
+            Some(anchor) => unit.with_package_anchor(anchor),
+            None => unit,
+        }
+    }
+
+    fn std_hash(unit: &CodeUnit) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        unit.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// `Eq`, `Hash` and the persisted `declaration_id` must agree on what
+        /// one declaration is. The package anchor is persistence metadata and
+        /// belongs to none of them.
+        #[test]
+        fn equality_hash_and_declaration_id_agree(
+            (left_spec, right_spec) in spec_pair(),
+            left_anchor in anchor(),
+            right_anchor in anchor(),
+        ) {
+            let file = ProjectFile::new(absolute_test_root("workspace"), "src/Widget.java");
+            let left = build(&file, &left_spec, left_anchor);
+            let right = build(&file, &right_spec, right_anchor);
+            prop_assert_eq!(left == right, left.declaration_id() == right.declaration_id());
+            if left == right {
+                prop_assert_eq!(std_hash(&left), std_hash(&right));
+            }
+        }
     }
 }
 
@@ -5922,5 +6957,293 @@ mod semantic_diagnostic_report_tests {
             },
             diagnostic(location),
         );
+    }
+}
+
+#[cfg(test)]
+mod range_and_paren_properties {
+    use super::{Range, matching_close_paren};
+    use proptest::prelude::*;
+
+    /// Balanced parenthesis text mixed with plain and multi-byte characters.
+    fn balanced() -> impl Strategy<Value = String> {
+        let leaf = prop_oneof![
+            Just(String::new()),
+            Just("x".to_string()),
+            Just("e\u{301}".to_string())
+        ];
+        leaf.prop_recursive(4, 24, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(|parts| parts.concat()),
+                inner.prop_map(|body| format!("({body})")),
+            ]
+        })
+    }
+
+    /// Source text and a byte range inside it, with the range's lines counted
+    /// from the text itself.
+    fn text_and_range() -> impl Strategy<Value = (String, Range)> {
+        proptest::collection::vec(prop_oneof![Just('a'), Just('\n'), Just('b')], 0..12)
+            .prop_flat_map(|chars| {
+                let len = chars.len();
+                (Just(chars), 0..=len, 0..=len)
+            })
+            .prop_map(|(chars, a, b)| {
+                let (start, end) = (a.min(b), a.max(b));
+                let text: String = chars.into_iter().collect();
+                let line_of = |offset: usize| text[..offset].matches('\n').count();
+                let range = Range {
+                    start_byte: start,
+                    end_byte: end,
+                    start_line: line_of(start),
+                    end_line: line_of(end),
+                };
+                (text, range)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// A group built as `(` + balanced body + `)` is closed by exactly its
+        /// last character, whatever surrounds it. The expected index is known
+        /// from construction rather than from scanning.
+        #[test]
+        fn close_paren_of_a_constructed_group_is_its_last_character(
+            prefix in "[a-z(), ]{0,6}",
+            body in balanced(),
+            suffix in "[a-z(), ]{0,6}",
+        ) {
+            let text = format!("{prefix}({body}){suffix}");
+            let open = prefix.len();
+            prop_assert_eq!(matching_close_paren(&text, open), Some(open + 1 + body.len()));
+        }
+
+        /// With the final `)` removed and nothing that could close the group
+        /// after it, no match exists. A `)` where the scan starts closes an
+        /// empty depth and is also rejected.
+        #[test]
+        fn unclosed_or_unopened_groups_have_no_match(
+            body in balanced(),
+            suffix in "[a-z ]{0,6}",
+        ) {
+            let unclosed = format!("({body}{suffix}");
+            prop_assert_eq!(matching_close_paren(&unclosed, 0), None);
+            let unopened = format!("){body}");
+            prop_assert_eq!(matching_close_paren(&unopened, 0), None);
+        }
+
+        /// An offset outside the text, or inside a multi-byte character, has no
+        /// match rather than panicking.
+        #[test]
+        fn unusable_offsets_have_no_match(body in balanced(), past_end in 0usize..4) {
+            let text = format!("({body})");
+            prop_assert_eq!(matching_close_paren(&text, text.len() + 1 + past_end), None);
+            let accented = "e\u{301}()";
+            prop_assert_eq!(matching_close_paren(accented, 2), None);
+        }
+
+        /// `contains` compares byte bounds only: `outer` contains `inner` when
+        /// every byte of `inner` is a byte of `outer`. An empty `inner` is
+        /// contained when its position lies within `outer`, ends included.
+        #[test]
+        fn contains_means_byte_subset(
+            outer in (0usize..12, 0usize..8),
+            inner in (0usize..12, 0usize..8),
+            outer_lines in (0usize..5, 0usize..5),
+            inner_lines in (0usize..5, 0usize..5),
+        ) {
+            let range = |(start, length): (usize, usize), (start_line, end_line)| Range {
+                start_byte: start,
+                end_byte: start + length,
+                start_line,
+                end_line,
+            };
+            let outer = range(outer, outer_lines);
+            let inner = range(inner, inner_lines);
+            let expected = if inner.start_byte == inner.end_byte {
+                outer.start_byte <= inner.start_byte && inner.start_byte <= outer.end_byte
+            } else {
+                (inner.start_byte..inner.end_byte)
+                    .all(|byte| (outer.start_byte..outer.end_byte).contains(&byte))
+            };
+            prop_assert_eq!(outer.contains(&inner), expected);
+        }
+
+        /// For a range cut from real text, `is_empty` is exactly "the cut text
+        /// is empty", including a cut that starts on a line break.
+        #[test]
+        fn is_empty_means_no_text_selected((text, range) in text_and_range()) {
+            prop_assert_eq!(
+                range.is_empty(),
+                text[range.start_byte..range.end_byte].is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod code_unit_order_properties {
+    use super::{CodeUnit, CodeUnitType, FqName, ProjectFile, SegmentKind, absolute_test_root};
+    use crate::analyzer::fq_name::segment_interner;
+    use proptest::prelude::*;
+    use std::cmp::Ordering;
+
+    /// The independent fields of one generated unit.
+    #[derive(Clone, Debug)]
+    struct UnitSpec {
+        texts: Vec<&'static str>,
+        segment_kinds: Vec<SegmentKind>,
+        package_count: prop::sample::Index,
+        path: &'static str,
+        kind: CodeUnitType,
+        signature: Option<String>,
+        synthetic: bool,
+    }
+
+    /// Segment texts and kinds are chosen so that structurally different
+    /// names often render to the same text: `a.b` as one segment against `a`,
+    /// `b` as two, `a$b` against a `Nested` `b`, and `Package`/`Type`/`Unknown`
+    /// kinds that all join with `.`.
+    fn unit_spec(len: usize) -> impl Strategy<Value = UnitSpec> {
+        (
+            proptest::collection::vec(prop::sample::select(vec!["a", "b", "a.b", "a$b"]), len),
+            proptest::collection::vec(
+                prop::sample::select(vec![
+                    SegmentKind::Package,
+                    SegmentKind::Type,
+                    SegmentKind::Member,
+                    SegmentKind::Nested,
+                    SegmentKind::Unknown,
+                ]),
+                len,
+            ),
+            any::<prop::sample::Index>(),
+            prop::sample::select(vec!["src/A.java", "src/B.java"]),
+            prop::sample::select(vec![CodeUnitType::Class, CodeUnitType::Function]),
+            prop::option::of(Just("(int)".to_string())),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(texts, segment_kinds, package_count, path, kind, signature, synthetic)| {
+                    UnitSpec {
+                        texts,
+                        segment_kinds,
+                        package_count,
+                        path,
+                        kind,
+                        signature,
+                        synthetic,
+                    }
+                },
+            )
+    }
+
+    /// `base` with each field replaced by `other`'s where `take` says so, so
+    /// that generated units often agree on every field but one.
+    fn mix(base: &UnitSpec, other: &UnitSpec, take: [bool; 7]) -> UnitSpec {
+        UnitSpec {
+            texts: if take[0] {
+                other.texts.clone()
+            } else {
+                base.texts.clone()
+            },
+            segment_kinds: if take[1] {
+                other.segment_kinds.clone()
+            } else {
+                base.segment_kinds.clone()
+            },
+            package_count: if take[2] {
+                other.package_count
+            } else {
+                base.package_count
+            },
+            path: if take[3] { other.path } else { base.path },
+            kind: if take[4] { other.kind } else { base.kind },
+            signature: if take[5] {
+                other.signature.clone()
+            } else {
+                base.signature.clone()
+            },
+            synthetic: if take[6] {
+                other.synthetic
+            } else {
+                base.synthetic
+            },
+        }
+    }
+
+    fn build(spec: &UnitSpec) -> CodeUnit {
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        for (text, kind) in spec.texts.iter().zip(&spec.segment_kinds) {
+            fq.push(interner.intern(text, *kind));
+        }
+        CodeUnit::from_fq(
+            ProjectFile::new(absolute_test_root("workspace"), spec.path),
+            spec.kind,
+            fq,
+            spec.package_count.index(spec.texts.len()),
+            spec.signature.clone(),
+            spec.synthetic,
+        )
+    }
+
+    /// Three units over one segment count, the second and third each a copy
+    /// of the first with a random subset of fields replaced.
+    fn unit_triple() -> impl Strategy<Value = [CodeUnit; 3]> {
+        (1usize..=3).prop_flat_map(|len| {
+            (
+                unit_spec(len),
+                unit_spec(len),
+                unit_spec(len),
+                any::<[bool; 7]>(),
+                any::<[bool; 7]>(),
+            )
+                .prop_map(|(a, b, c, take_b, take_c)| {
+                    [
+                        build(&a),
+                        build(&mix(&a, &b, take_b)),
+                        build(&mix(&a, &c, take_c)),
+                    ]
+                })
+        })
+    }
+
+    /// The rendered keys the order compared before the structured tie-break.
+    fn display_key(
+        unit: &CodeUnit,
+    ) -> (&str, &str, CodeUnitType, &ProjectFile, Option<&str>, bool) {
+        (
+            unit.package_name(),
+            unit.short_name(),
+            unit.kind(),
+            unit.source(),
+            unit.signature(),
+            unit.is_synthetic(),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `cmp` is a total order consistent with `==`: `Equal` exactly for
+        /// equal units, antisymmetric, and transitive. Units that differ on a
+        /// rendered key keep the order those keys give, so sorted output does
+        /// not change for them.
+        #[test]
+        fn code_unit_order_agrees_with_equality([a, b, c] in unit_triple()) {
+            for (x, y) in [(&a, &b), (&b, &c), (&a, &c)] {
+                prop_assert_eq!(x.cmp(y) == Ordering::Equal, x == y, "{:?} vs {:?}", x, y);
+                prop_assert_eq!(x.cmp(y), y.cmp(x).reverse());
+                let display = display_key(x).cmp(&display_key(y));
+                if display != Ordering::Equal {
+                    prop_assert_eq!(x.cmp(y), display);
+                }
+            }
+            if a <= b && b <= c {
+                prop_assert!(a <= c, "{:?} <= {:?} <= {:?}", a, b, c);
+            }
+        }
     }
 }

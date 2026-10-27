@@ -496,6 +496,7 @@ mod tests {
                     site: ProcedureCallSiteLocator {
                         start_byte: 10,
                         end_byte: 20,
+                        ordinal: 0,
                     },
                 },
                 answer,
@@ -564,6 +565,7 @@ mod tests {
                 site: ProcedureCallSiteLocator {
                     start_byte: 3,
                     end_byte: 13,
+                    ordinal: 1,
                 },
             },
             LookupQuestion::ProcedureCallSite {
@@ -572,6 +574,7 @@ mod tests {
                 site: ProcedureCallSiteLocator {
                     start_byte: 0,
                     end_byte: 0,
+                    ordinal: 0,
                 },
             },
             LookupQuestion::Summary {

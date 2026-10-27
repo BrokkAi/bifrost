@@ -4,12 +4,12 @@ use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteVa
 
 use crate::analyzer::IAnalyzer;
 use crate::analyzer::Language;
-use crate::analyzer::semantic_model::CatalogPackSourceKind;
 use crate::analyzer::semantic_model::PayloadKind;
 use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::semantic_model::SemanticModelOverlayBuildError;
 use crate::analyzer::semantic_model::SemanticPackCatalog;
 use crate::analyzer::semantic_model::SemanticPackSelectorQuery;
+use crate::analyzer::semantic_model::{CatalogMiss, CatalogPackSourceKind};
 pub use crate::analyzer::store::active_models::{
     ActivatedProcedureSummary, ActivatedSemanticModelRecord, ActiveSemanticModelShard,
     EffectiveProcedureClaims, MatcherIndexes, ProcedureSummaryMatch, ResolvedActiveSemanticModels,
@@ -419,6 +419,55 @@ pub fn resolve_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelResolutionOutcome {
+    resolve_active_semantic_models_with_loader(catalog, request, cancellation, |candidate| {
+        catalog.load(candidate)
+    })
+}
+
+/// Test-only per-language backing choice. Every selected shard of a language
+/// uses the same backing; product activation selects rows for Rust only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn resolve_row_backed_semantic_models_for_test(
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+    languages: &[&str],
+) -> SemanticModelResolutionOutcome {
+    for language in languages {
+        assert!(
+            row_backing_language_supported_in_m2(language),
+            "M3 owns the remaining eager derivations for {language}; M2 tests cannot row-back that language"
+        );
+    }
+    resolve_active_semantic_models_with_loader(catalog, request, cancellation, |candidate| {
+        let loaded = catalog.load_metadata_only_for_test(candidate)?;
+        if languages.contains(&loaded.manifest.language.as_str()) {
+            Ok(loaded)
+        } else {
+            catalog.load_decoded_for_test(candidate)
+        }
+    })
+}
+
+/// M3 owns the language-wide derived surfaces that cannot yet come from rows.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn row_backing_language_supported_in_m2(language: &str) -> bool {
+    !matches!(
+        language,
+        "go" | "jvm" | "java" | "kotlin" | "scala" | "python" | "c" | "c++" | "cpp"
+    )
+}
+
+fn resolve_active_semantic_models_with_loader(
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+    load: impl Fn(
+        &crate::analyzer::semantic_model::catalog::CatalogCandidate,
+    )
+        -> Result<crate::analyzer::semantic_model::catalog::LoadedCatalogShard, CatalogMiss>,
+) -> SemanticModelResolutionOutcome {
     let _scope = crate::profiling::scope("semantic_pack.resolve_active");
     let mut report = SemanticModelActivationReport::default();
     let activation_sql_start = catalog.sql_statement_count();
@@ -549,9 +598,11 @@ pub fn resolve_active_semantic_models(
             return SemanticModelResolutionOutcome::Cancelled(report);
         }
         let load_started = Instant::now();
-        let loaded = match catalog.load(&candidate) {
+        let loaded = match load(&candidate) {
             Ok(loaded) => loaded,
             Err(miss) => {
+                let reconciliation_required =
+                    matches!(miss, CatalogMiss::IndexReconciliationRequired { .. });
                 incomplete = true;
                 push_explanation(
                     &mut report,
@@ -566,14 +617,18 @@ pub fn resolve_active_semantic_models(
                         reason: catalog_miss_reason(&miss),
                     },
                 );
+                if reconciliation_required {
+                    return SemanticModelResolutionOutcome::Unavailable(report);
+                }
                 continue;
             }
         };
         decode_hydration_nanos = decode_hydration_nanos.saturating_add(elapsed_ns(load_started));
         report.loaded_shards = report.loaded_shards.saturating_add(1);
-        report.loaded_records = report
-            .loaded_records
-            .saturating_add(loaded.shard.record_count());
+        report.loaded_records = report.loaded_records.saturating_add(
+            usize::try_from(loaded.descriptor.record_count)
+                .expect("validated record count fits usize"),
+        );
         if report.loaded_shards > request.limits.max_loaded_shards
             || report.loaded_records > request.limits.max_records
         {
@@ -619,7 +674,7 @@ pub fn resolve_active_semantic_models(
         } else {
             strict_activation_match(
                 &loaded.manifest,
-                &loaded.shard,
+                &loaded.selectors,
                 &evidence,
                 &request.bifrost_version,
             )
@@ -632,7 +687,7 @@ pub fn resolve_active_semantic_models(
         }) = activation_match
         else {
             let reason =
-                strict_activation_mismatch_reason(&loaded.manifest, &loaded.shard, &evidence);
+                strict_activation_mismatch_reason(&loaded.manifest, &loaded.selectors, &evidence);
             push_loaded_explanation(
                 &mut report,
                 request.limits,
@@ -666,7 +721,7 @@ pub fn resolve_active_semantic_models(
             );
             continue;
         }
-        if loaded.shard.safety().review_required
+        if loaded.manifest.safety.review_required
             && control != Some(SemanticModelControlAction::Enable)
         {
             // A shipped language-wide pack is an optional capability, not a
@@ -700,16 +755,27 @@ pub fn resolve_active_semantic_models(
             evidence_rank,
             matched_requirements,
             source_rank: loaded.source_kind.precedence(),
-            active: ActiveSemanticModelShard {
-                approximate,
-                manifest: loaded.manifest,
-                shard: loaded.shard,
-                source_kind: loaded.source_kind,
-                source_id: loaded.source_id,
-                matched_evidence,
-                matching_evidence,
-                evidence_rank,
-                source_rank: loaded.source_kind.precedence(),
+            active: {
+                let has_callable_values = loaded.has_callable_values;
+                ActiveSemanticModelShard {
+                    metadata: std::sync::Arc::new(
+                        crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                            approximate,
+                            manifest: loaded.manifest,
+                            descriptor: loaded.descriptor,
+                            selectors: loaded.selectors,
+                            row_store: None,
+                            has_callable_values,
+                            source_kind: loaded.source_kind,
+                            source_id: loaded.source_id,
+                            matched_evidence,
+                            matching_evidence,
+                            evidence_rank,
+                            source_rank: loaded.source_kind.precedence(),
+                        },
+                    ),
+                    decoded: loaded.shard,
+                }
             },
         });
     }
@@ -733,7 +799,7 @@ pub fn resolve_active_semantic_models(
                 SemanticModelActivationExplanation {
                     manifest_digest: selection.active.manifest.content_sha256.clone(),
                     pack_id: Some(selection.active.manifest.pack_id.clone()),
-                    shard_id: selection.active.shard.shard_id().to_owned(),
+                    shard_id: selection.active.descriptor.shard_id.as_str().to_owned(),
                     source_kind: selection.active.source_kind,
                     source_id: selection.active.source_id.clone(),
                     status: SemanticModelActivationStatus::Shadowed,
@@ -755,9 +821,10 @@ pub fn resolve_active_semantic_models(
             .cmp(&right.active.manifest.pack_id)
             .then_with(|| {
                 left.active
-                    .shard
-                    .shard_id()
-                    .cmp(right.active.shard.shard_id())
+                    .descriptor
+                    .shard_id
+                    .as_str()
+                    .cmp(right.active.descriptor.shard_id.as_str())
             })
             .then_with(|| left.semantic_sha256.cmp(&right.semantic_sha256))
     });
@@ -795,7 +862,7 @@ pub fn resolve_active_semantic_models(
             SemanticModelActivationExplanation {
                 manifest_digest: selection.active.manifest.content_sha256.clone(),
                 pack_id: Some(selection.active.manifest.pack_id.clone()),
-                shard_id: selection.active.shard.shard_id().to_owned(),
+                shard_id: selection.active.descriptor.shard_id.as_str().to_owned(),
                 source_kind: selection.active.source_kind,
                 source_id: selection.active.source_id.clone(),
                 status: SemanticModelActivationStatus::Active,
@@ -861,6 +928,10 @@ pub fn resolve_active_semantic_models(
             .then_with(|| left.pack_id.cmp(&right.pack_id))
             .then_with(|| left.reason.cmp(&right.reason))
     });
+    let extraction_gaps = extraction_gaps
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>();
     let mut extraction_gaps_by_declaration = map_with_capacity(extraction_gaps.len());
     for (index, gap) in extraction_gaps.iter().enumerate() {
         extraction_gaps_by_declaration
@@ -871,9 +942,9 @@ pub fn resolve_active_semantic_models(
     report.extraction_gaps = extraction_gaps.len();
 
     let active_model_set_hash = active_model_set_hash(&active, &extraction_gaps);
-    let shards = active
+    let mut shards = active
         .into_iter()
-        .map(|selection| selection.active)
+        .map(|selection| std::sync::Arc::new(selection.active))
         .collect::<Vec<_>>();
     report.phase_measurements.decode_hydration_nanos = decode_hydration_nanos;
     let matcher_started = Instant::now();
@@ -898,8 +969,34 @@ pub fn resolve_active_semantic_models(
             report.phase_measurements
         )
     });
+    let (source_reader, row_identities) =
+        match catalog.runtime_source_reader_with_shard_keys(shards.iter().map(|shard| {
+            (
+                shard.manifest.content_sha256.as_str(),
+                shard.descriptor.shard_id.as_str(),
+                shard.source_kind,
+            )
+        })) {
+            Ok(reader) => reader,
+            Err(error) => {
+                push_request_explanation(&mut report, request.limits, error.to_string());
+                return SemanticModelResolutionOutcome::Unavailable(report);
+            }
+        };
+    for (shard, identity) in shards.iter_mut().zip(row_identities) {
+        debug_assert_eq!(
+            source_reader
+                .callable_values_presence(identity)
+                .expect("selected shard marker exists"),
+            shard.has_callable_values,
+        );
+        let shard = Arc::get_mut(shard).expect("active shard has not been published");
+        Arc::get_mut(&mut shard.metadata)
+            .expect("shard metadata has not been published")
+            .row_store = Some(identity);
+    }
     let resolved = ResolvedActiveSemanticModels {
-        source_reader: Some(catalog.runtime_source_reader()),
+        source_reader: Some(source_reader),
         active_model_set_hash,
         shards,
         indexes,
@@ -1315,7 +1412,7 @@ pub(crate) fn compare_selection(left: &CandidateSelection, right: &CandidateSele
 
 pub(crate) fn active_model_set_hash(
     active: &[CandidateSelection],
-    extraction_gaps: &[ActivePackExtractionGap],
+    extraction_gaps: &[Arc<ActivePackExtractionGap>],
 ) -> String {
     let mut rows = active.iter().collect::<Vec<_>>();
     rows.sort_unstable_by(|left, right| {
@@ -1411,7 +1508,7 @@ pub(crate) fn push_loaded_explanation(
         SemanticModelActivationExplanation {
             manifest_digest: loaded.manifest.content_sha256.clone(),
             pack_id: Some(loaded.manifest.pack_id.clone()),
-            shard_id: loaded.shard.shard_id().to_owned(),
+            shard_id: loaded.descriptor.shard_id.as_str().to_owned(),
             source_kind: loaded.source_kind,
             source_id: loaded.source_id.clone(),
             status,
@@ -1636,16 +1733,37 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &DecodeLimits::default(),
         )
         .expect("exact-PyPI fixture decodes");
-        ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(compiled.manifest),
-            shard,
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: format!("test:pypi:{}", evidence.artifact_sha256.as_deref().unwrap()),
-            matched_evidence: evidence.clone(),
-            matching_evidence: vec![evidence.clone()],
-            evidence_rank: EvidenceRank::ExactArtifact,
-            source_rank,
+        {
+            let decoded = shard;
+            let manifest = Arc::new(compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: format!(
+                            "test:pypi:{}",
+                            evidence.artifact_sha256.as_deref().unwrap()
+                        ),
+                        matched_evidence: evidence.clone(),
+                        matching_evidence: vec![evidence.clone()],
+                        evidence_rank: EvidenceRank::ExactArtifact,
+                        source_rank,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         }
     }
 
@@ -1671,16 +1789,34 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &DecodeLimits::default(),
         )
         .expect("PyPI wildcard fixture decodes");
-        ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(compiled.manifest),
-            shard,
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:pypi-wildcard".to_owned(),
-            matched_evidence: evidence.clone(),
-            matching_evidence: vec![evidence.clone()],
-            evidence_rank: EvidenceRank::NamedCoordinate,
-            source_rank,
+        {
+            let decoded = shard;
+            let manifest = Arc::new(compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:pypi-wildcard".to_owned(),
+                        matched_evidence: evidence.clone(),
+                        matching_evidence: vec![evidence.clone()],
+                        evidence_rank: EvidenceRank::NamedCoordinate,
+                        source_rank,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         }
     }
 
@@ -1711,16 +1847,34 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             configuration: None,
             artifact_sha256: None,
         };
-        ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(compiled.manifest),
-            shard,
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:generic-python".to_owned(),
-            matched_evidence: evidence.clone(),
-            matching_evidence: vec![evidence],
-            evidence_rank: EvidenceRank::Language,
-            source_rank: 0,
+        {
+            let decoded = shard;
+            let manifest = Arc::new(compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:generic-python".to_owned(),
+                        matched_evidence: evidence.clone(),
+                        matching_evidence: vec![evidence],
+                        evidence_rank: EvidenceRank::Language,
+                        source_rank: 0,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         }
     }
 
@@ -1799,18 +1953,37 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             configuration: None,
             artifact_sha256: None,
         };
-        let active_shard = ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(compiled.manifest),
-            shard,
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:variadic-formals".to_owned(),
-            matched_evidence: evidence.clone(),
-            matching_evidence: vec![evidence],
-            evidence_rank: EvidenceRank::Language,
-            source_rank: 0,
+        let active_shard = {
+            let decoded = shard;
+            let manifest = Arc::new(compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:variadic-formals".to_owned(),
+                        matched_evidence: evidence.clone(),
+                        matching_evidence: vec![evidence],
+                        evidence_rank: EvidenceRank::Language,
+                        source_rank: 0,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         };
         let mut report = SemanticModelActivationReport::default();
+        let active_shard = Arc::new(active_shard);
         let indexes = MatcherIndexes::build(
             std::slice::from_ref(&active_shard),
             SemanticModelRuntimeLimits::default(),
@@ -1930,7 +2103,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let second = evidence("2");
         let matched = strict_activation_match(
             &compiled.manifest,
-            &shard,
+            shard.activation(),
             &[first.clone(), second.clone()],
             &Version::parse("0.9.0").expect("valid runtime version"),
         )
@@ -1978,7 +2151,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let java22 = row("22.0.1", "2");
         let matched = strict_activation_match(
             &compiled.manifest,
-            &shard,
+            shard.activation(),
             &[java21.clone(), java22],
             &Version::parse("0.9.0").expect("valid runtime version"),
         )
@@ -2037,7 +2210,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         assert_eq!(
             strict_activation_mismatch_reason(
                 &compiled.manifest,
-                &shard,
+                shard.activation(),
                 std::slice::from_ref(&declared)
             ),
             format!(
@@ -2117,7 +2290,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         assert!(
             strict_activation_match(
                 &compiled.manifest,
-                &shard,
+                shard.activation(),
                 std::slice::from_ref(&matching),
                 &Version::parse("99.0.0").expect("valid cross-engine version"),
             )
@@ -2126,7 +2299,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         assert!(
             strict_activation_match(
                 &compiled.manifest,
-                &shard,
+                shard.activation(),
                 &[evidence("22.0.1", &artifact_sha256)],
                 &Version::parse("99.0.0").expect("valid cross-engine version"),
             )
@@ -2135,7 +2308,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         assert!(
             strict_activation_match(
                 &compiled.manifest,
-                &shard,
+                shard.activation(),
                 &[evidence("21.0.8", &"b".repeat(64))],
                 &Version::parse("99.0.0").expect("valid cross-engine version"),
             )
@@ -2149,7 +2322,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         assert!(
             strict_activation_match(
                 &unknown_schema,
-                &shard,
+                shard.activation(),
                 std::slice::from_ref(&matching),
                 &Version::parse("99.0.0").expect("valid cross-engine version"),
             )
@@ -2197,23 +2370,42 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         };
         let first = evidence("21.0.8", "1");
         let second = evidence("21.0.8", "2");
-        let active = ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(compiled.manifest),
-            shard,
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:reviewed-jdk-obligation".to_owned(),
-            matched_evidence: second.clone(),
-            matching_evidence: vec![first.clone(), second.clone()],
-            evidence_rank: EvidenceRank::Language,
-            source_rank: 0,
+        let active = {
+            let decoded = shard;
+            let manifest = Arc::new(compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:reviewed-jdk-obligation".to_owned(),
+                        matched_evidence: second.clone(),
+                        matching_evidence: vec![first.clone(), second.clone()],
+                        evidence_rank: EvidenceRank::Language,
+                        source_rank: 0,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         };
-        let payload = active.shard.payload().procedure_summaries().unwrap();
+        let active = Arc::new(active);
+        let payload = active.decoded().payload().procedure_summaries().unwrap();
         let reviewed = ActivatedProcedureSummary {
-            record: &payload[0],
-            shard: &active,
-            payload,
+            record: Arc::clone(&payload[0]),
+            shard: Arc::clone(&active),
             actual_to_formal: None,
+            matched_owner_identity: None,
             matched_target_locator: Some(target("fixed", 3).locator().clone()),
             matched_call_arguments: None,
         };
@@ -2260,19 +2452,37 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
 
         let mut separate = [first.clone(), second.clone()]
             .into_iter()
-            .map(|evidence| ActiveSemanticModelShard {
-                approximate: false,
-                manifest: Arc::clone(&active.manifest),
-                shard: active.shard.clone(),
-                source_kind: CatalogPackSourceKind::Embedded,
-                source_id: format!(
-                    "test:artifact-{}",
-                    evidence.artifact_sha256.as_deref().unwrap()
-                ),
-                matched_evidence: evidence.clone(),
-                matching_evidence: vec![evidence],
-                evidence_rank: EvidenceRank::Language,
-                source_rank: 0,
+            .map(|evidence| {
+                let decoded = active.decoded().clone();
+                let manifest = Arc::clone(&active.manifest);
+                let has_callable_values = decoded.callable_values().is_some();
+                ActiveSemanticModelShard {
+                    metadata: std::sync::Arc::new(
+                        crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                            descriptor: manifest
+                                .shards
+                                .iter()
+                                .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                                .expect("fixture descriptor exists")
+                                .clone(),
+                            selectors: decoded.activation().to_vec(),
+                            row_store: None,
+                            has_callable_values,
+                            manifest,
+                            approximate: false,
+                            source_kind: CatalogPackSourceKind::Embedded,
+                            source_id: format!(
+                                "test:artifact-{}",
+                                evidence.artifact_sha256.as_deref().unwrap()
+                            ),
+                            matched_evidence: evidence.clone(),
+                            matching_evidence: vec![evidence],
+                            evidence_rank: EvidenceRank::Language,
+                            source_rank: 0,
+                        },
+                    ),
+                    decoded: Some(decoded),
+                }
             })
             .collect::<Vec<_>>();
         let mut bare_source = source.clone();
@@ -2284,23 +2494,42 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &CompilerOptions::default(),
         )
         .expect("ordinary model without an obligation compiles");
-        separate.push(ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(bare_compiled.manifest),
-            shard: decode_shard(
+        separate.push({
+            let decoded = decode_shard(
                 &bare_compiled.shards[0].descriptor,
                 &bare_compiled.shards[0].bytes,
                 &DecodeLimits::default(),
             )
-            .unwrap(),
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:higher-rank-unannotated-jdk-summary".to_owned(),
-            matched_evidence: second.clone(),
-            matching_evidence: vec![second.clone()],
-            evidence_rank: EvidenceRank::Language,
-            source_rank: 1,
+            .unwrap();
+            let manifest = Arc::new(bare_compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:higher-rank-unannotated-jdk-summary".to_owned(),
+                        matched_evidence: second.clone(),
+                        matching_evidence: vec![second.clone()],
+                        evidence_rank: EvidenceRank::Language,
+                        source_rank: 1,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         });
         let mut report = SemanticModelActivationReport::default();
+        let separate = separate.into_iter().map(Arc::new).collect::<Vec<_>>();
         let indexes = MatcherIndexes::build(
             &separate,
             SemanticModelRuntimeLimits::default(),
@@ -2346,6 +2575,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let lower_rank_selected_artifact = python_artifact_shard(&selected_evidence, 0);
         let shards = vec![higher_rank_other_artifact, lower_rank_selected_artifact];
         let mut report = SemanticModelActivationReport::default();
+        let shards = shards.into_iter().map(Arc::new).collect::<Vec<_>>();
         let indexes = MatcherIndexes::build(
             &shards,
             SemanticModelRuntimeLimits::default(),
@@ -2400,15 +2630,15 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             .find(|shard| shard.matched_evidence == selected_evidence)
             .unwrap();
         let payload = selected_shard
-            .shard
+            .decoded()
             .payload()
             .procedure_summaries()
             .unwrap();
         let selected_summary = ActivatedProcedureSummary {
-            record: &payload[0],
-            shard: selected_shard,
-            payload,
+            record: Arc::clone(&payload[0]),
+            shard: Arc::clone(selected_shard),
             actual_to_formal: None,
+            matched_owner_identity: None,
             matched_target_locator: None,
             matched_call_arguments: None,
         };
@@ -2481,12 +2711,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             .iter()
             .find(|shard| shard.matched_evidence == other_evidence)
             .unwrap();
-        let other_payload = other_shard.shard.payload().procedure_summaries().unwrap();
+        let other_payload = other_shard
+            .decoded()
+            .payload()
+            .procedure_summaries()
+            .unwrap();
         let other_summary = ActivatedProcedureSummary {
-            record: &other_payload[0],
-            shard: other_shard,
-            payload: other_payload,
+            record: Arc::clone(&other_payload[0]),
+            shard: Arc::clone(other_shard),
             actual_to_formal: None,
+            matched_owner_identity: None,
             matched_target_locator: None,
             matched_call_arguments: None,
         };
@@ -2498,6 +2732,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
 
         let generic_shard = python_generic_shard();
         let mut generic_report = SemanticModelActivationReport::default();
+        let generic_shard = Arc::new(generic_shard);
         let generic_indexes = MatcherIndexes::build(
             std::slice::from_ref(&generic_shard),
             SemanticModelRuntimeLimits::default(),
@@ -2569,21 +2804,39 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &CompilerOptions::default(),
         )
         .expect("same-artifact variadic model compiles");
-        let incompatible = ActiveSemanticModelShard {
-            approximate: false,
-            manifest: Arc::new(incompatible_compiled.manifest),
-            shard: decode_shard(
+        let incompatible = {
+            let decoded = decode_shard(
                 &incompatible_compiled.shards[0].descriptor,
                 &incompatible_compiled.shards[0].bytes,
                 &DecodeLimits::default(),
             )
-            .expect("same-artifact variadic model decodes"),
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:pypi:variadic-model".to_owned(),
-            matched_evidence: evidence.clone(),
-            matching_evidence: vec![evidence.clone()],
-            evidence_rank: EvidenceRank::ExactArtifact,
-            source_rank: 1,
+            .expect("same-artifact variadic model decodes");
+            let manifest = Arc::new(incompatible_compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:pypi:variadic-model".to_owned(),
+                        matched_evidence: evidence.clone(),
+                        matching_evidence: vec![evidence.clone()],
+                        evidence_rank: EvidenceRank::ExactArtifact,
+                        source_rank: 1,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         };
         assert_eq!(compatible.matching_evidence, incompatible.matching_evidence);
         assert_ne!(
@@ -2593,6 +2846,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
 
         let shards = vec![compatible, incompatible];
         let mut report = SemanticModelActivationReport::default();
+        let shards = shards.into_iter().map(Arc::new).collect::<Vec<_>>();
         let indexes = MatcherIndexes::build(
             &shards,
             SemanticModelRuntimeLimits::default(),
@@ -2661,6 +2915,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let evidence = python_evidence('a');
         let shard = python_pypi_wildcard_shard(&evidence, 0);
         let mut report = SemanticModelActivationReport::default();
+        let shard = Arc::new(shard);
         let indexes = MatcherIndexes::build(
             std::slice::from_ref(&shard),
             SemanticModelRuntimeLimits::default(),
@@ -2726,6 +2981,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let shard = python_artifact_shard(&evidence, 0);
         let manifest_sha256 = shard.manifest.content_sha256.clone();
         let mut report = SemanticModelActivationReport::default();
+        let shard = Arc::new(shard);
         let indexes = MatcherIndexes::build(
             std::slice::from_ref(&shard),
             SemanticModelRuntimeLimits::default(),
@@ -2794,11 +3050,11 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             );
         }
         let payload = active.shards[0]
-            .shard
+            .decoded()
             .payload()
             .procedure_summaries()
             .unwrap();
-        let mut unsupported = payload[0].clone();
+        let mut unsupported = payload[0].as_ref().clone();
         unsupported.ordinary_heap_unchanged = true;
         unsupported.preconditions = Some(vec![brokk_bifrost_analysis::analyzer::semantic_model::artifact::CompiledOperationPrecondition {
             input: brokk_bifrost_analysis::analyzer::semantic_model::artifact::CompiledSummaryInput::Parameter { ordinal: 0 },
@@ -2822,6 +3078,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         let evidence = python_evidence('a');
         let shard = python_artifact_shard(&evidence, 0);
         let mut report = SemanticModelActivationReport::default();
+        let shard = Arc::new(shard);
         let indexes = MatcherIndexes::build(
             std::slice::from_ref(&shard),
             SemanticModelRuntimeLimits::default(),
@@ -2912,18 +3169,37 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             configuration: None,
             artifact_sha256: None,
         };
-        let active_shard = ActiveSemanticModelShard {
-            approximate: false,
-            manifest: std::sync::Arc::new(compiled.manifest),
-            shard,
-            source_kind: CatalogPackSourceKind::Embedded,
-            source_id: "test:call-shape".to_owned(),
-            matching_evidence: vec![matched_evidence.clone()],
-            matched_evidence,
-            evidence_rank: EvidenceRank::Language,
-            source_rank: 0,
+        let active_shard = {
+            let decoded = shard;
+            let manifest = std::sync::Arc::new(compiled.manifest);
+            let has_callable_values = decoded.callable_values().is_some();
+            ActiveSemanticModelShard {
+                metadata: std::sync::Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        descriptor: manifest
+                            .shards
+                            .iter()
+                            .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                            .expect("fixture descriptor exists")
+                            .clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values,
+                        manifest,
+                        approximate: false,
+                        source_kind: CatalogPackSourceKind::Embedded,
+                        source_id: "test:call-shape".to_owned(),
+                        matching_evidence: vec![matched_evidence.clone()],
+                        matched_evidence,
+                        evidence_rank: EvidenceRank::Language,
+                        source_rank: 0,
+                    },
+                ),
+                decoded: Some(decoded),
+            }
         };
         let mut report = SemanticModelActivationReport::default();
+        let active_shard = Arc::new(active_shard);
         let indexes = MatcherIndexes::build(
             std::slice::from_ref(&active_shard),
             SemanticModelRuntimeLimits::default(),
@@ -3116,16 +3392,34 @@ pub(crate) mod active_model_set_identity_tests {
             evidence_rank,
             matched_requirements: Vec::new(),
             source_rank: 0,
-            active: ActiveSemanticModelShard {
-                approximate: false,
-                manifest: std::sync::Arc::new(compiled.manifest),
-                shard,
-                source_kind: CatalogPackSourceKind::Embedded,
-                source_id: format!("test:{pack_id}"),
-                matching_evidence: vec![matched_evidence.clone()],
-                matched_evidence,
-                evidence_rank,
-                source_rank: 0,
+            active: {
+                let decoded = shard;
+                let manifest = std::sync::Arc::new(compiled.manifest);
+                let has_callable_values = decoded.callable_values().is_some();
+                ActiveSemanticModelShard {
+                    metadata: std::sync::Arc::new(
+                        crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                            descriptor: manifest
+                                .shards
+                                .iter()
+                                .find(|descriptor| descriptor.shard_id == decoded.shard_id())
+                                .expect("fixture descriptor exists")
+                                .clone(),
+                            selectors: decoded.activation().to_vec(),
+                            row_store: None,
+                            has_callable_values,
+                            manifest,
+                            approximate: false,
+                            source_kind: CatalogPackSourceKind::Embedded,
+                            source_id: format!("test:{pack_id}"),
+                            matching_evidence: vec![matched_evidence.clone()],
+                            matched_evidence,
+                            evidence_rank,
+                            source_rank: 0,
+                        },
+                    ),
+                    decoded: Some(decoded),
+                }
             },
         }
     }
@@ -3161,7 +3455,7 @@ pub(crate) mod active_model_set_identity_tests {
         let active_model_set_hash = active_model_set_hash(&active, &[]);
         let shards = active
             .into_iter()
-            .map(|selection| selection.active)
+            .map(|selection| std::sync::Arc::new(selection.active))
             .collect::<Vec<_>>();
         let mut report = SemanticModelActivationReport::default();
         let indexes = MatcherIndexes::build(

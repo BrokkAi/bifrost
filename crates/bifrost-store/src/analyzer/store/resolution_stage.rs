@@ -30,6 +30,74 @@ pub mod rust_context;
 #[doc(hidden)]
 pub mod typed;
 
+// Stage families carry schema rules; the selection owns the occupancy memo.
+macro_rules! stage_families {
+    ($($variant:ident => $table:literal),* $(,)?) => {
+        /// Fixed schema identifiers bound the occupancy memo independently of hosts.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub(in crate::analyzer::store) enum StageFamily {
+            $($variant,)*
+            Nodes,
+            ClosedReasons,
+        }
+
+        impl StageFamily {
+            pub(in crate::analyzer::store) fn occupancy_sql(self) -> &'static str {
+                match self {
+                    $(Self::$variant => concat!(
+                        "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_stage_", $table,
+                        "),EXISTS(SELECT 1 FROM temp.selected_resolution_stage_", $table,
+                        " fact JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal)"
+                    ),)*
+                    Self::Nodes => NODE_OCCUPANCY_SQL,
+                    Self::ClosedReasons => CLOSED_REASON_OCCUPANCY_SQL,
+                }
+            }
+        }
+    };
+}
+
+const NODE_OCCUPANCY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_stage_nodes),EXISTS(SELECT 1 FROM temp.selected_resolution_stage_nodes fact JOIN temp.selected_resolution_stage_node_owners owner ON owner.node=fact.node JOIN temp.selected_resolution_stage_producers producer ON producer.producer_id=owner.producer_id JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=producer.host_ordinal)";
+const CLOSED_REASON_OCCUPANCY_SQL: &str = "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_stage_closed_reasons),EXISTS(SELECT 1 FROM temp.selected_resolution_stage_closed_reasons fact JOIN temp.selected_resolution_stage_producers producer ON producer.producer_id=fact.producer_id JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=producer.host_ordinal)";
+
+stage_families! {
+    TypeFrontiers => "type_frontiers",
+    TypeTransfers => "type_transfers",
+    TypeProductions => "type_productions",
+    TypeComponents => "type_components",
+    DeclaredTypeArguments => "declared_type_arguments",
+    TypeArguments => "type_arguments",
+    GenericTypeAliasParameters => "generic_type_alias_parameters",
+    GenericFormals => "generic_formals",
+    GenericFormalDefaults => "generic_formal_defaults",
+    UnderlyingTypes => "underlying_types",
+    IntrinsicSeeds => "intrinsic_seeds",
+    IntrinsicSeedIdentities => "intrinsic_seed_identities",
+    BindingProjections => "binding_projections",
+    QualifiedRoutes => "qualified_routes",
+    DeclarationTypes => "declaration_types",
+    DeclarationVisibilities => "declaration_visibilities",
+    MemberScopes => "member_scopes",
+    MemberOwners => "member_owners",
+    DeferredMemberOwners => "deferred_member_owners",
+    ConstructionRequirements => "construction_requirements",
+    Supertypes => "supertypes",
+    DefinitionPropertyGaps => "definition_property_gaps",
+    CallObligations => "call_obligations",
+    CallableSignatures => "callable_signatures",
+    Paths => "paths",
+    SemanticCoordinates => "semantic_coordinates",
+    NodeCoordinates => "node_coordinates",
+    PackageReferences => "package_references",
+    PackageMembers => "package_members",
+    GoPackageImports => "go_package_imports",
+    Semantics => "semantics",
+    Declarations => "declarations",
+    Gaps => "gaps",
+    ReferenceContexts => "reference_contexts",
+    Recipes => "recipes",
+}
+
 pub(super) fn completion_from_reasons(
     reasons: impl IntoIterator<Item = crate::analyzer::resolution::ResolutionIncompleteReason>,
 ) -> crate::analyzer::resolution::ResolutionCompletion {
@@ -165,7 +233,7 @@ pub(super) fn schema_sql() -> &'static str {
             format!(
                 "{STAGE_SCHEMA_SQL}{}{}",
                 rows::schema_sql(),
-                context::SCHEMA_SQL
+                context::schema_sql()
             )
         };
         #[cfg(any(test, feature = "test-support"))]

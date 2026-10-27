@@ -468,6 +468,36 @@ impl ExactDependencyArtifact {
     }
 }
 
+impl crate::analyzer::semantic_model::ArtifactExtraction {
+    /// Bind a producer's composite input to exact component bytes and their
+    /// structured artifact slots, independently of enumeration and local paths.
+    pub fn from_dependency_artifacts(
+        kind: ExternalArtifactKind,
+        artifacts: &[ExactDependencyArtifact],
+    ) -> Self {
+        let mut components = artifacts
+            .iter()
+            .map(|artifact| {
+                let mut hasher = CanonicalHasher::new(b"bifrost.artifact-extraction.component.v1");
+                hash_artifact_slot(
+                    &mut hasher,
+                    artifact.role(),
+                    artifact.kind(),
+                    artifact.module(),
+                );
+                hasher.field("sha256", artifact.sha256().as_bytes());
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+        components.sort_unstable();
+        let mut hasher = CanonicalHasher::new(b"bifrost.artifact-extraction.source-set.v1");
+        hasher.sequence("components", &components, |hasher, digest| {
+            hasher.field("component", digest)
+        });
+        Self::source_set(kind, &lower_hex_string(&hasher.finish()))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GoSourcePackageMetadata {
     import_path: String,

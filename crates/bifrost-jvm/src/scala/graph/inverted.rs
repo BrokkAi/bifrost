@@ -92,7 +92,7 @@ use brokk_bifrost_core::analyzer::usages::local_inference::{
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
-use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::borrow::Borrow;
@@ -710,33 +710,8 @@ pub fn single_replica_family<'a>(units: impl Iterator<Item = &'a CodeUnit>) -> b
 }
 
 impl ProjectTypes {
-    /// The declarations a bulk file-state read contributes to Scala's
-    /// request-local project facts, in insertion order. What stays here is the
-    /// decision about *which* units enter, which is Scala's:
-    /// the definition-lookup units and the declarations, file scopes excluded,
-    /// deduplicated in that order.
-    pub fn indexable_declarations(
-        file_states: &HashMap<ProjectFile, ScalaFileFacts>,
-    ) -> Vec<CodeUnit> {
-        let mut declarations = Vec::new();
-        let mut seen = HashSet::default();
-        for state in file_states.values() {
-            for unit in state
-                .definition_lookup_units
-                .iter()
-                .chain(&state.declarations)
-            {
-                if !unit.is_file_scope() && seen.insert(unit.clone()) {
-                    declarations.push(unit.clone());
-                }
-            }
-        }
-        declarations
-    }
-
-    /// Assemble the project type index from a bulk file-state read plus the two
-    /// finished analysis-side indexes built over
-    /// [`Self::indexable_declarations`].
+    /// Assemble the project type index from a bulk file-state read and the two
+    /// finished analysis-side indexes.
     pub fn from_parts(
         index: Arc<dyn ScalaDefinitionIndex>,
         facts: Arc<dyn ScalaCallableFactsIndex>,
@@ -7948,50 +7923,6 @@ pub fn scan_edge_file(
     sink.edges
 }
 
-/// Scan one caller-supplied Scala file through the same structured resolver used
-/// by the whole-workspace graph, without constructing or hydrating that graph.
-/// The caller supplies the exact-target sink and owns file eligibility.
-///
-/// `workspace` is the dispatching, all-language definition view (see
-/// [`ScalaWorkspaceSource`]). The walk consults it only to give a receiver or
-/// type whose written name has no Scala declaration one logical chance through
-/// the realm before giving up on it (#1859); per-file `ScalaSource` state is
-/// never used for that (#1805).
-#[allow(clippy::too_many_arguments)]
-pub fn scan_scala_query_file(
-    scala: &dyn ScalaSource,
-    token: QueryToken<'_>,
-    types: &ProjectTypes,
-    analyzer: &dyn CodeUnitIndex,
-    workspace: &dyn ScalaWorkspaceSource,
-    file: &ProjectFile,
-    source: &str,
-    sink: &mut dyn ScalaReferenceSink,
-    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-) -> bool {
-    if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled) {
-        return false;
-    }
-    let Some(tree) = parse_scala_query_file(scala, source) else {
-        return false;
-    };
-    let class_ranges = ClassRangeIndex::build(analyzer, file);
-    let parents = ParentIndex::new(tree.root_node());
-    scan_scala_query_tree(
-        scala,
-        token,
-        types,
-        workspace,
-        file,
-        source,
-        &tree,
-        class_ranges,
-        sink,
-        cancellation,
-        &parents,
-    )
-}
-
 pub fn parse_scala_query_file(scala: &dyn ScalaSource, source: &str) -> Option<Tree> {
     #[cfg(not(any(test, feature = "test-support")))]
     let _ = scala;
@@ -13135,40 +13066,54 @@ fn template_supertype_owners(
 /// The fqn of a receiver expression's type, for the shapes that resolve without
 /// return-type inference.
 fn receiver_type_declaration(
-    receiver: Node<'_>,
+    mut receiver: Node<'_>,
     token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<CodeUnit> {
-    match receiver.kind() {
-        "identifier" => {
-            let name = node_text(receiver, ctx.source);
-            if name == "this" {
-                return ctx.enclosing_class_unit(receiver.start_byte()).cloned();
-            }
-            if let Some(binding) = precise_scala_binding(bindings, name) {
-                if let Some(declaration) = binding.receiver_declaration {
-                    return Some(declaration);
+    let mut fields = Vec::new();
+    let mut declaration = loop {
+        if receiver.kind() != "field_expression" {
+            break (|| match receiver.kind() {
+                "identifier" => {
+                    let name = node_text(receiver, ctx.source);
+                    if name == "this" {
+                        return ctx.enclosing_class_unit(receiver.start_byte()).cloned();
+                    }
+                    if let Some(binding) = precise_scala_binding(bindings, name) {
+                        if let Some(declaration) = binding.receiver_declaration {
+                            return Some(declaration);
+                        }
+                        let receiver_type = binding.receiver_type?;
+                        return exact_receiver_type_declaration(
+                            &receiver_type,
+                            ctx.enclosing_class_unit(receiver.start_byte())?,
+                            ctx,
+                        );
+                    }
+                    if bindings.is_shadowed(name) || !is_field_expression_value(receiver) {
+                        return None;
+                    }
+                    match ctx.visible_object_reference(receiver.start_byte(), name) {
+                        Some(ScalaResolvedReference::Exact(object)) => Some(object),
+                        Some(ScalaResolvedReference::Logical(_)) | None => None,
+                    }
                 }
-                let receiver_type = binding.receiver_type?;
-                return exact_receiver_type_declaration(
-                    &receiver_type,
-                    ctx.enclosing_class_unit(receiver.start_byte())?,
-                    ctx,
-                );
-            }
-            if bindings.is_shadowed(name) || !is_field_expression_value(receiver) {
-                return None;
-            }
-            match ctx.visible_object_reference(receiver.start_byte(), name) {
-                Some(ScalaResolvedReference::Exact(object)) => Some(object),
-                Some(ScalaResolvedReference::Logical(_)) | None => None,
-            }
+                _ => None,
+            })();
         }
-        "field_expression" => {
-            let value = receiver.child_by_field_name("value")?;
-            let member = receiver.child_by_field_name("field")?;
-            let Some(owner) = receiver_type_declaration(value, token, ctx, bindings) else {
+        let Some(value) = receiver.child_by_field_name("value") else {
+            break None;
+        };
+        let Some(member) = receiver.child_by_field_name("field") else {
+            break None;
+        };
+        fields.push((receiver, member));
+        receiver = value;
+    };
+    for (receiver, member) in fields.into_iter().rev() {
+        declaration = (|| {
+            let Some(owner) = declaration.take() else {
                 return stable_object_path_declaration(receiver, ctx, bindings);
             };
             let member = node_text(member, ctx.source).trim();
@@ -13200,9 +13145,9 @@ fn receiver_type_declaration(
                 }
                 MemberReturnResolution::NoMatch | MemberReturnResolution::Unresolved => None,
             }
-        }
-        _ => None,
+        })();
     }
+    declaration
 }
 
 /// The semantic owner of a receiver expression.
@@ -13672,35 +13617,35 @@ fn preseed_owner_fields_in(
     owner: &CodeUnit,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "val_definition" | "var_definition" => {
-                if direct_owner_field_owner(child, ctx).as_ref() == Some(owner) {
-                    seed_value_definition_with_owner(
-                        child,
-                        token,
-                        ctx,
-                        Some(owner.clone()),
-                        bindings,
-                    );
-                }
-            }
-            "function_definition"
-            | "function_declaration"
-            | "class_definition"
-            | "object_definition"
-            | "trait_definition"
-            | "enum_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression"
-            | "anonymous_function" => {}
-            _ => preseed_owner_fields_in(child, token, ctx, owner, bindings),
+    visit_owner_field_definitions(node, &mut |child| {
+        if direct_owner_field_owner(child, ctx).as_ref() == Some(owner) {
+            seed_value_definition_with_owner(child, token, ctx, Some(owner.clone()), bindings);
         }
-    }
+    });
+}
+
+/// Visit field definitions without crossing callable or nested-owner scopes.
+fn visit_owner_field_definitions<'tree>(node: Node<'tree>, visit: &mut impl FnMut(Node<'tree>)) {
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+    walk_named_tree_preorder(node, false, |child| match child.kind() {
+        "val_definition" | "var_definition" => {
+            visit(child);
+            WalkControl::SkipChildren
+        }
+        "function_definition"
+        | "function_declaration"
+        | "class_definition"
+        | "object_definition"
+        | "trait_definition"
+        | "enum_definition"
+        | "block"
+        | "block_expression"
+        | "indented_block"
+        | "case_clause"
+        | "lambda_expression"
+        | "anonymous_function" => WalkControl::SkipChildren,
+        _ => WalkControl::Continue,
+    });
 }
 
 fn seed_value_definition(
@@ -14472,6 +14417,51 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::model::CodeUnitType;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "d5886539d3ef: quicksilver round 5 on brokk-bifrost-jvm: owner field preseeding recursed through deep expressions"
+    )]
+    fn owner_field_preseeding_deep_expressions_are_stack_safe() {
+        let source = format!(
+            "class Owner {{ {}0; val kept = 1; def f = {{ val hidden = 2 }}; class Nested {{ val hidden = 3 }} }}",
+            "1 + ".repeat(30_000)
+        );
+        let tree = crate::scala::language::parse_tree(&source)
+            .unwrap()
+            .unwrap();
+        assert!(!tree.root_node().has_error());
+        let body = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("body")
+            .unwrap();
+        let mut expression = body.named_child(0).unwrap();
+        let mut depth = 0;
+        while expression.kind() == "infix_expression" {
+            depth += 1;
+            expression = expression.named_child(0).unwrap();
+        }
+        assert_eq!(
+            depth, 30_000,
+            "template expression reaches the recursive descent arm"
+        );
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, || {
+                    let mut fields = Vec::new();
+                    visit_owner_field_definitions(body, &mut |node| {
+                        fields.push(node.utf8_text(source.as_bytes()).unwrap())
+                    });
+                    assert_eq!(fields, ["val kept = 1"]);
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+    }
 
     #[test]
     #[hardwon("#3393: Scala source-facts cache grew with every touched file")]

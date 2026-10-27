@@ -79,7 +79,10 @@ pub mod go_extraction_support_13 {
             let root = self.project.root();
             let module = json!({"Path":"example.test/root","Dir":root,"Main":true,"GoMod":root.join("go.mod")});
             GoPackageDiscovery {
-                    domain: Default::default(),
+                    domain: brokk_bifrost_go::package_discovery::GoDiscoveryDomain {
+                        modules: vec![(String::new(), "example.test/root".into())],
+                        ..Default::default()
+                    },
                     input_digest: None,
                     failure: None,
                 packages: vec![
@@ -87,7 +90,9 @@ pub mod go_extraction_support_13 {
                     serde_json::from_value(json!({"ImportPath":"example.test/root/provider","Name":"provider","Dir":root.join("provider"),"Module":module,"GoFiles":["item.go"]})).unwrap(),
                 ],
                 environment:serde_json::from_value(json!({"GOROOT":root.join("sdk"),"GOPATH":root.join("gopath"),"GOMODCACHE":root.join("modules"),"GOVERSION":"go1.22.0","GOWORK":"off","GOOS":"linux","GOARCH":"amd64"})).unwrap(),
-                goos:"linux".into(),goarch:"amd64".into(),build_tags:Vec::new(),workspace_patterns:vec!["./consumer".into()],vendor:false,
+                build_configuration:brokk_bifrost_go::package_discovery::GoBuildConfiguration{
+                    goos:"linux".into(),goarch:"amd64".into(),cgo_enabled:false,tags:Vec::new(),
+                },workspace_patterns:vec!["./consumer".into()],vendor:false,
             }
         }
         #[doc(hidden)]

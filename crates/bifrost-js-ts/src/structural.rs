@@ -1530,3 +1530,58 @@ mod result_use_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod qualified_path_tests {
+    use super::TYPESCRIPT_STRUCTURAL_SPEC;
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn qualified_type_segments_keep_nested_generic_arity() {
+        let cases = [
+            (
+                "type Result = Namespace.Outer<Inner<Leaf>>;",
+                ["Namespace", "Outer"].as_slice(),
+                [None, Some(1)].as_slice(),
+            ),
+            (
+                "type Result = Library.Collection<Key, Value>;",
+                ["Library", "Collection"].as_slice(),
+                [None, Some(2)].as_slice(),
+            ),
+        ];
+        for (source, expected_segments, expected_arities) in cases {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let mut paths = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "nested_type_identifier" {
+                    paths.push(node);
+                }
+                for index in (0..node.named_child_count()).rev() {
+                    stack.push(node.named_child(index).unwrap());
+                }
+            }
+            let path = paths
+                .into_iter()
+                .max_by_key(|node| node.named_child_count())
+                .unwrap_or_else(|| panic!("qualified type path: {}", tree.root_node().to_sexp()));
+            let tokens = TYPESCRIPT_STRUCTURAL_SPEC.path_segment_tokens(path);
+            let spellings: Vec<_> = tokens
+                .iter()
+                .map(|node| &source[node.start_byte()..node.end_byte()])
+                .collect();
+            assert_eq!(spellings, expected_segments);
+            let arities: Vec<_> = tokens
+                .iter()
+                .map(|token| TYPESCRIPT_STRUCTURAL_SPEC.segment_generic_arity(*token))
+                .collect();
+            assert_eq!(arities, expected_arities);
+        }
+    }
+}

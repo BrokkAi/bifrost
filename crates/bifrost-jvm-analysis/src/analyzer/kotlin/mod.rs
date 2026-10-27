@@ -916,6 +916,8 @@ impl IAnalyzer for KotlinAnalyzer {
         self
     }
 
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     fn begin_query(
         &self,
         context: &Arc<brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext>,
@@ -1746,7 +1748,15 @@ impl LanguageSupport for KotlinSupport {
     fn reference_graph_backend(
         &self,
     ) -> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
-        brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(&KotlinEdgePass)
+        if super::jvm::native_graph::native_jvm_graph_selected() {
+            brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Native(
+                &super::jvm::native_graph::JVM_NATIVE_GRAPH,
+            )
+        } else {
+            brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(
+                &KotlinEdgePass,
+            )
+        }
     }
 
     fn dead_code(&self) -> DeadCodeSupport {

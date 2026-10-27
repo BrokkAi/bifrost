@@ -101,6 +101,7 @@ impl<'a, 'store, 'input> ForwardProvider<'a, 'store, 'input> {
             arena,
             paths: prepared.paths,
             ready: prepared.ready,
+            projection_memo: None,
             base: prepared.base,
             session,
             cancellation,

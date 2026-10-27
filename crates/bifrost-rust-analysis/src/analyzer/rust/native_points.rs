@@ -719,6 +719,7 @@ fn resolve_rust_definition_with_operation(
         None
     };
     let mut matcher_diagnostic = None;
+    let mut matcher_namespace_undecided = false;
     if let Some(matched) = macro_binding {
         use brokk_bifrost_rust::macro_matcher::{
             MacroMatchError, MacroNamespaceEvidence, classify_fragment_interior,
@@ -750,20 +751,12 @@ fn resolve_rust_definition_with_operation(
                         )
                         .into_complete_resolution();
                     }
-                    // `tt`, `meta`, `vis`, `lifetime`, `literal`, or an `ident`
-                    // whose transcriber role is mixed, unused or undetermined
-                    // (`macro_matcher.rs:287-305`). The matcher is saying it
-                    // does not know which namespace the token is in, and a
-                    // `tt` group can hold a path. That is an incompleteness,
-                    // never a proved absence.
+                    // A fragment specifier alone may not carry a namespace,
+                    // but structured transcriber replay can have already
+                    // published an ordinary reference at this input span.
+                    // Let that producer authority answer before abstaining.
                     Some(MacroNamespaceEvidence::NoNamespace) => {
-                        return complete_definition(
-                            query.site,
-                            DefinitionLookupStatus::Incomplete,
-                            brokk_bifrost_analysis::analyzer::usages::get_definition::MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND,
-                            "the matched macro fragment carries no namespace, so the token's reference role is undecided",
-                        )
-                        .into_complete_resolution();
+                        matcher_namespace_undecided = true;
                     }
                     // The matcher bound the token inside a parsed fragment.
                     // Which namespace it is in is the fragment's own syntax to
@@ -923,6 +916,21 @@ fn resolve_rust_definition_with_operation(
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Complete { value, work } => {
             let mut outcome = adapt_definition_value(&query, value);
+            if matcher_namespace_undecided
+                && outcome
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == "native_reference_missing")
+            {
+                outcome = complete_definition(
+                    query.site,
+                    DefinitionLookupStatus::Incomplete,
+                    brokk_bifrost_analysis::analyzer::usages::get_definition::MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND,
+                    "the matched macro fragment carries no namespace and has no replayed reference site",
+                )
+                .into_complete_value();
+            }
+
             if let Some(condition) = &conditional_site_cfg {
                 outcome
                     .diagnostics
@@ -1835,25 +1843,24 @@ fn definition_answer_abstains(resolution: &FactResolutionAnswer) -> bool {
 /// so operation-specific cancellation and budget reasons are matched here too.
 ///
 /// A semantic that is one of the binding's own targets keeps the name from
-/// the `(SemanticId, definition)` pairing the answer carries. File-owned
-/// identities retain their spelling. Operation and selected-context ordinals
-/// depend on unrelated earlier lookups, so they are described without
-/// publishing the ordinal. The reason and any target name remain available to the caller.
+/// the `(SemanticId, definition)` pairing the answer carries. Local and
+/// shared semantics use the store's portable projection. Operation and
+/// selected-context semantics keep their runtime marker without an ordinal.
+/// The reason and any target name remain available to the caller.
 fn describe_incomplete_binding(
     completion: &ResolutionCompletion,
     names: &std::collections::BTreeMap<SemanticId, String>,
+    identities: &std::collections::BTreeMap<SemanticId, String>,
 ) -> String {
     use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason as Reason;
     let ResolutionCompletion::Incomplete(reasons) = completion else {
         unreachable!("an incomplete binding diagnostic requires an incomplete completion")
     };
-    let mut has_runtime_semantic = false;
-    let mut named = |semantic: &SemanticId| {
+    let named = |semantic: &SemanticId| {
         let identity = if semantic.operation_local_number().is_some() {
-            has_runtime_semantic = true;
             "runtime semantic".to_owned()
         } else {
-            semantic.to_string()
+            identities.get(semantic).cloned().unwrap_or_else(|| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_diagnostic_identity("semantic", None, None, None))
         };
         match names.get(semantic) {
             Some(name) => format!("{identity}, {name}"),
@@ -1886,11 +1893,8 @@ fn describe_incomplete_binding(
             Reason::UnmountedFile { fragment } => format!("unmounted_file({fragment})"),
         });
     }
-    if has_runtime_semantic {
-        // Runtime ordinals also order the reasons internally. Public
-        // descriptions must not inherit that lookup-dependent order.
-        described.sort_unstable();
-    }
+    // Every identity space can change encounter order across fresh stores.
+    described.sort_unstable();
     described.join(", ")
 }
 
@@ -1987,7 +1991,7 @@ fn modeled_macro_definitions(
     query: &BoundedReceiverQuery<'_>,
     answers: &[SelectedRustReferenceAnswer],
 ) -> Result<
-    Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    Vec<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     brokk_bifrost_rust::graph_support::RustCargoRouteError,
 > {
     use crate::analyzer::semantic_model::SemanticModelLocation;
@@ -2041,7 +2045,7 @@ fn modeled_macro_definitions(
     {
         return Ok(Vec::new());
     }
-    Ok(records.into_iter().cloned().collect())
+    Ok(records)
 }
 
 /// The attribute-macro frontiers that cannot change which declaration one Rust
@@ -2277,6 +2281,13 @@ fn adapt_definition_answer(
         .fold(ResolutionCompletion::Complete, |completion, answer| {
             completion.combine(answer.resolution.binding().completion())
         });
+    let diagnostic_identities = answers
+        .iter()
+        .flat_map(|answer| answer.diagnostic_identities.iter().cloned())
+        .collect::<BTreeMap<_, _>>();
+    let project_identity = |semantic: &SemanticId| {
+        diagnostic_identities.get(semantic).cloned().unwrap_or_else(|| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_diagnostic_identity("semantic", None, None, None))
+    };
     let definition_names = answers
         .iter()
         .flat_map(|answer| answer.definition_names.iter().cloned())
@@ -2464,14 +2475,19 @@ fn adapt_definition_answer(
             .to_string(),
         });
     }
-    for semantic in &generated_surface_gaps {
+    let mut public_generated_surface_gaps = generated_surface_gaps
+        .iter()
+        .map(project_identity)
+        .collect::<Vec<_>>();
+    public_generated_surface_gaps.sort_unstable();
+    for semantic in public_generated_surface_gaps {
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: "GeneratedItemSurface".to_owned(),
             message: serde_json::json!({
                 "evidence": [{
                     "reason": "GeneratedItemSurface",
-                    "semantic": semantic.to_string(),
+                    "semantic": semantic,
                 }]
             })
             .to_string(),
@@ -2645,7 +2661,7 @@ fn adapt_definition_answer(
                 UnindexedClaim::external_boundary_many(boundary_import_names, ClaimSubjectRole::Any)
             }),
             kind: "unindexed_import_boundary".to_owned(),
-            message: format!("selected Rust binding reaches an unindexed import: {completion:?}"),
+            message: format!("selected Rust binding reaches an unindexed import: {}", brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_completion_details(&completion, |id| project_identity(&id))),
         });
         DefinitionLookupStatus::UnresolvableImportBoundary
     } else if generated_surface_boundary || inactive_cfg_boundary {
@@ -2657,7 +2673,7 @@ fn adapt_definition_answer(
             message: format!(
                 "the language orders none of these candidates over the others (for Rust trait items, rustc E0034: multiple applicable items in scope): {:?}; {}",
                 definitions.iter().map(CodeUnit::fq_name).collect::<Vec<_>>(),
-                describe_incomplete_binding(&completion, &definition_names)
+                describe_incomplete_binding(&completion, &definition_names, &diagnostic_identities)
             ),
         });
         DefinitionLookupStatus::Ambiguous
@@ -2667,7 +2683,7 @@ fn adapt_definition_answer(
             kind: "incomplete_binding".to_owned(),
             message: format!(
                 "selected Rust binding is incomplete: {}",
-                describe_incomplete_binding(&completion, &definition_names)
+                describe_incomplete_binding(&completion, &definition_names, &diagnostic_identities)
             ),
         });
         DefinitionLookupStatus::Incomplete
@@ -2713,6 +2729,12 @@ fn adapt_definition_answer(
     attribute_frontier_evidence
         .sort_unstable_by_key(|frontier| (frontier.semantic, frontier.kind.evidence_name()));
     attribute_frontier_evidence.dedup();
+    attribute_frontier_evidence.sort_unstable_by_key(|frontier| {
+        (
+            project_identity(&frontier.semantic),
+            frontier.kind.evidence_name(),
+        )
+    });
     if attribute_frontier_closure.is_none() {
         for frontier in attribute_frontier_evidence {
             diagnostics.push(DefinitionLookupDiagnostic {
@@ -2729,7 +2751,7 @@ fn adapt_definition_answer(
                         "gap_kind": frontier.kind.evidence_name(),
                         "native_macro_invocation": false,
                         "reason": "GeneratedItemSurface",
-                        "semantic": frontier.semantic.to_string(),
+                        "semantic": project_identity(&frontier.semantic),
                     }]
                 })
                 .to_string(),
@@ -2737,7 +2759,7 @@ fn adapt_definition_answer(
         }
     }
     if let Some(closure) = attribute_frontier_closure {
-        let (kind, reason, frontiers) = match closure {
+        let (kind, reason, mut frontiers) = match closure {
             AttributeFrontierClosure::WrittenInherentMethod(frontiers) => (
                 "attribute_macro_frontier_cannot_change_inherent_dispatch",
                 "attribute macro frontier cannot change inherent dispatch",
@@ -2749,6 +2771,12 @@ fn adapt_definition_answer(
                 frontiers,
             ),
         };
+        frontiers.sort_unstable_by_key(|frontier| {
+            (
+                project_identity(&frontier.semantic),
+                frontier.kind.evidence_name(),
+            )
+        });
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
             kind: kind.to_owned(),
@@ -2756,7 +2784,7 @@ fn adapt_definition_answer(
             message: serde_json::json!({
                 "evidence": frontiers.iter().map(|frontier| serde_json::json!({
                     "gap_kind": frontier.kind.evidence_name(),
-                    "semantic": frontier.semantic.to_string(),
+                    "semantic": project_identity(&frontier.semantic),
                 })).collect::<Vec<_>>(),
                 "reason": reason,
             })
@@ -2870,6 +2898,21 @@ fn adapt_type_answer(
     answers: Vec<SelectedRustReferenceAnswer<SelectedRustTypeProjection>>,
 ) -> TypeLookupOutcome {
     let site = query.site;
+    let diagnostic_identities = answers
+        .iter()
+        .flat_map(|answer| {
+            answer
+                .projection
+                .diagnostic_identities
+                .iter()
+                .chain(answer.diagnostic_identities.iter())
+        })
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    let project_identity = |semantic: SemanticId| {
+        diagnostic_identities.get(&semantic).cloned().unwrap_or_else(|| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_diagnostic_identity("semantic", None, None, None))
+    };
+
     let local_declaration = match answers.as_slice() {
         [answer] if answer.definitions.is_empty() => match answer.lexical_definitions.as_slice() {
             [definition] => Some(definition.clone()),
@@ -2976,8 +3019,8 @@ fn adapt_type_answer(
                 diagnostics.push(TypeLookupDiagnostic {
                     kind: "incomplete_typed_frontier".to_owned(),
                     message: format!(
-                        "selected Rust type frontier is incomplete: {:?}",
-                        frontier.completion()
+                        "selected Rust type frontier is incomplete: {}",
+                        brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_completion_details(frontier.completion(), project_identity)
                     ),
                 });
             }
@@ -3006,7 +3049,8 @@ fn adapt_type_answer(
                     diagnostics.push(TypeLookupDiagnostic {
                         kind: "missing_nominal_type_definition".to_owned(),
                         message: format!(
-                            "selected Rust type identity {identity:?} has no source definition"
+                            "selected Rust type identity {} has no source definition",
+                            project_identity(identity)
                         ),
                     });
                     continue;
@@ -3048,7 +3092,7 @@ fn adapt_type_answer(
                         diagnostics.push(TypeLookupDiagnostic {
                             kind: "unsupported_unit_less_type_definition".to_owned(),
                             message: format!(
-                                "selected Rust type identity {identity:?} is a language universe entry with no source declaration"
+                                "selected Rust type identity {} is a language universe entry with no source declaration", project_identity(identity)
                             ),
                         });
                     }
@@ -3068,7 +3112,11 @@ fn adapt_type_answer(
         }
     }
     let canonical_type_count = canonical_types.len();
-    let canonical_keys = canonical_types.keys().copied().collect::<Vec<_>>();
+    let mut canonical_keys = canonical_types
+        .keys()
+        .map(|(identity, depth)| (project_identity(*identity), *depth))
+        .collect::<Vec<_>>();
+    canonical_keys.sort_unstable();
     let mut types = BTreeMap::<String, Vec<CodeUnit>>::new();
     for (fqn, definitions) in canonical_types.into_values() {
         types.entry(fqn).or_default().extend(definitions);

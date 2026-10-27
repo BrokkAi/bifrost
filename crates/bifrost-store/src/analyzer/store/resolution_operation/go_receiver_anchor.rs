@@ -107,10 +107,13 @@ pub enum GoReceiverAnchorMember {
     Unknown,
 }
 
-pub(crate) const GO_POINT_NULL_RECEIVER_FRONTIER: &str = r#"
+pub(crate) static GO_POINT_NULL_RECEIVER_FRONTIER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 SELECT DISTINCT obligation.receiver_slot
 FROM temp.selected_resolution_mounts mounted
-JOIN temp.selected_go_context_source_files selected_file
+JOIN ({}) selected_file
   ON selected_file.file_version_id=mounted.file_version_id AND selected_file.context_id=?4 AND selected_file.source_role<>'ignored'
 JOIN main.resolution_sites site
   ON site.blob_id=mounted.blob_id AND site.start_byte=?2 AND site.end_byte=?3
@@ -124,7 +127,10 @@ JOIN main.resolution_call_obligations obligation
 JOIN main.resolution_type_frontiers frontier
   ON frontier.blob_id=obligation.blob_id AND frontier.slot=obligation.receiver_slot
 WHERE mounted.mount_ordinal=?1 AND frontier.identity_reference IS NULL
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 pub(crate) const GO_POINT_RECEIVER_ANCHOR: &str = r#"
 WITH RECURSIVE package_files(mount_ordinal,blob_id) AS (
@@ -974,7 +980,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .inventory
             .connection()
-            .prepare_cached(GO_POINT_NULL_RECEIVER_FRONTIER)?;
+            .prepare_cached(&GO_POINT_NULL_RECEIVER_FRONTIER)?;
         let mut rows = statement.query(rusqlite::params![
             caller.ordinal().get(),
             i64::try_from(focus_start_byte).expect("Go source offsets fit SQLite integers"),

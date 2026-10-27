@@ -2575,6 +2575,84 @@ mod tests {
         ));
     }
 
+    fn analyzer_over_rust_fixture(
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+    ) -> TreeSitterAnalyzer<RustAdapter> {
+        let project = fixture.project_dyn();
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project),
+            RustAdapter,
+            AnalyzerConfig::default(),
+            store_context_from_store(project.as_ref(), store, false),
+            None,
+        )
+        .expect("analyzer over the fixture")
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6650: a source refused by admission cleared graph readiness for the whole inventory"
+    )]
+    fn refused_source_is_recorded_without_clearing_graph_readiness() {
+        let blob = format!("pub const DATA: &str = \"{}\";\n", "A".repeat(20_000));
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub fn ok() {}\n")
+            .file("src/blob.rs", blob.as_str())
+            .build();
+        let analyzer = analyzer_over_rust_fixture(&fixture);
+        // A refused file is not indexed, so the absence of a declaration is
+        // still unprovable. It is recorded with its reason, so graph readiness
+        // holds and the exclusion is named instead of hiding every file.
+        assert!(!analyzer.workspace_package_inventory_complete());
+        assert!(analyzer.indexed_source_inventory_complete());
+        let refusals = analyzer
+            .selected_source_admission_refusals()
+            .expect("recorded refusals")
+            .into_iter()
+            .map(|(file, reason)| {
+                (
+                    file.rel_path().to_path_buf(),
+                    serde_json::from_str::<serde_json::Value>(&reason).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let observed = blob.lines().map(str::len).max().unwrap();
+        assert_eq!(
+            refusals,
+            [(
+                std::path::PathBuf::from("src/blob.rs"),
+                serde_json::json!({"code": "structural_line", "limit": 16000, "observed": observed})
+            )]
+        );
+    }
+
+    #[test]
+    fn timed_out_source_is_not_a_refusal_and_clears_graph_readiness() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "pub fn ok() {}\n")
+            .file("src/slow.rs", "pub fn slow() {}\n")
+            .build();
+        *FORCED_PARSE_TIMEOUT_PATHS
+            .lock()
+            .expect("forced parse timeout paths mutex poisoned") =
+            vec![fixture.file("src/slow.rs").abs_path()];
+        let analyzer = analyzer_over_rust_fixture(&fixture);
+        FORCED_PARSE_TIMEOUT_PATHS
+            .lock()
+            .expect("forced parse timeout paths mutex poisoned")
+            .clear();
+        // A parse that did not finish is transient: nothing is recorded and
+        // the inventory is neither indexed nor accounted for.
+        assert!(!analyzer.indexed_source_inventory_complete());
+        assert!(
+            analyzer
+                .selected_source_admission_refusals()
+                .expect("recorded refusals")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn parse_timeout_stays_transient_and_same_content_recovers_on_retry_and_reopen() {
         let temp = tempfile::tempdir().unwrap();

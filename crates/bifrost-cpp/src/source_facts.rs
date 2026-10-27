@@ -7,7 +7,8 @@ use crate::declarations::{
 };
 use crate::graph::resolver::{
     cpp_declared_field_type_fact, cpp_type_name_components, declarator_name_node,
-    declarator_names_function_type, structured_alias_type_target,
+    declarator_names_function_type, parse_cpp_integer_literal as parse_integer_literal,
+    structured_alias_type_target,
 };
 use brokk_bifrost_core::analyzer::cpp_facts::*;
 use brokk_bifrost_core::analyzer::source_facts::{
@@ -261,7 +262,7 @@ fn capture_function_signature(
     fact.width_bits = width_bits;
     fact.member_function = Some(enclosing_member_function(node, declarator));
     fact.return_top_level_const = Some(declaration_has_direct_const_qualifier(node, source));
-    fact.member_function_const = Some(function_has_const_qualifier(declarator, source));
+    fact.member_function_const = Some(declaration_has_direct_const_qualifier(declarator, source));
     Some(fact.complete())
 }
 
@@ -270,20 +271,11 @@ fn capture_loop_variable(
     source: &str,
     occurrence: SourceOccurrenceId,
 ) -> Option<CppExpressionFact> {
-    let binding = node
-        .child_by_field_name("left")
-        .or_else(|| node.child_by_field_name("initializer"))
-        .and_then(|binding| first_declaration_or_name(binding));
-    let name = binding
-        .and_then(|binding| crate::structural::declarator_name_node(binding))
-        .map(|name| node_text(name, source).to_owned());
-    let type_node = node
-        .child_by_field_name("left")
-        .and_then(|left| left.child_by_field_name("type"))
-        .or_else(|| {
-            node.child_by_field_name("initializer")
-                .and_then(|init| init.child_by_field_name("type"))
-        });
+    let name = loop_binding_name(node, source);
+    let type_node = node.child_by_field_name("type").or_else(|| {
+        node.child_by_field_name("initializer")
+            .and_then(|init| init.child_by_field_name("type"))
+    });
     let (type_text, type_form, signedness, width_bits) = type_properties(type_node, source);
     let mut fact = CppExpressionFact::new(occurrence, CppExpressionKind::LoopVariable);
     fact.name = name;
@@ -399,10 +391,10 @@ fn enum_has_implicit_before_nonreference(node: Node<'_>) -> Option<bool> {
 }
 
 fn loop_binding_name(node: Node<'_>, source: &str) -> Option<String> {
-    let binding = node
-        .child_by_field_name("left")
-        .or_else(|| node.child_by_field_name("initializer"))
-        .and_then(first_declaration_or_name)?;
+    let binding = node.child_by_field_name("declarator").or_else(|| {
+        node.child_by_field_name("initializer")
+            .and_then(first_declaration_or_name)
+    })?;
     let name = crate::structural::declarator_name_node(binding)?;
     Some(node_text(name, source).to_owned())
 }
@@ -461,6 +453,15 @@ fn exact_parameter_type_size(
     source: &str,
     named_record_sizes: &HashMap<String, Option<u64>>,
 ) -> Option<u64> {
+    // Only a scalar/by-value declarator has the size of its written type.
+    // Pointer ABI size and adjusted array parameters are not known here;
+    // references likewise carry no exact-size evidence in this projection.
+    if node
+        .child_by_field_name("declarator")
+        .is_some_and(cpp_declarator_adds_indirection)
+    {
+        return None;
+    }
     let type_node = node.child_by_field_name("type")?;
     let type_text = node_text(type_node, source).trim();
     match type_text {
@@ -525,16 +526,26 @@ fn exact_char_record_size(record: Node<'_>, source: &str) -> Option<u64> {
         if !matches!(type_text, "char" | "signed char" | "unsigned char") {
             return None;
         }
-        let declarator = field.child_by_field_name("declarator")?;
-        let shape = declarator_shape(declarator, source);
-        let field_size = if shape.has_array {
-            shape.array_extent?
-        } else if shape.top == CppTypeForm::Unknown {
-            1
-        } else {
-            return None;
-        };
-        size = size.checked_add(field_size)?;
+        let mut cursor = field.walk();
+        let mut declarators = field
+            .children_by_field_name("declarator", &mut cursor)
+            .peekable();
+        declarators.peek()?;
+        for declarator in declarators {
+            let shape = declarator_shape(declarator, source);
+            let field_size = if shape.has_array {
+                shape.array_extent?
+            } else if shape.top == CppTypeForm::Unknown {
+                1
+            } else {
+                return None;
+            };
+            size = if record.kind() == "union_specifier" {
+                size.max(field_size)
+            } else {
+                size.checked_add(field_size)?
+            };
+        }
     }
     Some(size)
 }
@@ -714,48 +725,10 @@ fn type_properties(
     (Some(text), type_form, signedness, width_bits)
 }
 
-fn function_has_const_qualifier(declarator: Node<'_>, source: &str) -> bool {
-    let mut stack = vec![declarator];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "type_qualifier" && node_text(current, source).trim() == "const" {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    false
-}
-
 fn declaration_has_direct_const_qualifier(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| child.kind() == "type_qualifier" && node_text(child, source).trim() == "const")
-}
-
-fn parse_integer_literal(text: &str) -> Option<i128> {
-    let text = text.trim().replace('\'', "");
-    for candidate in std::iter::once(text.as_str()).chain(
-        ["ull", "llu", "ll", "ul", "lu", "u", "l"]
-            .into_iter()
-            .filter_map(|suffix| {
-                text.strip_suffix(suffix)
-                    .or_else(|| text.strip_suffix(&suffix.to_ascii_uppercase()))
-            }),
-    ) {
-        let (digits, radix) = if let Some(hex) = candidate.strip_prefix("0x") {
-            (hex, 16)
-        } else if let Some(binary) = candidate.strip_prefix("0b") {
-            (binary, 2)
-        } else if candidate.len() > 1 && candidate.starts_with('0') {
-            (candidate, 8)
-        } else {
-            (candidate, 10)
-        };
-        if let Ok(value) = i128::from_str_radix(digits, radix) {
-            return Some(value);
-        }
-    }
-    None
 }
 
 /// Parse the bounded C++ statement rows used by the statement-fact RQL
@@ -875,6 +848,52 @@ pub(crate) fn capture_field_type(
     let names_function_type = declarator.is_some_and(declarator_names_function_type);
     let field_type = cpp_declared_field_type_fact(node, type_node, field_name, source);
     (field_type, names_function_type)
+}
+
+/// Capture one `namespace name = target;` definition while the primary tree is
+/// live. The target path, the enclosing namespaces and the guard environment
+/// come from the same structured helpers that using declarations use.
+pub(crate) fn capture_namespace_alias(
+    node: Node<'_>,
+    source: &str,
+    ancestry: &ParentIndex<'_>,
+    namespaces: &crate::graph::resolver::OrphanedNamespaceScopeIndex,
+    collector: &mut PrimarySourceFactCollector<'_>,
+) -> Option<CppNamespaceAliasFact> {
+    if node.kind() != "namespace_alias_definition" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    let mut cursor = node.walk();
+    let target = node.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "namespace_identifier" | "nested_namespace_specifier" | "splice_specifier"
+        ) && child.id() != name.id()
+    })?;
+    let block = std::iter::successors(ancestry.parent(node), |current| ancestry.parent(*current))
+        .take_while(|current| {
+            !matches!(current.kind(), "namespace_definition" | "translation_unit")
+        })
+        .find(|current| current.kind() == "compound_statement");
+    Some(CppNamespaceAliasFact {
+        occurrence: collector.intern_node(node),
+        name: node_text(name, source).to_owned(),
+        target: crate::graph::resolver::cpp_name_component_nodes(target)
+            .filter(|components| !components.is_empty())
+            .map(|components| {
+                components
+                    .into_iter()
+                    .map(|component| node_text(component, source).to_owned())
+                    .collect()
+            }),
+        target_global: target.child(0).is_some_and(|child| child.kind() == "::"),
+        namespace: namespaces.enclosing_namespace_components(node, source),
+        block: block.map(|block| collector.intern_node(block)),
+        guards: crate::graph::resolver::binding_site_guards(node, source)
+            .as_ref()
+            .map(crate::source_context::cpp_guard_set_from_runtime),
+    })
 }
 
 pub(crate) fn capture_declaration(
@@ -1262,7 +1281,7 @@ fn callable_parameter_shape(
     let Some(inner) = reference else {
         return (false, false, remaining_parameters_defaulted);
     };
-    let CppComparableNode::Named { name, konst, .. } = parameter.node(inner) else {
+    let CppComparableNode::Named { name, .. } = parameter.node(inner) else {
         return (false, false, remaining_parameters_defaulted);
     };
     let same_owner = name.path().last().is_some_and(|name| name == owner_name);
@@ -1272,7 +1291,7 @@ fn callable_parameter_shape(
     let rvalue = first
         .child_by_field_name("declarator")
         .is_some_and(|declarator| declarator_contains_rvalue_reference(declarator));
-    let copy = *konst && !rvalue;
+    let copy = !rvalue;
     let move_parameter = rvalue;
     (copy, move_parameter, remaining_parameters_defaulted)
 }
@@ -1280,7 +1299,7 @@ fn callable_parameter_shape(
 fn declarator_contains_rvalue_reference(node: Node<'_>) -> bool {
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if current.kind() == "&&" {
+        if crate::declarations::reference_declarator_is_rvalue(current) {
             return true;
         }
         let mut cursor = current.walk();
@@ -1502,7 +1521,9 @@ pub(crate) fn base_access_specifier(
         if child.start_byte() >= base.start_byte() {
             break;
         }
-        if child.kind() == "access_specifier" {
+        if child.kind() == "," {
+            access = default;
+        } else if child.kind() == "access_specifier" {
             access = match child.child(0).map(|keyword| keyword.kind()) {
                 Some("public") => CppAccessSpecifier::Public,
                 Some("protected") => CppAccessSpecifier::Protected,
@@ -1680,6 +1701,439 @@ impl CppFileSourceFacts {
             range,
             role: fact.occurrence_role,
             conditional_family,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: range bindings, member const and numeric values used wrong syntax"
+    )]
+    fn source_fact_grammar_boundary() {
+        let source = "void f() { for (char i : xs) { for (char item : xs) {} } }\nstruct C { void f(const int x); void g() const; };\nint n[] = {0X10, 0B10, 1uLL, 2Lu, 010};\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        // Hand-written half-open spans pin which grammar fields carry these facts.
+        let mut stack = vec![tree.root_node()];
+        let mut loops = Vec::new();
+        let mut qualifiers = Vec::new();
+        let mut literals = Vec::new();
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "for_range_loop" => {
+                    assert!(node.child_by_field_name("left").is_none());
+                    loops.push((
+                        node.child_by_field_name("type").unwrap().byte_range(),
+                        node.child_by_field_name("declarator").unwrap().byte_range(),
+                    ));
+                }
+                "type_qualifier" => {
+                    qualifiers.push((node.parent().unwrap().kind(), node.byte_range()))
+                }
+                "number_literal" => literals.push(node.byte_range()),
+                _ => {}
+            }
+            let children: Vec<_> = node.named_children(&mut node.walk()).collect();
+            stack.extend(children.into_iter().rev());
+        }
+        assert_eq!(loops, [(16..20, 21..22), (36..40, 41..45)]);
+        assert_eq!(
+            qualifiers,
+            [
+                ("parameter_declaration", 77..82),
+                ("function_declarator", 100..105)
+            ]
+        );
+        assert_eq!(literals, [121..125, 127..131, 133..137, 139..142, 144..147]);
+        let rows = parse_cpp_expression_source_facts(source);
+        let bindings: Vec<_> = rows
+            .expressions
+            .iter()
+            .filter(|f| f.kind == CppExpressionKind::LoopVariable)
+            .map(|f| {
+                (
+                    f.name.as_deref(),
+                    f.type_text.as_deref(),
+                    f.loop_has_short_ancestor,
+                )
+            })
+            .collect();
+        let methods: Vec<_> = rows
+            .expressions
+            .iter()
+            .filter(|f| {
+                f.kind == CppExpressionKind::FunctionSignature && f.member_function == Some(true)
+            })
+            .map(|f| (f.name.as_deref(), f.member_function_const))
+            .collect();
+        let values: Vec<_> = rows
+            .expressions
+            .iter()
+            .filter(|f| f.kind == CppExpressionKind::IntegerLiteral)
+            .map(|f| f.integer_value)
+            .collect();
+        assert_eq!(
+            (bindings, methods, values),
+            (
+                vec![
+                    (Some("i"), Some("char"), Some(false)),
+                    (Some("item"), Some("char"), Some(true))
+                ],
+                vec![(Some("f"), Some(false)), (Some("g"), Some(true))],
+                vec![Some(16), Some(2), Some(1), Some(2), Some(8)]
+            )
+        );
+        // The C++20 init-statement is not the range binding. A traditional
+        // declaration-initialized inner loop still sees the short range name.
+        let rows = parse_cpp_expression_source_facts(
+            "void f() { for (int setup = 0; char i : xs) { for (int j = 0; j < 3; ++j) {} } }",
+        );
+        let bindings: Vec<_> = rows
+            .expressions
+            .iter()
+            .filter(|f| f.kind == CppExpressionKind::LoopVariable)
+            .map(|f| {
+                (
+                    f.name.as_deref(),
+                    f.type_text.as_deref(),
+                    f.loop_has_short_ancestor,
+                )
+            })
+            .collect();
+        assert_eq!(
+            bindings,
+            [
+                (Some("i"), Some("char"), Some(false)),
+                (Some("j"), Some("int"), Some(true))
+            ]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: base access leaked across commas"
+    )]
+    fn source_fact_base_access_defaults() {
+        // [class.access.base]: omitted access is decided independently per base.
+        let source = "struct A {}; struct B {}; struct S : private A, B {}; class C : public A, B {}; struct P : protected A {};";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut access = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "base_class_clause" {
+                for base in node
+                    .named_children(&mut node.walk())
+                    .filter(|n| n.kind() == "type_identifier")
+                {
+                    access.push(base_access_specifier(
+                        node,
+                        base,
+                        node.parent().unwrap().kind(),
+                    ));
+                }
+            }
+            let children: Vec<_> = node.named_children(&mut node.walk()).collect();
+            stack.extend(children.into_iter().rev());
+        }
+        assert_eq!(
+            access,
+            [
+                CppAccessSpecifier::Private,
+                CppAccessSpecifier::Public,
+                CppAccessSpecifier::Public,
+                CppAccessSpecifier::Private,
+                CppAccessSpecifier::Protected
+            ]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: parameter indirection reused pointee size"
+    )]
+    fn source_fact_parameter_sizes_respect_indirection() {
+        let rows = parse_cpp_expression_source_facts(
+            "void f(char a, signed char b, unsigned char c, char *p, char &r, char xs[3]);",
+        );
+        let sizes: Vec<_> = rows
+            .expressions
+            .iter()
+            .filter(|f| {
+                f.name.is_some()
+                    && matches!(
+                        f.kind,
+                        CppExpressionKind::FunctionParameter | CppExpressionKind::ArrayParameter
+                    )
+            })
+            .map(|f| (f.name.as_deref(), f.type_size_bytes, f.type_size_exact))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                (Some("a"), Some(1), Some(true)),
+                (Some("b"), Some(1), Some(true)),
+                (Some("c"), Some(1), Some(true)),
+                (Some("p"), None, Some(false)),
+                (Some("r"), None, Some(false)),
+                (Some("xs"), None, Some(false))
+            ]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: union sizes summed and later field declarators vanished"
+    )]
+    fn source_fact_record_sizes_follow_member_layout() {
+        let rows = parse_cpp_expression_source_facts(
+            "union U { char a[2]; char b[3]; }; struct S { char a, b; }; void f(U u, S s);",
+        );
+        let sizes: Vec<_> = rows
+            .expressions
+            .iter()
+            .filter(|f| f.kind == CppExpressionKind::FunctionParameter)
+            .map(|f| (f.name.as_deref(), f.type_size_bytes))
+            .collect();
+        // [class.union] requires room for the largest member; char has size one.
+        assert_eq!(sizes, [(Some("u"), Some(3)), (Some("s"), Some(2))]);
+    }
+
+    const REFERENCES: &str = "struct C {\n C(C& a); C(const C& a); C(C&& a); C(const C&& a);\n C(C&& a, int n = 0); C(C* a);\n C& operator=(const C& a); C& operator=(C&& a);\n operator C&(); operator C&&();\n};\nC& l = c; C&& r = f();\nvoid f() { try {} catch(C& e) {} try {} catch(const C& e) {} try {} catch(C&& e) {} }\nstruct V {\n V(V& a);\n V& operator=(V& a);\n V(const V& a);\n V& operator=(const V& a);\n V(volatile V& a);\n V& operator=(volatile V& a);\n V(const volatile V& a);\n V& operator=(const volatile V& a);\n V(V& a, int n = 0);\n V(volatile V& a, int n = 0);\n};\n";
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d4f00f8567e4: quicksilver round 4 on brokk-bifrost-cpp: unnamed && tokens hid rvalue references"
+    )]
+    #[brokk_bifrost_test_macros::hardwon(
+        "d4f00f8567e4: quicksilver round 4 on brokk-bifrost-cpp: a mutable C& copy constructor was not classified as copy"
+    )]
+    fn cpp_reference_token_grammar() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(REFERENCES, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        // Half-open byte spans from the pinned grammar boundary table. The
+        // reference wrapper has no fields; the parameter owns `declarator`.
+        let expected = "reference_declarator 15..18 & 15..16 identifier 17..18
+reference_declarator 30..33 & 30..31 identifier 32..33
+reference_declarator 39..43 && 39..41 identifier 42..43
+reference_declarator 55..59 && 55..57 identifier 58..59
+reference_declarator 66..70 && 66..68 identifier 69..70
+reference_declarator 95..118 & 95..96 function_declarator 97..118
+reference_declarator 114..117 & 114..115 identifier 116..117
+reference_declarator 121..139 & 121..122 function_declarator 123..139
+reference_declarator 134..138 && 134..136 identifier 137..138
+abstract_reference_declarator 152..155 & 152..153 abstract_function_declarator 153..155
+abstract_reference_declarator 167..171 && 167..169 abstract_function_declarator 169..171
+reference_declarator 177..180 & 177..178 identifier 179..180
+reference_declarator 187..191 && 187..189 identifier 190..191
+reference_declarator 224..227 & 224..225 identifier 226..227
+reference_declarator 252..255 & 252..253 identifier 254..255
+reference_declarator 274..278 && 274..276 identifier 277..278
+reference_declarator 300..303 & 300..301 identifier 302..303
+reference_declarator 308..325 & 308..309 function_declarator 310..325
+reference_declarator 321..324 & 321..322 identifier 323..324
+reference_declarator 337..340 & 337..338 identifier 339..340
+reference_declarator 345..368 & 345..346 function_declarator 347..368
+reference_declarator 364..367 & 364..365 identifier 366..367
+reference_declarator 383..386 & 383..384 identifier 385..386
+reference_declarator 391..417 & 391..392 function_declarator 393..417
+reference_declarator 413..416 & 413..414 identifier 415..416
+reference_declarator 438..441 & 438..439 identifier 440..441
+reference_declarator 446..478 & 446..447 function_declarator 448..478
+reference_declarator 474..477 & 474..475 identifier 476..477
+reference_declarator 484..487 & 484..485 identifier 486..487
+reference_declarator 514..517 & 514..515 identifier 516..517";
+        let mut stack = vec![tree.root_node()];
+        let mut actual = Vec::new();
+        let mut references = Vec::new();
+        let mut qualifiers = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "type_qualifier" && node.start_byte() >= 285 {
+                assert_eq!(node.parent().unwrap().kind(), "parameter_declaration");
+                qualifiers.push((
+                    node.utf8_text(REFERENCES.as_bytes()).unwrap(),
+                    node.byte_range(),
+                ));
+            }
+            if matches!(
+                node.kind(),
+                "reference_declarator" | "abstract_reference_declarator"
+            ) {
+                let token = node.child(0).unwrap();
+                let wrapped = node.named_child(0).unwrap();
+                assert!(!token.is_named());
+                assert!(node.child_by_field_name("declarator").is_none());
+                assert_eq!(node.field_name_for_child(0), None);
+                assert_eq!(node.field_name_for_child(1), None);
+                if node.parent().unwrap().kind() == "parameter_declaration" {
+                    assert_eq!(
+                        node.parent().unwrap().child_by_field_name("declarator"),
+                        Some(node)
+                    );
+                }
+                actual.push(format!(
+                    "{} {:?} {} {:?} {} {:?}",
+                    node.kind(),
+                    node.byte_range(),
+                    token.kind(),
+                    token.byte_range(),
+                    wrapped.kind(),
+                    wrapped.byte_range()
+                ));
+                references.push(node);
+            }
+            let children: Vec<_> = node.named_children(&mut node.walk()).collect();
+            stack.extend(children.into_iter().rev());
+        }
+        assert_eq!(actual.join("\n"), expected);
+        assert_eq!(
+            qualifiers,
+            [
+                ("const", 330..335),
+                ("const", 357..362),
+                ("volatile", 373..381),
+                ("volatile", 403..411),
+                ("const", 422..427),
+                ("volatile", 428..436),
+                ("const", 458..463),
+                ("volatile", 464..472),
+                ("volatile", 504..512),
+            ]
+        );
+        for node in references {
+            let token = node.child(0).unwrap();
+            let wrapped = node.named_child(0).unwrap();
+            // A return wrapper also contains the function's parameters. The
+            // producer calls this helper on parameter declarators only.
+            if wrapped.kind() == "function_declarator" {
+                continue;
+            }
+            assert_eq!(
+                declarator_contains_rvalue_reference(node),
+                token.kind() == "&&",
+                "reference at {:?}",
+                node.byte_range()
+            );
+        }
+        let rows = parse_cpp_class_fact_rows(REFERENCES);
+        use CppSpecialMemberKind::{
+            CopyAssignment, CopyConstructor, MoveAssignment, MoveConstructor, None as NotSpecial,
+        };
+        // Pin the defect's public class/catch consequences as well as its
+        // grammar boundary, including all cv-qualified lvalue references.
+        let members: Vec<_> = rows
+            .members
+            .iter()
+            .take(8)
+            .map(|member| member.special_member)
+            .collect();
+        assert_eq!(
+            members,
+            [
+                CopyConstructor,
+                CopyConstructor,
+                MoveConstructor,
+                MoveConstructor,
+                MoveConstructor,
+                NotSpecial,
+                CopyAssignment,
+                MoveAssignment
+            ]
+        );
+        assert!(rows.members[4].remaining_parameters_defaulted);
+        let cv_members: Vec<_> = rows
+            .members
+            .iter()
+            .filter(|member| member.owner == ["V"])
+            .collect();
+        assert_eq!(
+            cv_members
+                .iter()
+                .map(|member| member.special_member)
+                .collect::<Vec<_>>(),
+            [
+                CopyConstructor,
+                CopyAssignment,
+                CopyConstructor,
+                CopyAssignment,
+                CopyConstructor,
+                CopyAssignment,
+                CopyConstructor,
+                CopyAssignment,
+                CopyConstructor,
+                CopyConstructor
+            ]
+        );
+        assert!(cv_members.iter().all(|member| member.copy_parameter));
+        assert!(
+            cv_members[8..]
+                .iter()
+                .all(|member| member.remaining_parameters_defaulted)
+        );
+        assert_eq!(
+            rows.catches
+                .iter()
+                .map(|catch| catch.value_category)
+                .collect::<Vec<_>>(),
+            [
+                CppParameterValueCategory::LValueReference,
+                CppParameterValueCategory::LValueReference,
+                CppParameterValueCategory::RValueReference
+            ]
+        );
+    }
+
+    #[test]
+    fn specialized_declaration_name_grammar_boundary() {
+        for (source, field_kind, expected, offset) in [
+            ("struct Plain {};", "type_identifier", "Plain", 7),
+            ("template<> struct Box<int> {};", "template_type", "Box", 18),
+            (
+                "struct ns::Qualified {};",
+                "qualified_identifier",
+                "Qualified",
+                11,
+            ),
+        ] {
+            let tree = crate::diagnostics::parse_cpp_tree(source);
+            assert!(!tree.root_node().has_error());
+            let mut stack = vec![tree.root_node()];
+            let mut names = Vec::new();
+            while let Some(node) = stack.pop() {
+                if node.kind() == "struct_specifier" {
+                    let field = node.child_by_field_name("name").unwrap();
+                    assert_eq!(field.kind(), field_kind);
+                    let unit = CodeUnit::new(
+                        brokk_bifrost_core::analyzer::ProjectFile::new(
+                            std::env::temp_dir(),
+                            "names.cpp",
+                        ),
+                        brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
+                        "",
+                        expected,
+                    );
+                    let name = declaration_name(node, &unit, source).unwrap();
+                    names.push((node_text(name, source), name.byte_range()));
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+            assert_eq!(names, [(expected, offset..offset + expected.len())]);
         }
     }
 }

@@ -417,6 +417,7 @@ fn java_native_operation_mounts_every_selected_jvm_snapshot() {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .unwrap();
     }
@@ -2097,7 +2098,7 @@ fn java_native_type_prefix_obscures_package_only_after_complete_lookup() {
     // may supply MissingTypes, Nested constructor applicability, and Nested
     // type ambiguity all remain open without a binding for MissingTypes.
     assert_eq!(
-        binding.message.matches("UnsupportedSemantic(").count(),
+        binding.message.matches("UnsupportedSemantic:").count(),
         4,
         "{missing:?}"
     );

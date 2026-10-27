@@ -34,6 +34,26 @@ pub fn semantic_cells(semantic: SemanticId) -> (Option<i64>, Option<i64>) {
     }
 }
 
+/// A root endpoint's fixed-prefix seek key. Outer None is cancellation;
+/// inner None means this endpoint is not the universal root.
+pub(super) fn root_endpoint_key(
+    endpoint: &EndpointSignature,
+    cancellation: &CancellationToken,
+) -> Option<Option<(String, bool)>> {
+    if endpoint.node() != BindingNodeId::universal_root() {
+        return Some(None);
+    }
+    let mut key = RootKeyBuilder::default();
+    for symbol in endpoint.symbols().fixed() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let (runtime, shared) = semantic_cells(symbol.symbol());
+        key.push(runtime, shared, symbol.scopes().is_some());
+    }
+    Some(Some((key.finish().0, endpoint.symbols().tail().is_some())))
+}
+
 /// Decode an actual ordinary catalog payload with its selected owner and
 /// request shared-name aliases. NULL kind remains catalog-only authority.
 pub(in crate::analyzer::store) fn decode_ordinary_node_kind(
@@ -122,22 +142,7 @@ pub fn prepare_lexical_fragment(
         let start = endpoint_lead(path.start());
         let end = endpoint_lead(path.end());
         let root = path.end().node() == BindingNodeId::universal_root();
-        let (fixed, tail) = if root {
-            let mut key = RootKeyBuilder::default();
-            for symbol in path.end().symbols().fixed() {
-                if cancellation.is_cancelled() {
-                    return None;
-                }
-                let (runtime, shared) = semantic_cells(symbol.symbol());
-                key.push(runtime, shared, symbol.scopes().is_some());
-            }
-            (
-                Some(key.finish().0),
-                Some(path.end().symbols().tail().is_some()),
-            )
-        } else {
-            (None, None)
-        };
+        let (fixed, tail) = root_endpoint_key(path.end(), cancellation)?.unzip();
         let terminal = if root && path.end().symbols().fixed().len() >= 3 {
             path.end()
                 .symbols()

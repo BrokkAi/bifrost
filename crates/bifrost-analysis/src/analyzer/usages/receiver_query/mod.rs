@@ -3197,8 +3197,8 @@ fn resolved_member_targets(
                         unreachable!("unique modeled member resolution has one record");
                     };
                     targets.push(ReceiverMemberTarget::SemanticModel {
-                        receiver: Box::new(ModeledDeclarationIdentity::from(*owner)),
-                        member: Box::new(ModeledDeclarationIdentity::from(*member)),
+                        receiver: Box::new(ModeledDeclarationIdentity::from(owner.as_ref())),
+                        member: Box::new(ModeledDeclarationIdentity::from(member.as_ref())),
                         receiver_proof: receiver_proof.clone(),
                     });
                     exhaustive_absence = false;
@@ -3209,8 +3209,8 @@ fn resolved_member_targets(
                     exhaustive_absence = false;
                     for member in matched.records {
                         targets.push(ReceiverMemberTarget::SemanticModel {
-                            receiver: Box::new(ModeledDeclarationIdentity::from(*owner)),
-                            member: Box::new(ModeledDeclarationIdentity::from(member)),
+                            receiver: Box::new(ModeledDeclarationIdentity::from(owner.as_ref())),
+                            member: Box::new(ModeledDeclarationIdentity::from(member.as_ref())),
                             receiver_proof: receiver_proof.clone(),
                         });
                     }
@@ -3220,8 +3220,8 @@ fn resolved_member_targets(
                     exhaustive_absence = false;
                     for member in matched.records {
                         targets.push(ReceiverMemberTarget::SemanticModel {
-                            receiver: Box::new(ModeledDeclarationIdentity::from(*owner)),
-                            member: Box::new(ModeledDeclarationIdentity::from(member)),
+                            receiver: Box::new(ModeledDeclarationIdentity::from(owner.as_ref())),
+                            member: Box::new(ModeledDeclarationIdentity::from(member.as_ref())),
                             receiver_proof: receiver_proof.clone(),
                         });
                     }

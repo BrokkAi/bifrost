@@ -224,38 +224,6 @@ impl RustSourceContextIndex {
         Ok(binder)
     }
 
-    /// Build one binder per context in the visible chain, ordered from the
-    /// queried context outward to its file root. Each binder contains only
-    /// imports declared directly in that context. The anchor index is walked
-    /// once and rows are distributed to their direct context binder, so a
-    /// deep chain does not rescan its imports once per ancestor.
-    pub fn visible_import_binders(
-        &self,
-        facts: &RustHierarchySourceFacts,
-        context: SourceOccurrenceId,
-        keep_going: &dyn Fn() -> bool,
-    ) -> Result<Vec<(SourceOccurrenceId, ImportBinder)>, RustCargoRouteError> {
-        let mut binders = HashMap::default();
-        let chain =
-            self.for_each_visible_import(facts, context, keep_going, |context, import| {
-                insert_rust_source_import_binding(
-                    binders.entry(context).or_insert_with(ImportBinder::empty),
-                    import,
-                );
-            })?;
-
-        chain
-            .into_iter()
-            .map(|context| {
-                let context_id = context.context;
-                let binder = binders
-                    .remove(&context_id)
-                    .unwrap_or_else(ImportBinder::empty);
-                Ok((context_id, binder))
-            })
-            .collect()
-    }
-
     fn for_each_visible_import<'facts>(
         &self,
         facts: &'facts RustHierarchySourceFacts,

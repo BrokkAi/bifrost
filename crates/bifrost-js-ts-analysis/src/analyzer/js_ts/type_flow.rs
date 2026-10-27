@@ -197,14 +197,14 @@ fn js_ts_external_symbol(symbol: &SemanticModelSymbol) -> bool {
         )
 }
 
-fn external_type_from_symbols<'a>(
+fn external_type_from_symbols(
     overlay: Option<&SemanticModelOverlay>,
-    symbols: impl Iterator<Item = &'a SemanticModelSymbol>,
+    symbols: impl Iterator<Item = Arc<SemanticModelSymbol>>,
 ) -> Option<ExternalType> {
     let symbols = symbols
         .filter(|symbol| js_ts_external_symbol(symbol))
         .collect::<Vec<_>>();
-    let symbol = *symbols.first()?;
+    let symbol = symbols.first()?.clone();
     if symbol.kind == SemanticModelSymbolKind::Class {
         if symbols.iter().any(|candidate| {
             candidate.kind != SemanticModelSymbolKind::Class
@@ -229,7 +229,7 @@ fn external_type_from_symbols<'a>(
     let [symbol] = symbols.as_slice() else {
         return None;
     };
-    let symbol = *symbol;
+    let symbol = symbol.clone();
     let identity = ClassIdentity::External {
         qualified_name: symbol.qualified_name.clone().into_boxed_str(),
         symbol_id: symbol.id.clone().into_boxed_str(),
@@ -1352,8 +1352,7 @@ fn external_member_lookup(
         }
         let relevant = records
             .iter()
-            .copied()
-            .filter(|symbol| {
+            .filter(|&symbol| {
                 matches!(
                     (kind, symbol.kind),
                     (MemberAccessKind::Call, SemanticModelSymbolKind::Method)
@@ -1365,6 +1364,7 @@ fn external_member_lookup(
                         )
                 )
             })
+            .cloned()
             .collect::<Vec<_>>();
         if relevant.is_empty() {
             return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
@@ -1997,7 +1997,7 @@ fn scan_surface_call(
         .map(|(root, member)| (root.as_str(), member.as_str()))
     {
         Some(("Object", "assign")) => {
-            let Some(target) = arguments.first().copied() else {
+            let Some(target) = arguments.first().cloned() else {
                 return;
             };
             let targets = || {
@@ -2006,7 +2006,7 @@ fn scan_surface_call(
                     target,
                 )
             };
-            for source in arguments.iter().skip(1).copied() {
+            for source in arguments.iter().skip(1).cloned() {
                 match object_literal_member_names(source, prepared.source()) {
                     Ok(names) => {
                         for name in names {
@@ -2018,7 +2018,7 @@ fn scan_surface_call(
             }
         }
         Some(("Object", "defineProperty")) => {
-            let Some(target) = arguments.first().copied() else {
+            let Some(target) = arguments.first().cloned() else {
                 return;
             };
             let targets = mutation_targets(
@@ -2033,7 +2033,7 @@ fn scan_surface_call(
         }
         Some(("Object", "defineProperties" | "setPrototypeOf"))
         | Some(("Reflect", "defineProperty" | "set" | "setPrototypeOf")) => {
-            let Some(target) = arguments.first().copied() else {
+            let Some(target) = arguments.first().cloned() else {
                 return;
             };
             let targets = mutation_targets(
@@ -2043,7 +2043,7 @@ fn scan_surface_call(
             summary.record(targets, None);
         }
         Some(("Proxy", "revocable")) => {
-            let Some(target) = arguments.first().copied() else {
+            let Some(target) = arguments.first().cloned() else {
                 return;
             };
             let targets = mutation_targets(
@@ -2195,7 +2195,7 @@ fn member_surface_survey(
                 && constructor.kind() == "identifier"
                 && slice(constructor, prepared.source()) == "Proxy"
                 && !lexical.is_bound_at("Proxy", constructor.start_byte())
-                && let Some(target) = call_arguments(node).first().copied()
+                && let Some(target) = call_arguments(node).first().cloned()
             {
                 let targets = mutation_targets(
                     workspace, language, host, &lookup, &file, &prepared, &imports, &lexical,

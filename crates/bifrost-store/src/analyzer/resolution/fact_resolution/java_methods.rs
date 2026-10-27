@@ -6,6 +6,7 @@ use super::super::fact_source::{
     language_can_close_interface_object_frontier, language_implicit_root_member_names,
 };
 use super::*;
+use brokk_bifrost_core::analyzer::structural::callable::ArgumentConversion;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
 
@@ -70,12 +71,15 @@ impl FactReadSession<'_> {
 }
 
 impl FactEvaluation<'_, '_> {
-    pub(super) fn java_call_candidate_type_frontier_reasons(
+    /// Operand types affect applicability, not a fixed member inventory.
+    /// Keep operational failures open even when all semantic operand gaps
+    /// can be left on the nested evaluation that produced them.
+    pub(super) fn jvm_call_candidate_operand_frontier(
         &mut self,
         obligation: &LoweredCallApplicabilityObligation,
         signature: &LoweredCallableSignatureProperty,
         states: &StateMap,
-    ) -> StoreResult<Option<Option<BTreeSet<SemanticId>>>> {
+    ) -> StoreResult<Option<Option<BTreeSet<ResolutionIncompleteReason>>>> {
         if obligation.explicit_type_argument_count() != 0
             || signature.completion() != &ResolutionCompletion::Complete
             || signature.type_parameter_count() != 0
@@ -100,24 +104,19 @@ impl FactEvaluation<'_, '_> {
                 let Some(state) = states.get(&slot) else {
                     return Ok(Some(None));
                 };
-                if state
-                    .possible_values()
-                    .iter()
-                    .any(|value| !matches!(value, ResolutionSlotValue::Runtime { .. }))
-                    || (state.completion() == &ResolutionCompletion::Complete
-                        && state.possible_values().is_empty())
-                {
-                    return Ok(Some(None));
-                }
                 if let ResolutionCompletion::Incomplete(incomplete) = state.completion() {
                     for reason in incomplete.iter() {
                         if self.poll_cancelled() {
                             return Ok(None);
                         }
-                        let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason else {
-                            return Ok(Some(None));
-                        };
-                        reasons.insert(*reason);
+                        match reason {
+                            ResolutionIncompleteReason::UnsupportedSemantic(_)
+                            | ResolutionIncompleteReason::OpenBoundary { .. }
+                            | ResolutionIncompleteReason::InconsistentPrecedence(_) => {
+                                reasons.insert(*reason);
+                            }
+                            _ => return Ok(Some(None)),
+                        }
                     }
                 }
             }
@@ -557,6 +556,14 @@ impl FactEvaluation<'_, '_> {
             if owner.hierarchy_depth == 0 {
                 continue;
             }
+            if let Some((_, rules)) = self.implicit_interface_member_rules(owner) {
+                debug_assert_eq!(rules.visibility, DeclaredVisibility::Public);
+                debug_assert!(rules.is_abstract);
+                // JLS 9.2 declares this member directly on the interface.
+                // Its public, abstract instance modifiers come from the
+                // selected language rule; no Object owner metadata is needed.
+                continue;
+            }
             let Some(method) = declarations.get(&target) else {
                 unresolved = true;
                 continue;
@@ -574,32 +581,35 @@ impl FactEvaluation<'_, '_> {
                 removed.insert(target);
                 continue;
             }
-            let Some(declaration) = declarations.get(&owner.owner) else {
-                unresolved = true;
-                continue;
-            };
-            if is_static
-                && matches!(
-                    declaration.kind,
-                    JavaInheritanceDeclarationKind::Type {
-                        is_interface: true,
-                        ..
+            if is_static {
+                match declarations.get(&owner.owner).map(|row| &row.kind) {
+                    Some(JavaInheritanceDeclarationKind::Type {
+                        is_interface: true, ..
+                    }) => {
+                        removed.insert(target);
+                        continue;
                     }
-                )
-            {
-                removed.insert(target);
-                continue;
+                    Some(JavaInheritanceDeclarationKind::Type {
+                        is_interface: false,
+                        ..
+                    }) => {}
+                    _ => unresolved = true,
+                }
             }
             if visibility == DeclaredVisibility::PackagePrivate {
                 for step in &owner.owner_path {
                     match declarations.get(step) {
-                        Some(declaration) if method.package != declaration.package => {
+                        Some(declaration)
+                            if method.package.same_known_package(&declaration.package)
+                                == Some(false) =>
+                        {
                             removed.insert(target);
                             break;
                         }
-                        // None names the known unnamed package on a present
-                        // source declaration, not unavailable metadata.
-                        Some(_) => {}
+                        Some(declaration)
+                            if method.package.same_known_package(&declaration.package)
+                                == Some(true) => {}
+                        Some(_) => unresolved = true,
                         None => unresolved = true,
                     }
                 }
@@ -624,26 +634,38 @@ impl FactEvaluation<'_, '_> {
                 .then_some(target)
             })
             .collect::<HashSet<_>>();
+        let declaration_owners = candidates
+            .iter()
+            .filter_map(|target| {
+                let owner = self.member_owner_by_target.get(target)?.as_ref()?;
+                Some((*target, self.method_declaration_owner(owner)))
+            })
+            .collect::<HashMap<_, _>>();
         let additional_dominance = |base: SemanticId,
                                     derived: SemanticId,
-                                    base_owner: &FactMemberOwner,
-                                    derived_owner: &FactMemberOwner,
+                                    _base_owner: &FactMemberOwner,
+                                    _derived_owner: &FactMemberOwner,
                                     nearer: bool| {
-            let class_over_interface = matches!(
-                declarations.get(&base_owner.owner).map(|row| &row.kind),
-                Some(JavaInheritanceDeclarationKind::Type {
-                    is_interface: true,
-                    ..
-                })
-            ) && matches!(
-                declarations.get(&derived_owner.owner).map(|row| &row.kind),
-                Some(JavaInheritanceDeclarationKind::Type {
-                    is_interface: false,
-                    ..
-                })
-            );
             let static_family = static_methods.contains(&base) || static_methods.contains(&derived);
-            class_over_interface || (static_family && nearer)
+            if static_family && nearer {
+                return Some(true);
+            }
+            let owner_kind = |target| match declarations
+                .get(&declaration_owners[&target])
+                .map(|row| &row.kind)
+            {
+                Some(JavaInheritanceDeclarationKind::Type { is_interface, .. }) => {
+                    Some(*is_interface)
+                }
+                _ => None,
+            };
+            match (owner_kind(base), owner_kind(derived)) {
+                (Some(false), _) | (_, Some(true)) => Some(false),
+                (Some(base_interface), Some(derived_interface)) => {
+                    Some(base_interface && !derived_interface)
+                }
+                _ => None,
+            }
         };
         let owners = candidates
             .iter()
@@ -993,11 +1015,15 @@ impl FactEvaluation<'_, '_> {
         let Some(named_reference_slots) = self.java_named_reference_parameter_slots(&slots)? else {
             return Ok(None);
         };
-        let excluded = candidates
+        // The first primitive argument whose formal is a reference type needs
+        // boxing, which strict invocation does not permit.
+        let boxed = candidates
             .into_iter()
-            .filter(|(_, parameters, slots)| {
-                arguments.iter().zip(parameters.iter().zip(slots)).any(
-                    |(argument, (parameter, slot))| {
+            .filter_map(|(target, parameters, slots)| {
+                let ordinal = arguments
+                    .iter()
+                    .zip(parameters.iter().zip(&slots))
+                    .position(|(argument, (parameter, slot))| {
                         argument.indirection() == 0
                             && primitives.contains_key(&argument.identity())
                             && (named_reference_slots.contains(slot)
@@ -1005,31 +1031,35 @@ impl FactEvaluation<'_, '_> {
                                     parameter.indirection() == 0
                                         && reference_types.contains(&parameter.identity())
                                 }))
-                    },
-                )
+                    })?;
+                Some((target, ordinal))
             })
-            .map(|(target, _, _)| target)
-            .collect::<BTreeSet<_>>();
-        if excluded.is_empty() {
+            .collect::<Vec<_>>();
+        if boxed.is_empty() {
             return Ok(Some(answer));
         }
         if obligation.callee_reference() == self.root {
-            for &target in &excluded {
+            for &(target, ordinal) in &boxed {
+                let record = FactCallableCandidateApplicability::assessed(
+                    target,
+                    ApplicabilityVerdict::Inapplicable,
+                    Some(CallableRejectionReason::RequiresBoxing),
+                    answer.witnesses(),
+                )
+                .in_phase(Some(InvocationPhase::Strict))
+                .with_failing_argument(Some(failing_argument(ordinal, ArgumentConversion::Boxing)));
                 assert!(
                     self.callable_candidate_applicability
-                        .insert(
-                            target,
-                            FactCallableCandidateApplicability {
-                                target,
-                                verdict: ApplicabilityVerdict::Inapplicable,
-                                reason: Some(CallableRejectionReason::RequiresBoxing),
-                            },
-                        )
+                        .insert(target, record)
                         .is_none(),
                     "one native Java candidate has one final applicability reason"
                 );
             }
         }
+        let excluded = boxed
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<BTreeSet<_>>();
         let (targets, witnesses, completion) = answer.into_parts();
         let targets = targets
             .iter()
@@ -1046,6 +1076,68 @@ impl FactEvaluation<'_, '_> {
             .filter(|witness| !excluded.contains(&witness.target()))
             .collect::<Vec<_>>();
         Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
+    }
+
+    #[doc(hidden)]
+    /// The first argument of a strict-phase primitive mismatch that the shared
+    /// assessment found, read from the exact argument and formal types it
+    /// recorded. `Some(None)` when the mismatched pair is not two Java
+    /// primitives; the outer `None` reports cancellation.
+    #[doc(hidden)]
+    pub fn java_primitive_mismatch_argument(
+        &mut self,
+        conversions: &[super::call_applicability::ConversionEvidence],
+    ) -> StoreResult<Option<Option<FailingArgument>>> {
+        let identities = conversions
+            .iter()
+            .flat_map(|conversion| [conversion.source_type, conversion.target_type])
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let Some(intrinsics) = self.session.intrinsic_type_descriptors(&identities)? else {
+            return Ok(None);
+        };
+        let mut primitives = HashMap::default();
+        for intrinsic in intrinsics {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            if intrinsic.kind() == IntrinsicTypeKind::Primitive
+                && let Some(primitive) =
+                    brokk_bifrost_jvm::java::primitives::primitive_for_name(intrinsic.spelling())
+            {
+                primitives.insert(intrinsic.identity(), primitive);
+            }
+        }
+        let mut ordered = conversions
+            .iter()
+            .filter(|conversion| conversion.argument_ordinal != u32::MAX)
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|conversion| conversion.argument_ordinal);
+        for conversion in ordered {
+            let (Some(source), Some(target)) = (conversion.source_type, conversion.target_type)
+            else {
+                return Ok(Some(None));
+            };
+            if source == target {
+                continue;
+            }
+            let (Some(&source), Some(&target)) = (primitives.get(&source), primitives.get(&target))
+            else {
+                return Ok(Some(None));
+            };
+            if brokk_bifrost_jvm::java::primitives::primitive_converts(source, target) {
+                continue;
+            }
+            let failure = java_primitive_failure(&[source], &[target])
+                .expect("a primitive pair outside strict conversion fails");
+            return Ok(Some(Some(FailingArgument {
+                ordinal: conversion.argument_ordinal,
+                conversion: failure.conversion,
+            })));
+        }
+        Ok(Some(None))
     }
 
     #[doc(hidden)]
@@ -1171,6 +1263,8 @@ impl FactEvaluation<'_, '_> {
             .map(|identity| primitives[identity])
             .collect::<Vec<_>>();
 
+        // Strict invocation (JLS 15.12.2.2) admits identity and widening
+        // primitive conversions; the first argument outside them fails it.
         let candidates = candidate_formals
             .into_iter()
             .map(|(target, formals)| {
@@ -1178,32 +1272,24 @@ impl FactEvaluation<'_, '_> {
                     .into_iter()
                     .map(|identity| primitives[&identity])
                     .collect::<Vec<JavaPrimitive>>();
-                let applicable =
-                    argument_primitives
-                        .iter()
-                        .zip(&formals)
-                        .all(|(&argument, &formal)| {
-                            argument == formal
-                                || brokk_bifrost_jvm::java::primitives::primitive_converts(
-                                    argument, formal,
-                                )
-                        });
-                (target, formals, applicable)
+                let failure = java_primitive_failure(&argument_primitives, &formals);
+                (target, formals, failure)
             })
             .collect::<Vec<_>>();
-        if !candidates.iter().any(|(_, _, applicable)| *applicable) {
+        if candidates.iter().all(|(_, _, failure)| failure.is_some()) {
             if obligation.callee_reference() == self.root {
-                for (target, _, _) in candidates {
+                for &(target, _, failure) in &candidates {
+                    let record = FactCallableCandidateApplicability::assessed(
+                        target,
+                        ApplicabilityVerdict::Inapplicable,
+                        Some(CallableRejectionReason::PrimitiveTypeMismatch),
+                        answer.witnesses(),
+                    )
+                    .in_phase(Some(InvocationPhase::Strict))
+                    .with_failing_argument(failure);
                     assert!(
                         self.callable_candidate_applicability
-                            .insert(
-                                target,
-                                FactCallableCandidateApplicability {
-                                    target,
-                                    verdict: ApplicabilityVerdict::Inapplicable,
-                                    reason: Some(CallableRejectionReason::PrimitiveTypeMismatch),
-                                },
-                            )
+                            .insert(target, record)
                             .is_none(),
                         "one native Java candidate has one final applicability reason"
                     );
@@ -1225,15 +1311,16 @@ impl FactEvaluation<'_, '_> {
             }
             strictly_more_specific
         };
+        // JLS 15.12.2.5: among the strictly applicable candidates, one whose
+        // formals another applicable candidate's formals widen to is less
+        // specific. It still accepts the call; it cannot be chosen.
         let most_specific = candidates
             .iter()
-            .filter(|(_, _, applicable)| *applicable)
+            .filter(|(_, _, failure)| failure.is_none())
             .filter(|(_, formals, _)| {
-                !candidates
-                    .iter()
-                    .any(|(_, other_formals, other_applicable)| {
-                        *other_applicable && dominates(other_formals, formals)
-                    })
+                !candidates.iter().any(|(_, other_formals, other_failure)| {
+                    other_failure.is_none() && dominates(other_formals, formals)
+                })
             })
             .map(|(target, _, _)| *target)
             .collect::<BTreeSet<_>>();
@@ -1242,30 +1329,28 @@ impl FactEvaluation<'_, '_> {
             "an applicable finite primitive overload set has a maximal candidate"
         );
         if obligation.callee_reference() == self.root {
-            for (target, _, applicable) in &candidates {
-                let (verdict, reason) = if !applicable {
+            for &(target, _, failure) in &candidates {
+                let (verdict, reason) = if failure.is_some() {
                     (
                         ApplicabilityVerdict::Inapplicable,
                         Some(CallableRejectionReason::PrimitiveTypeMismatch),
                     )
-                } else if most_specific.contains(target) {
+                } else if most_specific.contains(&target) {
                     (ApplicabilityVerdict::Applicable, None)
                 } else {
-                    (
-                        ApplicabilityVerdict::Inapplicable,
-                        Some(CallableRejectionReason::LessSpecificPrimitiveOverload),
-                    )
+                    (ApplicabilityVerdict::LessSpecific, None)
                 };
+                let record = FactCallableCandidateApplicability::assessed(
+                    target,
+                    verdict,
+                    reason,
+                    answer.witnesses(),
+                )
+                .in_phase(Some(InvocationPhase::Strict))
+                .with_failing_argument(failure);
                 assert!(
                     self.callable_candidate_applicability
-                        .insert(
-                            *target,
-                            FactCallableCandidateApplicability {
-                                target: *target,
-                                verdict,
-                                reason,
-                            },
-                        )
+                        .insert(target, record)
                         .is_none(),
                     "one native Java candidate has one final applicability reason"
                 );
@@ -1273,26 +1358,12 @@ impl FactEvaluation<'_, '_> {
         }
         let excluded = candidates
             .iter()
-            .filter_map(|(target, _, applicable)| {
-                if !applicable {
-                    Some((*target, CallableRejectionReason::PrimitiveTypeMismatch))
-                } else if !most_specific.contains(target) {
-                    Some((
-                        *target,
-                        CallableRejectionReason::LessSpecificPrimitiveOverload,
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+            .filter(|(target, _, _)| !most_specific.contains(target))
+            .map(|(target, _, _)| *target)
+            .collect::<BTreeSet<_>>();
         if excluded.is_empty() {
             return Ok(Some(answer));
         }
-        let excluded = excluded
-            .into_iter()
-            .map(|(target, _)| target)
-            .collect::<BTreeSet<_>>();
         let (targets, witnesses, completion) = answer.into_parts();
         let targets = targets
             .iter()
@@ -1410,9 +1481,9 @@ impl FactEvaluation<'_, '_> {
             .map(|row| row.definition)
             .collect::<HashSet<_>>();
         let mut closures = HashMap::<SemanticId, Option<HashSet<SemanticId>>>::default();
-        let mut excluded = BTreeSet::new();
+        let mut excluded = BTreeMap::new();
         for (target, formals) in &candidates {
-            for (&argument, formal) in arguments.iter().zip(formals) {
+            for (ordinal, (&argument, formal)) in arguments.iter().zip(formals).enumerate() {
                 if self.poll_cancelled() {
                     return Ok(None);
                 }
@@ -1438,7 +1509,7 @@ impl FactEvaluation<'_, '_> {
                     .as_ref()
                     .is_some_and(|closure| !closure.contains(&formal))
                 {
-                    excluded.insert(*target);
+                    excluded.insert(*target, ordinal);
                     break;
                 }
             }
@@ -1446,16 +1517,37 @@ impl FactEvaluation<'_, '_> {
         if excluded.is_empty() || excluded.len() == answer.targets().len() {
             return Ok(Some(answer));
         }
+        if obligation.callee_reference() == self.root {
+            for (&target, &ordinal) in &excluded {
+                let record = FactCallableCandidateApplicability::assessed(
+                    target,
+                    ApplicabilityVerdict::Inapplicable,
+                    Some(CallableRejectionReason::ArgumentTypeMismatch),
+                    answer.witnesses(),
+                )
+                .in_phase(Some(InvocationPhase::Strict))
+                .with_failing_argument(Some(failing_argument(
+                    ordinal,
+                    ArgumentConversion::NoWideningReference,
+                )));
+                assert!(
+                    self.callable_candidate_applicability
+                        .insert(target, record)
+                        .is_none(),
+                    "one native Java candidate has one final applicability reason"
+                );
+            }
+        }
         let (targets, witnesses, completion) = answer.into_parts();
         let targets = targets
             .iter()
             .copied()
-            .filter(|target| !excluded.contains(target))
+            .filter(|target| !excluded.contains_key(target))
             .collect::<Vec<_>>();
         let witnesses = witnesses
             .into_vec()
             .into_iter()
-            .filter(|witness| !excluded.contains(&witness.target()))
+            .filter(|witness| !excluded.contains_key(&witness.target()))
             .collect::<Vec<_>>();
         Ok(Some(ResolutionAnswer::new(targets, witnesses, completion)))
     }
@@ -1600,4 +1692,39 @@ fn java_invocation_argument_type(
         [ResolutionSlotValue::Runtime { ty, .. }] => Some(*ty),
         _ => None,
     }
+}
+
+fn failing_argument(ordinal: usize, conversion: ArgumentConversion) -> FailingArgument {
+    FailingArgument {
+        ordinal: u32::try_from(ordinal).expect("a call's argument ordinal fits u32"),
+        conversion,
+    }
+}
+
+/// The first argument that no strict invocation conversion carries to its
+/// primitive formal, or `None` when every argument converts.
+fn java_primitive_failure(
+    arguments: &[JavaPrimitive],
+    formals: &[JavaPrimitive],
+) -> Option<FailingArgument> {
+    assert_eq!(
+        arguments.len(),
+        formals.len(),
+        "a fixed-arity candidate has one formal per argument"
+    );
+    let ordinal = arguments
+        .iter()
+        .zip(formals)
+        .position(|(&argument, &formal)| {
+            !brokk_bifrost_jvm::java::primitives::primitive_converts(argument, formal)
+        })?;
+    let conversion = if brokk_bifrost_jvm::java::primitives::primitive_narrows(
+        arguments[ordinal],
+        formals[ordinal],
+    ) {
+        ArgumentConversion::NarrowingPrimitive
+    } else {
+        ArgumentConversion::NoPrimitiveConversion
+    };
+    Some(failing_argument(ordinal, conversion))
 }

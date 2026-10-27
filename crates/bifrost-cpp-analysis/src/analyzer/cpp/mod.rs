@@ -115,9 +115,7 @@ pub use brokk_bifrost_cpp::identity::{
     cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
     cpp_is_recovered_macro_character_token_type,
 };
-use brokk_bifrost_cpp::imports::{
-    IncludeTargetIndex, include_paths, resolve_include_targets_with_index,
-};
+use brokk_bifrost_cpp::imports::{IncludeTargetIndex, resolve_include_targets_with_index};
 pub use brokk_bifrost_cpp::structural::{CppCallResultUseIndex, cpp_call_result_use};
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use moka::sync::Cache;
@@ -753,8 +751,9 @@ impl CppAnalyzer {
             if !visited.insert(file.clone()) {
                 continue;
             }
-            let imports = self.import_statements_from_projection(token, &file);
-            for include in include_paths(&imports) {
+            let includes =
+                CppSource::canonical_include_paths(self, token, &file).unwrap_or_default();
+            for include in includes {
                 for target in
                     resolve_include_targets_with_index(&file, &include, include_target_index)
                 {
@@ -3345,12 +3344,17 @@ impl IAnalyzer for CppAnalyzer {
         file: &ProjectFile,
         weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
-        brokk_bifrost_analysis::analyzer::test_assertion_smells_for_file(
-            self,
-            file,
-            Language::Cpp,
-            |source| detect_cpp_test_assertion_smells(file, source, &weights),
-        )
+        if !brokk_bifrost_analysis::analyzer::is_test_assertion_candidate(self, file, Language::Cpp)
+        {
+            return Vec::new();
+        }
+        // The prepared tree is retained across requests within a byte cap, so a
+        // repeated report does not reparse every C++ test file (#7001).
+        let scope = AnalyzerQueryScope::new(self);
+        let Some(prepared) = self.prepared_syntax(scope.token(), file) else {
+            return Vec::new();
+        };
+        detect_cpp_test_assertion_smells(file, prepared.source(), prepared.tree(), &weights)
     }
 
     fn find_structural_clone_smells(

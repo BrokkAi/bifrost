@@ -473,6 +473,8 @@ fn scala_entry_facts(
         }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
         let fact = TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),

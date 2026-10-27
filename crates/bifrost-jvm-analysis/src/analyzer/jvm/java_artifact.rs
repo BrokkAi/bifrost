@@ -634,6 +634,8 @@ pub(crate) fn java_api_facts(
             .expect("parsed Java type receives an id")
             .clone();
         types.push(TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: declaration.jvm_inventory.map(|inventory| *inventory),
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),

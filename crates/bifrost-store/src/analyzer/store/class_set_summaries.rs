@@ -870,7 +870,7 @@ pub(crate) const DEPENDENCY_SOURCES_SQL: &str =
      WHERE summary_id=?1 ORDER BY dependency_ordinal,source_ordinal";
 pub(crate) const READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
-        blob_oid,subject,start_byte,end_byte,digest,read_ordinal
+        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,read_ordinal
      FROM class_set_summary_reads WHERE summary_id=?1 ORDER BY read_ordinal";
 pub(crate) const CHARGES_SQL: &str = "SELECT charge_kind,amount
      FROM class_set_summary_charges WHERE summary_id=?1 ORDER BY charge_kind";
@@ -1459,8 +1459,8 @@ fn insert_summary(
         conn.execute(
             "INSERT INTO class_set_summary_reads(
                 summary_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
-                index_key,blob_oid,subject,start_byte,end_byte,digest
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 id,
                 row.ordinal,
@@ -1476,6 +1476,7 @@ fn insert_summary(
                 columns.start_byte,
                 columns.end_byte,
                 columns.digest,
+                columns.site_ordinal,
             ],
         )?;
     }
@@ -1822,7 +1823,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<Vec<ClassSetSummar
     let mut reads = Vec::new();
     while let Some(row) = rows.next()? {
         reads.push(ClassSetSummaryReadRow {
-            ordinal: row.get(12)?,
+            ordinal: row.get(13)?,
             key: decode_read_key(row)?,
         });
     }
@@ -2088,6 +2089,7 @@ mod tests {
                         site: ProcedureCallSiteLocator {
                             start_byte: 12,
                             end_byte: 19,
+                            ordinal: 0,
                         },
                     },
                     digest: StableDigest::sha256(b"targets"),

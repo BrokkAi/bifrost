@@ -743,13 +743,31 @@ fn java_callable_dispatch_extensibility(
     }
 }
 
-fn enclosing_java_type_is_final(node: Node<'_>) -> bool {
+/// Whether the nearest declaring type is final. Outer types cannot close a
+/// nested type's methods. Anonymous creation bodies are non-final; enum
+/// constant bodies and records are implicitly final (JLS 8.9, 8.10, 15.9.5).
+pub fn enclosing_java_type_is_final(node: Node<'_>) -> bool {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
         match current.kind() {
             "record_declaration" => return true,
             "class_declaration" => {
                 return java_modifier_keywords(current).any(|modifier| modifier == "final");
+            }
+            "interface_declaration" | "annotation_type_declaration" => return false,
+            "enum_declaration" => {
+                let Some(body) = current.child_by_field_name("body") else {
+                    return false;
+                };
+                let mut cursor = body.walk();
+                return !body.named_children(&mut cursor).any(|member| {
+                    member.kind() == "enum_constant" && member.child_by_field_name("body").is_some()
+                });
+            }
+            "class_body" if is_java_synthetic_class_body(current) => {
+                return current
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "enum_constant");
             }
             _ => ancestor = current.parent(),
         }
@@ -825,6 +843,99 @@ fn visit_field_declaration<'tree>(
     }
 }
 
+/// One complete component of a record header. The same grammar reader feeds
+/// source metadata and native members, including the array implied by `...`.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct JavaRecordComponent<'tree> {
+    pub node: Node<'tree>,
+    pub name: Node<'tree>,
+    pub ty: Node<'tree>,
+    pub repeated: bool,
+}
+
+#[doc(hidden)]
+pub fn java_record_components(
+    parameters: Node<'_>,
+) -> Result<Vec<JavaRecordComponent<'_>>, Vec<Node<'_>>> {
+    use brokk_bifrost_core::analyzer::tree_walk::{named_children, walk_tree_preorder};
+    let mut malformed = Vec::new();
+    // Include unnamed tokens: a missing ')' is as incomplete as a missing
+    // component name. Attribute recovery nodes to their header component.
+    walk_tree_preorder(parameters, true, |node| {
+        if node.is_error() || node.is_missing() {
+            let mut component = node;
+            while let Some(parent) = component.parent() {
+                if parent == parameters || component == parameters {
+                    break;
+                }
+                component = parent;
+            }
+            if !component.is_named()
+                && let Some(preceding) = named_children(parameters)
+                    .into_iter()
+                    .filter(|child| !child.is_extra())
+                    .take_while(|child| child.end_byte() <= node.start_byte())
+                    .last()
+            {
+                // A missing separator or closing token belongs to the
+                // preceding component, whose name explains the header gap.
+                component = preceding;
+            }
+            if !malformed.contains(&component) {
+                malformed.push(component);
+            }
+        }
+        WalkControl::Continue
+    });
+    let mut components = Vec::new();
+    for node in named_children(parameters)
+        .into_iter()
+        .filter(|node| !node.is_extra())
+    {
+        let repeated = node.kind() == "spread_parameter";
+        let fields = match node.kind() {
+            "formal_parameter" if node.child_by_field_name("dimensions").is_none() => node
+                .child_by_field_name("name")
+                .zip(node.child_by_field_name("type")),
+            "spread_parameter" => spread_parameter_name(node).zip(spread_parameter_type_node(node)),
+            _ => None,
+        };
+        if let Some((name, ty)) = fields {
+            components.push(JavaRecordComponent {
+                node,
+                name,
+                ty,
+                repeated,
+            });
+        } else if !malformed.contains(&node) {
+            malformed.push(node);
+        }
+    }
+    if malformed.is_empty() {
+        Ok(components)
+    } else {
+        Err(malformed)
+    }
+}
+
+#[doc(hidden)]
+pub fn java_record_declares_accessor(record: Node<'_>, name: &str, source: &str) -> bool {
+    let Some(body) = record.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor).any(|member| {
+        member.kind() == "method_declaration"
+            && member
+                .child_by_field_name("name")
+                .is_some_and(|node| node_text(node, source) == name)
+            && member
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| callable_arity_for_parameters(parameters).total() == 0)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_record_components(
     file: &ProjectFile,
@@ -833,49 +944,91 @@ fn visit_record_components(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+    parsed: &mut ParsedFile,
     collector: &mut PrimarySourceFactCollector<'_>,
     links: &mut Vec<(SourceDeclarationId, CodeUnit)>,
+    metadata_links: &mut Vec<SourceDeclarationMetadataLink>,
 ) {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return;
     };
-
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if child.kind() != "formal_parameter" {
-            continue;
-        }
-
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-
-        let name = node_text(name_node, source).trim();
-        if name.is_empty() {
-            continue;
-        }
-
+    let Ok(components) = java_record_components(parameters) else {
+        return;
+    };
+    for component in components {
+        let name = node_text(component.name, source);
+        let ty = format!(
+            "{}{}",
+            normalize_whitespace(node_text(component.ty, source)),
+            if component.repeated { "[]" } else { "" }
+        );
         let fq = parent
             .fq()
             .clone()
             .with_pushed(segment_interner().intern(name, SegmentKind::Member));
-        let code_unit = CodeUnit::new_fq(
+        let field = CodeUnit::new_fq(
             file.clone(),
             brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
-            fq,
+            fq.clone(),
         );
         parsed.add_code_unit(
-            code_unit.clone(),
-            child,
+            field.clone(),
+            component.node,
             source,
             Some(parent.clone()),
             Some(top_level.clone()),
         );
-        record_source_declaration(collector, links, child, &code_unit);
-        parsed.add_signature(code_unit, normalize_whitespace(node_text(child, source)));
+        let declaration = collector.declare_node(component.node, Some(component.name));
+        links.push((declaration, field.clone()));
+        add_source_metadata(
+            parsed,
+            metadata_links,
+            declaration,
+            &field,
+            SignatureMetadata::new(format!("private final {ty} {name}"), Vec::new())
+                .with_return_type_text(Some(ty.clone()))
+                .with_field_modifiers(false, true)
+                .with_field_initializer(false),
+            DeclaredVisibility::Private,
+        );
+        if java_record_declares_accessor(node, name, source) {
+            continue;
+        }
+        let accessor = CodeUnit::with_signature_and_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+            package_name.to_string(),
+            format!("{}.{}", parent.short_name(), name),
+            Some("()".to_owned()),
+            false,
+            fq,
+        );
+        parsed.add_code_unit(
+            accessor.clone(),
+            component.node,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        // The header supplies an implicit method; the component node supplies
+        // its field. Distinct occurrence/name pairs keep their identities apart.
+        let declaration = collector.declare_node(parameters, Some(component.name));
+        links.push((declaration, accessor.clone()));
+        add_source_metadata(
+            parsed,
+            metadata_links,
+            declaration,
+            &accessor,
+            SignatureMetadata::with_parameter_labels(format!("public {ty} {name}()"), Vec::new())
+                .with_return_type_text(Some(ty))
+                .with_callable_arity(CallableArity::exact(0))
+                .with_callable_modifiers(false, false, DeclaredVisibility::Public)
+                .with_callable_parameter_types(Vec::new())
+                .with_dispatch_extensibility(DispatchExtensibility::Closed),
+            DeclaredVisibility::Public,
+        );
     }
 }
 
@@ -1347,7 +1500,7 @@ fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String 
 /// source spelling, not a resolved or erased type. It is recorded so that
 /// consumers can discriminate overloads structurally instead of splitting a
 /// rendered signature string.
-fn canonical_parameter_type_texts(parameters: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn canonical_parameter_type_texts(parameters: Node<'_>, source: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cursor = parameters.walk();
     for child in parameters.named_children(&mut cursor) {
@@ -1555,7 +1708,7 @@ fn java_type_constructor_shape(node: Node<'_>) -> Option<JavaTypeConstructorShap
     }
 }
 
-fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = parameter.walk();
     parameter.named_children(&mut cursor).find(|child| {
         !matches!(
@@ -2007,20 +2160,39 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
                 self.capture_source_visibility(node, declaration, visibility);
                 if node.kind() == "record_declaration"
                     && let Some(parameters) = node.child_by_field_name("parameters")
+                    && let Ok(components) = java_record_components(parameters)
                 {
-                    let mut cursor = parameters.walk();
-                    for component in parameters.named_children(&mut cursor) {
-                        if component.kind() != "formal_parameter"
-                            || component.child_by_field_name("name").is_none()
-                        {
-                            continue;
-                        }
-                        let declaration = self.intern_source_declaration(component);
+                    for component in components {
+                        let field = self
+                            .resolution
+                            .source_collector_mut()
+                            .declare_node(component.node, Some(component.name));
                         self.capture_source_visibility(
-                            component,
-                            declaration,
+                            component.node,
+                            field,
                             DeclaredVisibility::Private,
                         );
+                        self.resolution
+                            .record_source_declaration_owner(field, declaration);
+                        if !java_record_declares_accessor(
+                            node,
+                            node_text(component.name, self.source),
+                            self.source,
+                        ) {
+                            let accessor = self
+                                .resolution
+                                .source_collector_mut()
+                                .declare_node(parameters, Some(component.name));
+                            self.capture_source_visibility(
+                                component.name,
+                                accessor,
+                                DeclaredVisibility::Public,
+                            );
+                            self.resolution
+                                .record_source_callable(component.node, accessor);
+                            self.resolution
+                                .record_source_declaration_owner(accessor, declaration);
+                        }
                     }
                 }
                 if let Some(owner) = JavaSourceOwner::from_declaration(node) {
@@ -2211,6 +2383,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
                 self.parsed,
                 self.resolution.source_collector_mut(),
                 &mut self.source_declaration_units,
+                &mut self.source_declaration_metadata,
             );
         }
         if is_root && let Some(module) = self.package_module.clone() {
@@ -2269,153 +2442,47 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         true
     }
 
-    fn enter_declaration(&mut self, node: Node<'tree>, active: bool) {
+    fn enter_declaration(&mut self, node: Node<'tree>) {
         let mut pushed = false;
-        if active {
-            match node.kind() {
-                "package_declaration" => {
-                    if let Some(module) = self.package_module.clone() {
-                        self.parsed.add_code_unit(
-                            module.clone(),
-                            node,
-                            self.source,
-                            None,
-                            Some(module.clone()),
-                        );
-                        self.parsed.add_signature(
-                            module.clone(),
-                            format!("package {};", self.package_name),
-                        );
-                        self.record_unit_source(node, &module);
-                    }
-                }
-                kind if is_class_like_declaration_kind(kind) => {
-                    pushed = self.add_class_scope(node);
-                }
-                "method_declaration" | "constructor_declaration"
-                    if self.current_owner().is_some() =>
-                {
-                    let parent = self.current_owner().cloned().expect("callable owner");
-                    let top_level = self.current_top_level().expect("callable top level");
-                    let visibility = self.source_visibility(node);
-                    let modifiers = self.resolution.source_modifiers_for(node);
-                    let properties = self.resolution.source_callable_shape_for(node).properties();
-                    if let Some(unit) = visit_callable(
-                        &self.file,
-                        self.source,
-                        node,
-                        &self.package_name,
-                        &parent,
-                        &top_level,
-                        self.parsed,
-                        self.resolution.source_collector_mut(),
-                        &mut self.source_declaration_units,
-                        &mut self.source_declaration_metadata,
-                        visibility,
-                        modifiers,
-                        properties,
-                    ) {
-                        self.declaration_contexts.push(JavaDeclarationContext {
-                            unit,
-                            top_level,
-                            is_record: false,
-                        });
-                        pushed = true;
-                    }
-                }
-                "compact_constructor_declaration"
-                    if self.current_owner().is_some()
-                        && self
-                            .declaration_contexts
-                            .last()
-                            .is_some_and(|context| context.is_record) =>
-                {
-                    let parent = self.current_owner().cloned().expect("record owner");
-                    let top_level = self.current_top_level().expect("record top level");
-                    let record = node
-                        .parent()
-                        .and_then(|body| body.parent())
-                        .filter(|record| record.kind() == "record_declaration");
-                    let visibility = self.source_visibility(node);
-                    let properties = self.resolution.source_callable_shape_for(node).properties();
-                    if let Some(record) = record
-                        && let Some(unit) = visit_compact_constructor(
-                            &self.file,
-                            self.source,
-                            node,
-                            record,
-                            &self.package_name,
-                            &parent,
-                            &top_level,
-                            self.parsed,
-                            self.resolution.source_collector_mut(),
-                            &mut self.source_declaration_units,
-                            &mut self.source_declaration_metadata,
-                            visibility,
-                            properties,
-                        )
-                    {
-                        self.declaration_contexts.push(JavaDeclarationContext {
-                            unit,
-                            top_level,
-                            is_record: false,
-                        });
-                        pushed = true;
-                    }
-                }
-                "field_declaration" | "constant_declaration" if self.current_owner().is_some() => {
-                    let parent = self.current_owner().cloned().expect("field owner");
-                    let top_level = self.current_top_level().expect("field top level");
-                    if let Some(visibility) = self.field_visibility(node) {
-                        let shape = self.resolution.source_field_shape_for(node);
-                        visit_field_declaration(
-                            &self.file,
-                            self.source,
-                            node,
-                            &self.package_name,
-                            &parent,
-                            &top_level,
-                            self.parsed,
-                            self.resolution.source_collector_mut(),
-                            &mut self.source_declaration_units,
-                            &mut self.source_declaration_metadata,
-                            visibility,
-                            shape,
-                        );
-                    }
-                }
-                "enum_constant" if self.current_owner().is_some() => {
-                    let parent = self.current_owner().cloned().expect("enum owner");
-                    let top_level = self.current_top_level().expect("enum top level");
-                    let visibility = self.source_visibility(node);
-                    visit_enum_constant(
-                        &self.file,
-                        self.source,
-                        node,
-                        &self.package_name,
-                        &parent,
-                        &top_level,
-                        self.parsed,
-                        self.resolution.source_collector_mut(),
-                        &mut self.source_declaration_units,
-                        &mut self.source_declaration_metadata,
-                        visibility,
-                    );
-                }
-                "class_body" => {
-                    pushed = self.add_synthetic_class_scope(node);
-                }
-                "lambda_expression" if self.current_owner().is_some() => {
-                    let parent = self.current_owner().cloned().expect("lambda owner");
-                    let top_level = self.current_top_level().expect("lambda top level");
-                    let unit = lambda_code_unit(&self.file, &self.package_name, &parent, node);
+        match node.kind() {
+            "package_declaration" => {
+                if let Some(module) = self.package_module.clone() {
                     self.parsed.add_code_unit(
-                        unit.clone(),
+                        module.clone(),
                         node,
                         self.source,
-                        Some(parent),
-                        Some(top_level.clone()),
+                        None,
+                        Some(module.clone()),
                     );
+                    self.parsed
+                        .add_signature(module.clone(), format!("package {};", self.package_name));
+                    self.record_unit_source(node, &module);
+                }
+            }
+            kind if is_class_like_declaration_kind(kind) => {
+                pushed = self.add_class_scope(node);
+            }
+            "method_declaration" | "constructor_declaration" if self.current_owner().is_some() => {
+                let parent = self.current_owner().cloned().expect("callable owner");
+                let top_level = self.current_top_level().expect("callable top level");
+                let visibility = self.source_visibility(node);
+                let modifiers = self.resolution.source_modifiers_for(node);
+                let properties = self.resolution.source_callable_shape_for(node).properties();
+                if let Some(unit) = visit_callable(
+                    &self.file,
+                    self.source,
+                    node,
+                    &self.package_name,
+                    &parent,
+                    &top_level,
+                    self.parsed,
+                    self.resolution.source_collector_mut(),
+                    &mut self.source_declaration_units,
+                    &mut self.source_declaration_metadata,
+                    visibility,
+                    modifiers,
+                    properties,
+                ) {
                     self.declaration_contexts.push(JavaDeclarationContext {
                         unit,
                         top_level,
@@ -2423,8 +2490,108 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
                     });
                     pushed = true;
                 }
-                _ => {}
             }
+            "compact_constructor_declaration"
+                if self.current_owner().is_some()
+                    && self
+                        .declaration_contexts
+                        .last()
+                        .is_some_and(|context| context.is_record) =>
+            {
+                let parent = self.current_owner().cloned().expect("record owner");
+                let top_level = self.current_top_level().expect("record top level");
+                let record = node
+                    .parent()
+                    .and_then(|body| body.parent())
+                    .filter(|record| record.kind() == "record_declaration");
+                let visibility = self.source_visibility(node);
+                let properties = self.resolution.source_callable_shape_for(node).properties();
+                if let Some(record) = record
+                    && let Some(unit) = visit_compact_constructor(
+                        &self.file,
+                        self.source,
+                        node,
+                        record,
+                        &self.package_name,
+                        &parent,
+                        &top_level,
+                        self.parsed,
+                        self.resolution.source_collector_mut(),
+                        &mut self.source_declaration_units,
+                        &mut self.source_declaration_metadata,
+                        visibility,
+                        properties,
+                    )
+                {
+                    self.declaration_contexts.push(JavaDeclarationContext {
+                        unit,
+                        top_level,
+                        is_record: false,
+                    });
+                    pushed = true;
+                }
+            }
+            "field_declaration" | "constant_declaration" if self.current_owner().is_some() => {
+                let parent = self.current_owner().cloned().expect("field owner");
+                let top_level = self.current_top_level().expect("field top level");
+                if let Some(visibility) = self.field_visibility(node) {
+                    let shape = self.resolution.source_field_shape_for(node);
+                    visit_field_declaration(
+                        &self.file,
+                        self.source,
+                        node,
+                        &self.package_name,
+                        &parent,
+                        &top_level,
+                        self.parsed,
+                        self.resolution.source_collector_mut(),
+                        &mut self.source_declaration_units,
+                        &mut self.source_declaration_metadata,
+                        visibility,
+                        shape,
+                    );
+                }
+            }
+            "enum_constant" if self.current_owner().is_some() => {
+                let parent = self.current_owner().cloned().expect("enum owner");
+                let top_level = self.current_top_level().expect("enum top level");
+                let visibility = self.source_visibility(node);
+                visit_enum_constant(
+                    &self.file,
+                    self.source,
+                    node,
+                    &self.package_name,
+                    &parent,
+                    &top_level,
+                    self.parsed,
+                    self.resolution.source_collector_mut(),
+                    &mut self.source_declaration_units,
+                    &mut self.source_declaration_metadata,
+                    visibility,
+                );
+            }
+            "class_body" => {
+                pushed = self.add_synthetic_class_scope(node);
+            }
+            "lambda_expression" if self.current_owner().is_some() => {
+                let parent = self.current_owner().cloned().expect("lambda owner");
+                let top_level = self.current_top_level().expect("lambda top level");
+                let unit = lambda_code_unit(&self.file, &self.package_name, &parent, node);
+                self.parsed.add_code_unit(
+                    unit.clone(),
+                    node,
+                    self.source,
+                    Some(parent),
+                    Some(top_level.clone()),
+                );
+                self.declaration_contexts.push(JavaDeclarationContext {
+                    unit,
+                    top_level,
+                    is_record: false,
+                });
+                pushed = true;
+            }
+            _ => {}
         }
         self.declaration_exits.push(pushed);
     }
@@ -2468,12 +2635,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
         parse_package_syntax(node, self.source)
     }
 
-    fn enter(
-        &mut self,
-        node: Node<'tree>,
-        declaration_active: bool,
-        native_active: bool,
-    ) -> (bool, TreeWalkAction) {
+    fn enter(&mut self, node: Node<'tree>, native_active: bool) -> TreeWalkAction {
         // Capture source-owned declaration properties before either projection
         // applies its own admission or suppression rules.
         self.capture_source_type_facts(node);
@@ -2537,8 +2699,8 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
             self.resolution.record_type_identifier(node);
             TreeWalkAction::Skip
         };
-        self.enter_declaration(node, declaration_active);
-        (true, native_action)
+        self.enter_declaration(node);
+        native_action
     }
 
     fn exit(&mut self, native_exit: bool) {
@@ -2639,7 +2801,6 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
 enum JavaPrimaryFrame<'tree> {
     Enter {
         node: Node<'tree>,
-        declaration_active: bool,
         native_active: bool,
     },
     Exit {
@@ -2653,18 +2814,15 @@ fn walk_java_primary_tree<'tree>(
 ) {
     let mut stack = vec![JavaPrimaryFrame::Enter {
         node: root,
-        declaration_active: true,
         native_active: true,
     }];
     while let Some(frame) = stack.pop() {
         match frame {
             JavaPrimaryFrame::Enter {
                 node,
-                declaration_active,
                 native_active,
             } => {
-                let (declaration_descend, native_action) =
-                    state.enter(node, declaration_active, native_active);
+                let native_action = state.enter(node, native_active);
                 let native_descend = native_active
                     && matches!(
                         &native_action,
@@ -2678,7 +2836,6 @@ fn walk_java_primary_tree<'tree>(
                 children.reverse();
                 stack.extend(children.into_iter().map(|child| JavaPrimaryFrame::Enter {
                     node: child,
-                    declaration_active: declaration_active && declaration_descend,
                     native_active: native_descend,
                 }));
             }
@@ -2935,6 +3092,48 @@ mod source_shape_tests {
             Some(DispatchExtensibility::Open),
             "an overridable instance method stays open",
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6291: a nested interface's methods inherited finality from an outer final class"
+    )]
+    fn nested_type_dispatch_finality_stops_at_its_own_owner() {
+        let parsed = parse(
+            "final class Outer { \
+               interface Handler { void handle(); } \
+               class Inner { void inner() {} } \
+               Object value = new Object() { void anonymous() {} }; \
+               enum OpenEnum { VALUE { void constantBody() {} }; void enumMethod() {} } \
+               enum FinalEnum { VALUE; void finalEnumMethod() {} } \
+               record NestedRecord() { void recordMethod() {} } \
+               void outerMethod() {} \
+             }",
+        );
+        for prefix in [
+            "void handle",
+            "void inner",
+            "void anonymous",
+            "void enumMethod",
+        ] {
+            assert_eq!(
+                metadata(&parsed, prefix).dispatch_extensibility(),
+                Some(DispatchExtensibility::Open),
+                "{prefix} does not inherit finality from Outer",
+            );
+        }
+        for prefix in [
+            "void constantBody",
+            "void finalEnumMethod",
+            "void recordMethod",
+            "void outerMethod",
+        ] {
+            assert_eq!(
+                metadata(&parsed, prefix).dispatch_extensibility(),
+                Some(DispatchExtensibility::Closed),
+                "{prefix} belongs to its own final type",
+            );
+        }
     }
 
     #[test]

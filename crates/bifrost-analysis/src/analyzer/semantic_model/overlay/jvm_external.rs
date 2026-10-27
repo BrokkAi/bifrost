@@ -81,10 +81,10 @@ pub fn model_declared_external_owner(
 }
 
 #[doc(hidden)]
-pub fn qualified_model_symbols<'a>(
-    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+pub fn qualified_model_symbols(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     fqn: &str,
-) -> Vec<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+) -> Vec<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>> {
     overlay
         .symbols_named(fqn)
         .records

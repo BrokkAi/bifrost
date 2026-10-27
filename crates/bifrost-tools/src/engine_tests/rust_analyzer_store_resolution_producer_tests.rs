@@ -246,14 +246,12 @@ fn bench() {}
         };
         let before;
         {
-            let environment = PythonNativeEnvironment::open(&path, profile.clone()).unwrap();
-            environment.begin(1).unwrap();
-            environment
-                .stage_source(project.clone(), &file, source, 1)
-                .unwrap();
+            let environment =
+                PythonNativeEnvironment::open(&path, project.root(), profile.clone()).unwrap();
+            let revision = environment.publish_project(project.clone()).unwrap();
             assert!(
                 environment
-                    .reconcile(1, &CancellationToken::default())
+                    .reconcile(revision, &CancellationToken::default())
                     .unwrap()
                     .failed
                     .is_empty()
@@ -270,7 +268,7 @@ fn bench() {}
             assert_eq!(conn.query_row("SELECT count(*) FROM python_member_operations WHERE form=4 AND name_kind=0 AND NOT EXISTS(SELECT 1 FROM python_member_operation_names names WHERE names.operation=python_member_operations.id)",[],|r|r.get::<_,usize>(0)).unwrap(),1);
             before = snapshot(&conn);
         }
-        let environment = PythonNativeEnvironment::open(&path, profile).unwrap();
+        let environment = PythonNativeEnvironment::open(&path, project.root(), profile).unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(
             snapshot(&conn),
@@ -278,14 +276,11 @@ fn bench() {}
             "reopen must retain complete operation/name rows"
         );
         let replacement = "getattr(owner, 'replacement')\n";
-        environment.begin(2).unwrap();
         std::fs::write(file.abs_path(), replacement).unwrap();
-        environment
-            .stage_source(project, &file, replacement, 2)
-            .unwrap();
+        let revision = environment.publish_project(project).unwrap();
         assert!(
             environment
-                .reconcile(2, &CancellationToken::default())
+                .reconcile(revision, &CancellationToken::default())
                 .unwrap()
                 .failed
                 .is_empty()

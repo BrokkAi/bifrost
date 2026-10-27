@@ -142,6 +142,29 @@ existing global and using-namespace candidates; an explicit global qualifier
 uses only the global scope. Missing or conflicting proof cannot authorize a
 new owner. Multi-owner and template reconciliation retain their existing rules.
 
+A class-template member and its out-of-line definition need not spell their
+template heads alike. Callable comparison reads each declaration's template
+levels from syntax: every enclosing class with the head that introduces its
+parameters and the written arguments that select it, then the declaration's
+own head. Two levels agree when their heads match position by position in
+arity, parameter kind, pack-ness, non-type parameter type and requires-clause,
+and their owner arguments match once each side's parameter names are bound
+to the other's. Parameter types are then compared under that binding. A
+qualifier whose arguments are not the head's own parameters selects a
+specialization, a different owner from the primary template. A shape the
+comparison cannot align, such as a qualifier spelled through an alias, keeps
+the declarations separate.
+
+A class defined identically in two headers is one class, but a shared name
+does not prove that. Two complete definitions are one class only when their
+template levels agree, their base specifiers agree, and they declare the same
+members with the same signatures. A translation unit that includes one copy
+then relates to the other copy's member declarations, so definition lookup
+from either copy reaches the body, and inverse usages of the body find
+references made through either copy. Each source declaration keeps its own
+identity: declaration navigation still answers with the copy the reference
+can reach.
+
 Ordinary structured receiver types use lookup at the declaration site and
 preserve a selected alias. An ambiguous or missing lexical result cannot fall
 back to a pool of unrelated types with the same terminal name. Navigation of

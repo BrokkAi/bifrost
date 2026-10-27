@@ -8,7 +8,7 @@ impl SemanticModelOverlay {
     #[doc(hidden)]
     pub fn java_reference_widening(
         &self,
-        source: &SemanticModelSymbol,
+        source: &Arc<SemanticModelSymbol>,
         target: &SemanticModelSymbol,
         max_visits: usize,
         cancellation: Option<&crate::CancellationToken>,
@@ -17,7 +17,11 @@ impl SemanticModelOverlay {
             witness: None,
             incomplete: Vec::new(),
         };
-        let mut pending = VecDeque::from([(source, vec![source.provenance.clone()], Vec::new())]);
+        let mut pending = VecDeque::from([(
+            Arc::clone(source),
+            vec![source.provenance.clone()],
+            Vec::new(),
+        )]);
         let mut seen = HashSet::default();
         let mut visited = 0;
         let mut edge_visits = 0;
@@ -26,7 +30,7 @@ impl SemanticModelOverlay {
                 answer.incomplete.push(JavaHierarchyIncomplete::Cancelled);
                 break;
             }
-            if !seen.insert(current.id.as_str()) {
+            if !seen.insert(current.id.clone()) {
                 continue;
             }
             if visited == max_visits {
@@ -139,7 +143,7 @@ impl SemanticModelOverlay {
                 next_path.push(next.provenance.clone());
                 let mut next_edges = path_edges.clone();
                 next_edges.push(edge.clone());
-                pending.push_back((next, next_path, next_edges));
+                pending.push_back((Arc::clone(next), next_path, next_edges));
             }
         }
         let mut unique = Vec::new();

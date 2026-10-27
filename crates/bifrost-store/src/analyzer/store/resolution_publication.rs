@@ -1168,19 +1168,45 @@ impl AnalyzerStore {
         let path = persisted_relative_path.to_owned();
         let cancellation = cancellation.clone();
         self.conn.execute(move |conn| {
-            let result = super::resolution::with_resolution_progress_handler(conn, &cancellation, |conn| {
-            if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some(outcome) = validate_owner_conn(&tx, &owner, prepared.bundle.producer_epoch())? {
-                return Ok(outcome);
-            }
-            let ResolutionContentInput::Capsule { key, checkpoint_digest, host_module_scope } = &prepared.input else {
-                unreachable!("a prepared capsule carries its derivation input")
-            };
-            let oid = key.content_oid()?;
-            let oid_text = oid.to_string();
-            let existing: Option<(i64, [u8;32], bool)> = tx.query_row(
-                "SELECT blob.id, manifest.interior_digest,
+            let result =
+                super::resolution::with_resolution_progress_handler(conn, &cancellation, |conn| {
+                    publish_resolution_capsule_on(conn, owner, path, prepared, &cancellation)
+                });
+            interrupted_capsule_publication(result, &cancellation)
+        })
+    }
+}
+
+/// Publish one capsule on `conn`, in its own immediate transaction. The
+/// store's writer runs this, and so does a selected operation on the
+/// in-memory fallback, whose reader is that writer connection (#6018).
+pub(super) fn publish_resolution_capsule_on(
+    conn: &rusqlite::Connection,
+    owner: WorkspaceSnapshotId,
+    path: String,
+    prepared: PreparedResolutionCapsule,
+    cancellation: &CancellationToken,
+) -> Result<ResolutionContentPublicationOutcome> {
+    if cancellation.is_cancelled() {
+        return Ok(ResolutionContentPublicationOutcome::Cancelled);
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if let Some(outcome) = validate_owner_conn(&tx, &owner, prepared.bundle.producer_epoch())? {
+        return Ok(outcome);
+    }
+    let ResolutionContentInput::Capsule {
+        key,
+        checkpoint_digest,
+        host_module_scope,
+    } = &prepared.input
+    else {
+        unreachable!("a prepared capsule carries its derivation input")
+    };
+    let oid = key.content_oid()?;
+    let oid_text = oid.to_string();
+    let existing: Option<(i64, [u8; 32], bool)> = tx
+        .query_row(
+            "SELECT blob.id, manifest.interior_digest,
                    input.host_content_oid = ?5 AND input.invocation = ?6
                    AND input.definition_content_oid = ?7 AND input.selected_declaration = ?8
                    AND input.matched_arm_index = ?9 AND input.producer_epoch = ?4
@@ -1191,35 +1217,57 @@ impl AnalyzerStore {
                  JOIN resolution_capsule_inputs AS input ON input.blob_id = blob.id
                  WHERE blob.blob_oid = ?1 AND blob.lang = ?2 AND blob.generation = ?3
                    AND manifest.publication_state = 'complete' AND manifest.producer_epoch = ?4",
-                params![oid_text, owner.lang, owner.generation.0, prepared.bundle.producer_epoch(),
-                    key.host_content_oid.to_string(), key.invocation.get(), key.definition_content_oid.to_string(),
-                    key.selected_declaration.get(), super::usize_to_i64(key.matched_arm_index)?,
-                    key.digest().as_slice(), checkpoint_digest.as_slice(), host_module_scope.get()],
-                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-            ).optional()?;
-            if let Some((blob_id, actual_digest, input_matches)) = existing {
-                if actual_digest != prepared.bundle.interior_digest() || !input_matches {
-                    return Ok(ResolutionContentPublicationOutcome::Unavailable(
-                        SelectedResolutionUnavailable::InteriorOwnershipMismatch {
-                            storage_language: owner.lang, persisted_relative_path: path }
-                    ));
-                }
-                root_content_tx(&tx, &owner, blob_id)?;
-                let Some(receipt) = publication_receipt_tx(&tx, &owner, blob_id, oid,
-                    prepared.input, &cancellation)? else {
-                    return Ok(ResolutionContentPublicationOutcome::Cancelled);
-                };
-                if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
-                tx.commit()?;
-                if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
-                return Ok(ResolutionContentPublicationOutcome::Ready(Box::new(receipt)));
-            }
-            // Host-local ownership is source authority. Prove it against the
-            // host catalog identified by the key, never a selected runtime ID.
-            for row in &prepared.references {
-                if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
-                if let ResolutionCapsuleReferenceOwner::HostLocal(local) = row.reference_owner {
-                    let valid: bool = tx.query_row(
+            params![
+                oid_text,
+                owner.lang,
+                owner.generation.0,
+                prepared.bundle.producer_epoch(),
+                key.host_content_oid.to_string(),
+                key.invocation.get(),
+                key.definition_content_oid.to_string(),
+                key.selected_declaration.get(),
+                super::usize_to_i64(key.matched_arm_index)?,
+                key.digest().as_slice(),
+                checkpoint_digest.as_slice(),
+                host_module_scope.get()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((blob_id, actual_digest, input_matches)) = existing {
+        if actual_digest != prepared.bundle.interior_digest() || !input_matches {
+            return Ok(ResolutionContentPublicationOutcome::Unavailable(
+                SelectedResolutionUnavailable::InteriorOwnershipMismatch {
+                    storage_language: owner.lang,
+                    persisted_relative_path: path,
+                },
+            ));
+        }
+        root_content_tx(&tx, &owner, blob_id)?;
+        let Some(receipt) =
+            publication_receipt_tx(&tx, &owner, blob_id, oid, prepared.input, cancellation)?
+        else {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        tx.commit()?;
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        return Ok(ResolutionContentPublicationOutcome::Ready(Box::new(
+            receipt,
+        )));
+    }
+    // Host-local ownership is source authority. Prove it against the
+    // host catalog identified by the key, never a selected runtime ID.
+    for row in &prepared.references {
+        if cancellation.is_cancelled() {
+            return Ok(ResolutionContentPublicationOutcome::Cancelled);
+        }
+        if let ResolutionCapsuleReferenceOwner::HostLocal(local) = row.reference_owner {
+            let valid: bool = tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM blobs AS host
                          JOIN resolution_semantic_catalog AS catalog ON catalog.blob_id = host.id
                          JOIN resolution_semantic_sites AS site ON site.blob_id = host.id
@@ -1229,47 +1277,75 @@ impl AnalyzerStore {
                         params![key.host_content_oid.to_string(), owner.lang, owner.generation.0, local.get()],
                         |row| row.get(0),
                     )?;
-                    if !valid {
-                        return Ok(ResolutionContentPublicationOutcome::Unavailable(
-                            SelectedResolutionUnavailable::InteriorOwnershipMismatch {
-                                storage_language: owner.lang, persisted_relative_path: path }
-                        ));
-                    }
-                }
+            if !valid {
+                return Ok(ResolutionContentPublicationOutcome::Unavailable(
+                    SelectedResolutionUnavailable::InteriorOwnershipMismatch {
+                        storage_language: owner.lang,
+                        persisted_relative_path: path,
+                    },
+                ));
             }
-            let Some(previous_owners) = repair_owners_tx(&tx, &oid_text, &owner.lang, owner.generation, &cancellation)? else {
-                return Ok(ResolutionContentPublicationOutcome::Cancelled);
-            };
-            tx.execute("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2", params![oid_text,owner.lang])?;
-            tx.execute("INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,?2,?3)",
-                params![oid_text,owner.lang,owner.generation.0])?;
-            let blob_id = tx.last_insert_rowid();
-            if !insert_capsule_presentation_tx(&tx, blob_id, &prepared, &cancellation)? ||
-                !super::resolution::insert_prepared_bundle_tx(&tx, blob_id, &owner.lang, &prepared.bundle, &cancellation)? {
-                tx.rollback()?;
-                return Ok(ResolutionContentPublicationOutcome::Cancelled);
-            }
-            for previous in &previous_owners { root_content_tx(&tx, previous, blob_id)?; }
-            root_content_tx(&tx, &owner, blob_id)?;
-            let receipt = publication_receipt_tx(&tx, &owner, blob_id, oid, prepared.input, &cancellation)?;
-            let Some(receipt) = receipt else {
-                tx.rollback()?;
-                return Ok(ResolutionContentPublicationOutcome::Cancelled);
-            };
-            if cancellation.is_cancelled() {
-                tx.rollback()?;
-                return Ok(ResolutionContentPublicationOutcome::Cancelled);
-            }
-            tx.commit()?;
-            if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
-            Ok(ResolutionContentPublicationOutcome::Ready(Box::new(receipt)))
-            });
-            match result {
-                Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() =>
-                    Ok(ResolutionContentPublicationOutcome::Cancelled),
-                result => result,
-            }
-        })
+        }
+    }
+    let Some(previous_owners) =
+        repair_owners_tx(&tx, &oid_text, &owner.lang, owner.generation, cancellation)?
+    else {
+        return Ok(ResolutionContentPublicationOutcome::Cancelled);
+    };
+    tx.execute(
+        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
+        params![oid_text, owner.lang],
+    )?;
+    tx.execute(
+        "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,?2,?3)",
+        params![oid_text, owner.lang, owner.generation.0],
+    )?;
+    let blob_id = tx.last_insert_rowid();
+    if !insert_capsule_presentation_tx(&tx, blob_id, &prepared, cancellation)?
+        || !super::resolution::insert_prepared_bundle_tx(
+            &tx,
+            blob_id,
+            &owner.lang,
+            &prepared.bundle,
+            cancellation,
+        )?
+    {
+        tx.rollback()?;
+        return Ok(ResolutionContentPublicationOutcome::Cancelled);
+    }
+    for previous in &previous_owners {
+        root_content_tx(&tx, previous, blob_id)?;
+    }
+    root_content_tx(&tx, &owner, blob_id)?;
+    let receipt = publication_receipt_tx(&tx, &owner, blob_id, oid, prepared.input, cancellation)?;
+    let Some(receipt) = receipt else {
+        tx.rollback()?;
+        return Ok(ResolutionContentPublicationOutcome::Cancelled);
+    };
+    if cancellation.is_cancelled() {
+        tx.rollback()?;
+        return Ok(ResolutionContentPublicationOutcome::Cancelled);
+    }
+    tx.commit()?;
+    if cancellation.is_cancelled() {
+        return Ok(ResolutionContentPublicationOutcome::Cancelled);
+    }
+    Ok(ResolutionContentPublicationOutcome::Ready(Box::new(
+        receipt,
+    )))
+}
+
+/// A capsule publication that its own cancellation interrupted is
+/// cancelled, not failed.
+pub(super) fn interrupted_capsule_publication(
+    result: Result<ResolutionContentPublicationOutcome>,
+    cancellation: &CancellationToken,
+) -> Result<ResolutionContentPublicationOutcome> {
+    match result {
+        Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
+            Ok(ResolutionContentPublicationOutcome::Cancelled)
+        }
+        result => result,
     }
 }
 

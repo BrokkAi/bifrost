@@ -33,7 +33,7 @@ use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 
 #[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvider;
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+use brokk_bifrost_core::analyzer::usages::model::{UsageProof, UsageProofAuthority};
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallArgument;
 
@@ -100,6 +100,7 @@ impl CallRelationProvider for GoNativeCallRelationProvider {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return CallRelationResult {
                 cancelled: true,
+                proof_authority: UsageProofAuthority::Native,
                 ..CallRelationResult::default()
             };
         }
@@ -148,6 +149,7 @@ fn diagnostic(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> Call
 fn failed(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationResult {
     CallRelationResult {
         diagnostics: vec![diagnostic(kind, message, caller)],
+        proof_authority: UsageProofAuthority::Native,
         ..CallRelationResult::default()
     }
 }
@@ -166,6 +168,21 @@ struct GoCallShape {
 /// same case; keep that completeness behavior aligned until the owner changes
 /// the shared contract.
 pub(crate) fn outgoing(
+    go: &GoAnalyzer,
+    caller: &CodeUnit,
+    limits: CallRelationLimits,
+    budget: ReceiverAnalysisBudget,
+    cancellation: &CancellationToken,
+) -> CallRelationResult {
+    // Every result of this function, including cancellation and failures,
+    // comes from the native engine (#6829).
+    CallRelationResult {
+        proof_authority: UsageProofAuthority::Native,
+        ..resolve_outgoing(go, caller, limits, budget, cancellation)
+    }
+}
+
+fn resolve_outgoing(
     go: &GoAnalyzer,
     caller: &CodeUnit,
     limits: CallRelationLimits,
@@ -315,6 +332,10 @@ pub(crate) fn outgoing(
                 ));
             }
         };
+        operation.initialize_go_base_profile(
+            &go.native_context_base_profile()
+                .expect("outgoing query selected an active Go context"),
+        );
         operation.bind_go_context_publication(context.clone());
         let caller_path = brokk_bifrost_core::path_utils::rel_path_string(caller.source());
         let mut selected_imports = operation.go_selected_external_imports(
@@ -946,6 +967,42 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6811: Go reverse search and outgoing calls read participation without a base profile"
+    )]
+    fn native_outgoing_excludes_build_ignored_sibling_method() {
+        let Some((fixture, go)) = crate::analyzer::go::build_constrained_sibling_fixture_for_test(
+            "package workerprofile\n\nfunc Invoke(s *Service) { s.Run() }\n",
+        ) else {
+            return;
+        };
+        let caller = go
+            .declarations(&fixture.file("service.go"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "Invoke")
+            .expect("caller declaration");
+        let result = GoNativeCallRelationProvider.outgoing(
+            &go,
+            &caller,
+            CallRelationLimits {
+                max_files: 4,
+                max_source_bytes: 32_768,
+                max_candidates: 16,
+            },
+            None,
+        );
+        assert!(!result.cancelled && !result.truncated, "{result:?}");
+        assert!(result.diagnostics.is_empty(), "{result:?}");
+        let [site] = result.sites.as_slice() else {
+            panic!("one call to the participating method: {result:?}");
+        };
+        assert_eq!(site.callee.identifier(), "Run");
+        assert_eq!(site.callee.source(), &fixture.file("service_linux.go"));
+        assert_eq!(site.kind, CallSyntaxKind::Method);
+        assert_eq!(site.proof, UsageProof::Proven);
+    }
+
+    #[test]
     fn native_outgoing_projects_workspace_calls_and_omits_conversions() {
         let (_fixture, go, caller) = fixture();
         let overlay = brokk_bifrost_analysis::analyzer::semantic_model::overlay::go_extra_support_0::go_external_receiver_test_overlay();
@@ -1074,6 +1131,46 @@ mod tests {
         )
         .expect("the model-backed os import proves f.Close as external");
         assert_eq!(exact_proof.canonical_callee(), "os.File.Close");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6825: Go outgoing calls reported Complete-empty for a method declared in another file than its receiver type"
+    )]
+    fn native_outgoing_resolves_cross_file_receiver_method() {
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/calls\n\ngo 1.22\n")
+            .file(
+                "service.go",
+                "package service\ntype Service struct{}\nfunc Invoke(s *Service) { s.Run() }\n",
+            )
+            .file("method.go", "package service\nfunc (s *Service) Run() {}\n")
+            .build();
+        let go = GoAnalyzer::new(fixture.project_dyn());
+        crate::analyzer::go::persist_live_go_sources_for_test(&go);
+        let caller = go
+            .declarations(&fixture.file("service.go"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "Invoke")
+            .expect("caller");
+        let result = GoNativeCallRelationProvider.outgoing(
+            &go,
+            &caller,
+            CallRelationLimits {
+                max_files: 4,
+                max_source_bytes: 32_768,
+                max_candidates: 16,
+            },
+            None,
+        );
+        assert_eq!(result.proof_authority, UsageProofAuthority::Native);
+        assert!(result.diagnostics.is_empty(), "{result:#?}");
+        let [site] = result.sites.as_slice() else {
+            panic!("one cross-file method target: {result:#?}")
+        };
+        assert_eq!(site.callee.source(), &fixture.file("method.go"));
+        assert_eq!(site.callee.identifier(), "Run");
+        assert_eq!(site.proof, UsageProof::Proven);
     }
 
     #[test]

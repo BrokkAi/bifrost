@@ -1,7 +1,7 @@
 //! One endpoint's finite crate-row plan. Nothing here is retained by a selection.
 use super::super::demand_closure::{
     ClosureTag, ExportHydration, HalfBoundary, HalfObservation, PlacementFacts, PlacementStart,
-    RouteLocation, StartSelection, WalkCursor,
+    Read, RouteLocation, StartSelection, WalkCursor,
 };
 use super::super::rust_crate_context::{self as sql, Module};
 use super::super::rust_crate_rows::{RustCrateDeclaration, RustCrateRows};
@@ -1045,7 +1045,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
         scope: ResolutionScopeId,
         depth: u32,
         lookup: &ResolutionLookupSemanticRecipe,
-    ) -> Result<Self::LexicalTiers> {
+    ) -> Result<Read<Self::LexicalTiers>> {
         use super::super::demand_closure::RouteEdgeTier;
         let conn = self.rows.ready.inventory.connection();
         let rows = RustCrateRows {
@@ -1121,7 +1121,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
                 lookup.clone(),
             )
         });
-        Ok(std::iter::once(
+        Ok(Read::ready(std::iter::once(
             super::super::demand_closure::LexicalStartTier {
                 ranked: super::super::demand_closure::RankedLexicalTier {
                     rank: (depth, 0),
@@ -1130,7 +1130,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
                 },
                 head,
             },
-        ))
+        )))
     }
     fn lexical_selection(
         &self,
@@ -1282,12 +1282,10 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
         facts: &PlacementFacts<Self::Target>,
         observation: &mut HalfObservation,
     ) -> Result<()> {
-        let conn = self.rows.ready.inventory.connection();
         if let Some(resolved) = &self.resolved {
             let generated_surface =
                 super::super::rust_crate_context::generated_item_surface_boundary(
-                    conn,
-                    &self.rows.ready.context_identities,
+                    self.rows.ready,
                     &resolved.targets,
                 )?;
             if generated_surface != ResolutionCompletion::Complete {

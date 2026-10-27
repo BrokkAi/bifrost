@@ -26,6 +26,10 @@ impl<K: Eq + Hash, V> Default for RequestContextMemo<K, V> {
 }
 
 impl<K: Eq + Hash, V: Clone> RequestContextMemo<K, V> {
+    pub(super) fn clear(&self) {
+        self.entries.replace(ExactReadMemo::default());
+    }
+
     /// Read only an already admitted preparation. Publication must never
     /// derive on a miss or convert a promised ready value into a cached miss.
     pub(super) fn get(&self, key: &K) -> Option<V> {
@@ -92,6 +96,27 @@ impl<K, V> Default for ContextPlanMemo<K, V> {
 }
 
 impl<K: Eq + Hash, V: Clone> ContextPlanMemo<K, V> {
+    pub(super) fn clear(&self) {
+        self.entries
+            .lock()
+            .expect("context plan memo is not poisoned")
+            .clear();
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("context plan memo is not poisoned")
+            .len()
+    }
+
+    pub(super) fn contains_key(&self, key: &K) -> bool {
+        self.entries
+            .lock()
+            .expect("context plan memo is not poisoned")
+            .contains_key(key)
+    }
+
     pub(super) fn get(&self, key: &K) -> Option<V> {
         self.entries
             .lock()

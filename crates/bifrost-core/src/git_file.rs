@@ -335,3 +335,333 @@ fn normalize_path_lexically(path: PathBuf) -> PathBuf {
     }
     normalized
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use git2::Signature;
+
+    use super::{
+        git_history_path_is_file, list_git_files_at_revision, parse_rev_path, read_git_file,
+        read_git_file_bytes, resolve_git_file_path,
+    };
+    use crate::gitblob::test_repo::init_repo;
+
+    fn commit(repo: &git2::Repository) -> String {
+        let signature = Signature::now("T", "t@example.com").unwrap();
+        crate::test_git_support::commit_all_with_deletions(repo, "fixture", &signature).to_string()
+    }
+
+    fn write(root: &Path, rel: &str, bytes: &[u8]) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn paths(rels: &[&str]) -> Vec<PathBuf> {
+        rels.iter().map(PathBuf::from).collect()
+    }
+
+    /// The `rev:path` selector split must leave Windows drive paths alone and
+    /// cut at the first colon only, so a committed name containing `:` survives.
+    #[test]
+    fn parse_rev_path_splits_at_the_first_colon_and_spares_drive_paths() {
+        assert_eq!(
+            parse_rev_path("HEAD~2:src/lib.rs"),
+            Some(("HEAD~2", "src/lib.rs"))
+        );
+        assert_eq!(
+            parse_rev_path("main:dir/a:b.txt"),
+            Some(("main", "dir/a:b.txt"))
+        );
+        // A one-letter revision with a drive-absolute path is a path.
+        assert_eq!(parse_rev_path("C:\\src\\lib.rs"), None);
+        assert_eq!(parse_rev_path("C:/src/lib.rs"), None);
+        // A drive-relative spelling is not drive-absolute, so it is a selector.
+        assert_eq!(parse_rev_path("C:lib.rs"), Some(("C", "lib.rs")));
+        for malformed in ["", "HEAD", ":path", "HEAD:", ":"] {
+            assert_eq!(parse_rev_path(malformed), None, "accepted {malformed:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_git_file_path_anchors_trims_and_normalizes() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+
+        assert_eq!(
+            resolve_git_file_path("  a/./b/../c.rs\n", root),
+            root.join("a").join("c.rs"),
+        );
+        // `..` past the workspace root leaves the root: this is a resolver for
+        // caller-chosen files, not a sandbox.
+        let outside = root.parent().unwrap().join("sibling.rs");
+        assert_eq!(resolve_git_file_path("../sibling.rs", root), outside);
+
+        let absolute = root.join("x").join("..").join("y.rs");
+        assert_eq!(
+            resolve_git_file_path(absolute.to_str().unwrap(), Path::new("/unused-root")),
+            root.join("y.rs"),
+        );
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let resolved = resolve_git_file_path("~/q/../r.rs", root);
+            assert!(resolved.is_absolute(), "{resolved:?}");
+            assert!(resolved.ends_with("r.rs"), "{resolved:?}");
+            assert!(
+                !resolved.starts_with(root),
+                "{resolved:?} was workspace-relative"
+            );
+            assert!(
+                resolved.starts_with(super::normalize_path_lexically(PathBuf::from(home))),
+                "{resolved:?} is not under HOME",
+            );
+        }
+    }
+
+    /// Two commits in a real repository, read back through the same chain a
+    /// `rev:path` selector takes: parse, resolve against the workspace, read.
+    /// The fixture has a non-ASCII path, a path deleted between the commits
+    /// (and from the working tree, so its absolute path is missing on disk), a
+    /// binary blob, and a non-UTF-8 text blob.
+    #[test]
+    fn git_readers_agree_with_a_two_commit_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = init_repo(root);
+
+        write(root, "src/lib.rs", b"v1\n");
+        write(root, "caf\u{e9}/\u{4e2d}.txt", "unicode v1\n".as_bytes());
+        write(root, "gone.txt", b"bye\n");
+        write(root, "bin.dat", &[0, 1, 2, 0xff, 0]);
+        write(root, "latin.txt", b"caf\xe9\n");
+        let first = commit(&repo);
+
+        write(root, "src/lib.rs", b"v2\n");
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        write(root, "later/new.txt", b"new\n");
+        let second = commit(&repo);
+
+        let read = |rev: &str, rel: &str| read_git_file(rev, &root.join(rel));
+
+        // Revision-selected content, through the selector pipeline.
+        for (rev, expected) in [(&first, "v1\n"), (&second, "v2\n")] {
+            let selector = format!("{rev}:src/lib.rs");
+            let (parsed_rev, parsed_path) = parse_rev_path(&selector).unwrap();
+            let abs = resolve_git_file_path(parsed_path, root);
+            assert_eq!(read_git_file(parsed_rev, &abs).unwrap(), expected);
+            assert!(git_history_path_is_file(parsed_rev, &abs));
+        }
+        assert_eq!(read("HEAD", "src/lib.rs").unwrap(), "v2\n");
+        assert_eq!(read("HEAD~1", "src/lib.rs").unwrap(), "v1\n");
+        assert!(read(&first, "caf\u{e9}/missing.txt").is_err());
+        assert_eq!(
+            read(&first, "caf\u{e9}/\u{4e2d}.txt").unwrap(),
+            "unicode v1\n"
+        );
+
+        // A deleted file is readable where it existed and absent afterwards,
+        // even though its working-tree path no longer exists.
+        let gone = root.join("gone.txt");
+        assert!(!gone.exists());
+        assert_eq!(read(&first, "gone.txt").unwrap(), "bye\n");
+        assert!(git_history_path_is_file(&first, &gone));
+        let err = read(&second, "gone.txt").unwrap_err();
+        assert!(err.contains("absent at git revision"), "{err}");
+        assert!(!git_history_path_is_file(&second, &gone));
+
+        // A file added by the second commit is absent from the first.
+        assert!(read(&first, "later/new.txt").is_err());
+        assert_eq!(read(&second, "later/new.txt").unwrap(), "new\n");
+
+        // Bytes are preserved exactly; text reads convert lossily; binary
+        // blobs are refused as text.
+        let bytes = read_git_file_bytes(&first, &root.join("bin.dat")).unwrap();
+        assert_eq!(bytes.as_bytes(), &[0, 1, 2, 0xff, 0]);
+        assert!(bytes.is_binary());
+        assert_eq!(bytes.repo_relative_path(), Path::new("bin.dat"));
+        assert_eq!(bytes.into_bytes(), vec![0, 1, 2, 0xff, 0]);
+        let err = read(&first, "bin.dat").unwrap_err();
+        assert!(err.contains("is binary"), "{err}");
+        let latin = read_git_file_bytes(&first, &root.join("latin.txt")).unwrap();
+        assert!(!latin.is_binary());
+        assert_eq!(latin.as_bytes(), b"caf\xe9\n");
+        assert_eq!(read(&first, "latin.txt").unwrap(), "caf\u{fffd}\n");
+
+        // Failure modes keep their distinct causes.
+        let err = read("no-such-revision", "src/lib.rs").unwrap_err();
+        assert!(err.contains("bad git revision"), "{err}");
+        let err = read(&first, "src").unwrap_err();
+        assert!(err.contains("is not a file blob"), "{err}");
+        assert!(!git_history_path_is_file(&first, &root.join("src")));
+        assert!(!git_history_path_is_file(
+            "no-such-revision",
+            &root.join("src/lib.rs")
+        ));
+        assert!(!git_history_path_is_file(
+            &first,
+            &root.join("never/existed.txt")
+        ));
+        let err = read_git_file("HEAD", Path::new("relative/lib.rs")).unwrap_err();
+        assert!(err.contains("must be absolute"), "{err}");
+
+        // Listing: whole-tree and subdirectory workspaces, per revision.
+        assert_eq!(
+            list_git_files_at_revision(root, &first).unwrap(),
+            paths(&[
+                "bin.dat",
+                "caf\u{e9}/\u{4e2d}.txt",
+                "gone.txt",
+                "latin.txt",
+                "src/lib.rs",
+            ]),
+        );
+        assert_eq!(
+            list_git_files_at_revision(root, &second).unwrap(),
+            paths(&[
+                "bin.dat",
+                "caf\u{e9}/\u{4e2d}.txt",
+                "later/new.txt",
+                "latin.txt",
+                "src/lib.rs",
+            ]),
+        );
+        assert_eq!(
+            list_git_files_at_revision(&root.join("src"), &second).unwrap(),
+            paths(&["lib.rs"]),
+        );
+        let err = list_git_files_at_revision(&root.join("later"), &first).unwrap_err();
+        assert!(err.contains("absent at git revision"), "{err}");
+        let err = list_git_files_at_revision(&root.join("bin.dat"), &first).unwrap_err();
+        assert!(err.contains("is not a tree"), "{err}");
+        let err = list_git_files_at_revision(root, "no-such-revision").unwrap_err();
+        assert!(err.contains("bad git revision"), "{err}");
+        let err = list_git_files_at_revision(&root.join("missing-dir"), &first).unwrap_err();
+        assert!(
+            err.contains("unable to canonicalize workspace root"),
+            "{err}"
+        );
+    }
+}
+
+/// Generative tests with independent oracles: a stack machine for lexical
+/// normalization, the directory structure the test itself built for the
+/// filesystem helpers, and the bytes the test itself committed for the readers.
+#[cfg(test)]
+mod git_file_properties {
+    use std::path::{Component, PathBuf};
+
+    use proptest::prelude::*;
+
+    use super::{
+        canonicalize_allow_missing, nearest_existing_ancestor, normalize_path_lexically,
+        read_git_file_bytes,
+    };
+
+    fn join_tokens(root: &str, stack: &[String]) -> PathBuf {
+        let mut path = PathBuf::from(root);
+        path.extend(stack);
+        path
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Lexical normalization against a stack machine: names push, `.` is
+        /// skipped, and `..` pops, doing nothing at the root or on an empty
+        /// relative path. The output is a fixed point holding no `.` or `..`.
+        #[test]
+        fn normalize_path_lexically_matches_a_stack_reference(
+            anchored in any::<bool>(),
+            tokens in prop::collection::vec(
+                prop_oneof![
+                    3 => "[a-z]{1,3}",
+                    1 => Just(".".to_string()),
+                    2 => Just("..".to_string()),
+                ],
+                0..10,
+            ),
+        ) {
+            let mut stack: Vec<String> = Vec::new();
+            for token in &tokens {
+                match token.as_str() {
+                    "." => {}
+                    ".." => {
+                        stack.pop();
+                    }
+                    name => stack.push(name.to_string()),
+                }
+            }
+            let root = if anchored { "/" } else { "" };
+            let input = join_tokens(root, &tokens);
+            let normalized = normalize_path_lexically(input.clone());
+
+            prop_assert_eq!(&normalized, &join_tokens(root, &stack), "input {:?}", input);
+            prop_assert_eq!(normalize_path_lexically(normalized.clone()), normalized.clone());
+            prop_assert!(
+                normalized
+                    .components()
+                    .all(|c| !matches!(c, Component::CurDir | Component::ParentDir)),
+                "dot component left in {normalized:?}",
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// On a directory tree the test built: the nearest existing ancestor
+        /// of a missing path is the deepest directory that exists, and
+        /// `canonicalize_allow_missing` is `canonicalize` of that directory
+        /// joined with the missing tail. A fully existing path canonicalizes
+        /// as `std` does.
+        #[test]
+        fn missing_tails_resolve_against_the_deepest_existing_directory(
+            existing in prop::collection::vec("[a-z]{1,3}", 0..3),
+            missing in prop::collection::vec("[a-z]{1,3}", 1..4),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let deepest = existing.iter().fold(root.clone(), |acc, name| acc.join(name));
+            std::fs::create_dir_all(&deepest).unwrap();
+            // A missing tail whose first name matches an existing sibling would
+            // not be missing; make it distinct from every created name.
+            let missing: Vec<String> = missing.iter().map(|name| format!("m-{name}")).collect();
+            let target = missing.iter().fold(deepest.clone(), |acc, name| acc.join(name));
+
+            prop_assert_eq!(nearest_existing_ancestor(&target), Some(deepest.clone()));
+            prop_assert_eq!(canonicalize_allow_missing(&target), Ok(target.clone()));
+            prop_assert_eq!(nearest_existing_ancestor(&deepest), Some(deepest.clone()));
+            prop_assert_eq!(canonicalize_allow_missing(&deepest), Ok(deepest.clone()));
+
+            // An unnormalized spelling of the same missing path resolves the same.
+            let dotted = deepest.join(".").join(missing.join("/"));
+            prop_assert_eq!(canonicalize_allow_missing(&dotted), Ok(target));
+        }
+
+        /// Bytes committed to a real repository come back unchanged. Content is
+        /// printable ASCII, newlines and NULs, so git's binary heuristic reduces
+        /// to "contains a NUL" (other control bytes can also trip it).
+        #[test]
+        fn read_git_file_bytes_round_trips_committed_content(
+            content in prop::collection::vec(
+                prop_oneof![8 => 0x20u8..0x7f, 1 => Just(b'\n'), 1 => Just(0u8)],
+                0..48,
+            ),
+            name in "[a-z]{1,6}\\.[a-z]{1,3}",
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let repo = crate::gitblob::test_repo::init_repo(root);
+            std::fs::write(root.join(&name), &content).unwrap();
+            crate::gitblob::test_repo::commit_all(&repo, "fixture");
+
+            let blob = read_git_file_bytes("HEAD", &root.join(&name)).unwrap();
+            prop_assert_eq!(blob.as_bytes(), content.as_slice());
+            prop_assert_eq!(blob.is_binary(), content.contains(&0));
+            prop_assert_eq!(blob.repo_relative_path(), std::path::Path::new(&name));
+        }
+    }
+}

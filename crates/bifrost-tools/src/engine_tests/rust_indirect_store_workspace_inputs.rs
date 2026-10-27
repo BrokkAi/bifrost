@@ -48,6 +48,7 @@ mod rust_indirect_table_tests {
                     &[],
                     std::slice::from_ref(configuration),
                     &[],
+                    &[],
                 )
                 .unwrap()
         };
@@ -107,6 +108,7 @@ mod rust_indirect_table_tests {
                 &[],
                 &[],
                 &[],
+                None,
             )
             .unwrap()
             .remove("rust")

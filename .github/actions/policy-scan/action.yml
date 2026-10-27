@@ -19,14 +19,14 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.14.1
+    default: v0.14.2
   packs-source:
     description: >-
       Trusted JSON source selection with repository, exact rules_version and
       manifest_sha256 plus semantic_manifest_sha256. Optional inventory_url and inventory_sha256 select an
       HTTPS archive mirror. Invalid explicit selections never fall back.
       When empty and the scan needs host content, the action acquires the exact
-      public 0.1.1 rules and semantic descriptor pins. An empty value with
+      public rules 0.5.1 and packs 0.6.0 descriptor pins. An empty value with
       caller-prepared roots, or with only policy files, acquires nothing.
     required: false
     default: ''
@@ -34,7 +34,9 @@ inputs:
     description: >-
       Existing Actions secret with contents read on the selected private GitHub
       repository. Used only during acquisition on trusted push/workflow_dispatch
-      events; prohibited on PRs. Authenticated content is never saved to Actions cache.
+      events; prohibited on PRs. Content it authenticates is never saved to Actions
+      cache. When empty, the job's github.token authenticates GitHub API reads of a
+      source outside this repository, which can only be public.
     required: false
     default: ''
   packs-cache:
@@ -245,7 +247,9 @@ runs:
       env:
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
         PACK_SOURCE: ${{ inputs.packs-source }}
-        DEFAULT_PACK_SOURCE: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.1.1","manifest_sha256":"6f188826fe5b4918967100d8c0816c8b230a13d4a47300497d2294390a112388","semantic_manifest_sha256":"f28356cb17e85d84de3432de837f2d045e554e6d3d8d1f08018015e4960446d8"}'
+        # scripts/release-dry-run.sh requires the engine this action installs
+        # to admit this pin (pack-admission phase).
+        DEFAULT_PACK_SOURCE: '{"repository":"https://github.com/BrokkAi/bifrost-packs","rules_version":"0.5.1","manifest_sha256":"e607e5c360889805bf614ab05f96feda199f6ad3009d00f49158cd9f507ada6b","semantic_manifest_sha256":"dd8888f763f13732ede1f05a34c2bd205dad25705b3da967e9df949c14842570"}'
         POLICY_ROOT: ${{ env.BIFROST_OPEN_POLICY_PACK_ROOT }}
         SEMANTIC_ROOT: ${{ env.BIFROST_OPEN_SEMANTIC_PACK_BUNDLE }}
         POLICY_PACKS: ${{ steps.policy-selection.outputs.packs }}
@@ -299,6 +303,7 @@ runs:
       shell: bash
       env:
         PACK_TOKEN: ${{ inputs.packs-token }}
+        JOB_TOKEN: ${{ github.token }}
         PACK_OFFLINE: ${{ inputs.packs-offline }}
         PACK_SOURCE: ${{ steps.pack-identity.outputs.source }}
         BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
@@ -310,10 +315,30 @@ runs:
           echo '::error::Private pack credentials require a trusted push or manually approved workflow.'
           exit 1
         fi
+        # Anonymous GitHub API reads share the runner IP's 60-an-hour quota,
+        # which PR scans exhausted (#6617). The job token lifts it on every
+        # event, PRs from forks included. It reads only this repository and
+        # public ones, so for a source outside this repository it authenticates
+        # public content only, which may still be cached. A mirror makes no API
+        # reads, and the engine refuses a token with one.
+        own_repository="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+        if [ -z "${PACK_TOKEN}" ] && [ "${GITHUB_SERVER_URL}" = https://github.com ] \
+          && jq -e --arg own "${own_repository}" \
+            '(has("inventory_url") | not) and (.repository | ascii_downcase) != ($own | ascii_downcase)' \
+            <<<"${PACK_SOURCE}" >/dev/null 2>&1; then
+          export PACK_TOKEN="${JOB_TOKEN}"
+        fi
         if [ "${PACK_OFFLINE}" = true ]; then export BIFROST_OPEN_PACKS_OFFLINE=1; fi
         receipt="${STATE_PATH}/receipt.json"
         env_file="${STATE_PATH}/environment.json"
-        "${BIFROST_BIN}" prepare-open-packs --cache-dir "${CACHE_PATH}" --receipt-path "${receipt}" --env-path "${env_file}"
+        if ! "${BIFROST_BIN}" prepare-open-packs --cache-dir "${CACHE_PATH}" --receipt-path "${receipt}" --env-path "${env_file}"; then
+          # Name the receipt's message, not only its class: older engines print
+          # only the class, and "unavailable" alone hid a rate limit (#6617).
+          jq -r '"::error::Open-pack acquisition failed: \(.failure.class) (\(.failure.message))"
+            | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")' "${receipt}" \
+            || echo '::error::Open-pack acquisition failed without a readable receipt.'
+          exit 1
+        fi
         jq -e 'type == "object" and .status == "selected" and (.selection.selection_id | type == "string" and length > 0) and (.selection.cache_reused | type == "boolean") and .selection.receipt.status == "qualified"' "${receipt}" >/dev/null
         jq -e 'type == "object" and ((keys | sort) == ["BIFROST_OPEN_POLICY_PACK_ROOT", "BIFROST_SEMANTIC_PACK_CACHE_ROOT"] or (keys | sort) == ["BIFROST_OPEN_POLICY_PACK_ROOT", "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE", "BIFROST_SEMANTIC_PACK_CACHE_ROOT"]) and all(.[]; type == "string" and length > 0)' "${env_file}" >/dev/null
         echo "selection-id=$(jq -er '.selection.selection_id' "${receipt}")" >> "${GITHUB_OUTPUT}"

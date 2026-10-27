@@ -11,14 +11,14 @@ pub use brokk_bifrost_semantic::analyzer::semantic_model::callable_values::*;
 /// Catalog availability is not activation and authored coverage is not an
 /// observation of callback execution.
 #[derive(Debug)]
-pub struct ActivatedCallableValuesRows<'a> {
-    pub shard: &'a crate::analyzer::semantic_model::ActiveSemanticModelShard,
+pub struct ActivatedCallableValuesRows {
+    pub shard: std::sync::Arc<crate::analyzer::semantic_model::ActiveSemanticModelShard>,
     pub rows: crate::analyzer::semantic_model::CatalogCallableValuesQueryResult,
 }
 
 #[derive(Debug)]
-pub struct ActivatedCallableValuesQuery<'a> {
-    pub publications: Vec<ActivatedCallableValuesRows<'a>>,
+pub struct ActivatedCallableValuesQuery {
+    pub publications: Vec<ActivatedCallableValuesRows>,
     pub executable_coverage: CsmiCoverageStatus,
     pub gap: Option<ActivatedCallableValuesGap>,
 }
@@ -26,17 +26,19 @@ pub struct ActivatedCallableValuesQuery<'a> {
 /// Read returned-callable contracts for an already resolver-bound factory.
 /// The factory must belong to this activation and carry exact artifact proof.
 /// All selected publishing shards are consulted; competing contracts survive.
-pub fn activated_returned_callable_targets<'a>(
-    catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
-    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+pub fn activated_returned_callable_targets(
+    _catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
+    active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
     factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     result: u32,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
-    let reader = catalog.runtime_source_reader();
+) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
+    let reader = active
+        .source_reader()
+        .ok_or(crate::analyzer::semantic_model::CatalogError::Unavailable)?;
     activated_returned_callable_targets_from_reader(
-        &reader,
+        reader,
         active,
         factory,
         result,
@@ -48,14 +50,14 @@ pub fn activated_returned_callable_targets<'a>(
 /// Read returned-callable contracts through the fixed runtime source reader
 /// retained by native dispatch. The activation, publication, and exact
 /// artifact checks are identical to [`activated_returned_callable_targets`].
-pub fn activated_returned_callable_targets_from_reader<'a>(
+pub fn activated_returned_callable_targets_from_reader(
     reader: &crate::analyzer::semantic_model::CatalogRuntimeSourceReader,
-    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
     factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     result: u32,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
     query_activated_callable_values(
         reader,
         active,
@@ -69,17 +71,19 @@ pub fn activated_returned_callable_targets_from_reader<'a>(
 /// Read during-call invocation contracts using exact structured callback input
 /// and shape evidence. This does not promote a partial heap observation or a
 /// contract's May invocation into an observed invocation.
-pub fn activated_callback_invocations<'a>(
-    catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
-    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+pub fn activated_callback_invocations(
+    _catalog: &crate::analyzer::semantic_model::SemanticPackCatalog,
+    active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
     factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     evidence: CallableInvocationEvidence<'_>,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
-    let reader = catalog.runtime_source_reader();
+) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
+    let reader = active
+        .source_reader()
+        .ok_or(crate::analyzer::semantic_model::CatalogError::Unavailable)?;
     activated_callback_invocations_from_reader(
-        &reader,
+        reader,
         active,
         factory,
         evidence,
@@ -92,14 +96,14 @@ pub fn activated_callback_invocations<'a>(
 /// retained by native dispatch. A contract's `May` modality remains authored
 /// evidence until the native observation consumer independently proves an
 /// actual invocation.
-pub fn activated_callback_invocations_from_reader<'a>(
+pub fn activated_callback_invocations_from_reader(
     reader: &crate::analyzer::semantic_model::CatalogRuntimeSourceReader,
-    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
     factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     evidence: CallableInvocationEvidence<'_>,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
     query_activated_callable_values(
         reader,
         active,
@@ -113,14 +117,14 @@ pub fn activated_callback_invocations_from_reader<'a>(
     )
 }
 
-pub(crate) fn query_activated_callable_values<'a>(
+pub(crate) fn query_activated_callable_values(
     reader: &crate::analyzer::semantic_model::CatalogRuntimeSourceReader,
-    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+    active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
     factory: &crate::analyzer::semantic_model::SemanticModelSymbol,
     question: crate::analyzer::semantic_model::CatalogCallableValuesQuestion<'_>,
     limits: CallableValuesQueryLimits,
     cancellation: &CancellationToken,
-) -> Result<ActivatedCallableValuesQuery<'a>, crate::analyzer::semantic_model::CatalogError> {
+) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
     let mut result = ActivatedCallableValuesQuery {
         publications: Vec::new(),
         executable_coverage: CsmiCoverageStatus::Unknown,
@@ -161,7 +165,7 @@ pub(crate) fn query_activated_callable_values<'a>(
             result.gap = Some(ActivatedCallableValuesGap::Cancelled);
             return Ok(result);
         }
-        if callable_publication_matches(member.shard, factory)
+        if callable_publication_matches(&member.shard, factory)
             && matches!(
                 member.record.member_kind,
                 super::MemberKind::Constructor
@@ -188,13 +192,12 @@ pub(crate) fn query_activated_callable_values<'a>(
             break;
         };
         remaining = next;
-        if !callable_publication_matches(shard, factory) || shard.shard.callable_values().is_none()
-        {
+        if !callable_publication_matches(&shard, factory) || !shard.has_callable_values {
             continue;
         }
         let request = crate::analyzer::semantic_model::CatalogCallableValuesQuery {
             manifest_digest: &shard.manifest.content_sha256,
-            shard_id: shard.shard.shard_id(),
+            shard_id: shard.descriptor.shard_id.as_str(),
             callable: &provenance.record_id,
             question,
         };

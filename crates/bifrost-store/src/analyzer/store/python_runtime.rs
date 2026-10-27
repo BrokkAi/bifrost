@@ -980,6 +980,7 @@ impl AnalyzerStore {
                         head,
                         &closed,
                         &replacements,
+                        &Default::default(),
                     )?;
                 }
             }

@@ -3,11 +3,53 @@
 //! This is one caller's query. Package membership stays in SQLite; the source
 //! halves, candidate export halves and compiled bridges die with the query.
 
+use super::file_context::RootHalfRequest;
+use super::root_bridges::{RootBridgePair, RootBridgeRules, assemble_root_bridges};
 use super::*;
 use crate::analyzer::resolution::{
-    FactPageVisitor, ResolutionLookupSemanticRecipe, SelectedResolutionMountContext,
-    SelectedRootPathHalf, SharedNameId, SharedNameInterner, visit_selected_root_export_half_pages,
+    ResolutionLookupSemanticRecipe, SelectedResolutionMountContext, SelectedRootPathHalf,
+    SharedNameId, SharedNameInterner,
 };
+
+// The go_context_source_files view's semantics in version-led order for
+// file-keyed probes. The view keeps context-led order for plan stability.
+// `probe` supplies the selected revision; the caller constrains the version.
+pub(in crate::analyzer::store) const GO_CONTEXT_SOURCE_FILE_BY_VERSION_JOIN: &str = r#"
+CROSS JOIN main.workspace_file_versions versions
+  ON versions.input_kind='source'
+ AND versions.valid_from<=probe.revision
+ AND (versions.valid_until IS NULL OR probe.revision<versions.valid_until)
+CROSS JOIN main.go_package_files source ON source.rel_path=versions.rel_path
+CROSS JOIN main.go_package_instances package
+  ON package.package_id=source.package_id
+CROSS JOIN main.go_context_publications publication
+  ON publication.context_id=package.context_id
+ AND versions.workspace_id=publication.workspace_id AND versions.lang=publication.lang
+ AND versions.generation=publication.generation
+ AND publication.valid_from<=probe.revision
+ AND (publication.valid_until IS NULL OR probe.revision<publication.valid_until)
+"#;
+
+// File-keyed users of the selected view use this equivalent derived table.
+// Outer file predicates push into `versions` before package membership is read.
+pub(super) static GO_SELECTED_SOURCE_FILE_BY_VERSION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
+SELECT package.context_id, package.package_id, source.source_role,
+       versions.file_version_id, versions.rel_path, versions.blob_oid,
+       versions.projection_digest, versions.valid_from, versions.valid_until,
+       publication.valid_from AS publication_valid_from,
+       publication.valid_until AS publication_valid_until,
+       versions.workspace_id, versions.lang, versions.generation
+FROM temp.selected_workspace_revisions probe
+{}
+WHERE probe.lang='go' AND versions.workspace_id=probe.workspace_id AND versions.lang=probe.lang
+  AND versions.generation=probe.generation
+"#,
+            GO_CONTEXT_SOURCE_FILE_BY_VERSION_JOIN
+        )
+    });
 
 /// Unsaved Go replacements that keep their predecessor's package placement.
 /// The Go tool placed the predecessor from its bytes through the imports; an
@@ -124,9 +166,12 @@ WHERE c.context_id = ?1 AND s.derivation_version = ?2
 
 // Exact file placement and import mapping, then only the selected provider's
 // admitted Go files. No package-name or path-suffix lookup is authority here.
-pub(crate) const DOT_IMPORT_TARGET_MOUNTS: &str = r#"
+pub(crate) static DOT_IMPORT_TARGET_MOUNTS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 SELECT mounted.mount_ordinal
-FROM temp.selected_go_context_source_files AS caller
+FROM ({}) AS caller
 JOIN main.go_package_instances AS package
   ON package.context_id=caller.context_id AND package.package_id=caller.package_id
  AND ((?3='go' AND package.for_test='')
@@ -148,7 +193,7 @@ WHERE caller.context_id = ?1 AND caller.file_version_id = ?2
   AND caller.source_role = ?3
 UNION ALL
 SELECT placed.mount_ordinal
-FROM temp.selected_go_context_source_files AS caller
+FROM ({}) AS caller
 JOIN main.go_package_instances AS package
   ON package.context_id=caller.context_id AND package.package_id=caller.package_id
  AND ((?3='go' AND package.for_test='')
@@ -168,7 +213,11 @@ JOIN temp.selected_go_transient_placements AS placed
   ON placed.file_version_id = provider.file_version_id
 WHERE caller.context_id = ?1 AND caller.file_version_id = ?2
   AND caller.source_role = ?3
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 #[derive(Clone, Default)]
 #[doc(hidden)]
@@ -213,6 +262,14 @@ pub enum GoDotImportContext {
     Cancelled,
 }
 
+/// A file-to-context lookup at one snapshot, in the provider or the owner role.
+type GoContextsForFileLookup = fn(
+    &rusqlite::Connection,
+    &crate::analyzer::store::WorkspaceSnapshotId,
+    &[u8; 32],
+    &str,
+) -> Result<Vec<(super::super::GoContextIdentity, [u8; 32])>>;
+
 impl SelectedResolutionOperation<'_, '_> {
     /// Failure metadata is independent of whether package membership admits a file.
     #[doc(hidden)]
@@ -242,36 +299,59 @@ impl SelectedResolutionOperation<'_, '_> {
         base: &[u8; 32],
         path: &str,
     ) -> Result<Vec<(super::super::GoContextIdentity, [u8; 32])>> {
-        let Some(snapshot) = self.captured_input.snapshots.get("go") else {
-            return Ok(Vec::new());
-        };
-        if let Some(previous) = self.ready.go_base_profile.replace(Some(*base)) {
-            assert_eq!(previous, *base, "one request uses one Go base profile");
-        }
-        let contexts = super::super::go_package_context::go_contexts_for_file_on(
-            self.ready.inventory.connection(),
-            snapshot,
+        self.bound_go_contexts_for_file(
             base,
             path,
-        )?;
-        for (context, _) in &contexts {
-            self.bind_go_context_publication(context.clone());
-        }
-        Ok(contexts)
+            super::super::go_package_context::go_contexts_for_file_on,
+        )
     }
 
+    /// The one context that owns this workspace source: its package belongs
+    /// to one of the context's main modules.
     #[doc(hidden)]
     pub fn go_context_for_file(
         &self,
         base: &[u8; 32],
         path: &str,
     ) -> Result<Option<super::super::GoContextIdentity>> {
-        let mut contexts = self.go_contexts_for_file(base, path)?;
+        let mut contexts = self.bound_go_contexts_for_file(
+            base,
+            path,
+            super::super::go_package_context::go_owner_context_for_file_on,
+        )?;
         assert!(
             contexts.len() <= 1,
             "one workspace source belongs to one discovery domain: {contexts:?}"
         );
         Ok(contexts.pop().map(|(context, _)| context))
+    }
+
+    /// Select the immutable Go profile on this operation, including worker readers.
+    pub fn initialize_go_base_profile(&self, base: &[u8; 32]) {
+        if let Some(previous) = self.ready.go_base_profile.get() {
+            assert_eq!(previous, *base, "one request uses one Go base profile");
+        } else {
+            self.ready.go_base_profile.set(Some(*base));
+        }
+    }
+
+    /// Run one file-to-context lookup at the request's snapshot and bind every
+    /// returned publication for this request.
+    fn bound_go_contexts_for_file(
+        &self,
+        base: &[u8; 32],
+        path: &str,
+        lookup: GoContextsForFileLookup,
+    ) -> Result<Vec<(super::super::GoContextIdentity, [u8; 32])>> {
+        let Some(snapshot) = self.captured_input.snapshots.get("go") else {
+            return Ok(Vec::new());
+        };
+        self.initialize_go_base_profile(base);
+        let contexts = lookup(self.ready.inventory.connection(), snapshot, base, path)?;
+        for (context, _) in &contexts {
+            self.bind_go_context_publication(context.clone());
+        }
+        Ok(contexts)
     }
 
     /// Compose only source-owned dot-import demands for one selected file.
@@ -394,7 +474,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GoDotImportContext::Unavailable);
         };
         let package_id: Option<i64> = connection
-            .prepare_cached(super::go_same_package::CALLER_PACKAGE)?
+            .prepare_cached(&super::go_same_package::CALLER_PACKAGE)?
             .query_row(
                 rusqlite::params![context_id, file_version, source_role],
                 |row| row.get(0),
@@ -464,7 +544,13 @@ impl SelectedResolutionOperation<'_, '_> {
             )
         };
         let lexical = self.ready.lexical_source();
-        if !self.go_import_inputs_loaded(source.ordinal())
+        let authority = super::go_named::GoImportAuthority::new(
+            source.ordinal(),
+            context_id,
+            file_version,
+            source_role,
+        );
+        if !self.go_import_inputs_loaded(&authority)
             && !self.load_go_import_inputs(
                 context_id,
                 &[(source.ordinal(), file_version, source_role)],
@@ -478,56 +564,40 @@ impl SelectedResolutionOperation<'_, '_> {
         // inventory of every root path it owns.
         let mut imports = Vec::new();
         if self.go_mount_has_dot_import(source.ordinal()) {
-            let outcome = visit_selected_root_import_half_pages(
-                &identities,
-                &lexical,
-                &lexical,
-                Some(&[source.ordinal()]),
-                cancellation,
-                &mut FactPageVisitor::new(&mut |page| {
-                    imports.extend_from_slice(page);
-                    Ok(true)
-                }),
-            )?;
+            let (halves, outcome) = self
+                .read_root_inventory(RootHalfRequest::Imports(&[source.ordinal()]), cancellation)?;
+            imports = halves;
             if outcome.is_cancelled() {
                 return Ok(GoDotImportContext::Cancelled);
             }
         }
         let mut bridges = Vec::new();
         for import in imports {
-            let SelectedRootPathHalf::Import {
-                route,
-                token,
-                anchor,
-                anchor_semantic,
-                demand,
-                ..
-            } = import
-            else {
+            let SelectedRootPathHalf::Import { route, demand, .. } = &import else {
                 continue;
             };
-            let mut semantics = route.into_vec();
-            semantics.push(demand);
-            let mut recipes = Vec::with_capacity(semantics.len());
-            for page in semantics.chunks(crate::analyzer::resolution::MAX_SOURCE_ROWS_PER_BATCH) {
-                let requests = page
-                    .iter()
-                    .map(|&semantic| SelectedLookupRecipeRequest {
-                        fragment: source.fragment(),
-                        semantic,
-                    })
-                    .collect::<Vec<_>>();
-                let SelectedLookupRecipeReadOutcome::Ready(rows) =
-                    lexical.lookup_semantic_recipes(&requests, cancellation, None)?
-                else {
-                    return Ok(GoDotImportContext::Cancelled);
-                };
-                for recipe in rows {
-                    recipes.push(recipe.ok_or_else(|| {
+            let mut semantics = route.to_vec();
+            semantics.push(*demand);
+            let requests = semantics
+                .iter()
+                .map(|&semantic| SelectedLookupRecipeRequest {
+                    fragment: source.fragment(),
+                    semantic,
+                })
+                .collect::<Vec<_>>();
+            let Some(rows) =
+                self.read_context_recipes(&lexical, &requests, cancellation, |_| {})?
+            else {
+                return Ok(GoDotImportContext::Cancelled);
+            };
+            let mut recipes = rows
+                .into_iter()
+                .map(|row| {
+                    row.ok_or_else(|| {
                         StoreError::corrupt("selected Go root lookup has no shared recipe")
-                    })?);
-                }
-            }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             let demand_recipe = recipes.pop().expect("one import demand");
             let spelling = recipes
                 .iter()
@@ -546,7 +616,7 @@ impl SelectedResolutionOperation<'_, '_> {
             else {
                 return Ok(GoDotImportContext::Cancelled);
             };
-            let mut statement = connection.prepare_cached(DOT_IMPORT_TARGET_MOUNTS)?;
+            let mut statement = connection.prepare_cached(&DOT_IMPORT_TARGET_MOUNTS)?;
             let rows = statement.query_map(
                 rusqlite::params![context_id, file_version, source_role, spelling],
                 |row| row.get::<_, u32>(0),
@@ -557,52 +627,35 @@ impl SelectedResolutionOperation<'_, '_> {
                     return Ok(GoDotImportContext::Cancelled);
                 }
                 let ordinal = SelectedResolutionMountOrdinal::new(target);
-                let mut exports = Vec::new();
-                let outcome = visit_selected_root_export_half_pages(
-                    &identities,
-                    &lexical,
-                    &lexical,
-                    Some(&[ordinal]),
-                    cancellation,
-                    &mut FactPageVisitor::new(&mut |page| {
-                        exports.extend_from_slice(page);
-                        Ok(true)
-                    }),
-                )?;
+                let (exports, outcome) =
+                    self.read_root_inventory(RootHalfRequest::Exports(&[ordinal]), cancellation)?;
                 if outcome.is_cancelled() {
                     return Ok(GoDotImportContext::Cancelled);
                 }
-                for export in exports {
-                    let SelectedRootPathHalf::Export {
-                        identity,
-                        token: export_token,
-                        demand: export_demand,
-                        ..
-                    } = &export
-                    else {
-                        unreachable!("export-only visitor")
-                    };
-                    if *export_demand != demand {
-                        continue;
-                    }
-                    bridges.push(
-                        SelectedRootBridgeDescriptor::from_selected_path_tokens(
-                            source.fragment(),
-                            Language::Go,
-                            token,
-                            anchor,
-                            anchor_semantic,
-                            identity.fragment(),
-                            Language::Go,
-                            *export_token,
-                            recipes.clone(),
-                            demand_recipe.clone(),
-                            demand_recipe.clone(),
-                            import_completion.clone(),
-                        )
-                        .with_selected_export(&self.ready.shared_names(), &export),
-                    );
+                let names = self.ready.shared_names();
+                let assembly = assemble_root_bridges(
+                    &self.ready,
+                    exports.iter().map(|export_half| RootBridgePair {
+                        import_half: &import,
+                        export_half,
+                        extra: (),
+                    }),
+                    &GoDotRootBridgeRules {
+                        names: &names,
+                        target: ordinal,
+                        route: &recipes,
+                        demand: &demand_recipe,
+                        completion: &import_completion,
+                    },
+                    cancellation,
+                )?;
+                if assembly
+                    .completion
+                    .contains_reason(ResolutionIncompleteReason::Cancelled)
+                {
+                    return Ok(GoDotImportContext::Cancelled);
                 }
+                bridges.extend(assembly.descriptors);
             }
         }
         let mount = SelectedResolutionMountContext::new(
@@ -617,11 +670,7 @@ impl SelectedResolutionOperation<'_, '_> {
             identities,
             vec![mount],
             mounts.mount_count(),
-            &|fragment| {
-                Ok(mounts
-                    .mount_for_fragment(fragment)?
-                    .map(|mount| (mount.ordinal(), mount.semantic_language())))
-            },
+            &selected_mount_lookup(mounts),
         )?;
         Ok(GoDotImportContext::Ready {
             context: reasons.into_iter().fold(
@@ -752,7 +801,9 @@ impl SelectedResolutionOperation<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        if !self.go_import_inputs_loaded(mount)
+        let authority =
+            super::go_named::GoImportAuthority::new(mount, context_id, file_version, source_role);
+        if !self.go_import_inputs_loaded(&authority)
             && !self.load_go_import_inputs(
                 context_id,
                 &[(mount, file_version, source_role)],
@@ -761,7 +812,7 @@ impl SelectedResolutionOperation<'_, '_> {
         {
             return Ok(None);
         }
-        let row = self.go_import_row(mount, spelling);
+        let row = self.go_import_row(&authority, spelling);
         Ok(Some(self.go_import_completion_for(
             context_id,
             file_version,
@@ -818,24 +869,60 @@ WHERE c.context_id=?1 AND c.complete=0
 LIMIT 1
 "#;
 
+/// Exact context reads owned by ReadySelectedResolution, never by its retained
+/// selection. Scope and stage changes replace the ordinal-indexed answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GoDefinitionContextAuthority {
+    scope: [u8; 32],
+    stage: (u64, u64),
+    base_profile: [u8; 32],
+}
+
+#[derive(Default)]
+pub(super) struct GoDefinitionContextMemo {
+    authority: Option<GoDefinitionContextAuthority>,
+    contexts: Vec<Option<Option<super::super::GoContextIdentity>>>,
+}
+
 impl super::super::resolution_typed::GoDefinitionContextBinder
     for super::ReadySelectedResolution<'_, '_>
 {
     // The caller has already selected this request's base profile. Candidate
     // declarations can belong to other domains under that same profile.
-    fn bind_context(&self, path: &str) -> Result<Option<super::super::GoContextIdentity>> {
+    fn bind_context(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+        path: &str,
+        candidates: &[SemanticId],
+    ) -> Result<Option<super::super::GoContextIdentity>> {
         let Some(snapshot) = &self.go_snapshot else {
             return Ok(None);
         };
-        let Some(base) = self.go_base_profile.get() else {
-            return Ok(None);
+        let base = self.go_base_profile.get().unwrap_or_else(|| {
+            panic!("Go candidate participation requires a base profile: file={path}, candidates={candidates:?}")
+        });
+        let authority = GoDefinitionContextAuthority {
+            scope: self.inventory.scope_identity(),
+            stage: self.inventory.staged_read_epoch(),
+            base_profile: base,
         };
-        let mut contexts = super::super::go_package_context::go_contexts_for_definition_file_on(
-            self.inventory.connection(),
-            snapshot,
-            &base,
-            path,
-        )?;
+        {
+            let mut memo = self.go_definition_contexts.borrow_mut();
+            if memo.authority != Some(authority) {
+                memo.authority = Some(authority);
+                memo.contexts = vec![None; self.inventory.persisted_mount_count()];
+            }
+            if let Some(context) = &memo.contexts[ordinal.get() as usize] {
+                return Ok(context.clone());
+            }
+        }
+        let mut contexts =
+            super::super::go_package_context::go_owner_context_for_definition_file_on(
+                self.inventory.connection(),
+                snapshot,
+                &base,
+                path,
+            )?;
         assert!(
             contexts.len() <= 1,
             "one workspace source belongs to one discovery domain: {contexts:?}"
@@ -844,6 +931,93 @@ impl super::super::resolution_typed::GoDefinitionContextBinder
         if let Some(context) = &context {
             self.bind_go_context_publication(context.clone());
         }
+        self.go_definition_contexts.borrow_mut().contexts[ordinal.get() as usize] =
+            Some(context.clone());
         Ok(context)
+    }
+}
+
+/// The target inventory has already proved exact package and source-role
+/// authority. Admission compares the canonical import and export lookups.
+struct GoDotRootBridgeRules<'a> {
+    names: &'a dyn SharedNameInterner,
+    target: SelectedResolutionMountOrdinal,
+    route: &'a [ResolutionLookupSemanticRecipe],
+    demand: &'a ResolutionLookupSemanticRecipe,
+    completion: &'a ResolutionCompletion,
+}
+
+impl RootBridgeRules for GoDotRootBridgeRules<'_> {
+    type Extra = ();
+    type Admission = ();
+
+    fn admit(
+        &self,
+        _operation: &ReadySelectedResolution<'_, '_>,
+        pair: &RootBridgePair<'_, Self::Extra>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<Self::Admission>> {
+        let () = pair.extra;
+        let SelectedRootPathHalf::Import { demand, .. } = pair.import_half else {
+            unreachable!("dot imports use import halves")
+        };
+        let SelectedRootPathHalf::Export {
+            identity,
+            demand: export_demand,
+            ..
+        } = pair.export_half
+        else {
+            unreachable!("export-only visitor")
+        };
+        debug_assert_eq!(identity.fragment().ordinal(), self.target.get());
+        Ok((export_demand == demand).then_some(()))
+    }
+
+    fn descriptor(
+        &self,
+        pair: &RootBridgePair<'_, Self::Extra>,
+        (): Self::Admission,
+    ) -> SelectedRootBridgeDescriptor {
+        let SelectedRootPathHalf::Import {
+            identity: source,
+            token,
+            anchor,
+            anchor_semantic,
+            ..
+        } = pair.import_half
+        else {
+            unreachable!("dot imports use import halves")
+        };
+        let SelectedRootPathHalf::Export {
+            identity,
+            token: export_token,
+            ..
+        } = pair.export_half
+        else {
+            unreachable!("export-only visitor")
+        };
+        SelectedRootBridgeDescriptor::from_selected_path_tokens(
+            source.fragment(),
+            Language::Go,
+            *token,
+            *anchor,
+            *anchor_semantic,
+            identity.fragment(),
+            Language::Go,
+            *export_token,
+            self.route.to_vec(),
+            self.demand.clone(),
+            self.demand.clone(),
+            self.completion.clone(),
+        )
+        .with_selected_export(self.names, pair.export_half)
+    }
+
+    fn fold_completion(
+        &self,
+        _completion: &mut ResolutionCompletion,
+        _descriptor: &SelectedRootBridgeDescriptor,
+    ) {
+        // Import evidence remains on its bridge, as before assembly.
     }
 }

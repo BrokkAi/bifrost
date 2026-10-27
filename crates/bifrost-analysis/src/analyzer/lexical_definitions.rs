@@ -708,6 +708,11 @@ fn matching_parameter<'tree>(
     source: &str,
     identifier: &str,
 ) -> Option<ParameterBinding<'tree>> {
+    if language_support_for_hook(language, "parameter_owner_has_lexical_bindings")
+        .is_some_and(|support| !support.parameter_owner_has_lexical_bindings(owner))
+    {
+        return None;
+    }
     let lambda = is_lambda_owner(language, owner.kind());
     let (ordinary_roots, receiver_roots) = parameter_roots(language, owner);
 
@@ -745,6 +750,10 @@ fn parameter_roots_with_step<'tree>(
     owner: Node<'tree>,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<(Vec<Node<'tree>>, Vec<Node<'tree>>)> {
+    let owner = match language_support_for_hook(language, "formal_parameter_source_owner") {
+        Some(support) => support.formal_parameter_source_owner(owner, scope_step)?,
+        None => owner,
+    };
     let mut ordinary_roots = Vec::new();
     for field in ["parameters", "parameter", "class_parameters"] {
         if !push_field_children_with_step(owner, field, &mut ordinary_roots, scope_step) {
@@ -1505,11 +1514,12 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
         return true;
     }
 
+    if let Some(kinds) = language_support_for_hook(language, "formal_parameter_owner_kinds")
+        .and_then(|support| support.formal_parameter_owner_kinds())
+    {
+        return kinds.contains(&kind);
+    }
     match language {
-        Language::Java => matches!(
-            kind,
-            "method_declaration" | "constructor_declaration" | "record_declaration"
-        ),
         Language::Go => matches!(
             kind,
             "function_declaration" | "method_declaration" | "method_elem"
@@ -1553,7 +1563,7 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
             kind,
             "function_declaration" | "secondary_constructor" | "primary_constructor" | "setter"
         ),
-        Language::None => false,
+        _ => false,
     }
 }
 
@@ -1674,7 +1684,7 @@ fn is_direct_parameter_binding(language: Language, kind: &str) -> bool {
 fn is_binding_leaf(language: Language, kind: &str) -> bool {
     match language {
         Language::Php => matches!(kind, "variable_name" | "name"),
-        Language::Rust => matches!(kind, "identifier" | "self"),
+        Language::Rust => matches!(kind, "identifier" | "self" | "shorthand_field_identifier"),
         Language::Java => matches!(kind, "identifier" | "this"),
         Language::Scala => matches!(kind, "identifier" | "operator_identifier"),
         Language::JavaScript | Language::TypeScript => {
@@ -1843,6 +1853,8 @@ mod tests {
 
     #[test]
     fn an_annotated_python_splat_parameter_is_still_variadic() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Python]);
         let source = concat!(
             "def run(*cmd: str, check: bool = True, **kwargs: object):\n",
             "    return cmd, check, kwargs\n",
@@ -1992,6 +2004,8 @@ mod tests {
 
     #[test]
     fn python_formal_slots_preserve_positional_and_named_regions() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Python]);
         let source = "def invoke(first, /, second, *values, third, **rest):\n    return second\n";
         let mut parser = Parser::new();
         parser
@@ -2021,6 +2035,8 @@ mod tests {
 
     #[test]
     fn rust_unnamed_parameters_still_occupy_formal_slots() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Rust]);
         let source = "fn discard(_: &str) {}\n";
         let mut parser = Parser::new();
         parser
@@ -2038,6 +2054,8 @@ mod tests {
 
     #[test]
     fn bounded_formal_parameter_layout_stops_before_a_wide_parameter_list() {
+        let _rules =
+            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Python]);
         let parameters = (0..64)
             .map(|index| format!("p{index}: int"))
             .collect::<Vec<_>>()

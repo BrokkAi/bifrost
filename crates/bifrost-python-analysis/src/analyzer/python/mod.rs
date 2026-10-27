@@ -8,6 +8,12 @@
 //! `PythonAdapter` forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and
 //! the `LanguageSupport` SPI block.
 
+/// Test-only selector for exercising production Python parsing with native facts.
+#[cfg(any(test, feature = "test-support"))]
+pub fn trial_native_python_selected() -> bool {
+    std::env::var_os("BIFROST_TRIAL_NATIVE_PYTHON").is_some()
+}
+
 #[doc(hidden)]
 pub mod adapter;
 mod cache;
@@ -250,9 +256,7 @@ pub use crate::analyzer::python::exception_identity::python_builtin_exception_is
 
 pub use crate::analyzer::python::exception_identity::python_builtin_exception_name;
 
-pub use brokk_bifrost_python::imports::{
-    PythonImportBinding, parse_python_import_bindings, parse_python_import_infos,
-};
+pub use brokk_bifrost_python::imports::PythonImportBinding;
 
 const FILE_STATE_BATCH_SIZE: usize = 256;
 
@@ -1783,12 +1787,12 @@ impl LanguageSupport for PythonSupport {
     }
 
     /// Select an effective external member under this language's inheritance rules.
-    fn external_member_declaration<'a>(
+    fn external_member_declaration(
         &self,
-        overlay: &'a brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+        overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
         owner_id: &str,
         member: &str,
-    ) -> Option<&'a brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol> {
+    ) -> Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol>> {
         python_external_member_declaration(overlay, owner_id, member)
     }
 
@@ -2714,6 +2718,15 @@ use brokk_bifrost_analysis::{
 use brokk_bifrost_analysis::delegate_inner_test_hook_methods;
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSupport {
+    #[cfg(any(test, feature = "test-support"))]
+    fn namespace_definition_provider(
+        &self,
+    ) -> Option<
+        brokk_bifrost_analysis::analyzer::store::language_support::NamespaceDefinitionProvider,
+    > {
+        Some(brokk_bifrost_analysis::analyzer::store::python_binding_rows::namespace_definition_provider)
+    }
+
     fn include_native_metadata_paths(
         &self,
         project: &dyn brokk_bifrost_analysis::analyzer::Project,

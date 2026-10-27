@@ -16,10 +16,23 @@ pub fn visit_declared_type_refs<'a>(
     types: impl IntoIterator<Item = &'a crate::analyzer::semantic_model::TypeRef>,
     mut visit: impl FnMut(&str),
 ) {
+    visit_type_refs(types, |reference| {
+        if let crate::analyzer::semantic_model::TypeRef::Declared { id, .. } = reference {
+            visit(id);
+        }
+    });
+}
+
+#[doc(hidden)]
+pub fn visit_type_refs<'a>(
+    types: impl IntoIterator<Item = &'a crate::analyzer::semantic_model::TypeRef>,
+    mut visit: impl FnMut(&'a crate::analyzer::semantic_model::TypeRef),
+) {
     use crate::analyzer::semantic_model::TypeRef;
 
     let mut pending = types.into_iter().collect::<Vec<_>>();
     while let Some(reference) = pending.pop() {
+        visit(reference);
         match reference {
             TypeRef::Projection {
                 owner,
@@ -32,9 +45,6 @@ pub fn visit_declared_type_refs<'a>(
                 pending.extend(arguments);
             }
             TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
-                if let TypeRef::Declared { id, .. } = reference {
-                    visit(id);
-                }
                 pending.extend(arguments);
             }
             TypeRef::Array { element }

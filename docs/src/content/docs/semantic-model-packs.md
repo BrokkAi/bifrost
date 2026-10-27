@@ -512,15 +512,23 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports, from
-`2` through `18`. The field is mandatory: omitted, zero, and unsupported versions
+`2` through `19`. The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
 
-The newest schema is `18`. Packs generated from pinned artifacts declare the
+The newest schema is `19`. Packs generated from pinned artifacts declare the
 lowest schema their content needs, never below `8`, so a reader that predates a
 field still accepts a pack that does not use it.
+
+Schema nineteen adds Rust implementation inventories, explicit negative impls,
+conditional bounds and bare-parameter blanket rules. Unsupported applicability
+stays unknown, and compiler-derived auto traits have no completeness claim.
+It also adds a producer-only `extraction` claim to compiled manifests and shard
+envelopes. Authored source files cannot set that field. The claim binds exact
+artifact inputs into semantic identity, so current artifact-generated packs
+require schema nineteen even when their declarations need an older schema.
 
 Schema eighteen retains Rust generic defaults, implemented-trait bindings,
 forwarding impl patterns, method self forms and associated-type projections.
@@ -568,7 +576,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v18.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v18.schema.json).
+[`schemas/semantic-model-pack-v19.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v19.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen

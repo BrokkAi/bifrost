@@ -4,7 +4,136 @@
 use super::super::fact_source::GoMemberDeclarationKind;
 use super::*;
 
+// Fixed-point re-entry may ask for the same package membership before a
+// receiver slot closes. Retain only immutable input rows, with both identity
+// and total-row caps, and drop them with this selected operation's read session.
+#[derive(Default)]
+pub(super) struct GoPackageMemberInputsMemo {
+    authority: Option<SeedReadAuthority>,
+    sources: HashMap<SemanticId, Option<Vec<SemanticId>>>,
+    placements: HashMap<SemanticId, bool>,
+    retained_rows: usize,
+}
+
 impl FactReadSession<'_> {
+    fn prepare_go_package_inputs(&mut self) {
+        // Like the context binder, keep inputs only for this request's current
+        // selected scope and stage. A source without authority is never reused.
+        let authority = self.lexical_source.selection_authority();
+        if authority.is_none() || self.go_package_member_sources.authority != authority {
+            self.go_package_member_sources = GoPackageMemberInputsMemo {
+                authority,
+                ..Default::default()
+            };
+        }
+    }
+
+    fn go_package_member_sources(
+        &mut self,
+        definitions: &[SemanticId],
+    ) -> StoreResult<Option<Vec<Option<Vec<SemanticId>>>>> {
+        self.prepare_go_package_inputs();
+        if self.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let missing = definitions
+            .iter()
+            .copied()
+            .filter(|definition| {
+                !self
+                    .go_package_member_sources
+                    .sources
+                    .contains_key(definition)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut fresh = HashMap::default();
+        if !missing.is_empty() {
+            let Some(rows) = self
+                .typed_source
+                .go_package_member_sources(&missing, self.cancellation)?
+            else {
+                return Ok(None);
+            };
+            assert_eq!(rows.len(), missing.len());
+            for (definition, sources) in missing.into_iter().zip(rows) {
+                let row_count = sources.as_ref().map_or(0, Vec::len);
+                let memo = &mut self.go_package_member_sources;
+                if memo.sources.len() < 1024 && memo.retained_rows + row_count <= 8192 {
+                    memo.retained_rows += row_count;
+                    memo.sources.insert(definition, sources);
+                } else {
+                    fresh.insert(definition, sources);
+                }
+            }
+        }
+        Ok((!self.cancellation.is_cancelled()).then(|| {
+            definitions
+                .iter()
+                .map(|definition| {
+                    self.go_package_member_sources
+                        .sources
+                        .get(definition)
+                        .or_else(|| fresh.get(definition))
+                        .expect("every requested membership was read")
+                        .clone()
+                })
+                .collect()
+        }))
+    }
+
+    fn go_source_placement_is_complete(
+        &mut self,
+        sources: &[SemanticId],
+    ) -> StoreResult<Option<bool>> {
+        self.prepare_go_package_inputs();
+        if self.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let missing = sources
+            .iter()
+            .copied()
+            .filter(|source| {
+                !self
+                    .go_package_member_sources
+                    .placements
+                    .contains_key(source)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut fresh = HashMap::default();
+        if !missing.is_empty() {
+            let Some(proofs) = self
+                .typed_source
+                .go_source_placement_proofs(&missing, self.cancellation)?
+            else {
+                return Ok(None);
+            };
+            assert_eq!(proofs.len(), missing.len());
+            for (source, placed) in missing.into_iter().zip(proofs) {
+                if self.go_package_member_sources.placements.len() < 8192 {
+                    self.go_package_member_sources
+                        .placements
+                        .insert(source, placed);
+                } else {
+                    fresh.insert(source, placed);
+                }
+            }
+        }
+        Ok((!self.cancellation.is_cancelled()).then(|| {
+            sources.iter().all(|source| {
+                *self
+                    .go_package_member_sources
+                    .placements
+                    .get(source)
+                    .or_else(|| fresh.get(source))
+                    .expect("every requested placement was read")
+            })
+        }))
+    }
+
     pub(super) fn ensure_go_member_declarations(
         &mut self,
         definitions: &[SemanticId],
@@ -76,7 +205,8 @@ impl FactReadSession<'_> {
             .and_then(|declaration| match declaration.kind {
                 GoMemberDeclarationKind::Method { pointer_receiver } => pointer_receiver,
                 GoMemberDeclarationKind::Struct { .. }
-                | GoMemberDeclarationKind::Interface { .. } => None,
+                | GoMemberDeclarationKind::Interface { .. }
+                | GoMemberDeclarationKind::Defined => None,
             })
     }
 
@@ -163,115 +293,6 @@ impl FactEvaluation<'_, '_> {
         )))
     }
 
-    /// A negative owner proof needs every promotion edge, including paths that
-    /// lose selector precedence. An unavailable edge makes the whole proof
-    /// unknown; it must not turn an unrelated owner's incompleteness into a miss.
-    pub(super) fn complete_go_member_owners(
-        &mut self,
-        routes: &[&SourceSelectedQualifiedRoute],
-        states: &StateMap,
-    ) -> StoreResult<Option<BTreeSet<SemanticId>>> {
-        let mut pending = Vec::new();
-        for route in routes {
-            let Some(state) = states.get(&route.row().qualifier_slot()) else {
-                return Ok(None);
-            };
-            if state.completion() != &ResolutionCompletion::Complete
-                || state.possible_values().is_empty()
-            {
-                return Ok(None);
-            }
-            for value in state.possible_values() {
-                let owner = value.ty().identity();
-                if !matches!(self.session.go_member_declarations.get(&owner),
-                    Some(Some(declaration)) if matches!(declaration.kind,
-                        GoMemberDeclarationKind::Struct { .. } | GoMemberDeclarationKind::Interface { .. }))
-                {
-                    // The existing receiver hook already read Go root metadata.
-                    // Do not add a read or work charge for another language.
-                    return Ok(None);
-                }
-                pending.push(owner);
-            }
-        }
-        let mut owners = BTreeSet::new();
-        while let Some(owner) = pending.pop() {
-            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
-                self.cancellation_observed = true;
-                return Ok(None);
-            }
-            if !owners.insert(owner) {
-                continue;
-            }
-            if !self.session.ensure_go_member_declarations(&[owner])? {
-                self.cancellation_observed = true;
-                return Ok(None);
-            }
-            let Some(Some(declaration)) = self.session.go_member_declarations.get(&owner) else {
-                // Other languages, aliases and unavailable Go source facts keep
-                // the existing name-based owner demand without a new SQL read.
-                return Ok(None);
-            };
-            match &declaration.kind {
-                GoMemberDeclarationKind::Struct { fields } => {
-                    for field in fields.iter().filter(|field| field.embedded) {
-                        let (Some(field_id), Some(slot)) = (field.field, field.value_type) else {
-                            return Ok(None);
-                        };
-                        let Some(state) = states.get(&slot) else {
-                            return Ok(None);
-                        };
-                        // Same declared-type completion rule as selector promotion.
-                        if completion_without_unsupported_semantic(state.completion(), field_id)
-                            != ResolutionCompletion::Complete
-                            || state.possible_values().is_empty()
-                        {
-                            return Ok(None);
-                        }
-                        pending.extend(
-                            state
-                                .possible_values()
-                                .iter()
-                                .map(|value| value.ty().identity()),
-                        );
-                    }
-                }
-                GoMemberDeclarationKind::Interface { .. } => {
-                    // Do not open hierarchy relations before scheduler closure.
-                    // A later pass can use the already sealed method-set graph.
-                    if !self.hierarchy.closure_contains(HierarchyOwnerKey {
-                        owner,
-                        policy: self.hierarchy_policy,
-                    }) {
-                        return Ok(None);
-                    }
-                    let node = self
-                        .hierarchy
-                        .edge_nodes
-                        .get(&HierarchyOwnerKey {
-                            owner,
-                            policy: self.hierarchy_policy,
-                        })
-                        .expect("a sealed hierarchy owner has an edge node");
-                    if !node.indexed
-                        || !node.hierarchy_inventory_complete
-                        || !matches!(node.evidence, HierarchyEvidence::Complete)
-                    {
-                        return Ok(None);
-                    }
-                    for edge in &node.edges {
-                        if !matches!(edge.residual_evidence, HierarchyEvidence::Complete) {
-                            return Ok(None);
-                        }
-                        pending.extend(edge.targets.iter().copied());
-                    }
-                }
-                GoMemberDeclarationKind::Method { .. } => return Ok(None),
-            }
-        }
-        Ok(Some(owners))
-    }
-
     /// A Go interface method declaration is a statically selected name, but
     /// invoking it can dispatch to implementations that are not in this
     /// binding. Preserve that boundary only on the implementation family;
@@ -339,6 +360,18 @@ struct GoPromotionPath {
     completion: ResolutionCompletion,
 }
 
+struct GoInterfaceMethodOrigin {
+    method: super::super::fact_source::GoInterfaceMethod,
+    owners: Vec<SemanticId>,
+    completion: ResolutionCompletion,
+}
+
+struct GoInterfaceMethodLookup {
+    methods: Vec<GoInterfaceMethodOrigin>,
+    owner_inventory_complete: bool,
+    absence: ResolutionCompletion,
+}
+
 pub(super) struct GoSelectedMember {
     pub(super) target: SemanticId,
     pub(super) kind: ResolutionMemberKind,
@@ -346,6 +379,13 @@ pub(super) struct GoSelectedMember {
     pub(super) owners: Box<[SemanticId]>,
     pub(super) fields: Vec<SemanticId>,
     pub(super) completion: ResolutionCompletion,
+}
+
+pub(super) enum GoMemberSearchPreparation {
+    Missing,
+    Pending,
+    Ready(GoMemberSearch),
+    AwaitingHierarchy(BTreeSet<SemanticId>),
 }
 
 pub(super) struct GoMemberSearch {
@@ -486,8 +526,9 @@ impl FactEvaluation<'_, '_> {
         ))
     }
 
-    /// A selected Go struct admits member search even when no method has the
-    /// requested spelling. Value selectors and calls share one shadowing space.
+    /// A selected Go named type admits member search even when no method has
+    /// the requested spelling. Value selectors and calls share one shadowing
+    /// space.
     pub(super) fn go_receiver_callable_lookups(
         &mut self,
         routes: &[&SourceSelectedQualifiedRoute],
@@ -533,11 +574,26 @@ impl FactEvaluation<'_, '_> {
             let Some(state) = states.get(&route.row().qualifier_slot()) else {
                 continue;
             };
-            let go_struct = state.possible_values().iter().any(|value| {
-                matches!(self.session.go_member_declarations.get(&value.ty().identity()),
-                        Some(Some(declaration)) if matches!(declaration.kind, GoMemberDeclarationKind::Struct { .. }))
+            let go_receiver = state.possible_values().iter().any(|value| {
+                match self
+                    .session
+                    .go_member_declarations
+                    .get(&value.ty().identity())
+                    .and_then(Option::as_ref)
+                    .map(|declaration| &declaration.kind)
+                {
+                    Some(GoMemberDeclarationKind::Struct { .. }) => true,
+                    Some(GoMemberDeclarationKind::Interface { .. }) => {
+                        route.row().namespace() == ResolutionNamespace::Callable
+                            && state.completion() == &ResolutionCompletion::Complete
+                    }
+                    Some(GoMemberDeclarationKind::Defined) => {
+                        state.completion() == &ResolutionCompletion::Complete
+                    }
+                    Some(GoMemberDeclarationKind::Method { .. }) | None => false,
+                }
             });
-            if !go_struct {
+            if !go_receiver {
                 continue;
             }
             let lookup = route.row().lookup();
@@ -605,15 +661,15 @@ impl FactEvaluation<'_, '_> {
                 if self.poll_cancelled() {
                     return Ok(None);
                 }
-                let row = row.get(self.session);
+                let row = *row.get(self.session);
                 let provenance_is_package_placement = row.origin()
                     == LoweringGapOrigin::Extracted(
                         ResolutionGapKind::UnsupportedPlacementBoundary,
                     )
-                    && self
-                        .session
-                        .lexical_source
-                        .go_package_inventory_complete_for_fragment(row.fragment());
+                    && match self.go_placement_reason_is_proven(row)? {
+                        Some(proven) => proven,
+                        None => return Ok(None),
+                    };
                 let reason = evidence
                     .get_mut(&row.reason())
                     .expect("gap provenance belongs to the requested reason batch");
@@ -627,25 +683,40 @@ impl FactEvaluation<'_, '_> {
     }
 
     /// Search fields and methods at the same depth before testing callability.
-    /// None means the receiver has no selected Go struct metadata. Cancellation
+    /// Missing means the receiver has no selected Go type metadata. Cancellation
     /// is also reflected in the evaluation, as at the other selected readers.
-    pub(super) fn go_struct_members(
+    /// Unclosed interface roots are prerequisites, not an unavailable method set.
+    pub(super) fn go_receiver_members(
         &mut self,
         reference: SemanticId,
         lookup: SemanticId,
         receiver: ResolutionSlotValue,
         rows: &[LoweredDeferredMemberOwner],
         states: &StateMap,
-    ) -> StoreResult<Option<GoMemberSearch>> {
+    ) -> StoreResult<GoMemberSearchPreparation> {
         let root = receiver.ty().identity();
         if !self.session.ensure_go_member_declarations(&[root])? {
             self.cancellation_observed = true;
-            return Ok(None);
+            return Ok(GoMemberSearchPreparation::Missing);
         }
-        if !matches!(self.session.go_member_declarations.get(&root),
-            Some(Some(declaration)) if matches!(declaration.kind, GoMemberDeclarationKind::Struct { .. }))
+        match self
+            .session
+            .go_member_declarations
+            .get(&root)
+            .and_then(Option::as_ref)
+            .map(|declaration| &declaration.kind)
         {
-            return Ok(None);
+            Some(
+                GoMemberDeclarationKind::Struct { .. }
+                | GoMemberDeclarationKind::Interface { .. }
+                | GoMemberDeclarationKind::Defined,
+            ) => {}
+            // Defined is known Go metadata, even when it contributes no fields.
+            // Only unavailable metadata falls back to name-first lookup.
+            None => return Ok(GoMemberSearchPreparation::Missing),
+            Some(GoMemberDeclarationKind::Method { .. }) => {
+                return Ok(GoMemberSearchPreparation::Missing);
+            }
         }
         let mut level = vec![GoPromotionPath {
             value: receiver,
@@ -662,7 +733,20 @@ impl FactEvaluation<'_, '_> {
                 .collect::<Vec<_>>();
             if !self.session.ensure_go_member_declarations(&owners)? {
                 self.cancellation_observed = true;
-                return Ok(None);
+                return Ok(GoMemberSearchPreparation::Missing);
+            }
+            // The promotion walk already owns this depth's declarations. Close
+            // its interface roots together before flattening any method set.
+            let roots = owners.iter().copied().filter(|owner| {
+                matches!(self.session.go_member_declarations.get(owner),
+                    Some(Some(declaration)) if matches!(declaration.kind, GoMemberDeclarationKind::Interface { .. }))
+                    && !self.hierarchy.closure_contains(HierarchyOwnerKey {
+                        owner: *owner,
+                        policy: self.hierarchy_policy,
+                    })
+            }).collect::<BTreeSet<_>>();
+            if !roots.is_empty() {
+                return Ok(GoMemberSearchPreparation::AwaitingHierarchy(roots));
             }
             let mut selected = Vec::new();
             let mut expansions = Vec::new();
@@ -670,39 +754,90 @@ impl FactEvaluation<'_, '_> {
             for mut path in level {
                 if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
                     self.cancellation_observed = true;
-                    return Ok(None);
+                    return Ok(GoMemberSearchPreparation::Missing);
                 }
                 let owner = path.value.ty().identity();
-                let metadata = self
-                    .session
-                    .go_member_declarations
-                    .get(&owner)
-                    .cloned()
-                    .flatten();
-                let (fields, interface_methods) = match metadata.map(|declaration| declaration.kind)
-                {
-                    Some(GoMemberDeclarationKind::Struct { fields }) => (fields, Vec::new()),
-                    // A struct may embed an interface value. The interface
-                    // has no fields to expand, but its declared methods are
-                    // still candidates for promoted selector lookup below.
-                    Some(GoMemberDeclarationKind::Interface { .. }) => {
-                        // A pointer struct receiver promotes an embedded
-                        // interface value's methods, not those of *I. Keep the
-                        // field's declared indirection; *I has no method set.
-                        if matches!(path.value, ResolutionSlotValue::TypeObject(_, _)) {
-                            path.value = ResolutionSlotValue::type_object(path.declared_type);
-                        }
-                        let Some((methods, complete)) = self.go_interface_method_set(owner)? else {
-                            return Ok(None);
-                        };
-                        unavailable |= !complete;
-                        (Vec::new(), methods)
+                let mut fields = Vec::new();
+                let mut interface_methods = Vec::new();
+                let mut surfaces = vec![owner];
+                let mut seen = HashSet::default();
+                while let Some(surface) = surfaces.pop() {
+                    // This path already charged its owner. Only an underlying
+                    // definition adds another surface expansion.
+                    if self.poll_cancelled()
+                        || (surface != owner && !self.session.charge_scope_steps(1))
+                    {
+                        self.cancellation_observed = true;
+                        return Ok(GoMemberSearchPreparation::Missing);
                     }
-                    _ => {
-                        unavailable = true;
+                    if !seen.insert(surface) {
                         continue;
                     }
-                };
+                    if !self.session.ensure_go_member_declarations(&[surface])? {
+                        self.cancellation_observed = true;
+                        return Ok(GoMemberSearchPreparation::Missing);
+                    }
+                    let metadata = self
+                        .session
+                        .go_member_declarations
+                        .get(&surface)
+                        .cloned()
+                        .flatten();
+                    match metadata.map(|declaration| declaration.kind) {
+                        Some(GoMemberDeclarationKind::Struct { fields: declared }) => {
+                            fields.extend(declared)
+                        }
+                        Some(GoMemberDeclarationKind::Interface { .. }) => {
+                            let roots = BTreeSet::from([surface]);
+                            if !self.hierarchy_owner_roots_closed(&roots) {
+                                return Ok(GoMemberSearchPreparation::AwaitingHierarchy(roots));
+                            }
+                            if matches!(path.value, ResolutionSlotValue::TypeObject(_, _)) {
+                                path.value = ResolutionSlotValue::type_object(path.declared_type);
+                            }
+                            let Some(methods) =
+                                self.go_interface_methods_for_lookup(surface, lookup, path.value)?
+                            else {
+                                return Ok(GoMemberSearchPreparation::Missing);
+                            };
+                            unavailable |= !methods.owner_inventory_complete;
+                            completion = completion.combine(&methods.absence);
+                            if surface != owner {
+                                let ty =
+                                    ResolutionTypeRef::new(surface, path.value.ty().indirection());
+                                path.value = match path.value {
+                                    ResolutionSlotValue::TypeObject(_, _) => {
+                                        ResolutionSlotValue::type_object(ty)
+                                    }
+                                    ResolutionSlotValue::Runtime { addressable, .. } => {
+                                        ResolutionSlotValue::runtime(ty, addressable)
+                                    }
+                                };
+                            }
+                            interface_methods.extend(methods.methods);
+                        }
+                        Some(GoMemberDeclarationKind::Defined) => {
+                            let Some(underlying) =
+                                self.go_underlying_type_objects(surface, states)?
+                            else {
+                                return Ok(GoMemberSearchPreparation::Missing);
+                            };
+                            if underlying.pending {
+                                return Ok(GoMemberSearchPreparation::Pending);
+                            }
+                            completion = completion.combine(&underlying.completion);
+                            path.completion = path.completion.combine(&underlying.completion);
+                            surfaces.extend(underlying.objects.into_iter().map(|ty| ty.identity()));
+                        }
+                        // Complete underlying type objects may be intrinsic
+                        // scalars or structural function/container types. They
+                        // contribute no named fields or interface methods.
+                        None => {}
+                        Some(GoMemberDeclarationKind::Method { .. }) => {
+                            unavailable = true;
+                        }
+                    }
+                }
                 if crate::analyzer::semantic::languages::language_knowledge(Language::Go)
                     .is_some_and(|support| support.call_may_apply_value())
                     && path.fields.is_empty()
@@ -720,7 +855,7 @@ impl FactEvaluation<'_, '_> {
                         // Its ordinary binding projection carries the field's
                         // declared type; unresolved methods on other owners
                         // cannot make that receiver route incomplete.
-                        return Ok(Some(GoMemberSearch {
+                        return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                             members: vec![GoSelectedMember {
                                 target,
                                 kind: ResolutionMemberKind::Field,
@@ -734,45 +869,133 @@ impl FactEvaluation<'_, '_> {
                         }));
                     }
                 }
-                // Distinct paths intentionally produce distinct candidates,
-                // including paths that end at the very same declaration.
-                for row in rows {
-                    if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
-                        self.cancellation_observed = true;
-                        return Ok(None);
-                    }
-                    // Go struct metadata owns field selection. The lowered
-                    // owner frontier is only needed to associate method rows
-                    // with this receiver; an unrelated field row's frontier
-                    // must not make the structured field walk incomplete.
-                    if row.kind() != ResolutionMemberKind::Method {
-                        continue;
-                    }
-                    let Some(state) = states.get(&row.owner_frontier()) else {
-                        unavailable = true;
+                // Method ownership belongs to the selected package, not to
+                // the file that declares the receiver type. The same keyed
+                // source proof admits a sibling's method even when its type
+                // frontier has no file context. Package membership comes from
+                // the existing source rows, including generic receivers.
+                // With no method candidates, there is no package proof to ask
+                // for. Keep such requests empty, including profile-free literal
+                // field and remote-absence lookups.
+                let owner_requests = rows
+                    .iter()
+                    .filter(|row| row.kind() == ResolutionMemberKind::Method)
+                    .take(1)
+                    .map(|_| owner)
+                    .collect::<Vec<_>>();
+                let Some(mut packages) = self.session.go_package_member_sources(&owner_requests)?
+                else {
+                    self.cancellation_observed = true;
+                    return Ok(GoMemberSearchPreparation::Missing);
+                };
+                assert_eq!(packages.len(), owner_requests.len());
+                let owner_sources = packages.pop().flatten();
+                let method_rows = rows
+                    .iter()
+                    .filter(|row| {
+                        row.kind() == ResolutionMemberKind::Method
+                            && owner_sources.as_ref().is_none_or(|sources| {
+                                sources
+                                    .iter()
+                                    .any(|source| source.ordinal() == row.definition().ordinal())
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let candidates = method_rows
+                    .iter()
+                    .map(|row| (row.definition(), row.owner_frontier()))
+                    .collect::<Vec<_>>();
+                let Some(proofs) = self.session.typed_source.deferred_member_owner_proofs(
+                    &[owner],
+                    &candidates,
+                    self.session.cancellation,
+                )?
+                else {
+                    self.cancellation_observed = true;
+                    return Ok(GoMemberSearchPreparation::Missing);
+                };
+                assert_eq!(
+                    proofs.len(),
+                    candidates.len(),
+                    "one ownership proof per method"
+                );
+                // Named receiver ownership does not close participation of
+                // saved siblings. Prove each package member's placement using
+                // the same selected role reader as placement-gap discharge.
+                let definitions = candidates
+                    .iter()
+                    .zip(&proofs)
+                    .filter(|(_, proof)| {
+                        **proof == super::super::fact_source::DeferredMemberOwnerProof::Matches
+                    })
+                    .map(|(candidate, _)| candidate.0)
+                    .collect::<Vec<_>>();
+                let Some(packages) = self.session.go_package_member_sources(&definitions)? else {
+                    self.cancellation_observed = true;
+                    return Ok(GoMemberSearchPreparation::Missing);
+                };
+                assert_eq!(packages.len(), definitions.len());
+                let mut complete_method_packages = HashSet::default();
+                for (definition, sources) in definitions.iter().zip(packages) {
+                    let Some(sources) = sources else {
                         continue;
                     };
-                    let owner_matches = state.possible_values().iter().any(|value| {
-                        matches!(value, ResolutionSlotValue::TypeObject(ty, _)
-                                if ty.indirection() <= 1 && ty.identity() == owner)
-                    });
-                    if !owner_matches {
-                        if state.completion() != &ResolutionCompletion::Complete {
-                            completion = completion.combine(state.completion());
-                        }
-                        continue;
+                    let Some(placed) = self.session.go_source_placement_is_complete(&sources)?
+                    else {
+                        self.cancellation_observed = true;
+                        return Ok(GoMemberSearchPreparation::Missing);
+                    };
+                    if !sources.is_empty() && placed {
+                        complete_method_packages.insert(*definition);
                     }
-                    completion = completion.combine(state.completion());
+                }
+                // Distinct paths intentionally produce distinct candidates,
+                // including paths that end at the very same declaration.
+                for (row, proof) in method_rows.into_iter().zip(proofs) {
+                    if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                        self.cancellation_observed = true;
+                        return Ok(GoMemberSearchPreparation::Missing);
+                    }
+                    use super::super::fact_source::DeferredMemberOwnerProof;
+                    let owner_completion = match proof {
+                        DeferredMemberOwnerProof::Matches
+                            if complete_method_packages.contains(&row.definition()) =>
+                        {
+                            ResolutionCompletion::Complete
+                        }
+                        DeferredMemberOwnerProof::DoesNotMatch => continue,
+                        DeferredMemberOwnerProof::Matches | DeferredMemberOwnerProof::Unknown => {
+                            if !self.charge_owner_expansion(row.owner_frontier()) {
+                                self.cancellation_observed = true;
+                                return Ok(GoMemberSearchPreparation::Missing);
+                            }
+                            self.demand_slot(row.owner_frontier());
+                            let Some(state) = states.get(&row.owner_frontier()) else {
+                                return Ok(GoMemberSearchPreparation::Pending);
+                            };
+                            let owner_matches = state.possible_values().iter().any(|value| {
+                                matches!(value, ResolutionSlotValue::TypeObject(ty, _)
+                                    if ty.indirection() <= 1 && ty.identity() == owner)
+                            });
+                            if !owner_matches {
+                                completion = completion.combine(state.completion());
+                                continue;
+                            }
+                            state.completion().clone()
+                        }
+                    };
+                    completion = completion.combine(&owner_completion);
                     selected.push(GoSelectedMember {
                         target: row.definition(),
                         kind: row.kind(),
                         value: path.value,
                         owners: path.owners.clone().into_boxed_slice(),
                         fields: path.fields.clone(),
-                        completion: path.completion.combine(state.completion()),
+                        completion: path.completion.combine(&owner_completion),
                     });
                 }
-                for method in &interface_methods {
+                for origin in &interface_methods {
+                    let method = &origin.method;
                     if method.callable_lookup != lookup {
                         continue;
                     }
@@ -781,9 +1004,13 @@ impl FactEvaluation<'_, '_> {
                             target,
                             kind: ResolutionMemberKind::Method,
                             value: path.value,
-                            owners: path.owners.clone().into_boxed_slice(),
+                            owners: path.owners[..path.owners.len() - 1]
+                                .iter()
+                                .copied()
+                                .chain(origin.owners.iter().copied())
+                                .collect(),
                             fields: path.fields.clone(),
-                            completion: path.completion.clone(),
+                            completion: path.completion.combine(&origin.completion),
                         });
                     } else {
                         unavailable = true;
@@ -792,7 +1019,7 @@ impl FactEvaluation<'_, '_> {
                 for field in &fields {
                     if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
                         self.cancellation_observed = true;
-                        return Ok(None);
+                        return Ok(GoMemberSearchPreparation::Missing);
                     }
                     if field.callable_lookup == lookup {
                         if let Some(target) = field.field {
@@ -829,18 +1056,48 @@ impl FactEvaluation<'_, '_> {
                     .iter()
                     .any(|member| member.kind != ResolutionMemberKind::Method)
             {
-                return Ok(Some(GoMemberSearch {
+                return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                     members: Vec::new(),
                     rejected: Vec::new(),
                     completion,
                 }));
+            }
+            // Preserve the hierarchy's declaring owners before applying the
+            // existing interface precedence and signature validity rules.
+            if selected.len() > 1
+                && selected.iter().all(|member| {
+                    matches!(member.owners.first().and_then(|root|
+                        self.session.go_member_declarations.get(root)),
+                        Some(Some(row)) if matches!(row.kind, GoMemberDeclarationKind::Interface { .. }))
+                })
+            {
+                let definitions = selected.iter().map(|member| member.target).collect::<Vec<_>>();
+                for member in &selected {
+                    self.record_member_owner(member.target, member.kind, member.owners.clone(), false);
+                }
+                let read = self.session.signatures_for_definitions(&definitions)?;
+                let Some(signatures) = self.accept_session_read(read) else {
+                    return Ok(GoMemberSearchPreparation::Missing);
+                };
+                let signatures = signatures.into_iter().map(|row| (row.get(self.session).row().definition(), row)).collect();
+                let Some(answer) = self.filter_go_interface_methods(
+                    ResolutionAnswer::new(definitions, Vec::new(), completion),
+                    &signatures, states,
+                )? else {
+                    return Ok(GoMemberSearchPreparation::Missing);
+                };
+                selected.retain(|member| answer.targets().contains(&member.target));
+                completion = answer.completion().clone();
+            }
+            for member in &selected {
+                completion = completion.combine(&member.completion);
             }
             if selected.len() > 1 {
                 let precedence = ResolutionCompletion::incomplete([
                     ResolutionIncompleteReason::InconsistentPrecedence(reference),
                 ]);
                 completion = completion.combine(&precedence);
-                return Ok(Some(GoMemberSearch {
+                return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                     // Preserve every promotion witness while precedence stays
                     // ambiguous. Consumers may report candidates but cannot
                     // select a unique callable target.
@@ -850,12 +1107,20 @@ impl FactEvaluation<'_, '_> {
                 }));
             }
             if let Some(member) = selected.pop() {
+                if member.kind == ResolutionMemberKind::Method
+                    && !self
+                        .session
+                        .ensure_go_member_declarations(&[member.target])?
+                {
+                    self.cancellation_observed = true;
+                    return Ok(GoMemberSearchPreparation::Missing);
+                }
                 // A field still shadows deeper methods, but selecting a field
                 // on a type does not form a Go method expression.
                 if matches!(receiver, ResolutionSlotValue::TypeObject(_, _))
                     && member.kind != ResolutionMemberKind::Method
                 {
-                    return Ok(Some(GoMemberSearch {
+                    return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                         members: Vec::new(),
                         rejected: Vec::new(),
                         completion,
@@ -877,7 +1142,7 @@ impl FactEvaluation<'_, '_> {
                             ],
                         )?),
                     ]));
-                    return Ok(Some(GoMemberSearch {
+                    return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                         members: Vec::new(),
                         rejected: Vec::new(),
                         completion,
@@ -899,7 +1164,7 @@ impl FactEvaluation<'_, '_> {
                             ],
                         )?),
                     ]));
-                    return Ok(Some(GoMemberSearch {
+                    return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                         members: Vec::new(),
                         rejected: vec![GoRejectedMember {
                             target: member.target,
@@ -909,7 +1174,7 @@ impl FactEvaluation<'_, '_> {
                         completion,
                     }));
                 }
-                return Ok(Some(GoMemberSearch {
+                return Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
                     members: vec![member],
                     rejected: Vec::new(),
                     completion,
@@ -926,7 +1191,7 @@ impl FactEvaluation<'_, '_> {
                     }
                     if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
                         self.cancellation_observed = true;
-                        return Ok(None);
+                        return Ok(GoMemberSearchPreparation::Missing);
                     }
                     let (Some(field_id), Some(slot)) = (field.field, field.value_type) else {
                         unavailable = true;
@@ -934,14 +1199,14 @@ impl FactEvaluation<'_, '_> {
                     };
                     if !self.charge_owner_expansion(path.value.ty().identity()) {
                         self.cancellation_observed = true;
-                        return Ok(None);
+                        return Ok(GoMemberSearchPreparation::Missing);
                     }
                     self.demand_slot(slot);
                     let Some(state) = states.get(&slot) else {
                         // This snapshot predates the slot demand above. The
                         // fixed-point pass will revisit the frontier after
                         // materializing the embedded field's type state.
-                        continue;
+                        return Ok(GoMemberSearchPreparation::Pending);
                     };
                     // This slot models the embedded field's value flow, while
                     // selector promotion needs only its declared type. Keep
@@ -954,14 +1219,14 @@ impl FactEvaluation<'_, '_> {
                         let Some(inventory_closes_frontier) =
                             self.go_package_inventory_covers_placement_frontier(&state_completion)?
                         else {
-                            return Ok(None);
+                            return Ok(GoMemberSearchPreparation::Missing);
                         };
                         unavailable |= !inventory_closes_frontier;
                     }
                     for value in state.possible_values() {
                         if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
                             self.cancellation_observed = true;
-                            return Ok(None);
+                            return Ok(GoMemberSearchPreparation::Missing);
                         }
                         // A known cycle cannot add a shorter selector path.
                         // Prune this path without hiding its sibling branches.
@@ -1012,7 +1277,7 @@ impl FactEvaluation<'_, '_> {
             }
             level = next;
         }
-        Ok(Some(GoMemberSearch {
+        Ok(GoMemberSearchPreparation::Ready(GoMemberSearch {
             members: Vec::new(),
             rejected: Vec::new(),
             completion,
@@ -1081,9 +1346,14 @@ impl FactResolutionOperation<'_> {
         // Inventory discovery adds roots; each subsequent round closes their
         // endpoints through the same demand provider used by reverse confirmation.
         // Only a stable, closed round is inspected for signature comparison.
+        let provider = std::cell::RefCell::new(provider);
         let answer = evaluation.run_with_rounds_and_inspection(
             |evaluation, answers, states| {
-                evaluation.evaluate_round_with_dependencies(answers, states, provider.as_mut())
+                evaluation.evaluate_round_with_dependencies(
+                    answers,
+                    states,
+                    provider.borrow_mut().as_mut(),
+                )
             },
             |evaluation, states| {
                 result = evaluation.go_check_method_interfaces(
@@ -1092,11 +1362,12 @@ impl FactResolutionOperation<'_> {
                     &closed_interfaces,
                     states,
                     &mut method_identity,
+                    provider.borrow_mut().as_mut(),
                 )?;
                 Ok(())
             },
         );
-        self.demand_provider = Some(provider);
+        self.demand_provider = Some(provider.into_inner());
         answer?;
         if evaluation.cancellation_observed
             || evaluation.cancellation.is_cancelled()
@@ -1128,15 +1399,143 @@ impl FactEvaluation<'_, '_> {
     fn go_interface_method_set(
         &mut self,
         root: SemanticId,
-    ) -> StoreResult<Option<(Vec<super::super::fact_source::GoInterfaceMethod>, bool)>> {
-        if !self.ensure_hierarchy_owner_closure(&BTreeSet::from([root]))? {
+    ) -> StoreResult<Option<(Vec<GoInterfaceMethodOrigin>, bool)>> {
+        let Some((paths, complete)) = self.go_interface_owner_paths(root)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .go_interface_declared_methods(&paths)
+            .map(|methods| (methods, complete)))
+    }
+
+    fn go_interface_declared_methods(
+        &mut self,
+        paths: &[Vec<SemanticId>],
+    ) -> Option<Vec<GoInterfaceMethodOrigin>> {
+        let mut methods = Vec::new();
+        for owners in paths {
+            if self.poll_cancelled() {
+                return None;
+            }
+            let owner = *owners.last().expect("interface route has its owner");
+            if let Some(Some(row)) = self.session.go_member_declarations.get(&owner)
+                && let GoMemberDeclarationKind::Interface { methods: declared } = &row.kind
+            {
+                methods.extend(
+                    declared
+                        .iter()
+                        .cloned()
+                        .map(|method| GoInterfaceMethodOrigin {
+                            method,
+                            owners: owners.clone(),
+                            completion: ResolutionCompletion::Complete,
+                        }),
+                );
+            }
+        }
+        methods.sort_unstable_by_key(|origin| {
+            (origin.method.callable_lookup, origin.method.definition)
+        });
+        methods.dedup_by(|a, b| a.method == b.method);
+        Some(methods)
+    }
+
+    fn go_interface_methods_for_lookup(
+        &mut self,
+        root: SemanticId,
+        lookup: SemanticId,
+        receiver: ResolutionSlotValue,
+    ) -> StoreResult<Option<GoInterfaceMethodLookup>> {
+        let Some((paths, owner_inventory_complete)) = self.go_interface_owner_paths(root)? else {
+            return Ok(None);
+        };
+        let Some(mut methods) = self.go_interface_declared_methods(&paths) else {
+            return Ok(None);
+        };
+        methods.retain(|origin| origin.method.callable_lookup == lookup);
+        let declared = methods
+            .iter()
+            .filter_map(|origin| origin.method.definition)
+            .collect::<HashSet<_>>();
+        let shape = self.hierarchy_shape(
+            lookup,
+            ResolutionNamespace::Callable,
+            QualifierCategory::of(receiver),
+            i64::from(receiver.ty().indirection()),
+        );
+        let keys = paths
+            .iter()
+            .map(|owners| HierarchyNodeKey {
+                shape,
+                owner: *owners.last().expect("interface route has its owner"),
+            })
+            .collect::<Vec<_>>();
+        if !self.ensure_hierarchy_local_nodes(&keys)? {
             return Ok(None);
         }
-        let mut pending = vec![root];
+        let mut absence = ResolutionCompletion::Complete;
+        for (owners, key) in paths.into_iter().zip(keys) {
+            if self.poll_cancelled() {
+                return Ok(None);
+            }
+            let node = &self.hierarchy.local_nodes[&key];
+            let evidence = {
+                let cancellation = self.cancellation;
+                let work = &mut self.work;
+                self.hierarchy
+                    .evidence
+                    .flatten(&node.evidence, u32::MAX, &mut || {
+                        poll_cancelled(cancellation, work)
+                    })
+            };
+            let Some(evidence) = evidence else {
+                self.cancellation_observed = true;
+                return Ok(None);
+            };
+            // declared metadata proves a positive selection; hierarchy-only
+            // recovery and absence inherit the node's inventory evidence.
+            absence = absence.combine(&evidence);
+            methods.extend(
+                node.direct_definitions
+                    .iter()
+                    .filter(|definition| !declared.contains(definition))
+                    .map(|&definition| GoInterfaceMethodOrigin {
+                        method: super::super::fact_source::GoInterfaceMethod {
+                            callable_lookup: lookup,
+                            definition: Some(definition),
+                        },
+                        owners: owners.clone(),
+                        completion: evidence.clone(),
+                    }),
+            );
+        }
+        methods.sort_unstable_by_key(|origin| {
+            (origin.method.callable_lookup, origin.method.definition)
+        });
+        methods.dedup_by(|a, b| a.method == b.method);
+        if !methods.is_empty() {
+            absence = ResolutionCompletion::Complete;
+        }
+        Ok(Some(GoInterfaceMethodLookup {
+            methods,
+            owner_inventory_complete,
+            absence,
+        }))
+    }
+
+    fn go_interface_owner_paths(
+        &mut self,
+        root: SemanticId,
+    ) -> StoreResult<Option<(Vec<Vec<SemanticId>>, bool)>> {
+        if !self.hierarchy_owner_roots_closed(&BTreeSet::from([root])) {
+            return Ok(None);
+        }
+        let mut pending = vec![vec![root]];
         let mut seen = HashSet::default();
-        let mut methods = Vec::new();
+        let mut paths = Vec::new();
         let mut complete = true;
-        while let Some(owner) = pending.pop() {
+        while let Some(owners) = pending.pop() {
+            let owner = *owners.last().expect("interface route has its owner");
             if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
                 return Ok(None);
             }
@@ -1146,15 +1545,10 @@ impl FactEvaluation<'_, '_> {
             if !self.session.ensure_go_member_declarations(&[owner])? {
                 return Ok(None);
             }
-            match self.session.go_member_declarations.get(&owner) {
-                Some(Some(row)) => match &row.kind {
-                    GoMemberDeclarationKind::Interface { methods: declared } => {
-                        methods.extend(declared.iter().cloned());
-                    }
-                    _ => complete = false,
-                },
-                _ => complete = false,
-            }
+            complete &= matches!(
+                self.session.go_member_declarations.get(&owner),
+                Some(Some(row)) if matches!(row.kind, GoMemberDeclarationKind::Interface { .. })
+            );
             let node = self
                 .hierarchy
                 .edge_nodes
@@ -1168,12 +1562,15 @@ impl FactEvaluation<'_, '_> {
                 && matches!(node.evidence, HierarchyEvidence::Complete);
             for edge in &node.edges {
                 complete &= matches!(edge.residual_evidence, HierarchyEvidence::Complete);
-                pending.extend(edge.targets.iter().copied());
+                pending.extend(edge.targets.iter().map(|target| {
+                    let mut path = owners.clone();
+                    path.push(*target);
+                    path
+                }));
             }
+            paths.push(owners);
         }
-        methods.sort_unstable_by_key(|method| (method.callable_lookup, method.definition));
-        methods.dedup();
-        Ok(Some((methods, complete)))
+        Ok(Some((paths, complete)))
     }
 
     fn go_signature_satisfaction(
@@ -1332,6 +1729,7 @@ impl FactEvaluation<'_, '_> {
         interfaces: &[SemanticId],
         states: &StateMap,
         method_identity: &mut impl FnMut(SemanticId) -> StoreResult<Option<(String, i64)>>,
+        provider: &mut dyn DemandRootProvider,
     ) -> StoreResult<Vec<GoInterfaceSatisfaction>> {
         use GoMethodSatisfaction::*;
         let read = self
@@ -1385,13 +1783,16 @@ impl FactEvaluation<'_, '_> {
         }
         let mut result = Vec::new();
         for &owner in interfaces {
+            if !self.close_hierarchy_owner_roots(&BTreeSet::from([owner]), provider)? {
+                return Ok(result);
+            }
             let Some((required_methods, complete)) = self.go_interface_method_set(owner)? else {
                 return Ok(result);
             };
             let matches = required_methods
                 .iter()
-                .filter(|method| method.callable_lookup == lookup)
-                .filter_map(|method| method.definition)
+                .filter(|origin| origin.method.callable_lookup == lookup)
+                .filter_map(|origin| origin.method.definition)
                 .collect::<Vec<_>>();
             if matches.is_empty() && complete {
                 continue;
@@ -1403,7 +1804,8 @@ impl FactEvaluation<'_, '_> {
                     (!complete).then_some("interface method-set inventory is incomplete");
                 let mut mismatch = false;
                 let mut selects_target = false;
-                for required_method in &required_methods {
+                for origin in &required_methods {
+                    let required_method = &origin.method;
                     let Some(required) = required_method.definition else {
                         unknown = true;
                         continue;
@@ -1425,14 +1827,25 @@ impl FactEvaluation<'_, '_> {
                     if !self.session.ensure_go_member_declarations(&definitions)? {
                         return Ok(result);
                     }
-                    let Some(search) = self.go_struct_members(
-                        target,
-                        required_method.callable_lookup,
-                        *receiver,
-                        &rows,
-                        states,
-                    )?
-                    else {
+                    let search = loop {
+                        match self.go_receiver_members(
+                            target,
+                            required_method.callable_lookup,
+                            *receiver,
+                            &rows,
+                            states,
+                        )? {
+                            GoMemberSearchPreparation::Ready(search) => break Some(search),
+                            GoMemberSearchPreparation::Missing
+                            | GoMemberSearchPreparation::Pending => break None,
+                            GoMemberSearchPreparation::AwaitingHierarchy(roots) => {
+                                if !self.close_hierarchy_owner_roots(&roots, provider)? {
+                                    break None;
+                                }
+                            }
+                        }
+                    };
+                    let Some(search) = search else {
                         unknown = true;
                         continue;
                     };

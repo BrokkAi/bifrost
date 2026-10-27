@@ -43,7 +43,8 @@ use crate::analyzer::structural::resolution::{EnvironmentAxis, PrecedenceTier};
 use crate::analyzer::usages::get_definition::trace::{ResolutionTraceResult, TraceCandidateRef};
 use crate::analyzer::{CodeUnit, Language};
 use brokk_bifrost_core::analyzer::structural::callable::{
-    ApplicabilityVerdict, CallableRejectionReason, SelectionResolution,
+    ApplicabilityVerdict, CallableRejectionReason, FailingArgument, InvocationPhase,
+    SelectionResolution,
 };
 
 const APPLICABILITY_ROW_ID_DOMAIN: &[u8] = b"bifrost.code_query.callable_applicability.v1";
@@ -81,6 +82,12 @@ pub struct ApplicabilityRow {
     pub verdict: ApplicabilityVerdict,
     /// Set only when `verdict` is `inapplicable`.
     pub reason: Option<CallableRejectionReason>,
+    /// The invocation phase whose test decided `verdict`, when the
+    /// language's resolver phases its overload resolution and recorded one.
+    pub phase: Option<InvocationPhase>,
+    /// The first argument that keeps an `inapplicable` candidate from its
+    /// deciding phase, with the conversion it would need.
+    pub failing_argument: Option<FailingArgument>,
     /// The precedence tier the resolver considered the candidate at, when the
     /// seam that recorded it could name one. `None` is unattributed, never
     /// weakest.
@@ -104,8 +111,12 @@ pub struct OverloadSelectionRow {
     pub resolution: SelectionResolution,
     /// Whether the language's resolver reports the callable axis at all.
     pub supported: bool,
-    /// How many candidates the resolver considered at this site.
+    /// How many candidates the resolver considered at this site. Besides the
+    /// three counted verdicts this includes every `less_specific` candidate:
+    /// it accepts the call, but a more specific applicable candidate wins.
     pub considered: usize,
+    /// Applicable candidates that no other applicable candidate is more
+    /// specific than: the winners the selection is computed from.
     pub applicable: usize,
     pub inapplicable: usize,
     /// Candidates whose applicability nobody could decide. Any non-zero count
@@ -151,6 +162,8 @@ pub fn overload_selection_report(
                     .map(|record| record.verdict)
                     .unwrap_or(ApplicabilityVerdict::Unknown),
                 reason: record.and_then(|record| record.reason),
+                phase: candidate.invocation_phase,
+                failing_argument: candidate.failing_argument,
                 tier: candidate.tier,
                 selected: candidate.is_selected(),
             }

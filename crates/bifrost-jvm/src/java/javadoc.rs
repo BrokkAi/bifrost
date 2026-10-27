@@ -258,20 +258,53 @@ mod tests {
 
     #[test]
     fn grammar_publishes_required_tag_facts() {
-        let facts = parse_comment_text(
-            "/** Explains the method.\n * @param value the input value\n * @throws IOException when reading\n * @exception RuntimeException unchecked\n * @return the result value\n */",
-        )
-        .expect("Javadoc grammar parses the selected block");
+        // The released nested grammar is the oracle for provenance. Unicode
+        // prose makes byte offsets distinguishable from character offsets.
+        let source = "/** Explains \u{03bb} values.\n * @param value the input value\n * @param <T> the value type\n * @throws java.io.IOException when reading\n * @exception RuntimeException unchecked\n * @return the result value\n */\n";
+        let facts = parse_comment_text(source).expect("Javadoc grammar parses");
         assert!(facts.complete);
         assert!(facts.acceptable_text);
-        assert_eq!(facts.tags.len(), 4);
-        assert_eq!(facts.tags[0].kind, JavadocTagKind::Param);
-        assert_eq!(facts.tags[0].name.as_deref(), Some("value"));
-        assert!(facts.tags[0].body_present);
-        assert!(facts.tags[0].acceptable);
-        assert_eq!(facts.tags[1].name.as_deref(), Some("IOException"));
-        assert_eq!(facts.tags[2].name.as_deref(), Some("RuntimeException"));
-        assert_eq!(facts.tags[3].kind, JavadocTagKind::Return);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javadoc::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut cursor = tree.root_node().walk();
+        let tags = tree
+            .root_node()
+            .named_children(&mut cursor)
+            .filter(|node| matches!(node.kind(), "param_tag" | "throws_tag" | "return_tag"))
+            .collect::<Vec<_>>();
+        assert_eq!(tags.len(), 5);
+        let expected = [
+            (JavadocTagKind::Param, Some("value"), Some("value")),
+            (JavadocTagKind::Param, Some("<T>"), Some("T")),
+            (
+                JavadocTagKind::Throws,
+                Some("java.io.IOException"),
+                Some("IOException"),
+            ),
+            (
+                JavadocTagKind::Throws,
+                Some("RuntimeException"),
+                Some("RuntimeException"),
+            ),
+            (JavadocTagKind::Return, None, None),
+        ];
+        assert_eq!(facts.tags.len(), tags.len());
+        for ((fact, node), (kind, name, terminal)) in facts.tags.iter().zip(tags).zip(expected) {
+            assert_eq!(fact.kind, kind);
+            assert_eq!(fact.name.as_deref(), name);
+            assert_eq!(fact.terminal_name.as_deref(), terminal);
+            assert_eq!(fact.start_byte..fact.end_byte, node.byte_range());
+            let slice = &source[fact.start_byte..fact.end_byte];
+            assert!(slice.starts_with('@'), "{slice:?}");
+            let body = node.child_by_field_name("description").unwrap();
+            assert!(fact.end_byte >= body.end_byte());
+            assert!(fact.body_present);
+            assert!(fact.acceptable);
+        }
     }
 
     #[test]

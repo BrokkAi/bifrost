@@ -85,6 +85,16 @@ source publications. Cargo interpretation, including the cfg set and patches a
 configuration file selects, is derived from those selected bytes; parsed
 manifest and configuration tables are not a second durable authority.
 
+A live source that source admission refuses (a binary file, an overlong
+structural line, a budget refusal) is never a selected source row. The revision
+records it instead in `workspace_source_refusals`, with its content identity
+and the refusal reason. The selected revision therefore accounts for every
+listed source: selected, refused with a reason, or missing. A consumer that
+compares the revision with the disk listing, such as the Go tool context's
+input observation, treats a recorded refusal as an explained exclusion and
+still validates its bytes. Full builds and incremental updates classify a
+source the same way, and editing a refused file advances the revision.
+
 Scoped sessions share the repository's content facts but select their files
 through a unique session projection. They never reconcile their partial file
 listing under the live workspace's identity. The projection remains available

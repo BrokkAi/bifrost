@@ -1133,12 +1133,8 @@ fn include_host_bindings(
     let mut bindings = Vec::new();
     for projected in imports {
         let (scope_start, scope_end) = match &projected.owner {
-            RustImportOwner::Module { start, end, .. } => (*start, *end),
-            RustImportOwner::LocalOnly {
-                module_start,
-                module_end,
-                ..
-            } => (*module_start, *module_end),
+            RustImportOwner::Module { start, end, .. }
+            | RustImportOwner::LocalOnly { start, end, .. } => (*start, *end),
         };
         if !(scope_start <= include_start && include_start < scope_end) {
             continue;

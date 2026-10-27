@@ -22,7 +22,10 @@
             4,
             10,
             15,
-            5
+            5,
+            91,
+            93,
+            110
           ],
           "is_stripped": false
         }
@@ -104,7 +107,8 @@
           "impls": [
             20,
             22,
-            24
+            24,
+            94
           ]
         }
       }
@@ -201,7 +205,19 @@
                 "name": "T",
                 "kind": {
                   "type": {
-                    "bounds": [],
+                    "bounds": [
+                      {
+                        "trait_bound": {
+                          "trait": {
+                            "path": "Forbidden",
+                            "id": 4,
+                            "args": null
+                          },
+                          "generic_params": [],
+                          "modifier": "none"
+                        }
+                      }
+                    ],
                     "default": null,
                     "is_synthetic": false
                   }
@@ -1490,6 +1506,185 @@
           "blanket_impl": null
         }
       }
+    },
+    "91": {
+      "id": 91,
+      "crate_id": 0,
+      "name": "Blanket",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "trait": {
+          "is_auto": false,
+          "is_unsafe": false,
+          "is_dyn_compatible": true,
+          "items": [],
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "bounds": [],
+          "implementations": [
+            92
+          ]
+        }
+      }
+    },
+    "92": {
+      "id": 92,
+      "crate_id": 0,
+      "name": null,
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "impl": {
+          "is_unsafe": false,
+          "generics": {
+            "params": [
+              {
+                "name": "T",
+                "kind": {
+                  "type": {
+                    "bounds": [
+                      {
+                        "trait_bound": {
+                          "trait": {
+                            "path": "Traverse",
+                            "id": 3,
+                            "args": {
+                              "angle_bracketed": {
+                                "args": [
+                                  {
+                                    "type": {
+                                      "generic": "Self"
+                                    }
+                                  }
+                                ],
+                                "constraints": []
+                              }
+                            }
+                          },
+                          "generic_params": [],
+                          "modifier": "none"
+                        }
+                      }
+                    ],
+                    "default": null,
+                    "is_synthetic": false
+                  }
+                }
+              }
+            ],
+            "where_predicates": []
+          },
+          "provided_trait_methods": [
+            "walk"
+          ],
+          "trait": {
+            "path": "Blanket",
+            "id": 91,
+            "args": null
+          },
+          "for": {
+            "generic": "T"
+          },
+          "items": [],
+          "is_negative": false,
+          "is_synthetic": false,
+          "blanket_impl": null
+        }
+      }
+    },
+    "93": {
+      "id": 93,
+      "crate_id": 0,
+      "name": "Send",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "trait": {
+          "is_auto": true,
+          "is_unsafe": false,
+          "is_dyn_compatible": true,
+          "items": [],
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "bounds": [],
+          "implementations": [
+            94
+          ]
+        }
+      }
+    },
+    "94": {
+      "id": 94,
+      "crate_id": 0,
+      "name": null,
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "impl": {
+          "is_unsafe": false,
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "provided_trait_methods": [
+            "walk"
+          ],
+          "trait": {
+            "path": "Send",
+            "id": 93,
+            "args": null
+          },
+          "for": {
+            "resolved_path": {
+              "path": "Widget",
+              "id": 2,
+              "args": null
+            }
+          },
+          "items": [],
+          "is_negative": false,
+          "is_synthetic": true,
+          "blanket_impl": null
+        }
+      }
+    },
+    "110": {
+      "id": 110,
+      "crate_id": 0,
+      "name": "slice",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "primitive": {
+          "name": "slice",
+          "impls": []
+        }
+      }
     }
   },
   "paths": {
@@ -1576,6 +1771,23 @@
         "Broken"
       ],
       "kind": "struct"
+    },
+    "91": {
+      "crate_id": 0,
+      "path": [
+        "core",
+        "Blanket"
+      ],
+      "kind": "trait"
+    },
+    "93": {
+      "crate_id": 0,
+      "path": [
+        "core",
+        "marker",
+        "Send"
+      ],
+      "kind": "trait"
     }
   },
   "external_crates": {

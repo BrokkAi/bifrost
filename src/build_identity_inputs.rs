@@ -18,7 +18,6 @@
 const COMPILED_INPUTS: &[&str] = &[
     "src",
     "crates",
-    "resources",
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",

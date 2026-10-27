@@ -149,7 +149,7 @@ fn modeled_identity(identity: &ClassIdentity) -> PythonModeledClassIdentity {
 
 fn retain_claim(
     active: &ResolvedActiveSemanticModels,
-    activated: &ActivatedSemanticModelRecord<'_, TypeFact>,
+    activated: &ActivatedSemanticModelRecord<TypeFact>,
     overlay: Option<&SemanticModelOverlay>,
     basis: &mut PythonAncestryBasis,
     budget: &mut HierarchyBudget<'_>,
@@ -159,8 +159,8 @@ fn retain_claim(
     };
     // Addresses are only query-local deduplication keys, never public identity.
     let key = (
-        std::ptr::from_ref(activated.shard),
-        std::ptr::from_ref(activated.record),
+        std::sync::Arc::as_ptr(&activated.shard),
+        std::sync::Arc::as_ptr(&activated.record),
     );
     if budget.retained_claims.contains(&key) {
         return Ok(None);
@@ -175,8 +175,8 @@ fn retain_claim(
     }
     let provenance = activated_type_provenance(
         active,
-        activated.shard,
-        activated.record,
+        &activated.shard,
+        &activated.record,
         ambiguous,
         &mut || budget.charge(1, 1),
     )?;
@@ -195,23 +195,23 @@ fn retain_claim(
     Ok(Some(index))
 }
 
-type RetainedRuntimeClaim<'a> = (ActivatedSemanticModelRecord<'a, TypeFact>, usize);
+type RetainedRuntimeClaim = (ActivatedSemanticModelRecord<TypeFact>, usize);
 
-struct CollectedRuntimeClaims<'a> {
-    records: Vec<RetainedRuntimeClaim<'a>>,
+struct CollectedRuntimeClaims {
+    records: Vec<RetainedRuntimeClaim>,
     // A previously retained posting still declares a claim. Dedupe is not absence.
     declared: bool,
 }
 
 /// Collect raw records for selected IDs, retaining lower-ranked same-ID owner
 /// conflicts. Presence is independent of whether a posting was already retained.
-fn collect_claim_ids<'a>(
-    active: &'a ResolvedActiveSemanticModels,
-    ids: &[&str],
+fn collect_claim_ids(
+    active: &ResolvedActiveSemanticModels,
+    ids: &[String],
     overlay: Option<&SemanticModelOverlay>,
     basis: &mut PythonAncestryBasis,
     budget: &mut HierarchyBudget<'_>,
-) -> Result<CollectedRuntimeClaims<'a>, PythonHierarchyReason> {
+) -> Result<CollectedRuntimeClaims, PythonHierarchyReason> {
     let mut records = Vec::new();
     let mut declared = false;
     for id in ids {
@@ -228,23 +228,23 @@ fn collect_claim_ids<'a>(
     Ok(CollectedRuntimeClaims { records, declared })
 }
 
-fn runtime_claim_owner_ids<'a>(
-    active: &'a ResolvedActiveSemanticModels,
+fn runtime_claim_owner_ids(
+    active: &ResolvedActiveSemanticModels,
     qualified_name: &str,
-    symbol_id: &'a str,
+    symbol_id: &str,
     budget: &mut HierarchyBudget<'_>,
-) -> Result<Vec<&'a str>, PythonHierarchyReason> {
+) -> Result<Vec<String>, PythonHierarchyReason> {
     budget.charge(1, 1)?;
-    let mut ids = vec![symbol_id];
+    let mut ids = vec![symbol_id.to_owned()];
     let mut seen_ids = HashSet::default();
-    seen_ids.insert(symbol_id);
+    seen_ids.insert(symbol_id.to_owned());
     for activated in active.all_type_records_named(qualified_name) {
         budget.charge(1, 1)?;
         if activated.shard.manifest.language == "python"
             && activated.record.name == qualified_name
-            && seen_ids.insert(activated.record.id.as_str())
+            && seen_ids.insert(activated.record.id.clone())
         {
-            ids.push(activated.record.id.as_str());
+            ids.push(activated.record.id.clone());
         }
     }
     Ok(ids)
@@ -256,7 +256,7 @@ fn collect_runtime_claims<'a>(
     overlay: Option<&SemanticModelOverlay>,
     basis: &mut PythonAncestryBasis,
     budget: &mut HierarchyBudget<'_>,
-) -> Result<CollectedRuntimeClaims<'a>, PythonHierarchyReason> {
+) -> Result<CollectedRuntimeClaims, PythonHierarchyReason> {
     let ClassIdentity::External {
         qualified_name,
         symbol_id,
@@ -282,9 +282,9 @@ fn retain_open_claims(
     for activated in active.all_type_records_named(name) {
         budget.charge(1, 1)?;
         if activated.shard.manifest.language == "python"
-            && seen_ids.insert(activated.record.id.as_str())
+            && seen_ids.insert(activated.record.id.clone())
         {
-            ids.push(activated.record.id.as_str());
+            ids.push(activated.record.id.clone());
         }
     }
     Ok(collect_claim_ids(active, &ids, overlay, basis, budget)?.declared)
@@ -359,7 +359,7 @@ fn runtime_bases(
     // Retain all contributors before checking their declaration admission.
     for (activated, index) in &records {
         let admitted =
-            active.type_declaration_admitted(activated.record, &mut || budget.charge(1, 1))?;
+            active.type_declaration_admitted(&activated.record, &mut || budget.charge(1, 1))?;
         let canonical = external_class_identity_with_visits(
             overlay,
             Language::Python,
@@ -454,7 +454,7 @@ fn runtime_base_claim_declared(
     let ids = runtime_claim_owner_ids(active, qualified_name, symbol_id, budget)?;
     let mut declared = false;
     for id in ids {
-        for activated in active.all_type_records_with_id(id) {
+        for activated in active.all_type_records_with_id(&id) {
             budget.charge(1, 1)?;
             declared |= activated.shard.manifest.language == "python"
                 && activated.record.runtime_bases.is_some();

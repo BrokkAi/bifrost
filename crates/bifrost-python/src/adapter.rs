@@ -61,3 +61,56 @@ pub fn is_string_line_data(
     });
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::ControlFlow;
+
+    #[test]
+    fn qs6_string_data_grammar_and_cancellation() {
+        for (literal, kind, interpolations, data) in [
+            ("u'caf\u{e9}'", "string", 0, true),
+            ("b'bytes'", "string", 0, true),
+            ("'one' 'two'", "concatenated_string", 0, true),
+            ("f'plain {{braces}}'", "string", 0, true),
+            ("f'{value:{width}}'", "string", 1, false),
+            ("'prefix' f'{value}'", "concatenated_string", 1, false),
+        ] {
+            let source = format!("value = {literal}\n");
+            let tree = crate::declarations::parse_python_tree(&source).unwrap();
+            let root = tree.root_node();
+            assert!(!root.has_error(), "{}", root.to_sexp());
+            let value = root
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("right")
+                .unwrap();
+            assert_eq!(value.kind(), kind);
+            let mut stack = vec![value];
+            let mut count = 0;
+            while let Some(node) = stack.pop() {
+                assert!(!node.is_error() && !node.is_missing());
+                count += usize::from(node.kind() == "interpolation");
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(count, interpolations, "{}", value.to_sexp());
+            assert_eq!(
+                is_string_line_data(value, &mut || false),
+                ControlFlow::Continue(data)
+            );
+            let mut stops = 0;
+            assert_eq!(
+                is_string_line_data(value, &mut || {
+                    stops += 1;
+                    true
+                }),
+                ControlFlow::Break(())
+            );
+            assert_eq!(stops, 1);
+        }
+    }
+}

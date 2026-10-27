@@ -638,3 +638,6 @@ pub(crate) mod dependency_packs {
 
 #[cfg(test)]
 mod intrinsic_inventory_generator;
+
+#[doc(hidden)]
+pub mod native_graph;

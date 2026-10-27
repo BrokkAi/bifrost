@@ -5,7 +5,7 @@
 //! open or mutate an analyzer catalog. The existing bundle and policy readers
 //! remain responsible for validating content when they activate it.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -1064,6 +1064,11 @@ struct SelectionContext<'a> {
 
 trait HttpTransport {
     fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, TransportError>;
+
+    /// Whether requests to the selected repository's GitHub API carry a credential.
+    fn authenticated(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1239,6 +1244,10 @@ impl HttpTransport for UreqTransport {
             return Ok(std::mem::take(&mut bytes));
         }
         Err(TransportError::redirect())
+    }
+
+    fn authenticated(&self) -> bool {
+        self.token.is_some()
     }
 }
 
@@ -2305,6 +2314,18 @@ fn discover_inventory(
     let mut releases = Vec::new();
     let mut tags = BTreeSet::new();
     let api_releases = fetch_all_release_pages(transport, source)?;
+    // Anonymous GitHub API requests share the caller's IP-wide quota of 60 an
+    // hour, which asset reads of the public repository's releases exhausted
+    // (#6617); release downloads do not count against it. Only a credentialed
+    // read of a repository that may be private needs the API asset form, which
+    // accepts the credential. Descriptor and archive digests bind the content
+    // whichever URL serves it.
+    let assets_through_api = transport.authenticated()
+        && source.is_some_and(|source| source.repository != REPOSITORY_URL);
+    // A repeated tag is a fault of the listing alone. Reject it before reading
+    // descriptors: their download URLs are keyed by tag, so a repeat makes them
+    // ambiguous.
+    let mut listed = Vec::new();
     for api_release in &api_releases {
         let object = api_release.as_object().ok_or_else(|| {
             OpenPackError::manifest("GitHub release listing contains an invalid release record")
@@ -2333,6 +2354,17 @@ fn discover_inventory(
                 "GitHub release listing repeats tag {tag}"
             )));
         }
+        listed.push((tag, object));
+    }
+    // Every listed release binds its tag's commit, so read all tag refs at
+    // once rather than one ref per release (#6617). A listing with no pack
+    // releases names no tag to resolve.
+    let mut tag_refs = if listed.is_empty() {
+        HashMap::new()
+    } else {
+        fetch_tag_refs(source, transport)?
+    };
+    for (tag, object) in listed {
         let prerelease = object
             .get("prerelease")
             .and_then(Value::as_bool)
@@ -2366,7 +2398,7 @@ fn discover_inventory(
                     ))
                 })?;
             validate_asset_url(url, name, false, source)?;
-            let cached_url = if let Some(source) = source {
+            let cached_url = if let Some(source) = source.filter(|_| assets_through_api) {
                 let id = item
                     .get("id")
                     .and_then(Value::as_u64)
@@ -2418,7 +2450,7 @@ fn discover_inventory(
                 "GitHub prerelease flag does not match {tag}"
             )));
         }
-        let tag_commit = resolve_tag_commit(tag, source, transport)?;
+        let tag_commit = resolve_tag_commit(tag, &mut tag_refs, source, transport)?;
         let manifest_sha256 = sha256(&manifest_bytes);
         let cached = CachedReleaseRecord {
             tag: tag.to_owned(),
@@ -2648,25 +2680,55 @@ fn api_root(source: Option<&PackSource>) -> String {
         )
 }
 
+/// Every tag ref of the source repository by tag name, from one request.
+/// `matching-refs` does not paginate: it answered all 13,491 tags of
+/// pytorch/pytorch in one 5.7 MB response, ignoring `per_page`, with no
+/// `Link` header (checked 2026-10-26). A repository too large to answer fails
+/// with a server error rather than a truncated listing.
+fn fetch_tag_refs(
+    source: Option<&PackSource>,
+    transport: &dyn HttpTransport,
+) -> Result<HashMap<String, Value>, OpenPackError> {
+    let url = format!("{}/git/matching-refs/tags/", api_root(source));
+    let bytes = fetch_bytes(transport, &url, MAX_API_PAGE_BYTES)?;
+    let Value::Array(references) = parse_json_value(&bytes).map_err(|error| {
+        OpenPackError::manifest(format!("GitHub returned invalid tag listing JSON: {error}"))
+    })?
+    else {
+        return Err(OpenPackError::manifest(
+            "GitHub tag listing is not an array of refs",
+        ));
+    };
+    let mut by_tag = HashMap::with_capacity(references.len());
+    for reference in references {
+        let tag = reference
+            .get("ref")
+            .and_then(Value::as_str)
+            .and_then(|name| name.strip_prefix("refs/tags/"))
+            .ok_or_else(|| OpenPackError::manifest("GitHub tag listing contains an invalid ref"))?
+            .to_owned();
+        if let Some(repeated) = by_tag.insert(tag, reference) {
+            return Err(OpenPackError::integrity(format!(
+                "GitHub tag listing repeats {}",
+                repeated["ref"]
+            )));
+        }
+    }
+    Ok(by_tag)
+}
+
+/// The commit `tag` names, peeling annotated tags with one read each.
 fn resolve_tag_commit(
     tag: &str,
+    tag_refs: &mut HashMap<String, Value>,
     source: Option<&PackSource>,
     transport: &dyn HttpTransport,
 ) -> Result<String, OpenPackError> {
-    let escaped = tag
-        .split('/')
-        .map(percent_encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/");
-    let mut url = format!("{}/git/ref/tags/{escaped}", api_root(source));
+    let mut reference = tag_refs.remove(tag).ok_or_else(|| {
+        OpenPackError::MissingRelease(format!("GitHub release {tag} has no tag ref"))
+    })?;
     let mut seen = BTreeSet::new();
     for _ in 0..10 {
-        let bytes = fetch_bytes(transport, &url, 1024 * 1024)?;
-        let reference = parse_json_value(&bytes).map_err(|error| {
-            OpenPackError::manifest(format!(
-                "GitHub returned invalid tag JSON for {tag}: {error}"
-            ))
-        })?;
         let object = reference
             .get("object")
             .and_then(Value::as_object)
@@ -2687,7 +2749,13 @@ fn resolve_tag_commit(
         match object.get("type").and_then(Value::as_str) {
             Some("commit") => return Ok(sha.to_owned()),
             Some("tag") if seen.insert(sha.to_owned()) => {
-                url = format!("{}/git/tags/{sha}", api_root(source));
+                let url = format!("{}/git/tags/{sha}", api_root(source));
+                let bytes = fetch_bytes(transport, &url, 1024 * 1024)?;
+                reference = parse_json_value(&bytes).map_err(|error| {
+                    OpenPackError::manifest(format!(
+                        "GitHub returned invalid tag JSON for {tag}: {error}"
+                    ))
+                })?;
             }
             _ => {
                 return Err(OpenPackError::integrity(format!(
@@ -2699,19 +2767,6 @@ fn resolve_tag_commit(
     Err(OpenPackError::integrity(format!(
         "GitHub tag {tag} has an excessively deep annotated-tag chain"
     )))
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(encoded, "%{byte:02X}").expect("write to String cannot fail");
-        }
-    }
-    encoded
 }
 
 #[cfg(test)]

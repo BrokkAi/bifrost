@@ -1,4 +1,10 @@
 //! Native Go usage queries over selected inverse rows.
+use std::ops::ControlFlow;
+
+use brokk_bifrost_analysis::analyzer::usages::native_result::{
+    NativeUsageDiagnostics, NativeUsageFile, NativeUsagePending, NativeUsageProjection,
+    NativeUsageSite, project_pending_files, unique_targets,
+};
 
 use crate::analyzer::go::GoAnalyzer;
 
@@ -10,8 +16,6 @@ use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
 
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
-
 use brokk_bifrost_core::analyzer::usages::outcome::GraphFailureReason;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
@@ -22,10 +26,6 @@ use brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic;
 
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHitSurface;
-
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
@@ -34,13 +34,7 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
-use brokk_bifrost_core::hash::HashMap;
-
-use brokk_bifrost_core::hash::HashSet;
-
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
-use brokk_bifrost_core::text_utils::compute_line_starts;
-use std::collections::BTreeSet;
 
 /// Native Go forward-usage discovery through the selected reference index.
 #[derive(Default)]
@@ -68,35 +62,25 @@ impl GraphUsageAnalyzer for GoNativeUsageStrategy {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-            return GraphUsageOutcome::TerminalFailure(diagnostic(
+            return DIAGNOSTICS.failure(
                 primary,
                 "native_resolution_unavailable",
                 "selected Go analyzer is unavailable".into(),
-            ));
+            );
         };
         let cancellation = scan_scope.cancellation().cloned().unwrap_or_default();
-        let mut hits_by_overload = HashMap::default();
-        let mut unproven_by_overload = HashMap::default();
-        let mut unproven_total_by_overload = HashMap::default();
-        let mut diagnostics = Vec::new();
-        let mut external_hits = BTreeSet::new();
-        let mut sources = HashMap::<ProjectFile, (String, Box<[usize]>)>::default();
-        let mut seen_targets = HashSet::default();
-        for target in overloads {
-            if !seen_targets.insert(target) {
-                continue;
-            }
+        let targets = unique_targets(overloads);
+        let mut pending = NativeUsagePending::new(&targets);
+        let mut projection = GoUsageProjection { go, primary };
+        for (target_index, target) in targets.iter().enumerate() {
             if cancellation.is_cancelled() {
-                return GraphUsageOutcome::TerminalFailure(diagnostic(
-                    primary,
-                    "cancelled",
-                    "native Go usage query was cancelled".into(),
-                ));
+                return DIAGNOSTICS.cancelled(primary);
             }
             let answer =
                 match go_selected_inverse_for_usage_scope(go, target, scan_scope, &cancellation) {
                     GoSelectedReverseOutcome::Ready(answer) => answer,
-                    GoSelectedReverseOutcome::Unavailable(reason) => {
+                    GoSelectedReverseOutcome::Unavailable(reason)
+                    | GoSelectedReverseOutcome::TargetUncovered(reason) => {
                         let mut unavailable = GraphFailureReason::UnavailableCanonicalFacts(
                             "Go graph indexed source was unavailable",
                         )
@@ -105,157 +89,81 @@ impl GraphUsageAnalyzer for GoNativeUsageStrategy {
                         return GraphUsageOutcome::TerminalFailure(unavailable);
                     }
                     GoSelectedReverseOutcome::Stale(reason) => {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "stale_selected_source",
-                            reason,
-                        ));
+                        return DIAGNOSTICS.failure(primary, "stale_selected_source", reason);
                     }
-                    GoSelectedReverseOutcome::Cancelled => {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "cancelled",
-                            "native Go usage query was cancelled".into(),
-                        ));
-                    }
+                    GoSelectedReverseOutcome::Cancelled => return DIAGNOSTICS.cancelled(primary),
                     GoSelectedReverseOutcome::StoreError(reason) => {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "native_store_error",
-                            reason,
-                        ));
+                        return DIAGNOSTICS.failure(primary, "native_store_error", reason);
                     }
                 };
             if let EdgeCompleteness::Incomplete { reasons } = &answer.completeness {
-                diagnostics.push(diagnostic(
+                pending.diagnostics.push(DIAGNOSTICS.diagnostic(
                     target,
                     "native_reference_inventory_incomplete",
                     format!("selected Go reference inventory is incomplete: {reasons:?}"),
                 ));
             }
-            let mut hits = BTreeSet::new();
-            let mut unproven = BTreeSet::new();
-            for edge in answer.edges {
-                if cancellation.is_cancelled() {
-                    return GraphUsageOutcome::TerminalFailure(diagnostic(
-                        primary,
-                        "cancelled",
-                        "native Go usage query was cancelled".into(),
-                    ));
-                }
-                if !scan_scope.allows(&edge.site.file) {
-                    continue;
-                }
-                if !sources.contains_key(&edge.site.file) {
-                    let Some(source) = go.indexed_source(&edge.site.file) else {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "native_source_unavailable",
-                            format!(
-                                "selected Go usage source is unavailable: {}",
-                                edge.site.file
-                            ),
-                        ));
-                    };
-                    if !go
-                        .inner
-                        .source_matches_selected_native_content(&edge.site.file, &source)
-                    {
-                        return GraphUsageOutcome::TerminalFailure(diagnostic(
-                            primary,
-                            "stale_selected_source",
-                            format!("selected Go usage source changed: {}", edge.site.file),
-                        ));
-                    }
-                    let line_starts = compute_line_starts(&source).into_boxed_slice();
-                    sources.insert(edge.site.file.clone(), (source, line_starts));
-                }
-                let (source, line_starts) = sources
-                    .get(&edge.site.file)
-                    .expect("selected Go usage source was admitted");
-                let snippet = brokk_bifrost_core::text_utils::trimmed_snippet_around_line(
-                    source,
-                    line_starts,
-                    edge.site.range.start_line.saturating_sub(1),
-                    0,
-                );
-                let owner = edge
-                    .site
-                    .enclosing
-                    .clone()
-                    .unwrap_or_else(|| CodeUnit::file_scope(edge.site.file.clone()));
-                let mut hit = UsageHit::new(
-                    edge.site.file,
-                    edge.site.range.start_line,
-                    edge.site.range.start_byte,
-                    edge.site.range.end_byte,
-                    owner,
-                    if edge.proof == UsageProof::Proven {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                    snippet,
-                );
-                hit.kind = edge.usage_kind;
-                hit.proof = edge.proof;
-                hit.reference_kind = edge.reference_kind;
-                if hit.proof == UsageProof::Proven {
-                    if hit.kind.included_in(UsageHitSurface::ExternalUsages) {
-                        external_hits.insert(hit.clone());
-                    }
-                    hits.insert(hit);
-                } else {
-                    unproven.insert(hit);
-                }
+            let edges = answer.edges;
+            if let ControlFlow::Break(()) = pending.queue_target_edges::<GoUsageProjection<'_>>(
+                target_index,
+                edges,
+                scan_scope,
+                &cancellation,
+            ) {
+                return DIAGNOSTICS.cancelled(primary);
             }
-            let FuzzyResult::Success {
-                hits_by_overload: proven,
-                unproven_by_overload: uncertain,
-                unproven_total_by_overload: totals,
-            } = FuzzyResult::success_with_unproven_limit(
-                target.clone(),
-                hits,
-                unproven,
-                scan_scope.max_unproven(),
-            )
-            else {
-                unreachable!("success constructor produces Success");
-            };
-            hits_by_overload.extend(proven);
-            unproven_by_overload.extend(uncertain);
-            unproven_total_by_overload.extend(totals);
         }
-        if external_hits.len() > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: primary.short_name().to_owned(),
-                total_callsites: external_hits.len(),
-                limit: max_usages,
-                sample_hits: external_hits.into_iter().take(max_usages).collect(),
-            });
+        match project_pending_files(
+            &mut projection,
+            pending,
+            scan_scope,
+            max_usages,
+            &cancellation,
+        ) {
+            Ok(Some(result)) => GraphUsageOutcome::Resolved(result),
+            Ok(None) => DIAGNOSTICS.cancelled(primary),
+            Err(diagnostic) => GraphUsageOutcome::TerminalFailure(diagnostic),
         }
-        GraphUsageOutcome::Resolved(if diagnostics.is_empty() {
-            FuzzyResult::Success {
-                hits_by_overload,
-                unproven_by_overload,
-                unproven_total_by_overload,
-            }
-        } else {
-            FuzzyResult::Incomplete {
-                hits_by_overload,
-                unproven_by_overload,
-                unproven_total_by_overload,
-                diagnostics,
-            }
-        })
     }
 }
 
-fn diagnostic(target: &CodeUnit, kind: &str, reason: String) -> UsageAnalysisDiagnostic {
-    UsageAnalysisDiagnostic {
-        fq_name: target.fq_name().to_string(),
-        strategy: "go_native".into(),
-        reason_kind: kind.into(),
-        reason,
+const DIAGNOSTICS: NativeUsageDiagnostics = NativeUsageDiagnostics {
+    strategy: "go_native",
+    cancelled_reason: "native Go usage query was cancelled",
+};
+
+struct GoUsageProjection<'a> {
+    go: &'a GoAnalyzer,
+    primary: &'a CodeUnit,
+}
+
+impl NativeUsageProjection for GoUsageProjection<'_> {
+    type Context = ();
+    type Error = UsageAnalysisDiagnostic;
+
+    fn load_file(
+        &mut self,
+        file: &ProjectFile,
+        _pending: &[NativeUsageSite],
+    ) -> Result<NativeUsageFile<Self::Context>, Self::Error> {
+        let source = self.go.indexed_source(file).ok_or_else(|| {
+            DIAGNOSTICS.diagnostic(
+                self.primary,
+                "native_source_unavailable",
+                format!("selected Go usage source is unavailable: {file}"),
+            )
+        })?;
+        if !self
+            .go
+            .inner
+            .source_matches_selected_native_content(file, &source)
+        {
+            return Err(DIAGNOSTICS.diagnostic(
+                self.primary,
+                "stale_selected_source",
+                format!("selected Go usage source changed: {file}"),
+            ));
+        }
+        Ok(NativeUsageFile::new(source, ()))
     }
 }

@@ -34,10 +34,15 @@ pub mod get_type;
 pub mod inverted_edges;
 
 #[doc(hidden)]
+pub mod native_incoming;
+
+#[doc(hidden)]
 pub mod java_usage_evidence_cache;
 
 pub mod member_completion;
 pub mod member_family;
+#[doc(hidden)]
+pub mod native_result;
 pub mod overload_selection;
 pub(crate) mod parsed_tree;
 

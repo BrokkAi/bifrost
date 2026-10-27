@@ -1,0 +1,1172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CompiledPackManifest",
+  "type": "object",
+  "properties": {
+    "carried_sources": {
+      "description": "The producer's claim that it parsed each of these relative source paths\nfrom a sources artifact while generating the pack (#2613); strictly\nascending. Serialized only when non-empty so packs without carried\nsources keep byte-identical manifests and digests.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "compatibility": {
+      "$ref": "#/$defs/Compatibility"
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "content_sha256": {
+      "type": "string"
+    },
+    "cpp_portability": {
+      "description": "Exact native C/C++ portability evidence retained at pack scope.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CppPortabilityEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ecosystem": {
+      "type": "string"
+    },
+    "extraction": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactExtraction"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "language": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    },
+    "pack_id": {
+      "type": "string"
+    },
+    "producer": {
+      "$ref": "#/$defs/Producer"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "python_correspondence": {
+      "description": "Exact Python cross-artifact correspondence retained at pack scope.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PythonCorrespondenceEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "safety": {
+      "$ref": "#/$defs/Safety"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "semantic_sha256": {
+      "type": "string"
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CompiledShardDescriptor"
+      }
+    },
+    "source_inputs": {
+      "description": "Exact generation inputs, independent of navigation/source locators.\nOmitted for packs that do not record a source-set acquisition.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceSetInputs"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_id",
+    "version",
+    "producer",
+    "language",
+    "ecosystem",
+    "compatibility",
+    "provenance",
+    "license",
+    "completeness",
+    "safety",
+    "semantic_sha256",
+    "content_sha256",
+    "shards"
+  ],
+  "$defs": {
+    "ArtifactEncoding": {
+      "type": "string",
+      "enum": [
+        "raw",
+        "deflate"
+      ]
+    },
+    "ArtifactExtraction": {
+      "description": "Artifact authority is carried by the production path, never authored JSON.",
+      "type": "object",
+      "properties": {
+        "inputs": {
+          "$ref": "#/$defs/ArtifactExtractionInputs"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactExtractionKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "inputs"
+      ]
+    },
+    "ArtifactExtractionInputs": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "single"
+            },
+            "sha256": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "digest": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "source_set"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "digest"
+          ]
+        }
+      ]
+    },
+    "ArtifactExtractionKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "npm_package_manifest",
+            "type_script_declaration_file",
+            "java_source_jar",
+            "java_class_jar",
+            "scala_source_jar",
+            "kotlin_source_jar",
+            "jdk_source_zip",
+            "jdk_jmod_set",
+            "dot_net_assembly",
+            "rustdoc_json",
+            "rustdoc_json_set",
+            "type_script_library_set",
+            "go_source_set",
+            "python_stub",
+            "python_source",
+            "ruby_gem_archive"
+          ]
+        },
+        {
+          "description": "One Composer-installed package tree. Composer installs sources rather\nthan a compiled artifact, so the ecosystem names the input instead of\nthe language, exactly as `NpmPackageManifest` does.",
+          "type": "string",
+          "const": "composer_package_source_set"
+        },
+        {
+          "description": "One tree of plain PHP declaration stubs: PHP source that states the\nruntime's classes, interfaces, constants and functions with native\nsignatures and empty bodies. Distinct from `ComposerPackageSourceSet`,\nwhich is an installed package's real, executable sources.",
+          "type": "string",
+          "const": "php_declaration_stub"
+        },
+        {
+          "description": "One explicit C++ include root containing exact header sources.",
+          "type": "string",
+          "const": "cpp_header_source_set"
+        }
+      ]
+    },
+    "Compatibility": {
+      "type": "object",
+      "properties": {
+        "bifrost": {
+          "description": "Required for legacy schemas 2 through 7. Schemas 8 and later are admitted by the\nreader's supported-schema set and must omit this field.",
+          "type": "string"
+        },
+        "toolchains": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VersionConstraint"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompiledShardDescriptor": {
+      "type": "object",
+      "properties": {
+        "content_sha256": {
+          "type": "string"
+        },
+        "defined_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "encoding": {
+          "$ref": "#/$defs/ArtifactEncoding"
+        },
+        "payload_kind": {
+          "$ref": "#/$defs/PayloadKind"
+        },
+        "raw_size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "record_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "referenced_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "routing_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "semantic_sha256": {
+          "type": "string"
+        },
+        "shard_id": {
+          "type": "string"
+        },
+        "stored_sha256": {
+          "type": "string"
+        },
+        "stored_size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "shard_id",
+        "payload_kind",
+        "routing_keys",
+        "encoding",
+        "raw_size",
+        "stored_size",
+        "record_count",
+        "defined_ids",
+        "referenced_ids",
+        "semantic_sha256",
+        "content_sha256",
+        "stored_sha256"
+      ]
+    },
+    "Completeness": {
+      "type": "string",
+      "enum": [
+        "partial",
+        "complete"
+      ]
+    },
+    "CppArtifactDigest": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/CppDigestAlgorithm"
+        },
+        "canonicalization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "coverage",
+        "value"
+      ]
+    },
+    "CppArtifactSelector": {
+      "type": "object",
+      "properties": {
+        "digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppArtifactDigest"
+          }
+        },
+        "purl": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "purl",
+        "digests"
+      ]
+    },
+    "CppCallableKind": {
+      "type": "string",
+      "enum": [
+        "constructor",
+        "method"
+      ]
+    },
+    "CppCallableSignature": {
+      "type": "object",
+      "properties": {
+        "callable_kind": {
+          "$ref": "#/$defs/CppCallableKind"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppCanonicalType"
+          }
+        },
+        "receiver": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CppCanonicalType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CppCanonicalType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "callable_kind",
+        "owner",
+        "parameters"
+      ]
+    },
+    "CppCanonicalType": {
+      "description": "Closed canonical type tree for C++ identity.  Declared and template\nprimary references use native declaration ids whose complete portable keys\nare retained in `CppPortabilityEvidence::symbols`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "fundamental"
+            },
+            "name": {
+              "$ref": "#/$defs/CppFundamentalTypeName"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "declared"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "symbol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CppCanonicalType"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "template_specialization"
+            },
+            "primary": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "primary",
+            "arguments"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "qualified"
+            },
+            "qualifiers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CppTypeQualifier"
+              }
+            },
+            "type": {
+              "$ref": "#/$defs/CppCanonicalType"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "qualifiers",
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "reference"
+            },
+            "reference_kind": {
+              "$ref": "#/$defs/CppReferenceKind"
+            },
+            "referent": {
+              "$ref": "#/$defs/CppCanonicalType"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "reference_kind",
+            "referent"
+          ]
+        }
+      ]
+    },
+    "CppDescriptorRole": {
+      "type": "string",
+      "enum": [
+        "namespace",
+        "type",
+        "callable"
+      ]
+    },
+    "CppDigestAlgorithm": {
+      "type": "string",
+      "enum": [
+        "sha256"
+      ]
+    },
+    "CppDirectHeader": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/CppArtifactSelector"
+        },
+        "include_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "include_name",
+        "artifact"
+      ]
+    },
+    "CppFundamentalTypeName": {
+      "type": "string",
+      "enum": [
+        "char"
+      ]
+    },
+    "CppHeaderClosure": {
+      "type": "string",
+      "enum": [
+        "complete"
+      ]
+    },
+    "CppIdentityStability": {
+      "type": "string",
+      "enum": [
+        "portable"
+      ]
+    },
+    "CppLanguage": {
+      "type": "string",
+      "enum": [
+        "c",
+        "cpp"
+      ]
+    },
+    "CppPortabilityEvidence": {
+      "description": "Exact C/C++ portability evidence imported from the CSMI 0.1 C/C++ profile.\n\nThe vectors are sorted into a canonical order by the semantic-pack\ncompiler.  Their contents remain typed all the way through artifact\nencoding and decoding so a consumer can distinguish an exact resolver\nresult from a missing or unsupported one without inspecting JSON values.",
+      "type": "object",
+      "properties": {
+        "resolution_contexts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppResolutionContextRecord"
+          }
+        },
+        "special_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppSpecialMemberEvidence"
+          }
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppPortableSymbolRecord"
+          }
+        },
+        "type_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppTypeAliasEvidence"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "CppPortableSymbolKey": {
+      "type": "object",
+      "properties": {
+        "artifact_selectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppArtifactSelector"
+          }
+        },
+        "descriptors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppSymbolDescriptor"
+          }
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "scheme_version": {
+          "type": "string"
+        },
+        "stability": {
+          "$ref": "#/$defs/CppIdentityStability"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_selectors",
+        "scheme",
+        "scheme_version",
+        "stability",
+        "descriptors"
+      ]
+    },
+    "CppPortableSymbolRecord": {
+      "description": "A portable C++ symbol key retained alongside the native declaration id\nthat the Bifrost pack uses for references.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/CppPortableSymbolKey"
+        },
+        "native_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "native_id",
+        "key"
+      ]
+    },
+    "CppReferenceKind": {
+      "type": "string",
+      "enum": [
+        "lvalue",
+        "rvalue"
+      ]
+    },
+    "CppResolutionContextRecord": {
+      "description": "A complete resolver context and the exact digest used to refer to it from\nalias and special-member facts.",
+      "type": "object",
+      "properties": {
+        "compile_arguments_digest": {
+          "type": "string"
+        },
+        "context_digest": {
+          "type": "string"
+        },
+        "direct_headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CppDirectHeader"
+          }
+        },
+        "header_closure": {
+          "$ref": "#/$defs/CppHeaderClosure"
+        },
+        "language": {
+          "$ref": "#/$defs/CppLanguage"
+        },
+        "translation_unit": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "context_digest",
+        "language",
+        "translation_unit",
+        "compile_arguments_digest",
+        "direct_headers",
+        "header_closure"
+      ]
+    },
+    "CppResolutionContextRef": {
+      "description": "The CSMI resolution-profile reference carried by a C++ profile fact.",
+      "type": "object",
+      "properties": {
+        "context_digest": {
+          "type": "string"
+        },
+        "header_closure": {
+          "$ref": "#/$defs/CppHeaderClosure"
+        },
+        "language": {
+          "$ref": "#/$defs/CppLanguage"
+        },
+        "version": {
+          "type": "string"
+        },
+        "vocabulary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "vocabulary",
+        "version",
+        "context_digest",
+        "language",
+        "header_closure"
+      ]
+    },
+    "CppSpecialMemberEvidence": {
+      "description": "An exact copy/move special-member declaration identity.",
+      "type": "object",
+      "properties": {
+        "member": {
+          "type": "string"
+        },
+        "member_disambiguator": {
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/CppSpecialMemberOperation"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "resolution_context": {
+          "$ref": "#/$defs/CppResolutionContextRef"
+        },
+        "signature": {
+          "$ref": "#/$defs/CppCallableSignature"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "member",
+        "operation",
+        "signature",
+        "member_disambiguator",
+        "resolution_context"
+      ]
+    },
+    "CppSpecialMemberOperation": {
+      "type": "string",
+      "enum": [
+        "copy_constructor",
+        "copy_assignment",
+        "move_constructor"
+      ]
+    },
+    "CppSymbolDescriptor": {
+      "type": "object",
+      "properties": {
+        "disambiguator": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/CppDescriptorRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "name",
+        "disambiguator"
+      ]
+    },
+    "CppTypeAliasEvidence": {
+      "description": "A type alias fact keyed by the native alias declaration id.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "resolution_context": {
+          "$ref": "#/$defs/CppResolutionContextRef"
+        },
+        "target": {
+          "$ref": "#/$defs/CppCanonicalType"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "target",
+        "resolution_context"
+      ]
+    },
+    "CppTypeQualifier": {
+      "type": "string",
+      "enum": [
+        "const",
+        "volatile"
+      ]
+    },
+    "CsmiArtifactDigest": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/CsmiDigestAlgorithm"
+        },
+        "canonicalization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "coverage",
+        "value"
+      ]
+    },
+    "CsmiArtifactSelector": {
+      "type": "object",
+      "properties": {
+        "digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CsmiArtifactDigest"
+          }
+        },
+        "purl": {
+          "type": "string"
+        },
+        "versionRange": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "purl"
+      ]
+    },
+    "CsmiDescriptor": {
+      "type": "object",
+      "properties": {
+        "disambiguator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/CsmiDescriptorRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role"
+      ]
+    },
+    "CsmiDescriptorRole": {
+      "type": "string",
+      "enum": [
+        "namespace",
+        "type",
+        "term",
+        "callable",
+        "type-parameter",
+        "value-parameter",
+        "meta"
+      ]
+    },
+    "CsmiDigestAlgorithm": {
+      "type": "string",
+      "enum": [
+        "sha-256",
+        "sha-384",
+        "sha-512"
+      ]
+    },
+    "CsmiPortableSymbolIdentity": {
+      "description": "Effective portable identity of one declaration, independent of its local\nhandle and display metadata. Native interchange locators retain this key\nso an exporter never reconstructs ownership from a rendered name.",
+      "type": "object",
+      "properties": {
+        "artifactSelectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CsmiArtifactSelector"
+          }
+        },
+        "descriptors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CsmiDescriptor"
+          }
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "schemeVersion": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifactSelectors",
+        "scheme",
+        "schemeVersion",
+        "descriptors"
+      ]
+    },
+    "PayloadKind": {
+      "type": "string",
+      "enum": [
+        "declaration_facts",
+        "generator_rules",
+        "procedure_summaries"
+      ]
+    },
+    "Producer": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source"
+      ]
+    },
+    "PythonCorrespondenceEvidence": {
+      "description": "Original CSMI Python declaration-to-runtime correspondence evidence bound\nto the native pack bytes that were compiled with it.",
+      "type": "object",
+      "properties": {
+        "completeness_statements": {
+          "type": "array",
+          "items": true
+        },
+        "core_completeness_statements": {
+          "description": "Original core completeness claims remain distinct from native pack\ncompleteness, which carries less scope and limitation detail.",
+          "type": "array",
+          "items": true
+        },
+        "declaration_artifact": {
+          "$ref": "#/$defs/CsmiArtifactSelector"
+        },
+        "default_provenance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extension_facts": {
+          "type": "array",
+          "items": true
+        },
+        "mappings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PythonCorrespondenceMapping"
+          }
+        },
+        "native_sha256": {
+          "description": "SHA-256 of the normalized full authored pack, with the carrier retained\nand only this field blanked to avoid a recursive digest.",
+          "type": "string"
+        },
+        "provenance_records": {
+          "type": "array",
+          "items": true
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PythonCorrespondenceSymbol"
+          }
+        },
+        "vocabulary_uses": {
+          "type": "array",
+          "items": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "native_sha256",
+        "declaration_artifact"
+      ]
+    },
+    "PythonCorrespondenceMapping": {
+      "description": "A typed relation between declaration and runtime CSMI symbol definitions.",
+      "type": "object",
+      "properties": {
+        "conditions": true,
+        "declaration": {
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/PythonCorrespondenceRelationKind"
+        },
+        "runtime": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "declaration",
+        "runtime",
+        "relation"
+      ]
+    },
+    "PythonCorrespondenceRelationKind": {
+      "description": "Relation vocabulary from the CSMI Python 0.1 declaration-correspondence\nprofile.",
+      "type": "string",
+      "enum": [
+        "describes",
+        "augments",
+        "replaces-for-type-checking"
+      ]
+    },
+    "PythonCorrespondenceSymbol": {
+      "description": "A CSMI symbol definition participating in Python correspondence. The\nportable identity is independent of native declaration facts and IDs.",
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/CsmiPortableSymbolIdentity"
+        },
+        "local_id": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "local_id",
+        "identity"
+      ]
+    },
+    "Safety": {
+      "type": "object",
+      "properties": {
+        "generated_code_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "review_required": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceInputFile": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ]
+    },
+    "SourceSetInputs": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "description": "Actual loaded closure, in strictly ascending relative-path order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SourceInputFile"
+          }
+        },
+        "sha256": {
+          "description": "Digest of the canonical exact source set, including paths and bytes.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "files"
+      ]
+    },
+    "VersionConstraint": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "requirement": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "requirement"
+      ]
+    }
+  }
+}

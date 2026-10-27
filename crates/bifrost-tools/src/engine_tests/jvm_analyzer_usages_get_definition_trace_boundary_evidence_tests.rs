@@ -184,6 +184,282 @@ mod boundary_evidence_tests {
         );
     }
 
+    // These rules belong to the native Java reader. The held switch used the
+    // ordinary trace entry; master keeps legacy routing, so probe explicitly.
+    fn native_java_trace(
+        fixture: &BoundaryFixture,
+        needle: &str,
+    ) -> (
+        DefinitionLookupOutcome,
+        Vec<brokk_bifrost_analysis::analyzer::usages::get_definition::trace::TraceCandidate>,
+    ) {
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+        use brokk_bifrost_core::analyzer::usages::reference_site::SourceLocationRequest;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        let request = SourceLocationRequest {
+            file: fixture.file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(
+                fixture
+                    .source
+                    .find(needle)
+                    .expect("native fixture reference"),
+            ),
+            end_byte: None,
+        };
+        let (outcome, trace) =
+            crate::native_resolution_test_support::probe_native_definition_trace(
+                fixture.workspace.analyzer(),
+                &request,
+                &fixture.source,
+                INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                &brokk_bifrost_core::cancellation::CancellationToken::new(),
+            )
+            .expect("native Java definition trace");
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("native Java probe did not complete: {outcome:?}");
+        };
+        (value, trace)
+    }
+
+    // The catalog half uses a pinned released declaration pack, never summaries.
+    // Keep it opt-in so ordinary test runs need no download or installed catalog.
+    const PARENTLESS_INTERFACE_SOURCE: &str = concat!(
+        "package app;\n",
+        "interface Model {}\n",
+        "class Caller { void run(Model model) {\n",
+        "  model.toString();\n",
+        "  model.missing();\n",
+        "  model.clone();\n",
+        "  model.finalize();\n",
+        "} }\n",
+    );
+
+    #[test]
+    #[hardwon(
+        "#6291: parentless interfaces falsely proved implicit Object methods absent after 63bf24c6a7"
+    )]
+    fn java_parentless_interface_keeps_only_public_object_member_obligations() {
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            PARENTLESS_INTERFACE_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let (outcome, trace) = native_java_trace(&fixture, "toString()");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Incomplete,
+            "{outcome:?} {trace:?}"
+        );
+        for member in ["missing()", "clone()", "finalize()"] {
+            let (outcome, trace) = native_java_trace(&fixture, member);
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::NoDefinition,
+                "{member}: {outcome:?} {trace:?}"
+            );
+        }
+
+        // An indexed owner without a toString declaration cannot turn the
+        // language's known member into a proved absence.
+        let owner_only = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            PARENTLESS_INTERFACE_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        activate_fixture_pack(
+            &owner_only,
+            "fixture.object-owner-only",
+            &single_type_pack(
+                "fixture.object-owner-only",
+                "java",
+                "jdk",
+                "java.base",
+                "type.object",
+                "java.lang.Object",
+                serde_json::json!([]),
+            ),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let (outcome, trace) = native_java_trace(&owner_only, "toString()");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::Incomplete,
+            "{outcome:?} {trace:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_TEST_RELEASED_JDK_CATALOG containing released bifrost.jdk@21.0.8"]
+    #[hardwon(
+        "#6291: parentless interfaces lost Object.toString even with a released declaration inventory"
+    )]
+    fn java_parentless_interface_resolves_object_member_with_released_jdk() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticPackCatalog,
+        };
+        let root = std::env::var_os("BIFROST_TEST_RELEASED_JDK_CATALOG")
+            .expect("set BIFROST_TEST_RELEASED_JDK_CATALOG to the installed release catalog");
+        let catalog = SemanticPackCatalog::open(
+            Path::new(&root),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .expect("open released JDK catalog");
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            PARENTLESS_INTERFACE_SOURCE,
+            |root| {
+                use brokk_bifrost_core::analyzer::config::JvmSourceToolchainBinding;
+                let jdk = root.join("jdk-metadata");
+                std::fs::create_dir(&jdk).expect("create metadata-only JDK");
+                std::fs::write(
+                    jdk.join("release"),
+                    concat!(
+                        "IMPLEMENTOR=\"Eclipse Adoptium\"\n",
+                        "JAVA_VERSION=\"21.0.8\"\n",
+                        "JAVA_RUNTIME_VERSION=\"21.0.8+9-LTS\"\n",
+                    ),
+                )
+                .expect("write JDK identity without any class/source inventory");
+                let mut config = jvm_config_with_artifact_jar(None);
+                config
+                    .jvm
+                    .standard_library_discovery
+                    .source_toolchains
+                    .push(JvmSourceToolchainBinding::new(PathBuf::from("app"), jdk));
+                config
+            },
+        );
+        let mut evidence = activation_evidence("java", "jdk", "java.base");
+        evidence.toolchain = Some(CatalogCoordinate {
+            name: "jdk".to_owned(),
+            version: Some(semver::Version::new(21, 0, 8)),
+        });
+        evidence.target = Some("jvm".to_owned());
+        activate_fixture_catalog(&fixture, &catalog, "bifrost.jdk", evidence);
+        let (outcome, trace) = native_java_trace(&fixture, "toString()");
+        // native_java_trace requires the bounded native probe to complete.
+        assert!(!trace.is_empty(), "{outcome:?} {trace:?}");
+        assert!(trace.iter().any(|candidate| {
+            candidate.outcome == brokk_bifrost_core::analyzer::structural::resolution::CandidateOutcome::Selected
+                && candidate.boundary == BoundaryStatus::ExternalIndexed
+                && candidate.external_target.as_deref() == Some("java.lang.Object.toString")
+        }), "{outcome:?} {trace:?}");
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "incomplete_binding"),
+            "{outcome:?} {trace:?}"
+        );
+        let routes = trace
+            .iter()
+            .map(|candidate| (candidate.boundary, candidate.external_target.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            routes.iter().any(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.lang.Object.toString")
+            }),
+            "{routes:?} {trace:?}"
+        );
+        let (outcome, trace) = native_java_trace(&fixture, "missing()");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::NoDefinition,
+            "{outcome:?} {trace:?}"
+        );
+
+        let formals = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Formals.java",
+            "package app; abstract class Stream extends com.acme.Stream { void check(Stream stream) { stream.write(1); stream.write(true); stream.<Stream>write(2); } }",
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let mut pack = single_type_pack(
+            "fixture.external-signatures",
+            "java",
+            "jvm",
+            "com.acme",
+            "type.stream",
+            "com.acme.Stream",
+            serde_json::json!([{
+                "id": "member.stream.write", "owner": "type.stream", "name": "write",
+                "member_kind": "method", "visibility": "public", "is_static": false,
+                "signature": { "parameters": [{"name":"data", "type":{"kind":"named", "name":"int"}, "passing_mode":"positional_only"}] },
+                "locator": {"kind":"artifact", "path":"fixture-only", "symbol":"com.acme.Stream.write"}
+            }]),
+        );
+        pack["shards"][0]["payload"]["types"][0]["jvm_inventory"] = serde_json::json!({
+            "callables_complete":true, "values_complete":true, "types_complete":true,
+            "supertypes_complete":true, "supertypes":[], "nested_types":[], "additional_members":[]
+        });
+        // Session/embedded fixtures cannot assert independent enumeration.
+        // Install this explicitly test-only declaration in an ephemeral
+        // catalog so the closed inventory has the same source authority as
+        // an installed pack, without authoring any product catalog content.
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CompilerOptions, DurablePackSource, DurablePackSourceKind, SourceFormat, compile_source,
+        };
+        let compiled = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&pack).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .expect("compile structured formal fixture");
+        let formal_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral formal catalog");
+        formal_catalog
+            .install(
+                &compiled,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "external-signature-test-only".to_owned(),
+                },
+            )
+            .expect("install test declaration inventory");
+        activate_fixture_catalog(
+            &formals,
+            &formal_catalog,
+            "fixture.external-signatures",
+            activation_evidence("java", "jvm", "com.acme"),
+        );
+        let (outcome, trace) = native_java_trace(&formals, "write(1)");
+        assert!(
+            trace.iter().any(|candidate| {
+                candidate.boundary == BoundaryStatus::ExternalIndexed
+                    && candidate.external_target.as_deref() == Some("com.acme.Stream.write")
+            }),
+            "{outcome:?} {trace:?}"
+        );
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "incomplete_binding"),
+            "{outcome:?} {trace:?}"
+        );
+        let (outcome, trace) = native_java_trace(&formals, "write(2)");
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "incomplete_binding"),
+            "External parameter/result terms do not prove the method nongeneric: {outcome:?} {trace:?}"
+        );
+        let (outcome, trace) = native_java_trace(&formals, "write(true)");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::NoDefinition,
+            "{outcome:?} {trace:?}"
+        );
+    }
+
     // BEGIN PRIVATE CSHARP EXTERNAL FIXTURE TRACE TEST
     // -----------------------------------------------------------------------
     // C#: end-to-end through the resolver's own boundary outcome.

@@ -506,9 +506,6 @@ fn generic_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
         // Bare type parameters are represented by the identifier itself in
         // tree-sitter-rust rather than by a named wrapper node.
         "type_identifier" | "identifier" | "lifetime" => Some(parameter),
-        // Bounds/defaults wrap the exact name in a structured field.
-        "constrained_type_parameter" => parameter.child_by_field_name("left"),
-        "optional_type_parameter" => parameter.child_by_field_name("name"),
         _ => parameter.child_by_field_name("name"),
     }
 }

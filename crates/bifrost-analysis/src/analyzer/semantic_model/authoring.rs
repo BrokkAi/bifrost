@@ -151,7 +151,7 @@ pub fn semantic_model_inventory(
                 .iter()
                 .find(|explanation| {
                     explanation.manifest_digest == shard.manifest.content_sha256
-                        && explanation.shard_id == shard.shard.shard_id
+                        && explanation.shard_id == shard.descriptor.shard_id
                         && explanation.source_kind == shard.source_kind
                         && explanation.source_id == shard.source_id
                         && explanation.status == SemanticModelActivationStatus::Active
@@ -161,8 +161,8 @@ pub fn semantic_model_inventory(
                 manifest_semantic_sha256: shard.manifest.semantic_sha256.clone(),
                 pack_id: shard.manifest.pack_id.clone(),
                 pack_version: shard.manifest.version.clone(),
-                shard_id: shard.shard.shard_id.clone(),
-                payload_kind: payload_kind_name(shard.shard.payload_kind()).to_owned(),
+                shard_id: shard.descriptor.shard_id.clone(),
+                payload_kind: payload_kind_name(shard.descriptor.payload_kind).to_owned(),
                 source_kind: shard.source_kind.as_str().to_owned(),
                 source_id: shard.source_id.clone(),
                 activation_status: "active".to_owned(),

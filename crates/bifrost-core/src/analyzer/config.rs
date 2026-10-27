@@ -8,6 +8,7 @@ use super::model::ProjectFile;
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
+    pub store_cache_budget_bytes: Option<u64>,
     /// Which class-hierarchy expansions call dispatch may add beyond the
     /// callee the static types already name.
     pub dispatch_hierarchy_expansion: DispatchHierarchyExpansion,
@@ -767,10 +768,10 @@ impl JvmMavenCoordinate {
 /// so batch consumers running many analyzers concurrently can cap each pool and avoid
 /// oversubscribing cores / exhausting the process thread budget; otherwise uses all cores.
 ///
-/// `pub(crate)`: also read directly by `pool_memo::dedicated_build_pool`, which builds its
-/// own rayon pool outside `AnalyzerConfig` and would otherwise silently default to every
-/// core regardless of this setting.
-pub(crate) fn default_parallelism() -> usize {
+/// Also used directly by dedicated build pools and selected-reader workers so
+/// their widths honor the same setting as the global Rayon pool.
+#[doc(hidden)]
+pub fn default_parallelism() -> usize {
     if let Ok(raw) = std::env::var("BIFROST_PARALLELISM")
         && let Ok(value) = raw.trim().parse::<usize>()
         && value > 0
@@ -828,6 +829,7 @@ impl Default for AnalyzerConfig {
         Self {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
+            store_cache_budget_bytes: Some(256 * 1024 * 1024),
             dispatch_hierarchy_expansion: DispatchHierarchyExpansion::from_environment(),
             rust: RustAnalyzerConfig::default(),
             jvm: JvmAnalyzerConfig::default(),
@@ -844,6 +846,10 @@ impl Default for AnalyzerConfig {
 impl AnalyzerConfig {
     pub fn parallelism(&self) -> usize {
         self.parallelism.unwrap_or_else(default_parallelism)
+    }
+
+    pub fn store_cache_budget_bytes(&self) -> u64 {
+        self.store_cache_budget_bytes.unwrap_or(256 * 1024 * 1024)
     }
 
     pub fn memo_cache_budget_bytes(&self) -> u64 {

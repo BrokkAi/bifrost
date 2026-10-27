@@ -17,6 +17,13 @@ use super::{
 
 const WRITER_QUEUE_CAPACITY: usize = 64;
 
+/// How often a cancellable wait for the local writer connection retries it.
+const WRITER_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The phase a request publishes while it waits for the local writer.
+#[doc(hidden)]
+pub const WRITER_WAIT_PHASE: &str = "waiting for the analyzer store writer connection";
+
 /// How the writer actor thread spends its life.
 ///
 /// One actor owns the write connection for a cache path, so a saturated writer
@@ -268,6 +275,42 @@ impl StoreWriter {
             Self::Persistent(_) => {
                 panic!("persistent analyzer connections are owned by the writer actor")
             }
+        }
+    }
+
+    /// [`Self::lock`] for a caller that holds a request's cancellation.
+    ///
+    /// `Mutex::lock` cannot be interrupted, so a request that waits there for
+    /// the in-memory fallback's only connection stays parked until the holder
+    /// is done, whatever its own deadline says. Polling makes the wait
+    /// answerable to the caller's cancellation. `None` means it was cancelled
+    /// before the connection became free.
+    pub(super) fn lock_cancellable(
+        &self,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<MutexGuard<'_, Connection>> {
+        self.assert_no_retained_exclusive_reader();
+        let Self::Local(conn) = self else {
+            panic!("persistent analyzer connections are owned by the writer actor")
+        };
+        // Entered on the first attempt that has to wait, and dropped on
+        // return, so the phase describes exactly the wait.
+        let mut phase = None;
+        loop {
+            match conn.try_lock() {
+                Ok(conn) => return Some(conn),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("analyzer store mutex poisoned")
+                }
+            }
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if phase.is_none() {
+                phase = Some(cancellation.enter_phase(WRITER_WAIT_PHASE));
+            }
+            std::thread::sleep(WRITER_LOCK_POLL_INTERVAL);
         }
     }
 
@@ -996,5 +1039,77 @@ mod tests {
         assert!(writer.execute(|conn| {
             brokk_bifrost_core::cache_gc::planner_statistics_row_count(conn).unwrap() > 0
         }));
+    }
+
+    fn writer_entry_panics(writer: &StoreWriter) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.execute(|_| ()))).is_err()
+    }
+
+    /// Exclusive-reader guards nest per writer and per thread: the writer
+    /// stays closed to this thread until the last guard for it drops, a guard
+    /// for one writer does not close another, and another thread is never
+    /// closed out.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn exclusive_reader_guards_close_the_writer_until_the_last_one_drops() {
+        let writer = StoreWriter::local(rusqlite::Connection::open_in_memory().unwrap());
+        let other = StoreWriter::local(rusqlite::Connection::open_in_memory().unwrap());
+
+        let outer = writer.retain_exclusive_reader();
+        let inner = writer.retain_exclusive_reader();
+        assert!(writer_entry_panics(&writer));
+        assert_eq!(other.execute(|_| 7), 7);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| assert_eq!(writer.execute(|_| 8), 8))
+                .join()
+                .unwrap();
+        });
+
+        drop(inner);
+        assert!(
+            writer_entry_panics(&writer),
+            "one remaining guard must still close the writer"
+        );
+        drop(outer);
+        assert_eq!(writer.execute(|_| 9), 9);
+
+        let again = writer.retain_exclusive_reader();
+        assert!(writer_entry_panics(&writer));
+        drop(again);
+        assert_eq!(writer.execute(|_| 10), 10);
+    }
+
+    /// Writer attribution separates time the actor spent running jobs from
+    /// time it spent waiting for one. The counters are process-global and
+    /// other tests run writers concurrently, so only lower bounds hold.
+    #[test]
+    fn writer_attribution_counts_busy_jobs_and_idle_waits() {
+        const JOB: std::time::Duration = std::time::Duration::from_millis(40);
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(60);
+        let temp = tempfile::TempDir::new().unwrap();
+        let (writer, _) = StoreWriter::persistent(&temp.path().join("attribution.db")).unwrap();
+        writer.execute(|_| ());
+
+        let before = super::attribution::snapshot();
+        writer.execute(move |_| std::thread::sleep(JOB));
+        std::thread::sleep(WAIT);
+        writer.execute(move |_| std::thread::sleep(JOB));
+        // The actor records a job's busy time after replying, so a third job
+        // orders the second job's accounting before the snapshot.
+        writer.execute(|_| ());
+        let delta = super::attribution::snapshot().since(before);
+
+        assert!(delta.jobs >= 2, "jobs: {}", delta.jobs);
+        assert!(
+            u128::from(delta.busy_nanos) >= (2 * JOB).as_nanos(),
+            "busy: {} ns",
+            delta.busy_nanos
+        );
+        assert!(
+            u128::from(delta.idle_nanos) >= WAIT.as_nanos(),
+            "idle: {} ns",
+            delta.idle_nanos
+        );
     }
 }

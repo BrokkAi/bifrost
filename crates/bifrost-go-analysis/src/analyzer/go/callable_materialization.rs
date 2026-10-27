@@ -648,7 +648,7 @@ impl GoCallableMaterialization for WorkspaceSemanticOracle<'_> {
         let [activated] = matched.records.as_slice() else {
             return Ok(None);
         };
-        if !go_factory_publication_matches(factory, activated.shard)
+        if !go_factory_publication_matches(&factory, &activated.shard)
             || activated.record.name != member
             || activated.record.member_kind != MemberKind::Function
             || activated.record.owner != factory.owner_id.as_deref().unwrap_or_default()
@@ -680,7 +680,7 @@ impl GoCallableMaterialization for WorkspaceSemanticOracle<'_> {
 
         let source_request = CatalogGoSourceRequest {
             manifest_digest: &activated.shard.manifest.content_sha256,
-            shard_id: activated.shard.shard.shard_id(),
+            shard_id: activated.shard.descriptor.shard_id.as_str(),
             artifact_sha256,
             package_import_path: &package_path,
             file: factory_path,
@@ -834,7 +834,7 @@ impl GoCallableMaterialization for WorkspaceSemanticOracle<'_> {
                     return Ok(None);
                 };
                 if factory_identities.next().is_some()
-                    || !go_factory_location_matches(factory, identity)
+                    || !go_factory_location_matches(&factory, identity)
                 {
                     return Ok(None);
                 }

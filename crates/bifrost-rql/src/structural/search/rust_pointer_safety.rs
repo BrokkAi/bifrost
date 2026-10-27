@@ -1,6 +1,7 @@
 //! Query-local Rust pointer findings projected from the shared provenance solver.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
@@ -53,13 +54,13 @@ fn modeled_call_return_owner(
     model_type_ref_owner(overlay, callable.structured_signature()?.returns.as_ref()?)
 }
 
-fn unique_modeled_callable<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn unique_modeled_callable(
+    overlay: &SemanticModelOverlay,
     owner: &str,
     member: &str,
     has_receiver: bool,
     parameter_count: usize,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let parameter_count = u32::try_from(parameter_count).ok()?;
     let application = SemanticModelCallApplication::positional(parameter_count);
     let matched = overlay.callable_for_application(
@@ -84,7 +85,7 @@ fn unique_modeled_callable<'a>(
     {
         return None;
     }
-    Some(callable)
+    Some(callable.clone())
 }
 
 fn model_type_ref_owner(overlay: &SemanticModelOverlay, mut reference: &TypeRef) -> Option<String> {
@@ -113,15 +114,19 @@ fn model_type_ref_owner(overlay: &SemanticModelOverlay, mut reference: &TypeRef)
     }
 }
 
-fn unique_rust_nominal_type<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn unique_rust_nominal_type(
+    overlay: &SemanticModelOverlay,
     identity: &str,
-) -> Option<&'a SemanticModelSymbol> {
-    let mut matches = overlay.symbols().iter().filter(|symbol| {
-        symbol.qualified_name == identity && is_complete_rust_nominal_type(symbol)
-    });
+) -> Option<Arc<SemanticModelSymbol>> {
+    let mut matches = overlay
+        .symbols_named(identity)
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.qualified_name == identity && is_complete_rust_nominal_type(symbol)
+        });
     let symbol = matches.next()?;
-    matches.next().is_none().then_some(symbol)
+    matches.next().is_none().then_some(symbol.clone())
 }
 
 fn is_complete_rust_nominal_type(symbol: &SemanticModelSymbol) -> bool {

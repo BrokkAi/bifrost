@@ -1,9 +1,16 @@
+//! This consumer stays Java-only because its caller-syntax projection uses
+//! Java grammar rules; target-general inverse rows do not generalize syntax.
 //! Test-support Java rename from complete selected inverse evidence.
 //!
 //! Only selected proven edges authorize edits, and the same selected inverse
 //! query checks the counterfactual world and actual peer-language inventory.
 
 use crate::analyzer::java::JavaAnalyzer;
+use brokk_bifrost_analysis::analyzer::rename::exact::{
+    AssembledExactRename, ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue,
+    RenameAssemblyLimits, RenameSourceIssue, assemble_exact_rename, check_rename_authority,
+};
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeSite;
 
 use crate::analyzer::java::selected_reverse::JavaSelectedReverseOutcome;
 
@@ -20,8 +27,6 @@ use brokk_bifrost_analysis::analyzer::rename::MAX_RENAME_IDENTIFIER_BYTES;
 use brokk_bifrost_analysis::analyzer::rename::RenameEdit;
 
 use brokk_bifrost_analysis::analyzer::rename::RenameFailure;
-
-use brokk_bifrost_analysis::analyzer::rename::RenameFileEdits;
 
 use brokk_bifrost_analysis::analyzer::rename::RenameResult;
 
@@ -164,149 +169,22 @@ pub fn java_native_rename(
             ));
         }
     };
-    require_complete_proven(&original, "original")?;
-    if original.edges.len() > DEFAULT_MAX_USAGES {
-        return Err(failure(
-            "too_many_callsites",
-            format!(
-                "native Java rename exceeds the usage limit: {}",
-                original.edges.len()
-            ),
-        ));
-    }
-    let target_source = project
-        .read_source(target.source())
-        .map_err(|error| failure("incomplete_analysis", error.to_string()))?;
-    if !java
-        .inner
-        .source_matches_selected_native_content(target.source(), &target_source)
-    {
-        return Err(failure(
-            "incomplete_analysis",
-            "native Java rename target source differs from selected content",
-        ));
-    }
-    let declaration =
-        brokk_bifrost_analysis::analyzer::declaration_range::code_unit_declaration_name_range(
-            java,
-            target.source(),
-            &target_source,
-            target,
-        )
-        .ok_or_else(|| {
-            failure(
-                "incomplete_analysis",
-                "native Java rename target has no structured declaration name",
-            )
-        })?;
-
-    let mut edits_by_file = BTreeMap::<ProjectFile, (String, Tree, Vec<RenameEdit>)>::new();
-    for edge in &original.edges {
-        let file = edge.site.file.clone();
-        if !edits_by_file.contains_key(&file) {
-            if edits_by_file.len() >= DEFAULT_MAX_FILES {
-                return Err(failure(
-                    "too_many_files",
-                    "native Java rename exceeds the file limit",
-                ));
-            }
-            let source = project
-                .read_source(&file)
-                .map_err(|error| failure("incomplete_analysis", error.to_string()))?;
-            if !java
-                .inner
-                .source_matches_selected_native_content(&file, &source)
-            {
-                return Err(failure(
-                    "incomplete_analysis",
-                    format!("native Java rename source differs from selected content: {file}"),
-                ));
-            }
-            let tree =
-                brokk_bifrost_jvm::java::declarations::parse_tree(&source).ok_or_else(|| {
-                    failure(
-                        "incomplete_analysis",
-                        format!("cannot parse selected Java source: {file}"),
-                    )
-                })?;
-            edits_by_file.insert(file.clone(), (source, tree, Vec::new()));
-        }
-        let (source, tree, edits) = edits_by_file
-            .get_mut(&file)
-            .expect("selected Java rename source was admitted");
-        let Some((start_byte, end_byte)) = reference_name_range(
-            tree.root_node(),
-            source,
-            edge.site.range.start_byte,
-            edge.site.range.end_byte,
-            target,
-        ) else {
-            return Err(failure(
-                "incomplete_analysis",
-                format!(
-                    "selected Java reference does not expose one structured target identifier: {:?}",
-                    edge.site
-                ),
-            ));
-        };
-        edits.push(RenameEdit {
-            start_byte,
-            end_byte,
-            new_text: new_name.to_owned(),
-        });
-    }
-
-    if !edits_by_file.contains_key(target.source()) {
-        if edits_by_file.len() >= DEFAULT_MAX_FILES {
-            return Err(failure(
-                "too_many_files",
-                "native Java rename exceeds the file limit",
-            ));
-        }
-        let tree =
-            brokk_bifrost_jvm::java::declarations::parse_tree(&target_source).ok_or_else(|| {
-                failure(
-                    "incomplete_analysis",
-                    "cannot parse selected Java declaration source",
-                )
-            })?;
-        edits_by_file.insert(
-            target.source().clone(),
-            (target_source.clone(), tree, Vec::new()),
-        );
-    }
-    let (declaration_source, _, declaration_edits) = edits_by_file
-        .get_mut(target.source())
-        .expect("target source was admitted");
-    if declaration_source.get(declaration.start_byte..declaration.end_byte)
-        != Some(target.identifier())
-    {
-        return Err(failure(
-            "incomplete_analysis",
-            "native Java declaration range does not contain its structured identifier",
-        ));
-    }
-    declaration_edits.push(RenameEdit {
-        start_byte: declaration.start_byte,
-        end_byte: declaration.end_byte,
-        new_text: new_name.to_owned(),
-    });
-
-    let counterfactual_files =
-        build_counterfactual_files(edits_by_file, target.identifier(), new_name)?;
-    let result = RenameResult {
-        target: target.clone(),
-        old_name: target.identifier().to_owned(),
-        files: counterfactual_files
-            .iter()
-            .filter_map(|(file, contents)| {
-                (!contents.edits.is_empty()).then_some(RenameFileEdits {
-                    file: file.clone(),
-                    edits: contents.edits.to_vec(),
-                })
-            })
-            .collect(),
-    };
+    let assembled = assemble_exact_rename(
+        java,
+        project,
+        target,
+        new_name,
+        &original,
+        RenameAssemblyLimits {
+            max_usages: DEFAULT_MAX_USAGES,
+            max_files: DEFAULT_MAX_FILES,
+        },
+        cancellation,
+        &JavaRenameHooks(java),
+    )
+    .map_err(rename_assembly_failure)?
+    .ok_or_else(|| failure("cancelled", "native Java rename was cancelled"))?;
+    let (result, counterfactual_files) = build_counterfactual_files(assembled);
 
     let hypothetical_java = counterfactual_analyzer(java, &counterfactual_files)?;
     let original_parent = java.parent_of(target);
@@ -337,7 +215,7 @@ pub fn java_native_rename(
             ),
         ));
     }
-    if cancellation.is_cancelled() || project.analysis_generation() != generation {
+    if check_rename_authority(project, generation, cancellation).is_err() {
         return Err(failure(
             "incomplete_analysis",
             "native Java rename was cancelled or selected generation changed",
@@ -438,48 +316,116 @@ fn reference_name_range(
 }
 
 fn build_counterfactual_files(
-    mut edits_by_file: BTreeMap<ProjectFile, (String, Tree, Vec<RenameEdit>)>,
-    old_name: &str,
-    new_name: &str,
-) -> Result<BTreeMap<ProjectFile, CounterfactualFile>, RenameFailure> {
-    let mut files = BTreeMap::new();
-    for (file, (original, _tree, edits)) in &mut edits_by_file {
-        edits.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
-        edits.dedup_by_key(|edit| (edit.start_byte, edit.end_byte));
-        if edits
-            .windows(2)
-            .any(|pair| pair[1].start_byte < pair[0].end_byte)
-        {
-            return Err(failure(
-                "incomplete_analysis",
-                "native Java rename edits overlap",
-            ));
+    assembled: AssembledExactRename,
+) -> (RenameResult, BTreeMap<ProjectFile, CounterfactualFile>) {
+    let AssembledExactRename { result, sources } = assembled;
+    let mut files = sources
+        .into_iter()
+        .map(|(file, hypothetical)| {
+            (
+                file,
+                CounterfactualFile {
+                    hypothetical,
+                    edits: Box::default(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for file_edits in &result.files {
+        let contents = files
+            .get_mut(&file_edits.file)
+            .expect("rename source was admitted");
+        for edit in file_edits.edits.iter().rev() {
+            contents
+                .hypothetical
+                .replace_range(edit.start_byte..edit.end_byte, &edit.new_text);
         }
-        for edit in edits.iter() {
-            if edit.new_text != new_name
-                || original.get(edit.start_byte..edit.end_byte) != Some(old_name)
-            {
-                return Err(failure(
-                    "incomplete_analysis",
-                    format!(
-                        "native Java rename edit is not an exact identifier replacement: {edit:?}"
-                    ),
-                ));
-            }
-        }
-        let mut hypothetical = original.clone();
-        for edit in edits.iter().rev() {
-            hypothetical.replace_range(edit.start_byte..edit.end_byte, &edit.new_text);
-        }
-        files.insert(
-            file.clone(),
-            CounterfactualFile {
-                hypothetical,
-                edits: edits.clone().into_boxed_slice(),
-            },
-        );
+        contents.edits = file_edits.edits.clone().into_boxed_slice();
     }
-    Ok(files)
+    (result, files)
+}
+
+struct JavaRenameHooks<'a>(&'a JavaAnalyzer);
+
+impl ExactRenameHooks for JavaRenameHooks<'_> {
+    type FileState = Tree;
+
+    fn admit_source(&self, file: &ProjectFile, source: &str) -> Result<Tree, RenameSourceIssue> {
+        if !self
+            .0
+            .inner
+            .source_matches_selected_native_content(file, source)
+        {
+            return Err(RenameSourceIssue::ContentChanged);
+        }
+        brokk_bifrost_jvm::java::declarations::parse_tree(source)
+            .ok_or(RenameSourceIssue::ParseFailed)
+    }
+
+    fn reference_name_range(
+        &self,
+        tree: &Tree,
+        source: &str,
+        site: &EdgeSite,
+        target: &CodeUnit,
+    ) -> Option<(usize, usize)> {
+        reference_name_range(
+            tree.root_node(),
+            source,
+            site.range.start_byte,
+            site.range.end_byte,
+            target,
+        )
+    }
+}
+
+fn rename_assembly_failure(issue: RenameAssemblyIssue<'_>) -> RenameFailure {
+    let message = match issue {
+        RenameAssemblyIssue::IncompleteInventory(result)
+        | RenameAssemblyIssue::UnprovenInventory(result) => {
+            format!("original Java inverse evidence is incomplete or unproven: {result:?}")
+        }
+        RenameAssemblyIssue::TooManyUsages(count) => {
+            return failure(
+                "too_many_callsites",
+                format!("native Java rename exceeds the usage limit: {count}"),
+            );
+        }
+        RenameAssemblyIssue::TooManyFiles => {
+            return failure(
+                "too_many_files",
+                "native Java rename exceeds the file limit",
+            );
+        }
+        RenameAssemblyIssue::ReadSource(error) => error.to_string(),
+        RenameAssemblyIssue::Source {
+            file,
+            issue: RenameSourceIssue::ContentChanged,
+        } => format!("native Java rename source differs from selected content: {file}"),
+        RenameAssemblyIssue::Source {
+            file,
+            issue: RenameSourceIssue::ParseFailed,
+        } => format!("cannot parse selected Java source: {file}"),
+        RenameAssemblyIssue::MissingReferenceName(site) => format!(
+            "selected Java reference does not expose one structured target identifier: {site:?}"
+        ),
+        RenameAssemblyIssue::MissingDeclarationName => {
+            "native Java rename target has no structured declaration name".into()
+        }
+        RenameAssemblyIssue::RangeOutsideSource { file, range } => {
+            format!("native Java inverse range is outside {file}: {range:?}")
+        }
+        RenameAssemblyIssue::DeclarationSpellingMismatch => {
+            "native Java declaration range does not contain its structured identifier".into()
+        }
+        RenameAssemblyIssue::Edit(ExactRenameEditIssue::Overlap) => {
+            "native Java rename edits overlap".into()
+        }
+        RenameAssemblyIssue::Edit(ExactRenameEditIssue::InexactReplacement(edit)) => {
+            format!("native Java rename edit is not an exact identifier replacement: {edit:?}")
+        }
+    };
+    failure("incomplete_analysis", message)
 }
 
 fn counterfactual_analyzer(

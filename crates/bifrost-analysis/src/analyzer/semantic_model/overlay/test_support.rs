@@ -25,11 +25,15 @@ use brokk_bifrost_core::hash::HashMap;
 /// half a dependency set is indexed.
 #[doc(hidden)]
 pub fn overlay(
-    symbols: Vec<SemanticModelSymbol>,
-    relations: Vec<SemanticModelRelation>,
+    mut symbols: Vec<SemanticModelSymbol>,
+    mut relations: Vec<SemanticModelRelation>,
 ) -> SemanticModelOverlay {
+    super::composition::freeze_symbol_order(&mut symbols);
+    super::composition::freeze_relation_order(relations.iter_mut());
     let mut overlay = SemanticModelOverlay {
+        row_source: None,
         active_model_set_hash: "test".to_string(),
+        composition_diagnostics: Vec::new(),
         extraction_gaps: Vec::new(),
         extraction_gap_by_declaration: HashMap::default(),
         declaration_surface_languages: Vec::new(),
@@ -39,8 +43,8 @@ pub fn overlay(
             .filter(|s| s.is_rule_generated_function())
             .map(|s| s.language.clone())
             .collect(),
-        symbols,
-        relations,
+        symbols: symbols.into_iter().map(std::sync::Arc::new).collect(),
+        relations: relations.into_iter().map(std::sync::Arc::new).collect(),
         java_hierarchy: HashMap::default(),
         symbols_by_id: HashMap::default(),
         symbols_by_name: HashMap::default(),
@@ -66,6 +70,7 @@ pub fn overlay(
 #[doc(hidden)]
 pub fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProvenance {
     SemanticModelProvenance {
+        extraction: None,
         active_model_set_hash: "test".to_string(),
         pack_digest: "digest".to_string(),
         pack_id: "test.pack".to_string(),
@@ -104,6 +109,8 @@ pub fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProve
 #[doc(hidden)]
 pub fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
     SemanticModelSymbol {
+        pre_composition_qualified_name: None,
+        semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
         non_overridable: None,
         ambient_use: None,
@@ -165,6 +172,8 @@ pub fn method(
     signature: Option<Signature>,
 ) -> SemanticModelSymbol {
     let mut symbol = SemanticModelSymbol {
+        pre_composition_qualified_name: None,
+        semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
         non_overridable: None,
         ambient_use: None,
@@ -228,6 +237,7 @@ pub fn method(
 #[doc(hidden)]
 pub fn extends(from: &SemanticModelSymbol, to: &str) -> SemanticModelRelation {
     SemanticModelRelation {
+        pre_composition_endpoints: None,
         id: format!("hierarchy:{}:extends:{to}", from.id),
         kind: "extends".to_string(),
         from: from.id.clone(),

@@ -196,3 +196,13 @@ pub(crate) fn mounted_identity_digest(
     hash.field("identity", &identity);
     hash.finish()
 }
+
+impl CanonicalIdentityNumbers {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        heap.map(&self.numbers);
+        heap.vec(&self.digests);
+    }
+}

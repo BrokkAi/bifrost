@@ -43,6 +43,10 @@ pub(crate) fn finalize_dialect(
     }
     needed.extend(cpp.expressions.iter().map(|fact| fact.occurrence));
     needed.extend(cpp.using_namespaces.iter().map(|(id, _)| *id));
+    for alias in &cpp.namespace_aliases {
+        needed.insert(alias.occurrence);
+        needed.extend(alias.block);
+    }
     for import in &shared.imports {
         needed.insert(import.declaration);
         needed.extend(import.target);
@@ -170,6 +174,10 @@ pub(crate) fn finalize_dialect(
     }
     for (id, _) in &mut cpp.using_namespaces {
         *id = occurrence(*id);
+    }
+    for alias in &mut cpp.namespace_aliases {
+        alias.occurrence = occurrence(alias.occurrence);
+        alias.block = alias.block.map(occurrence);
     }
     for fact in &mut cpp.expressions {
         fact.occurrence = occurrence(fact.occurrence);

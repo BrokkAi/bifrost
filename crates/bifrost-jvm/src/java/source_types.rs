@@ -17,6 +17,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
+use super::declarations::spread_parameter_type_node;
 use super::graph::return_type::{is_java_local_type_scope_node, java_type_name_components};
 use super::graph_support::{
     java_declared_type_parameters, java_type_parameter_bounds, java_type_parameter_in_scope,
@@ -131,12 +132,20 @@ impl JavaSourceTypeCollector {
                 }
                 JavaTypeFrame::FinishWrapper { current, kind } => {
                     let occurrence = sink.intern_node(current);
-                    let Some(element_node) = current.child_by_field_name("element").or_else(|| {
-                        let mut cursor = current.walk();
-                        current
-                            .named_children(&mut cursor)
-                            .find(|child| child.kind() != "annotation")
-                    }) else {
+                    let Some(element_node) = current
+                        .child_by_field_name("element")
+                        .or_else(|| {
+                            (current.kind() == "spread_parameter")
+                                .then(|| spread_parameter_type_node(current))
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            let mut cursor = current.walk();
+                            current
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() != "annotation")
+                        })
+                    else {
                         self.push_unknown_java_type(occurrence);
                         continue;
                     };
@@ -239,9 +248,12 @@ impl JavaSourceTypeCollector {
         sink: &mut PrimarySourceFactCollector<'_>,
     ) {
         self.record_type_parameters(node, callable, source, sink);
-        let return_type = node
-            .child_by_field_name("type")
-            .map(|type_node| self.record_type(type_node, source, sink));
+        let return_type = if node.kind() == "spread_parameter" {
+            Some(node)
+        } else {
+            node.child_by_field_name("type")
+        }
+        .map(|type_node| self.record_type(type_node, source, sink));
         if self.callable_rows.insert(callable) {
             self.facts.callable_returns.push(JavaCallableReturnFact {
                 callable,
@@ -367,6 +379,13 @@ fn java_type_children(node: Node<'_>) -> JavaTypeChildren<'_> {
                 JavaTypeChildren::Generic { base, arguments }
             }
         }
+        "spread_parameter" => match spread_parameter_type_node(node) {
+            Some(element) => JavaTypeChildren::Array {
+                element,
+                dimensions: 1,
+            },
+            None => JavaTypeChildren::Leaf,
+        },
         "array_type" => {
             let Some(element) = node.child_by_field_name("element") else {
                 return JavaTypeChildren::Leaf;
@@ -533,6 +552,13 @@ pub(crate) fn is_java_synthetic_class_body(node: Node<'_>) -> bool {
         })
 }
 
+/// Returns beneath another type or lambda belong to that nested scope.
+pub(crate) fn is_java_nested_return_scope(node: Node<'_>) -> bool {
+    is_java_class_like_kind(node.kind())
+        || is_java_synthetic_class_body(node)
+        || node.kind() == "lambda_expression"
+}
+
 impl JavaSourceTypeCollector {
     fn record_anonymous_returns(
         &mut self,
@@ -585,10 +611,7 @@ impl JavaSourceTypeCollector {
                 });
                 continue;
             }
-            if matches!(
-                node.kind(),
-                "class_declaration" | "interface_declaration" | "lambda_expression"
-            ) {
+            if is_java_nested_return_scope(node) {
                 continue;
             }
             let mut cursor = node.walk();
@@ -613,4 +636,57 @@ pub(super) fn java_has_anonymous_class_body(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(|child| child.kind() == "class_body")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "d5886539d3ef: quicksilver round 5 on brokk-bifrost-jvm: local type returns polluted enclosing method facts"
+    )]
+    fn anonymous_returns_exclude_local_type_methods() {
+        for local in [
+            "class Local { Object inner() { return null; } }",
+            "Object local = new Object() { Object inner() { return null; } };",
+            "java.util.function.Supplier<Object> local = () -> { return null; };",
+            "interface Local { default Object inner() { return null; } }",
+            "record Local() { Object inner() { return null; } }",
+            "enum Local { A; Object inner() { return null; } }",
+            // Annotation declarations are accepted by the parser during editing,
+            // even where Java's local-declaration rules reject them.
+            "@interface Local { Object inner() default 1; }",
+        ] {
+            let source =
+                format!("class Outer {{ Object outer() {{ {local} return new Object() {{}}; }} }}");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_java::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let method = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("body")
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            let mut sink = PrimarySourceFactCollector::new(&source);
+            let occurrence = sink.intern_node(method);
+            let callable = sink.declare(occurrence, None);
+            let mut collector = JavaSourceTypeCollector::default();
+            collector.record_anonymous_returns(method, callable, &source, &mut sink);
+            let fact = &collector.facts.anonymous_returns[0];
+            assert_eq!(
+                fact.status,
+                JavaAnonymousReturnStatus::AllAnonymous,
+                "{local}"
+            );
+            assert_eq!(fact.returns.len(), 1, "{local}");
+        }
+    }
 }

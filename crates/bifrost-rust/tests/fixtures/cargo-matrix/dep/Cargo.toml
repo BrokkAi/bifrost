@@ -1,0 +1,9 @@
+[package]
+name = "dep"
+version = "0.1.0"
+edition = "2021"
+[lib]
+name = "dep_api"
+[features]
+leaf_feature = []
+inherited_feature = []

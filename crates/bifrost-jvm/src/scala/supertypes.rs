@@ -263,28 +263,22 @@ fn direct_parent_type_nodes(extends_clause: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn collect_parent_type_roots<'tree>(node: Node<'tree>, parents: &mut Vec<Node<'tree>>) {
-    match node.kind() {
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+
+    walk_named_tree_preorder(node, true, |node| match node.kind() {
         "arguments" | "annotation" | "structural_type" | "tuple_type" | "named_tuple_type"
-        | "wildcard" => {}
+        | "wildcard" => WalkControl::SkipChildren,
         "type_identifier"
         | "stable_type_identifier"
         | "generic_type"
         | "projected_type"
         | "applied_constructor_type"
-        | "singleton_type" => parents.push(node),
-        "compound_type" | "annotated_type" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_parent_type_roots(child, parents);
-            }
+        | "singleton_type" => {
+            parents.push(node);
+            WalkControl::SkipChildren
         }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_parent_type_roots(child, parents);
-            }
-        }
-    }
+        _ => WalkControl::Continue,
+    });
 }
 
 #[cfg(test)]
@@ -316,6 +310,52 @@ mod tests {
             stack.extend(children);
         }
         Vec::new()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6942: collect_parent_type_roots recursion depth followed source nesting"
+    )]
+    fn collect_parent_type_roots_deep_infix_types_are_stack_safe() {
+        let depth = 3000;
+        let source = format!("type Deep = A{}", " & A".repeat(depth));
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let ty = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("type")
+            .unwrap();
+        let mut inner = ty;
+        let mut wrappers = 0;
+        while inner.kind() == "infix_type" {
+            wrappers += 1;
+            inner = inner.child_by_field_name("left").unwrap();
+        }
+        assert_eq!(wrappers, depth);
+        eprintln!("collect_parent_type_roots: parsed {wrappers} infix wrappers");
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, || {
+                    let mut parents = Vec::new();
+                    collect_parent_type_roots(ty, &mut parents);
+                    assert_eq!(parents.len(), depth + 1);
+                    assert!(
+                        parents
+                            .windows(2)
+                            .all(|pair| pair[0].start_byte() < pair[1].start_byte())
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
     }
 
     #[test]

@@ -525,8 +525,14 @@ fn is_unmaterialized_external_identity(
 /// (#1978). This reads a resolved or authored call-target string, not a
 /// `CodeUnit` name accessor, so it does not re-infer declaration structure.
 pub fn split_qualified_member(symbol: &str) -> Option<(&str, &str)> {
-    let without_parameters = callable_symbol_head(symbol);
-    let (owner, member) = without_parameters.rsplit_once('.')?;
+    split_owner_member(callable_symbol_head(symbol))
+}
+
+/// Split the final dotted segment of a caller-supplied qualified name value,
+/// not source text. Both sides must be non-empty and are returned trimmed.
+/// Parameter lists remain part of the member spelling for exact-name lookup.
+pub fn split_owner_member(head: &str) -> Option<(&str, &str)> {
+    let (owner, member) = head.rsplit_once('.')?;
     (!owner.is_empty() && !member.is_empty()).then_some((owner.trim(), member.trim()))
 }
 

@@ -241,6 +241,286 @@ pub fn run_selected_worker<'store, 'project, A: WorkerAnswer>(
     }
 }
 
+/// Run query-owned items on long-lived selected readers. `dispatch_order` is a
+/// permutation of item indices; returned final statuses follow `items` order.
+/// `consume` runs on the calling thread and receives each Native payload once,
+/// in item order, while workers are still running. Delivery is provisional:
+/// reader finalization can replace already delivered slots with failures. The
+/// caller must check every final status before publishing accumulated output.
+/// Delivery stops at the first unsuccessful slot or consumer error.
+/// A worker retires on its first non-Native item outcome. It fills the slots it
+/// already filled and every unclaimed slot with that item's own outcome, so the
+/// lowest-index failure always carries a real cause and outcome kind; each
+/// failing item keeps its own failure. Empty slots were not dispatched before
+/// the shared deadline or cancellation.
+/// The owner must use its inline path for one worker or single-connection stores.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_selected_queue<I: Sync, A: WorkerAnswer>(
+    store: &AnalyzerStore,
+    input: &CapturedSelectedResolutionInput<'_>,
+    items: &[I],
+    dispatch_order: &[usize],
+    worker_count: usize,
+    cancellation: &CancellationToken,
+    work: impl Fn(
+        &mut SelectedResolutionOperation<'_, '_>,
+        &I,
+    ) -> Result<SelectedResolutionOperationOutcome<A>>
+    + Sync,
+    mut consume: impl FnMut(usize, TransportedAnswer<A>) -> Result<()>,
+) -> Result<Vec<Option<Result<SelectedResolutionOperationOutcome<()>>>>> {
+    use crate::analyzer::store::StoreError;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    assert!(worker_count > 0);
+    assert!(
+        !store.uses_single_connection_reads(),
+        "queue workers require independent readers"
+    );
+    assert_eq!(items.len(), dispatch_order.len());
+    let mut seen = vec![false; items.len()];
+    for &index in dispatch_order {
+        assert!(
+            !std::mem::replace(&mut seen[index], true),
+            "dispatch order is a permutation"
+        );
+    }
+    crate::analyzer::ensure_global_rayon_pool();
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (sender, receiver) = mpsc::channel();
+    let mut pending = (0..items.len()).map(|_| None).collect::<Vec<_>>();
+    let mut delivered = 0;
+    let mut delivery_stopped = false;
+    let mut consumer_error = None;
+    let results = items.iter().map(|_| Mutex::new(None)).collect::<Vec<_>>();
+    // This marker lets run_selected_worker validate the entire reader after all
+    // item answers have been captured on it. It carries no identities itself.
+    struct Finished;
+    impl WorkerAnswer for Finished {
+        fn translate(self, _: &impl ResolutionIdentityTranslation) -> Self {
+            self
+        }
+    }
+    rayon::in_place_scope(|scope| {
+        for _ in 0..worker_count.min(items.len()) {
+            if cancellation.soft_deadline_passed() {
+                break;
+            }
+            let next = &next;
+            let results = &results;
+            let work = &work;
+            let stop = &stop;
+            let sender = sender.clone();
+            scope.spawn(move |_| {
+                let mut claimed = Vec::new();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_selected_worker(store, input, cancellation, |operation| {
+                        while !stop.load(Ordering::Relaxed)
+                            && !cancellation.soft_deadline_passed()
+                            && !cancellation.is_cancelled()
+                        {
+                            let position = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&index) = dispatch_order.get(position) else {
+                                break;
+                            };
+                            claimed.push(index);
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                || match work(operation, &items[index])? {
+                                    SelectedResolutionOperationOutcome::Native(answer) => {
+                                        Ok(SelectedResolutionOperationOutcome::Native(
+                                            TransportedAnswer::capture(
+                                                operation,
+                                                answer,
+                                                cancellation,
+                                            )?,
+                                        ))
+                                    }
+                                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                                        Ok(SelectedResolutionOperationOutcome::Unavailable(reason))
+                                    }
+                                    SelectedResolutionOperationOutcome::Stale(reason) => {
+                                        Ok(SelectedResolutionOperationOutcome::Stale(reason))
+                                    }
+                                    SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                                        Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                            completion,
+                                        ))
+                                    }
+                                },
+                            ))
+                            .unwrap_or_else(|panic| {
+                                Err(StoreError::new(format!(
+                                    "selected worker panicked for item {index}: {}",
+                                    brokk_bifrost_core::panic_report::panic_payload_message(
+                                        panic.as_ref()
+                                    ),
+                                )))
+                            });
+                            let (status, answer, retirement) = match result {
+                                Ok(SelectedResolutionOperationOutcome::Native(answer)) => (
+                                    Ok(SelectedResolutionOperationOutcome::Native(())),
+                                    Some(answer),
+                                    None,
+                                ),
+                                Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => (
+                                    Ok(SelectedResolutionOperationOutcome::Unavailable(
+                                        reason.clone(),
+                                    )),
+                                    None,
+                                    Some(Ok(SelectedResolutionOperationOutcome::Unavailable(
+                                        reason,
+                                    ))),
+                                ),
+                                Ok(SelectedResolutionOperationOutcome::Stale(reason)) => (
+                                    Ok(SelectedResolutionOperationOutcome::Stale(reason.clone())),
+                                    None,
+                                    Some(Ok(SelectedResolutionOperationOutcome::Stale(reason))),
+                                ),
+                                Ok(SelectedResolutionOperationOutcome::Cancelled(completion)) => (
+                                    Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                        completion.clone(),
+                                    )),
+                                    None,
+                                    Some(Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                        completion,
+                                    ))),
+                                ),
+                                Err(error) => (Err(error.clone()), None, Some(Err(error))),
+                            };
+                            *results[index].lock().expect("worker result lock") = Some(status);
+                            assert!(
+                                sender.send((index, answer)).is_ok(),
+                                "queue owner is receiving"
+                            );
+                            if let Some(retirement) = retirement {
+                                // Retire with this item's own outcome. The slots this
+                                // worker already filled lose their unvalidated answers,
+                                // so they must carry the real cause and outcome kind;
+                                // a generic error would turn an Unavailable or Stale
+                                // item into a request error only when W > 1.
+                                return retirement;
+                            }
+                        }
+                        Ok(SelectedResolutionOperationOutcome::Native(Finished))
+                    })
+                }))
+                .unwrap_or_else(|panic| {
+                    Err(StoreError::new(format!(
+                        "selected worker panicked: {}",
+                        brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
+                    )))
+                });
+                if matches!(outcome, Ok(SelectedResolutionOperationOutcome::Native(_))) {
+                    return;
+                }
+                // Open, item, and finish failures share retirement: claim the
+                // remaining queue so failure leaves no undispatched slots.
+                while let Some(&index) = dispatch_order.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    claimed.push(index);
+                }
+                for index in claimed {
+                    let failure = match &outcome {
+                        Err(error) => Err(error.clone()),
+                        Ok(SelectedResolutionOperationOutcome::Unavailable(reason)) => Ok(
+                            SelectedResolutionOperationOutcome::Unavailable(reason.clone()),
+                        ),
+                        Ok(SelectedResolutionOperationOutcome::Stale(reason)) => {
+                            Ok(SelectedResolutionOperationOutcome::Stale(reason.clone()))
+                        }
+                        Ok(SelectedResolutionOperationOutcome::Cancelled(completion)) => Ok(
+                            SelectedResolutionOperationOutcome::Cancelled(completion.clone()),
+                        ),
+                        Ok(SelectedResolutionOperationOutcome::Native(_)) => unreachable!(),
+                    };
+                    let mut slot = results[index].lock().expect("worker result lock");
+                    // Keep a job's own error: reader finalization must not hide
+                    // an earlier indexed failure discovered by that job.
+                    if matches!(
+                        &*slot,
+                        None | Some(Ok(SelectedResolutionOperationOutcome::Native(_)))
+                    ) {
+                        *slot = Some(failure);
+                        assert!(
+                            sender.send((index, None)).is_ok(),
+                            "queue owner is receiving"
+                        );
+                    }
+                }
+            });
+        }
+        drop(sender);
+        loop {
+            // A pool-thread caller must let queued workers run, even when the
+            // pool has only one thread. When no pool work is queued it waits
+            // briefly rather than spinning a core. Outside the pool, it blocks.
+            let message = if rayon::current_thread_index().is_some() {
+                match receiver.try_recv() {
+                    Ok(message) => message,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                            continue;
+                        }
+                        match receiver.recv_timeout(std::time::Duration::from_millis(1)) {
+                            Ok(message) => message,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                }
+            } else {
+                match receiver.recv() {
+                    Ok(message) => message,
+                    Err(_) => break,
+                }
+            };
+            let (index, answer) = message;
+            if delivery_stopped {
+                continue;
+            }
+            if index < delivered {
+                // A late reader failure invalidates even an imported prefix.
+                assert!(answer.is_none());
+                delivery_stopped = true;
+                pending.clear();
+                continue;
+            }
+            pending[index] = Some(answer);
+            while let Some(answer) = pending[delivered].take() {
+                let Some(answer) = answer else {
+                    delivery_stopped = true;
+                    pending.clear();
+                    break;
+                };
+                if let Err(error) = consume(delivered, answer) {
+                    stop.store(true, Ordering::Relaxed);
+                    consumer_error = Some(error);
+                    delivery_stopped = true;
+                    pending.clear();
+                    break;
+                }
+                delivered += 1;
+                if delivered == items.len() {
+                    break;
+                }
+            }
+        }
+    });
+    if let Some(error) = consumer_error {
+        return Err(error);
+    }
+    Ok(results
+        .into_iter()
+        .map(|slot| slot.into_inner().expect("worker result lock"))
+        .collect())
+}
+
 /// Capture leaf authority before a forward stage is cleaned up. The selected
 /// owner keeps these bounded digests in its query-owned authority memo.
 pub(crate) fn forward_identity_digests(

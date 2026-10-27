@@ -305,7 +305,8 @@ fn context(
         panic!("consumer context validates")
     };
     let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
-        .collect_jvm_blueprint_in_session(context, cancellation, session)
+        .ready
+        .collect_blueprint_in_session(context, cancellation, session)
         .unwrap()
     else {
         panic!("consumer blueprint compiles")
@@ -370,6 +371,7 @@ pub fn run_provider_only(
             arena: &candidate_arena,
             paths: &lexical,
             ready: &operation.ready,
+            projection_memo: Some(&operation.jvm_context_blueprints),
             base: &lexical,
             session: &session,
             cancellation,
@@ -445,7 +447,8 @@ pub fn run_source_sweep(
         panic!("point context validates")
     };
     let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
-        .collect_jvm_blueprint_in_session(context, cancellation, &session)
+        .ready
+        .collect_blueprint_in_session(context, cancellation, &session)
         .unwrap()
     else {
         panic!("point blueprint compiles")
@@ -498,6 +501,7 @@ pub fn run_source_sweep(
             arena: &actual_arena,
             paths: &lexical,
             ready: &operation.ready,
+            projection_memo: Some(&operation.jvm_context_blueprints),
             base: &lexical,
             session: &session,
             cancellation,
@@ -657,6 +661,7 @@ pub fn run_terminal_descent(
             arena: &candidate_arena,
             paths: &lexical,
             ready: &operation.ready,
+            projection_memo: Some(&operation.jvm_context_blueprints),
             base: &lexical,
             session: &session,
             cancellation,
@@ -760,6 +765,7 @@ pub fn run(
             arena: &trial_arena,
             paths: &lexical,
             ready: &operation.ready,
+            projection_memo: Some(&operation.jvm_context_blueprints),
             base: &lexical,
             session: &session,
             cancellation,
@@ -965,6 +971,7 @@ pub fn run_discovered(
             arena: &candidate_arena,
             paths: &lexical,
             ready: &operation.ready,
+            projection_memo: Some(&operation.jvm_context_blueprints),
             base: &lexical,
             session: &session,
             cancellation,
@@ -1004,6 +1011,7 @@ pub fn run_discovered(
         arena: &trial_arena,
         paths: &lexical,
         ready: &operation.ready,
+        projection_memo: Some(&operation.jvm_context_blueprints),
         base: &lexical,
         session: &session,
         cancellation,
@@ -1330,6 +1338,7 @@ fn order_attempt(
             arena: &arena,
             paths: &lexical,
             ready: &operation.ready,
+            projection_memo: Some(&operation.jvm_context_blueprints),
             base: &lexical,
             session,
             cancellation,

@@ -2625,7 +2625,10 @@ fn python_member_operations_migration_enforces_rows_and_cascade() {
     for migrated in [false, true] {
         let conn = if migrated {
             let conn = create_current_baseline_without_migration();
-            for migration in POST_BASELINE_MIGRATIONS {
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < 209)
+            {
                 conn.execute_batch(migration.sql).unwrap();
             }
             conn
@@ -2633,8 +2636,15 @@ fn python_member_operations_migration_enforces_rows_and_cascade() {
             open_in_memory_cache()
         };
         let blob = insert_resolution_test_blob(&conn, "member-operations", "python");
-        conn.execute("INSERT INTO python_binding_source VALUES(?1,6)", [blob])
-            .unwrap();
+        conn.execute(
+            if migrated {
+                "INSERT INTO python_binding_source VALUES(?1,7)"
+            } else {
+                "INSERT INTO python_binding_source VALUES(?1,7,0,0)"
+            },
+            [blob],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO resolution_binding_scopes VALUES(?1,0,NULL)",
             [blob],
@@ -2697,8 +2707,65 @@ fn python_member_operations_migration_enforces_rows_and_cascade() {
             );
         }
         validate_foreign_keys(&conn).unwrap();
-        conn.execute("DELETE FROM python_binding_source WHERE blob_id=?1", [blob])
+        if migrated {
+            // Persist selections and derived environment output independently of
+            // the source FK, then prove 0209 removes both validity families.
+            conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state) VALUES(1,'python','python_environment',zeroblob(32),zeroblob(32),'native',1,0,'building')", []).unwrap();
+            conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,valid_from,summary_id) VALUES(?1,'python',0,zeroblob(32),1,1)", ["e".repeat(64)]).unwrap();
+            conn.execute("INSERT INTO python_unit_summary_roots VALUES(1,0,'','workspace',0,'runtime',zeroblob(32))", []).unwrap();
+            conn.execute(
+                "INSERT INTO resolution_unit_summary_members VALUES(1,0,?1,'module.py','source')",
+                [blob],
+            )
             .unwrap();
+            conn.execute_batch("INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL);
+                INSERT INTO python_unit_summary_providers VALUES(1,'','module','',0,'module','selected','module.py',0,zeroblob(32));
+                INSERT INTO python_unit_summary_surfaces VALUES(1,'','module','slots');
+                INSERT INTO python_unit_summary_export_names VALUES(1,'','module','known',NULL);
+                INSERT INTO python_unit_summary_imports VALUES(1,0,0,'','','module',0,'known','known','from','activation_open');").unwrap();
+            conn.execute_batch(include_str!(
+                "../../../migrations/cache/0209-python-environment-source-inputs.sql"
+            ))
+            .unwrap();
+            for table in [
+                "python_binding_source",
+                "resolution_unit_summaries",
+                "resolution_unit_summary_versions",
+                "python_unit_summary_roots",
+                "python_unit_summary_providers",
+                "python_unit_summary_surfaces",
+                "python_unit_summary_export_names",
+                "python_unit_summary_imports",
+            ] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, usize>(0))
+                        .unwrap(),
+                    0,
+                    "migration left {table}"
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM resolution_binding_scopes WHERE blob_id=?1",
+                    [blob],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+                1,
+                "shared source facts survive"
+            );
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > 209)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            assert!(current_schema_is_valid(&conn).unwrap());
+        } else {
+            conn.execute("DELETE FROM python_binding_source WHERE blob_id=?1", [blob])
+                .unwrap();
+        }
         for table in ["python_member_operations", "python_member_operation_names"] {
             assert_eq!(
                 conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r

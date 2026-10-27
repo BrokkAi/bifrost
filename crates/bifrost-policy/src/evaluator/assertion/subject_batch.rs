@@ -1,40 +1,119 @@
 //! Complete subject selections shared inside one serial coordinator batch.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_analysis::analyzer::ReadKey;
 use brokk_bifrost_analysis::analyzer::capture_query_reads;
 use brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentity;
+use brokk_bifrost_rql::structural::search::UnitExecutionResult;
 
 use super::*;
 
 /// Bound to one immutable analyzer and the coordinator's pinned model scope.
 ///
-/// The full canonical query includes captures, authored union order, filters,
-/// projection and execution controls. All query limits must also match. The
-/// execution scope is always the whole workspace and the selected AST-id set
-/// is always unrestricted: this entry point cannot accept a row-family session
-/// or source selection. In particular, consumer-correlated occurrence and
-/// scope products never enter this cache.
+/// A subject is the query a policy selects its rows with: a non-relational
+/// assertion policy's subject selector, or a match policy's executable
+/// selector. The full canonical query includes captures, authored union order,
+/// filters, projection and execution controls. All query limits must also
+/// match. The execution scope is always the whole workspace, or one seed file
+/// of it on the unit path, and the selected AST-id set is always unrestricted:
+/// this entry point cannot accept a row-family session or source selection. In
+/// particular, consumer-correlated occurrence and scope products never enter
+/// this cache.
 ///
 /// Only queries with multiple consumers retain a product. Aggregate retained
 /// rows, evidence records and dependency keys share one weight budget, bounded
 /// by the batch's pipeline-row limit; exceeding it simply executes normally.
 /// Rc shares the immutable subject rows without copying their owned evidence.
+/// A reused product replays its dependency reads into every consumer's open
+/// ledgers, so a unit served from here is published under exactly the reads
+/// that its own execution would have recorded.
 pub(crate) struct SubjectQueryBatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     content: Option<WorkspaceContentIdentity>,
     limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
     repeated: HashSet<String>,
-    products: Mutex<HashMap<String, Arc<SubjectProduct>>>,
-    retained_weight: AtomicUsize,
+    retained: Mutex<RetainedProducts>,
 }
 
-struct SubjectProduct {
-    rows: Arc<ExecutedQueryRows>,
+/// Every product the batch holds, behind one lock so that reserving weight and
+/// inserting a product are one critical section: two workers that both passed
+/// the cap check would otherwise retain past the bound.
+#[derive(Default)]
+struct RetainedProducts {
+    subjects: HashMap<String, Arc<SubjectProduct<Arc<ExecutedQueryRows>>>>,
+    /// A match selector's unit executions, keyed by the seed file a sliced
+    /// unit covers, or by `None` for the whole-workspace unit a widened match
+    /// policy runs.
+    units: HashMap<(String, Option<ProjectFile>), Arc<SubjectProduct<UnitExecutionResult>>>,
+    weight: usize,
+}
+
+struct SubjectProduct<T> {
+    rows: T,
     reads: Vec<ReadKey>,
+}
+
+/// What the batch needs to know about a product to decide whether to keep it.
+trait RetainableRows: Clone {
+    /// Whether these rows are the whole answer: complete, untruncated and
+    /// diagnostic-free. Nothing else is ever served to a second consumer.
+    fn exhaustive(&self) -> bool;
+    /// Retained rows plus evidence records, before dependency keys.
+    fn weight(&self) -> usize;
+}
+
+impl RetainableRows for Arc<ExecutedQueryRows> {
+    fn exhaustive(&self) -> bool {
+        self.completion == CodeQueryCompletion::Complete
+            && !self.truncated
+            && self.diagnostics.is_empty()
+    }
+
+    fn weight(&self) -> usize {
+        self.items.len().saturating_add(self.evidence.len())
+    }
+}
+
+impl RetainableRows for UnitExecutionResult {
+    fn exhaustive(&self) -> bool {
+        self.completion == CodeQueryCompletion::Complete
+            && !self.truncated
+            && self.diagnostics.is_empty()
+    }
+
+    fn weight(&self) -> usize {
+        // One unit row carries both its item and its evidence.
+        self.rows.len().saturating_mul(2)
+    }
+}
+
+/// The batch's handle on one repeated match selector's unit executions.
+pub(crate) struct SharedQueryUnits<'b> {
+    batch: &'b SubjectQueryBatch<'b>,
+    query: String,
+}
+
+impl SharedQueryUnits<'_> {
+    /// `execute`'s unit product for `seed` (`None` is the whole workspace),
+    /// executed once for every consumer of this selector.
+    pub(crate) fn execute(
+        &self,
+        seed: Option<&ProjectFile>,
+        analyzer: &dyn IAnalyzer,
+        cancellation: Option<&CancellationToken>,
+        execute: impl FnOnce() -> UnitExecutionResult,
+    ) -> UnitExecutionResult {
+        self.batch.reuse_or_execute(
+            analyzer,
+            cancellation,
+            |retained| &mut retained.units,
+            (self.query.clone(), seed.cloned()),
+            execute,
+        )
+    }
 }
 
 impl<'a> SubjectQueryBatch<'a> {
@@ -45,15 +124,18 @@ impl<'a> SubjectQueryBatch<'a> {
     ) -> Self {
         let mut consumers = HashMap::<String, usize>::new();
         for policy in policies {
-            let PolicyAnalysis::Assertion { spec } = &policy.definition().analysis else {
-                continue;
-            };
-            if spec.relational.is_some() {
-                continue;
-            }
             // Invalid selectors still fail in the ordinary evaluator. Planning
             // reuse must neither replace nor preempt that policy-local result.
-            if let Ok(query) = assertion_subject_query(policy, budget) {
+            let query = match &policy.definition().analysis {
+                PolicyAnalysis::Assertion { spec } if spec.relational.is_none() => {
+                    assertion_subject_query(policy, budget).ok()
+                }
+                PolicyAnalysis::Match { .. } => match_policy_query(policy)
+                    .ok()
+                    .and_then(|query| executable_match_query(query, budget).ok()),
+                _ => None,
+            };
+            if let Some(query) = query {
                 *consumers
                     .entry(query.to_canonical_json().to_string())
                     .or_default() += 1;
@@ -67,21 +149,16 @@ impl<'a> SubjectQueryBatch<'a> {
                 .into_iter()
                 .filter_map(|(query, count)| (count > 1).then_some(query))
                 .collect(),
-            products: Mutex::new(HashMap::new()),
-            retained_weight: AtomicUsize::new(0),
+            retained: Mutex::new(RetainedProducts::default()),
         }
     }
 
-    pub(super) fn execute(
+    pub(in crate::evaluator) fn execute(
         &self,
         query: &CodeQuery,
         context: &PolicyEvaluationContext<'_>,
         budget: &PolicyBudget,
     ) -> Arc<ExecutedQueryRows> {
-        assert!(
-            std::ptr::addr_eq(self.analyzer, context.analyzer),
-            "subject batches belong to exactly one analyzer snapshot"
-        );
         let execute = || {
             let _timing = brokk_bifrost_analysis::profiling::scope("policy.subject_scan");
             let detailed = match context.workspace {
@@ -100,79 +177,120 @@ impl<'a> SubjectQueryBatch<'a> {
             };
             Arc::new(ExecutedQueryRows::of_detailed(detailed))
         };
+        match self.repeated_key(query, context.analyzer, budget.query_limits()) {
+            Some(key) => self.reuse_or_execute(
+                context.analyzer,
+                context.cancellation,
+                |retained| &mut retained.subjects,
+                key,
+                execute,
+            ),
+            None => execute(),
+        }
+    }
+
+    /// The handle a match policy's unit executions of `query` go through, when
+    /// another policy of this batch executes the same query.
+    ///
+    /// Unit products are executed with the workspace oracles, so every caller
+    /// must hold them; a unit run without them answers a different question
+    /// under the same key.
+    pub(crate) fn query_units(
+        &self,
+        query: &CodeQuery,
+        analyzer: &dyn IAnalyzer,
+        workspace: Option<&WorkspaceAnalyzer>,
+        limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
+    ) -> Option<SharedQueryUnits<'_>> {
+        assert!(
+            workspace.is_some(),
+            "shared query units are executed with the workspace oracles"
+        );
+        self.repeated_key(query, analyzer, limits)
+            .map(|query| SharedQueryUnits { batch: self, query })
+    }
+
+    /// `query`'s canonical key when this batch may serve it: more than one
+    /// policy consumes it, under this batch's limits and content snapshot.
+    fn repeated_key(
+        &self,
+        query: &CodeQuery,
+        analyzer: &dyn IAnalyzer,
+        limits: brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
+    ) -> Option<String> {
+        assert!(
+            std::ptr::addr_eq(self.analyzer, analyzer),
+            "subject batches belong to exactly one analyzer snapshot"
+        );
+        if self.repeated.is_empty()
+            || self.limits != limits
+            || self.content.is_none()
+            || self.content != analyzer.workspace_content_identity()
+        {
+            return None;
+        }
+        let key = query.to_canonical_json().to_string();
+        self.repeated.contains(&key).then_some(key)
+    }
+
+    /// The retained product under `key`, its reads replayed, or `execute`'s
+    /// rows, retained when they are exhaustive, bounded and within the weight
+    /// budget.
+    fn reuse_or_execute<K: Eq + Hash, T: RetainableRows>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        cancellation: Option<&CancellationToken>,
+        products: fn(&mut RetainedProducts) -> &mut HashMap<K, Arc<SubjectProduct<T>>>,
+        key: K,
+        execute: impl FnOnce() -> T,
+    ) -> T {
         let cancelled = || {
-            context
-                .cancellation
-                .is_some_and(CancellationToken::is_cancelled)
-                || context
-                    .analyzer
+            cancellation.is_some_and(CancellationToken::is_cancelled)
+                || analyzer
                     .active_query_cancellation()
                     .is_some_and(|token| token.is_cancelled())
         };
-        if self.repeated.is_empty()
-            || self.limits != budget.query_limits()
-            || self.content.is_none()
-            || self.content != context.analyzer.workspace_content_identity()
-            || cancelled()
-        {
+        if cancelled() {
             return execute();
         }
-        let key = query.to_canonical_json().to_string();
-        if !self.repeated.contains(&key) {
-            return execute();
-        }
-        let cached = self
-            .products
-            .lock()
-            .expect("policy subject batch products mutex poisoned")
-            .get(&key)
-            .cloned();
+        let cached = {
+            let mut retained = self
+                .retained
+                .lock()
+                .expect("policy subject batch products mutex poisoned");
+            products(&mut retained).get(&key).cloned()
+        };
         if let Some(product) = cached {
             // Replay through the analyzer, not the producer's closed ledger:
             // every currently open consumer ledger must observe these reads.
             for read in &product.reads {
-                context.analyzer.record_read(read.clone());
+                analyzer.record_read(read.clone());
             }
             if cancelled() {
                 return execute();
             }
             brokk_bifrost_analysis::profiling::note("policy.subject_query reused");
-            return Arc::clone(&product.rows);
+            return product.rows.clone();
         }
 
-        let (rows, reads) = capture_query_reads(context.analyzer, execute);
-        if rows.completion == CodeQueryCompletion::Complete
-            && !rows.truncated
-            && rows.diagnostics.is_empty()
-            && !cancelled()
-            && reads.is_bounded()
-        {
+        let (rows, reads) = capture_query_reads(analyzer, execute);
+        if rows.exhaustive() && !cancelled() && reads.is_bounded() {
             let reads = reads.keys();
-            let weight = rows
-                .items
-                .len()
-                .saturating_add(rows.evidence.len())
-                .saturating_add(reads.len());
-            // Reserving the retained weight and inserting the product are one
-            // critical section: two workers that both passed the cap check
-            // would otherwise retain past the bound.
-            let mut products = self
-                .products
+            let weight = rows.weight().saturating_add(reads.len());
+            let mut retained = self
+                .retained
                 .lock()
                 .expect("policy subject batch products mutex poisoned");
-            let retained = self
-                .retained_weight
-                .load(Ordering::Relaxed)
-                .saturating_add(weight);
-            if retained <= self.limits.max_pipeline_rows {
-                products.insert(
+            let total = retained.weight.saturating_add(weight);
+            if total <= self.limits.max_pipeline_rows {
+                retained.weight = total;
+                products(&mut retained).insert(
                     key,
                     Arc::new(SubjectProduct {
-                        rows: Arc::clone(&rows),
+                        rows: rows.clone(),
                         reads,
                     }),
                 );
-                self.retained_weight.store(retained, Ordering::Relaxed);
             }
         }
         rows
@@ -347,9 +465,10 @@ mod tests {
         assert_ne!(rows.completion, CodeQueryCompletion::Complete);
         assert!(
             batch
-                .products
+                .retained
                 .lock()
                 .expect("policy subject batch products mutex poisoned")
+                .subjects
                 .is_empty()
         );
     }

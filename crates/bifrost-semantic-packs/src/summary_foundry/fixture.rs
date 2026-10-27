@@ -509,6 +509,7 @@ fn pack_source(
     language: &dyn FixtureLanguage,
 ) -> String {
     let pack = AuthoredSemanticModelPack {
+        extraction: None,
         schema_version:
             brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: FIXTURE_PACK_ID.to_owned(),

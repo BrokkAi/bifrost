@@ -443,8 +443,8 @@ fn receiver_proven_arm_for_target(
                 {
                     return false;
                 }
-                declaring_owners.push(owner.qualified_name.as_str());
-                declared_member_ids.push(symbol.id.as_str());
+                declaring_owners.push(owner.qualified_name.clone());
+                declared_member_ids.push(symbol.id.clone());
             }
             if declaring_owners.is_empty()
                 || declaring_owners
@@ -877,7 +877,7 @@ fn model_call_binding_for_external_shape(
             let Some(symbol) = matched.unique() else {
                 return ModelCallBinding::Unavailable;
             };
-            if !exact_target_matches(symbol) {
+            if !exact_target_matches(&symbol) {
                 return ModelCallBinding::Conflict;
             }
             let Some(signature) = symbol.structured_signature() else {
@@ -920,7 +920,7 @@ fn model_call_binding_for_external_shape(
             }
         }
         SemanticModelCallableDisposition::CompatibleLayout => {
-            let Some(symbol) = matched.records.first().copied() else {
+            let Some(symbol) = matched.records.first().cloned() else {
                 return ModelCallBinding::Unavailable;
             };
             let Some(signature) = symbol.structured_signature() else {
@@ -1127,12 +1127,12 @@ struct PythonConstructorMroFrame {
     next_base: usize,
 }
 
-fn python_constructor_initializer<'a>(
-    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
-    class: &'a crate::analyzer::semantic_model::SemanticModelSymbol,
+fn python_constructor_initializer(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    class: &std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
 ) -> Option<(
-    &'a crate::analyzer::semantic_model::SemanticModelSymbol,
-    &'a crate::analyzer::semantic_model::SemanticModelSymbol,
+    std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
+    std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
 )> {
     let mut direct_initializers = overlay
         .members_of(&class.id)
@@ -1159,7 +1159,10 @@ fn python_constructor_initializer<'a>(
         {
             return None;
         }
-        return Some((initializer, class));
+        return Some((
+            std::sync::Arc::clone(initializer),
+            std::sync::Arc::clone(class),
+        ));
     }
     if class.provenance.completeness != SemanticModelCompleteness::Complete {
         return None;
@@ -1201,7 +1204,10 @@ fn python_constructor_initializer<'a>(
         {
             return None;
         }
-        return Some((*initializer, *declaring_class));
+        return Some((
+            std::sync::Arc::clone(initializer),
+            std::sync::Arc::clone(declaring_class),
+        ));
     }
     None
 }
@@ -1549,15 +1555,23 @@ fn authored_summary_selector_proof_for_target(
     target: &UnmaterializedExternalTarget,
     key: &ModeledProcedureKey,
 ) -> Option<CallBindingSelectorProof> {
-    if target.language().semantic_pack_label() != key.language
-        || target.owner_fqn() != key.owner
-        || target.member() != key.member
-        || target.has_receiver() != key.has_receiver
-        || target.arity() != key.parameter_count
-    {
+    if !unmaterialized_target_has_key(target, key) {
         return None;
     }
     authored_summary_selector_proof(analyzer, key)
+}
+
+/// Whether the resolver's canonical external identity is the same
+/// `(language, owner, member, receiver, arity)` member that `key` names.
+fn unmaterialized_target_has_key(
+    target: &UnmaterializedExternalTarget,
+    key: &ModeledProcedureKey,
+) -> bool {
+    target.language().semantic_pack_label() == key.language
+        && target.owner_fqn() == key.owner
+        && target.member() == key.member
+        && target.has_receiver() == key.has_receiver
+        && target.arity() == key.parameter_count
 }
 
 fn authored_summary_selector_proof(
@@ -1605,6 +1619,44 @@ fn resolver_proven_static_model_selector(answer: &DispatchSiteAnswer) -> bool {
         )
 }
 
+/// Whether the oracle's answer for this one call site is closed on `arm`
+/// alone: resolved, exhaustive, one proven and complete arm, and nothing the
+/// oracle could not name.
+fn answer_closed_on_arm(answer: &DispatchSiteAnswer, arm: &super::dispatch::DispatchArm) -> bool {
+    answer.outcome == "resolved"
+        && answer.coverage.is_exhaustive()
+        && answer.call_site_count == 1
+        && answer.call_contexts.len() == 1
+        && answer.semantic_unsupported.is_none()
+        && answer.exceeded_limit.is_none()
+        && answer.unnamed_boundaries.is_empty()
+        && matches!(answer.arms.as_slice(), [only] if only.target_id == arm.target_id)
+        && arm.proof == "proven"
+        && arm.completeness == "complete"
+}
+
+/// A modeled external call whose dispatch answer is already closed on the one
+/// external arm that the unique model binding was keyed from. The oracle can
+/// close such an arm from resolver structure alone, for example a Rust
+/// inherent method on one concrete nominal receiver whose body has one
+/// complete summary. The model binding then names the endpoint that dispatch
+/// selected, so the selector is exact without a static-call claim and without
+/// an authored override-coverage claim. The agreement is the arm's resolver
+/// target carrying the same `(language, owner, member, receiver, arity)` as
+/// the model key; neither the language nor receiver presence selects it.
+fn model_bound_closed_external_selector(
+    answer: &DispatchSiteAnswer,
+    arm: &super::dispatch::DispatchArm,
+    key: &ModeledProcedureKey,
+) -> bool {
+    answer_closed_on_arm(answer, arm)
+        && arm.target_unit.is_none()
+        && arm
+            .unmaterialized_target
+            .as_ref()
+            .is_some_and(|target| unmaterialized_target_has_key(target, key))
+}
+
 /// A direct class call retains the class identity while the dispatch target
 /// names its selected initializer. The complete initializer family has
 /// already supplied the binding layout; this closes only the exact call row.
@@ -1613,17 +1665,7 @@ fn resolver_proven_python_constructor_selector(
     arm: &super::dispatch::DispatchArm,
     key: &ModeledProcedureKey,
 ) -> bool {
-    if answer.outcome != "resolved"
-        || !answer.coverage.is_exhaustive()
-        || answer.call_site_count != 1
-        || answer.call_contexts.len() != 1
-        || answer.semantic_unsupported.is_some()
-        || answer.exceeded_limit.is_some()
-        || !answer.unnamed_boundaries.is_empty()
-        || answer.arms.len() != 1
-        || answer.arms[0].target_id != arm.target_id
-        || arm.proof != "proven"
-        || arm.completeness != "complete"
+    if !answer_closed_on_arm(answer, arm)
         || key.language != Language::Python.config_label()
         || !key.has_receiver
         || key.member != "__init__"
@@ -2177,6 +2219,23 @@ pub(super) fn call_binding_expansions(
                     );
                     python_constructor_selector_proven = true;
                 }
+                // The binding above was keyed from the dispatch arm itself, so
+                // a closed one-arm answer names the same endpoint the model
+                // record binds. Keep that arm's own proof instead of the
+                // id-less dispatch built before the model was known. When a
+                // complete override-covering summary exists, the authored
+                // selector below names that claim, so it is not reattributed.
+                if !python_constructor
+                    && !receiver_proof_model
+                    && resolver_owned_external_dispatch.is_none()
+                    && let (Some(answer), Some(arm)) =
+                        (dispatch_answer.as_ref(), external_model_arm)
+                    && model_bound_closed_external_selector(answer, arm, &key)
+                    && closed_model_selector_proof_for_external_target(analyzer, answer, &key)
+                        .is_none()
+                {
+                    dispatch = CallBindingDispatch::from_answer(answer, None, Some(&arm.target_id));
+                }
                 target = CallBindingTarget::ResolvedExternal { layout, receiver };
                 model_callable_id = Some(resolved_model_callable_id);
                 formal_layout_id = signature_id.clone();
@@ -2376,7 +2435,7 @@ pub(super) fn call_binding_expansions(
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: format!(
-                "native Java or Go call-target binding retained one source candidate with an incomplete selected frontier; original diagnostics: {original_gap:?}"
+                "native Java or Go call-target binding retained one source candidate with an incomplete selected frontier; original diagnostics: {}", original_gap.iter().map(|diagnostic| format!("{}: {}", diagnostic.kind, diagnostic.message)).collect::<Vec<_>>().join("; ")
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
@@ -2391,7 +2450,12 @@ pub(super) fn call_binding_expansions(
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: format!(
-                "call_bindings retained an incomplete callee lookup; original diagnostics: {original_reasons:?}"
+                "call_bindings retained an incomplete callee lookup; original diagnostics: {}",
+                original_reasons
+                    .iter()
+                    .map(|diagnostic| format!("{}: {}", diagnostic.kind, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,

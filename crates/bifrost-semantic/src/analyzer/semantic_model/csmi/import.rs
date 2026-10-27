@@ -603,6 +603,8 @@ fn import_semantic_document(
             .cloned()
             .unwrap_or_else(|| symbol.id.clone());
         types.push(TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),
@@ -1276,6 +1278,7 @@ fn import_semantic_document(
         }
     };
     let mut pack = AuthoredSemanticModelPack {
+        extraction: None,
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: format!("csmi.{pack_digest}"),
         version: format!("0.1.0+csmi.{pack_digest}"),
@@ -1498,7 +1501,7 @@ fn import_runtime_values(
                     let mut native: RuntimeGlobalExposure = native_runtime_record(record)?;
                     native.provenance = runtime_provenance(fact, default_provenance);
                     native.extensions = runtime_extensions(&fact.extensions);
-                    payload.exposures.push(native);
+                    payload.exposures.push(native.into());
                 }
                 CsmiRuntimeValuesPayload::KeyedReadBehavior(record) => {
                     let mut native: KeyedReadBehavior = native_runtime_record(record)?;

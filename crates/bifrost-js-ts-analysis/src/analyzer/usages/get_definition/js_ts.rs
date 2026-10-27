@@ -608,14 +608,14 @@ enum ModeledExternalReceiver {
 }
 
 #[derive(Debug)]
-struct ModeledExternalCall<'a> {
-    owner: &'a SemanticModelSymbol,
-    callable: &'a SemanticModelSymbol,
+struct ModeledExternalCall {
+    owner: Arc<SemanticModelSymbol>,
+    callable: Arc<SemanticModelSymbol>,
     parameter_count: u32,
     receiver: ModeledExternalReceiver,
 }
 
-impl ModeledExternalCall<'_> {
+impl ModeledExternalCall {
     fn proof(&self) -> ExactExternalCallProof {
         match self.receiver {
             ModeledExternalReceiver::BoundMember => {
@@ -657,14 +657,14 @@ pub(crate) fn exact_modeled_external_call(
     .map(|call| call.proof())
 }
 
-fn modeled_external_call_at_site<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn modeled_external_call_at_site(
+    overlay: &SemanticModelOverlay,
     language: Language,
     source: &str,
     root: Node<'_>,
     site: &ResolvedReferenceSite,
     lexical: &JsTsLexicalBindingIndex,
-) -> Option<ModeledExternalCall<'a>> {
+) -> Option<ModeledExternalCall> {
     let focused = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
     let call = enclosing_callee_call(focused)?;
     modeled_external_call_expression(overlay, language, source, call, lexical, 8)
@@ -684,14 +684,14 @@ fn enclosing_callee_call(mut node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn modeled_external_call_expression<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn modeled_external_call_expression(
+    overlay: &SemanticModelOverlay,
     language: Language,
     source: &str,
     call: Node<'_>,
     lexical: &JsTsLexicalBindingIndex,
     remaining: usize,
-) -> Option<ModeledExternalCall<'a>> {
+) -> Option<ModeledExternalCall> {
     let remaining = remaining.checked_sub(1)?;
     let function = call.child_by_field_name("function")?;
     if function.kind() == "identifier" {
@@ -719,7 +719,7 @@ fn modeled_external_call_expression<'a>(
         let inner = modeled_external_call_expression(
             overlay, language, source, receiver, lexical, remaining,
         )?;
-        callable_declared_return_owner(overlay, language, inner.callable)?
+        callable_declared_return_owner(overlay, language, &inner.callable)?
     } else {
         return None;
     };
@@ -749,14 +749,14 @@ fn modeled_external_call_expression<'a>(
 /// declaration, a function declaration, or an import all bind the name and
 /// therefore mint no identity, which is what keeps a shadowed `fetch` from
 /// borrowing the global model's effect by spelling.
-fn modeled_global_call_expression<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn modeled_global_call_expression(
+    overlay: &SemanticModelOverlay,
     language: Language,
     source: &str,
     call: Node<'_>,
     callee: Node<'_>,
     lexical: &JsTsLexicalBindingIndex,
-) -> Option<ModeledExternalCall<'a>> {
+) -> Option<ModeledExternalCall> {
     let member = simple_reference_name(callee, source, language)?;
     if !lexical
         .binding_identifier_ranges_at(member, callee.start_byte())
@@ -786,11 +786,11 @@ fn modeled_global_call_expression<'a>(
     })
 }
 
-fn exact_modeled_type_named<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn exact_modeled_type_named(
+    overlay: &SemanticModelOverlay,
     language: Language,
     name: &str,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let matched = overlay.symbols_named(name);
     if matched.disposition != SemanticModelOverlayDisposition::Unique {
         return None;
@@ -802,14 +802,14 @@ fn exact_modeled_type_named<'a>(
         && symbol.qualified_name == name
         && symbol.language == language.config_label()
         && !symbol.provenance.ambiguous)
-        .then_some(*symbol)
+        .then_some(symbol.clone())
 }
 
-fn callable_declared_return_owner<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn callable_declared_return_owner(
+    overlay: &SemanticModelOverlay,
     language: Language,
     callable: &SemanticModelSymbol,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let TypeRef::Declared {
         id,
         nullable: false,
@@ -828,7 +828,7 @@ fn callable_declared_return_owner<'a>(
     (owner.owner_id.is_none()
         && owner.language == language.config_label()
         && !owner.provenance.ambiguous)
-        .then_some(*owner)
+        .then_some(owner.clone())
 }
 
 fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {

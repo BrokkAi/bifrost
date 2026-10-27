@@ -12,6 +12,7 @@ pub(super) const TEST_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub(super) struct FakeTransport {
     responses: BTreeMap<String, Vec<u8>>,
     failures: BTreeMap<String, TransportError>,
+    credential: bool,
     pub(super) calls: Mutex<Vec<String>>,
 }
 
@@ -20,6 +21,7 @@ impl FakeTransport {
         Self {
             responses,
             failures: BTreeMap::new(),
+            credential: false,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -28,8 +30,15 @@ impl FakeTransport {
         Self {
             responses: BTreeMap::new(),
             failures,
+            credential: false,
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Report requests as credentialed, as `UreqTransport` does with `PACK_TOKEN`.
+    pub(super) fn with_credential(mut self) -> Self {
+        self.credential = true;
+        self
     }
 
     pub(super) fn call_count(&self) -> usize {
@@ -53,6 +62,10 @@ impl HttpTransport for FakeTransport {
         self.responses.get(url).cloned().ok_or_else(|| {
             TransportError::unavailable(format!("fixture has no response for {url}"))
         })
+    }
+
+    fn authenticated(&self) -> bool {
+        self.credential
     }
 }
 
@@ -430,19 +443,6 @@ pub(super) fn add_release_for_with_tag_override(
     responses.insert(artifact_url.clone(), archive.clone());
     responses.insert(manifest_asset_url, manifest);
     responses.insert(artifact_asset_url, archive);
-    let escaped_tag = tag
-        .split('/')
-        .map(percent_encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/");
-    let tag_url = format!("{api}/git/ref/tags/{escaped_tag}");
-    responses.insert(
-        tag_url,
-        serde_json::to_vec(&json!({
-            "object": { "sha": TEST_COMMIT, "type": "commit" },
-        }))
-        .expect("serialize fixture tag"),
-    );
     releases.push(json!({
         "tag_name": tag,
         "draft": false,
@@ -457,20 +457,7 @@ pub(super) fn add_release_for_with_tag_override(
         listing_url,
         serde_json::to_vec(releases).expect("serialize fixture release listing"),
     );
-    let tag_release_url = format!("{api}/releases/tags/{}", percent_encode_path_segment(&tag));
-    responses.insert(
-        tag_release_url,
-        serde_json::to_vec(&json!({
-            "tag_name": tag,
-            "draft": false,
-            "prerelease": false,
-            "assets": [
-                { "id": manifest_asset_id, "name": "pack-release.json", "browser_download_url": manifest_url },
-                { "id": artifact_asset_id, "name": artifact_name, "browser_download_url": artifact_url },
-            ],
-        }))
-        .expect("serialize explicit source release"),
-    );
+    set_lightweight_tag_refs(responses, &api, releases);
     manifest_sha
 }
 
@@ -630,14 +617,6 @@ pub(super) fn add_shaped_premium_release(
     ] {
         responses.insert(url, bytes);
     }
-    let tag_url = format!("{api}/git/ref/tags/{tag}");
-    responses.insert(
-        tag_url,
-        serde_json::to_vec(&json!({
-            "object": { "sha": TEST_COMMIT, "type": "commit" },
-        }))
-        .expect("serialize premium tag"),
-    );
     releases.push(json!({
         "tag_name": tag,
         "draft": false,
@@ -652,7 +631,34 @@ pub(super) fn add_shaped_premium_release(
         format!("{api}/releases?per_page=100&page=1"),
         serde_json::to_vec(releases).expect("serialize premium listing"),
     );
+    set_lightweight_tag_refs(responses, &api, releases);
     manifest_sha
+}
+
+pub(super) fn tag_refs_url(api: &str) -> String {
+    format!("{api}/git/matching-refs/tags/")
+}
+
+/// Answer the tag listing with a lightweight tag on `TEST_COMMIT` for every
+/// listed release.
+fn set_lightweight_tag_refs(
+    responses: &mut BTreeMap<String, Vec<u8>>,
+    api: &str,
+    releases: &[Value],
+) {
+    let refs = releases
+        .iter()
+        .map(|release| {
+            json!({
+                "ref": format!("refs/tags/{}", release["tag_name"].as_str().expect("fixture tag")),
+                "object": { "sha": TEST_COMMIT, "type": "commit" },
+            })
+        })
+        .collect::<Vec<_>>();
+    responses.insert(
+        tag_refs_url(api),
+        serde_json::to_vec(&refs).expect("serialize fixture tag refs"),
+    );
 }
 
 pub(super) fn v1_manifest(engine_min: &str, engine_max: &str) -> PackRelease {

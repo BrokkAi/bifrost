@@ -12,7 +12,15 @@ pub(super) fn child_guards(
         "conditional_expression" | "boolean_operator" | "assert_statement"
     ) {
         let site = p.site(node, scope, ResolutionSiteKind::UnsupportedExpression);
-        if node.has_error() || node.kind() == "assert_statement" {
+        let operands = if node.kind() == "conditional_expression" {
+            crate::syntax::python_conditional_expression_operands(node)
+        } else {
+            None
+        };
+        if node.has_error()
+            || node.kind() == "assert_statement"
+            || (node.kind() == "conditional_expression" && operands.is_none())
+        {
             let id = dense_ordinal(p.facts.python_guards.len(), "conditional activation guards");
             p.facts.python_guards.push(PythonNativeGuardFact {
                 id,
@@ -28,15 +36,8 @@ pub(super) fn child_guards(
             }
             return children;
         }
-        let (condition, branches) = if node.kind() == "conditional_expression" {
-            (
-                node.named_child(1)
-                    .expect("conditional expression condition"),
-                vec![
-                    (node.named_child(0).expect("conditional consequence"), true),
-                    (node.named_child(2).expect("conditional alternative"), false),
-                ],
-            )
+        let (condition, branches) = if let Some([consequence, condition, alternative]) = operands {
+            (condition, vec![(consequence, true), (alternative, false)])
         } else {
             let operator = node
                 .child_by_field_name("operator")

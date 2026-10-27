@@ -445,9 +445,9 @@ pub enum LookupQuestion {
     /// One exact procedure-local call site.
     ///
     /// `procedure` is stable declaration lineage. The byte interval is
-    /// relative to the owning procedure's start and is admitted only when it
-    /// selects exactly one structured call row. A preceding sibling may
-    /// therefore move the declaration without changing this question.
+    /// relative to the owning procedure's start, so a preceding sibling may
+    /// move the declaration without changing this question. The ordinal
+    /// selects one structured call row among those at that interval.
     ProcedureCallSite {
         rel_path: Box<str>,
         procedure: StableDigest,
@@ -469,6 +469,10 @@ pub struct CallSiteLocator {
 pub struct ProcedureCallSiteLocator {
     pub start_byte: usize,
     pub end_byte: usize,
+    /// The call's position, in call-row order, among the procedure's calls at
+    /// exactly this interval. Lowering can give one source call several rows:
+    /// a Python `finally` body is lowered once per exit path (#6638).
+    pub ordinal: usize,
 }
 
 impl LookupQuestion {
@@ -587,6 +591,7 @@ impl LookupQuestion {
                 hasher.field("procedure", procedure.as_bytes());
                 hasher.field("start_byte", &(site.start_byte as u64).to_be_bytes());
                 hasher.field("end_byte", &(site.end_byte as u64).to_be_bytes());
+                hasher.field("ordinal", &(site.ordinal as u64).to_be_bytes());
             }
             Self::Summary { identity } => hasher.field("identity", identity.as_bytes()),
         }

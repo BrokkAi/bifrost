@@ -1,0 +1,20 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+build = "custom/build.rs"
+[dependencies]
+dep_alias = { package = "dep", path = "../dep" }
+noise = { path = "../noise" }
+[build-dependencies]
+noise = { path = "../noise" }
+[dev-dependencies]
+dep_alias = { package = "dep", path = "../dep" }
+[features]
+default = ["dep_alias/leaf_feature"]
+[[bin]]
+name = "app"
+[[bin]]
+name = "manual"
+path = "custom/tool.rs"

@@ -773,4 +773,62 @@ void run(Table table) {
             &[("consume(table[0])", false)],
         );
     }
+
+    #[test]
+    fn nontrivial_lifetimes_at_parameter_and_subscript_boundaries() {
+        // These calls differ by the lifetime introduced by argument passing:
+        // a copied class value and a proxy from operator+ require destruction;
+        // passing a function reference or pointer invokes neither callback nor copy.
+        let source = r#"
+struct Token { Token(const Token&); ~Token(); operator int() const; };
+Token operator+(Token&, int);
+void unnamed(Token);
+void named(Token value);
+void pointer(Token* value);
+void callback_ref(Token (&callback)(int*));
+void callback_ptr(Token (*callback)(int*));
+Token callback(int*);
+void integer(int);
+void run(Token& existing, Token& index, Token* address) {
+  int values[8];
+  unnamed(existing);
+  named(existing);
+  pointer(address);
+  callback_ref(callback);
+  callback_ptr(callback);
+  integer(values[0]);
+  integer(values[0, 1]);
+  integer(values[0, index + 1]);
+}
+"#;
+        let tree = parse_cpp(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut stack = vec![tree.root_node()];
+        let mut subscripts = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "subscript_argument_list" {
+                subscripts.push(node.named_child_count());
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        subscripts.sort_unstable();
+        assert_eq!(subscripts, [1, 2, 2]);
+        assert_calls(
+            source,
+            &[
+                ("unnamed(existing)", false),
+                ("named(existing)", false),
+                ("pointer(address)", true),
+                ("callback_ref(callback)", true),
+                ("callback_ptr(callback)", true),
+                ("integer(values[0])", true),
+                ("integer(values[0, 1])", true),
+                ("integer(values[0, index + 1])", false),
+            ],
+        );
+    }
 }

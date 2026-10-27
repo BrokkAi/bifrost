@@ -1,4 +1,5 @@
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupDiagnostic;
+use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
 
@@ -432,7 +433,7 @@ fn model_type_outcome(
                 && symbol.language == Language::TypeScript.config_label()
                 && (symbol.name == type_name || symbol.qualified_name == type_name)
         })
-        .collect::<Vec<&SemanticModelSymbol>>();
+        .collect::<Vec<Arc<SemanticModelSymbol>>>();
     if records.is_empty() {
         return None;
     }
@@ -442,7 +443,7 @@ fn model_type_outcome(
         && records[0].provenance.completeness == SemanticModelCompleteness::Complete;
     let types = records
         .into_iter()
-        .map(|symbol| semantic_model_lookup_type(file, symbol))
+        .map(|symbol| semantic_model_lookup_type(file, &symbol))
         .collect::<Vec<_>>();
     let mut outcome = TypeLookupOutcome {
         status: if types.len() == 1 {

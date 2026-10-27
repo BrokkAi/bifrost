@@ -264,6 +264,7 @@ enum TypedPrerequisiteAnswer {
 /// Readiness of the member request is separate from its semantic coverage.
 #[derive(Debug)]
 pub(crate) enum MemberSelectionOutcome {
+    QualifierIsNamespace,
     Ready {
         request: Option<MemberSelectionRequest>,
         completion: ResolutionCompletion,
@@ -2242,6 +2243,22 @@ fn poll_qualified_member_consumer<'source>(
                     provenance,
                     resume,
                 )? {
+                    CloseProgress::Ready(MemberSelectionOutcome::QualifierIsNamespace) => {
+                        scheduler.tasks[task]
+                            .frame
+                            .as_mut()
+                            .expect("held typed task")
+                            .resume_qualified_namespace(
+                                wait.input.reference().reference,
+                                wait.input.member().route_ordinal,
+                            );
+                        hook.cancel_qualified_member(wait.id);
+                        active.remove(&wait.id);
+                        scheduler.tasks[task].hierarchy_waits.clear();
+                        scheduler.tasks[task].waits_on.clear();
+                        scheduler.runnable.push_back(Runnable::Task(task));
+                        return Ok(true);
+                    }
                     CloseProgress::Ready(MemberSelectionOutcome::Ready {
                         request: Some(request),
                         completion,
@@ -2826,6 +2843,9 @@ fn drive_scheduler_inner<'source>(
                     }
                     scheduler.relations[id].member_completion = completion;
                     request
+                }
+                MemberSelectionOutcome::QualifierIsNamespace => {
+                    unreachable!("namespace classification belongs to registered preparation")
                 }
                 MemberSelectionOutcome::Unavailable(completion) => {
                     scheduler
@@ -4017,6 +4037,9 @@ pub(super) fn prepare_forward(
             request,
             completion,
         } => (request, completion),
+        MemberSelectionOutcome::QualifierIsNamespace => {
+            unreachable!("namespace classification belongs to registered preparation")
+        }
         MemberSelectionOutcome::Unavailable(completion)
         | MemberSelectionOutcome::Cancelled(completion) => {
             let completion = inputs.iter().fold(

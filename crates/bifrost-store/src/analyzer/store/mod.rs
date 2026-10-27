@@ -1,3 +1,8 @@
+#[doc(hidden)]
+pub mod cache_budget;
+#[doc(hidden)]
+pub mod semantic_composition;
+
 pub mod language_support;
 pub use language_support::{StoreLanguageSupport, StoreLanguageTable};
 
@@ -250,6 +255,9 @@ pub(crate) use workspace_inputs::NativeConfigurationOverlayAuthority;
 pub use workspace_inputs::WorkspaceConfigurationInput;
 
 #[doc(hidden)]
+pub use workspace_inputs::WorkspaceSourceRefusalRow;
+
+#[doc(hidden)]
 pub use workspace_inputs::configuration_digest;
 
 use writer::StoreWriter;
@@ -417,6 +425,7 @@ pub enum StoreErrorKind {
     StaleGeneration,
     StaleResolution,
     SqliteInterrupted,
+    Cancelled,
     ResourceBound,
     Corrupt,
 }
@@ -451,6 +460,15 @@ impl StoreError {
     #[doc(hidden)]
     pub fn is_missing_required_source_facts(&self) -> bool {
         self.missing_required_source_facts
+    }
+
+    #[doc(hidden)]
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StoreErrorKind::Cancelled,
+            missing_required_source_facts: false,
+        }
     }
 
     #[doc(hidden)]
@@ -507,6 +525,11 @@ impl StoreError {
     #[doc(hidden)]
     pub fn is_stale_resolution(&self) -> bool {
         self.kind == StoreErrorKind::StaleResolution
+    }
+
+    #[doc(hidden)]
+    pub fn is_cancelled(&self) -> bool {
+        self.kind == StoreErrorKind::Cancelled
     }
 
     #[doc(hidden)]
@@ -939,24 +962,9 @@ pub struct AnalyzerStore {
     #[doc(hidden)]
     pub crate_statement_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
     writer_resolution_selection: Mutex<Option<resolution_selection::RetainedResolutionSelection>>,
-    /// The store's shared-name answers, shared by every request.
-    ///
-    /// An interned id is a fact of the store and is never reused, so this
-    /// cache never goes stale and nothing invalidates it; it is bounded by an
-    /// entry cap. See [`resolution::SharedNameCache`].
+    /// All cross-request relation caches share this weighted capacity.
     #[doc(hidden)]
-    pub resolution_shared_name_cache: resolution::SharedNameCache,
-    /// Complete selected Go contexts reused under their selected publication.
-    /// Both file-local bindings and prepared import closures share this
-    /// explicitly bounded cache and immutable value representation.
-    go_prepared_context_cache: resolution::BoundedResolutionCache<
-        resolution_operation::go_named::GoPreparedContextCacheKey,
-        Arc<resolution_operation::go_named::GoPreparedImportContextSnapshot>,
-    >,
-    /// Reusable selected Rust include-overlay plans, bounded to four entries.
-    #[doc(hidden)]
-    pub rust_macro_include_overlay_cache:
-        resolution_operation::SelectedRustMacroIncludeOverlayCache,
+    pub cache_budget: cache_budget::StoreCacheBudget,
     #[cfg(any(test, feature = "test-support"))]
     workspace_selection_counters: WorkspaceSelectionCounters,
     #[doc(hidden)]
@@ -1097,6 +1105,11 @@ fn workspace_selection_stamp(conn: &Connection) -> Result<WorkspaceSelectionStam
 pub struct AppliedWorkspaceSelection {
     snapshots: WorkspaceSnapshots,
     stamp: WorkspaceSelectionStamp,
+    /// The rows that applying selections on this connection has changed,
+    /// summed since the record was last cleared. A lent writer-backed reader
+    /// uses it to tell those writes from any other
+    /// ([`ReaderGuard::reclaim_writer`]).
+    application_changes: u64,
 }
 
 /// A reader connection together with the workspace selection its temp schema
@@ -1404,11 +1417,73 @@ enum ReaderConn<'a> {
     /// selection therefore lives beside the connection mutex rather than in a
     /// pool entry, and is held for as long as the connection guard is.
     Writer {
+        store: &'a AnalyzerStore,
         conn: std::sync::MutexGuard<'a, Connection>,
         selection: std::sync::MutexGuard<'a, Option<AppliedWorkspaceSelection>>,
         resolution_selection:
             std::sync::MutexGuard<'a, Option<resolution_selection::RetainedResolutionSelection>>,
+        // Another writer checkout on this thread would wait for this one.
+        _exclusive: writer::RetainedExclusiveReader,
     },
+    /// A writer-backed reader whose owner lent the connection to other store
+    /// users ([`ReaderGuard::lend_writer`]). It holds no lock, so nothing may
+    /// read through it until [`ReaderGuard::reclaim_writer`].
+    LentWriter {
+        store: &'a AnalyzerStore,
+        witness: LentWriterWitness,
+    },
+}
+
+/// Every way another user of the writer connection can change what a lent
+/// reader left there: rows in either database (SQLite does not move
+/// `data_version` for the connection's own commits) and either schema, with
+/// the share of the rows that ordinary selection applications changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LentWriterWitness {
+    total_changes: u64,
+    stamp: WorkspaceSelectionStamp,
+    application_changes: Option<u64>,
+}
+
+impl LentWriterWitness {
+    fn read(conn: &Connection, selection: Option<&AppliedWorkspaceSelection>) -> Result<Self> {
+        Ok(Self {
+            total_changes: conn.total_changes(),
+            stamp: workspace_selection_stamp(conn)?,
+            application_changes: selection.map(|selection| selection.application_changes),
+        })
+    }
+
+    /// Whether ordinary selection applications made every row change since
+    /// `lent`, with no schema or data-version change. They write only the
+    /// revision rows and the Rust unit rows filled from them.
+    fn only_selection_applications_since(&self, lent: &Self) -> bool {
+        let applied = self
+            .application_changes
+            .zip(lent.application_changes)
+            .and_then(|(now, then)| now.checked_sub(then));
+        self.stamp == lent.stamp && applied == Some(self.total_changes - lent.total_changes)
+    }
+}
+
+/// What a lent writer-backed reader found when it took the connection back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::analyzer::store) enum WriterReclaim {
+    /// No other user changed the connection while it was lent.
+    Unchanged,
+    /// Other users only applied ordinary workspace selections, which share
+    /// the lent selection's revision rows. Those rows hold its snapshots
+    /// again; `changes` counts every row changed since the lend, theirs and
+    /// the restoration's.
+    Restored { changes: u64 },
+    /// Another user wrote other rows or schema on the connection meanwhile.
+    Changed,
+    /// The caller's cancellation stopped the wait; the reader is still lent.
+    Cancelled,
+}
+
+fn lent_writer_used() -> ! {
+    panic!("a lent writer-backed reader was used before its owner reclaimed the connection")
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1420,11 +1495,95 @@ pub fn reader_eviction_bytes_for_test() -> i64 {
     READER_EVICTION_BYTES.with(std::cell::Cell::get)
 }
 
-impl ReaderGuard<'_> {
+impl<'a> ReaderGuard<'a> {
     /// Whether another store checkout on this thread would reacquire our mutex.
     #[doc(hidden)]
     pub fn excludes_store_access(&self) -> bool {
         matches!(self.inner, ReaderConn::Writer { .. })
+    }
+
+    pub(in crate::analyzer::store) fn is_lent_writer(&self) -> bool {
+        matches!(self.inner, ReaderConn::LentWriter { .. })
+    }
+
+    /// Release a writer-backed reader's locks, so that other store users,
+    /// including this thread, can use the connection until
+    /// [`Self::reclaim_writer`] takes it back.
+    ///
+    /// The temp schema stays on the connection. `installed` names the
+    /// workspace selection its revision rows hold, so that an ordinary read of
+    /// the same snapshots reuses them instead of rewriting them; `None`
+    /// records that the rows are no longer known.
+    pub(in crate::analyzer::store) fn lend_writer(
+        &mut self,
+        installed: Option<&WorkspaceSnapshots>,
+    ) -> Result<()> {
+        let ReaderConn::Writer {
+            store,
+            conn,
+            selection,
+            ..
+        } = &mut self.inner
+        else {
+            panic!("only a held writer-backed reader can lend its connection")
+        };
+        assert!(
+            conn.is_autocommit(),
+            "a writer-backed reader is lent only between transactions"
+        );
+        let stamp = workspace_selection_stamp(conn)?;
+        let application_changes = selection
+            .as_ref()
+            .map_or(0, |selection| selection.application_changes);
+        **selection = installed.map(|snapshots| AppliedWorkspaceSelection {
+            snapshots: snapshots.clone(),
+            stamp,
+            application_changes,
+        });
+        let witness = LentWriterWitness::read(conn, selection.as_ref())?;
+        let store = *store;
+        // Dropping the held variant releases the connection and both
+        // selection mutexes.
+        self.inner = ReaderConn::LentWriter { store, witness };
+        Ok(())
+    }
+
+    /// Take back a connection lent by [`Self::lend_writer`]. With a
+    /// cancellation the wait for the connection observes it.
+    ///
+    /// When ordinary selection applications were the only writers meanwhile,
+    /// the revision rows are restored to `installed`, the snapshots the
+    /// lender staged. Every other row the lender staged is then as it left
+    /// it. Without `installed` any change is reported as such.
+    pub(in crate::analyzer::store) fn reclaim_writer(
+        &mut self,
+        cancellation: Option<&CancellationToken>,
+        installed: Option<&WorkspaceSnapshots>,
+    ) -> Result<WriterReclaim> {
+        let ReaderConn::LentWriter { store, witness } = self.inner else {
+            panic!("only a lent writer-backed reader can be reclaimed")
+        };
+        let conn = match cancellation {
+            Some(cancellation) => match store.conn.lock_cancellable(cancellation) {
+                Some(conn) => conn,
+                None => return Ok(WriterReclaim::Cancelled),
+            },
+            None => store.conn.lock().expect("analyzer store mutex poisoned"),
+        };
+        self.inner = store.writer_reader_conn(conn);
+        let (conn, selection) = self.connection_and_selection();
+        let now = LentWriterWitness::read(conn, selection.as_ref())?;
+        if now == witness {
+            return Ok(WriterReclaim::Unchanged);
+        }
+        let Some(installed) = installed.filter(|_| now.only_selection_applications_since(&witness))
+        else {
+            return Ok(WriterReclaim::Changed);
+        };
+        store.apply_workspace_selection(conn, selection, installed)?;
+        Ok(WriterReclaim::Restored {
+            changes: conn.total_changes() - witness.total_changes,
+        })
     }
 
     /// This connection and the selection its temp schema holds, borrowed
@@ -1441,6 +1600,7 @@ impl ReaderGuard<'_> {
             ReaderConn::Writer {
                 conn, selection, ..
             } => (conn, selection),
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         }
     }
 }
@@ -1454,6 +1614,7 @@ impl std::ops::Deref for ReaderGuard<'_> {
                 &reader.as_ref().expect("reader guard already returned").conn
             }
             ReaderConn::Writer { conn, .. } => conn,
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         }
     }
 }
@@ -1465,6 +1626,7 @@ impl std::ops::DerefMut for ReaderGuard<'_> {
                 &mut reader.as_mut().expect("reader guard already returned").conn
             }
             ReaderConn::Writer { conn, .. } => conn,
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         }
     }
 }
@@ -1484,6 +1646,7 @@ impl ReaderGuard<'_> {
                 resolution_selection,
                 ..
             } => resolution_selection.take(),
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         }
     }
 
@@ -1503,6 +1666,7 @@ impl ReaderGuard<'_> {
                 resolution_selection,
                 ..
             } => &mut **resolution_selection,
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         };
         assert!(
             slot.replace(retained).is_none(),
@@ -1558,6 +1722,7 @@ impl ReaderGuard<'_> {
                 Ok(())
             }
             ReaderConn::Writer { .. } => self.stabilize_query_plans(),
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         }
     }
 
@@ -1571,6 +1736,7 @@ impl ReaderGuard<'_> {
                 .query_planner_stability_before_resolution
                 .take(),
             ReaderConn::Writer { .. } => None,
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         };
         if let Some(previous) = previous {
             match self.set_db_config(SQLITE_DBCONFIG_ENABLE_QPSG, previous) {
@@ -1629,6 +1795,12 @@ impl ReaderGuard<'_> {
 
 impl Drop for ReaderGuard<'_> {
     fn drop(&mut self) {
+        // The owner reclaims a lent connection first: its cleanup, the
+        // planner restoration and the checks below need the connection held.
+        assert!(
+            !self.is_lent_writer(),
+            "a lent writer-backed reader must be reclaimed before it is dropped"
+        );
         let had_cleanup = self.checkin_cleanup.is_some();
         let mut cleanup_errors = Vec::new();
         if let Some(sql) = self.checkin_cleanup.take() {
@@ -1639,6 +1811,7 @@ impl Drop for ReaderGuard<'_> {
                     .conn
                     .execute_batch(sql),
                 ReaderConn::Writer { conn, .. } => conn.execute_batch(sql),
+                ReaderConn::LentWriter { .. } => lent_writer_used(),
             };
             if let Err(error) = result {
                 cleanup_errors.push(("TEMP cleanup", error));
@@ -1703,6 +1876,7 @@ impl Drop for ReaderGuard<'_> {
                     "analyzer store writer fallback left TEMP state unverified"
                 );
             }
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
         }
     }
 }
@@ -2471,6 +2645,9 @@ fn workspace_file_projection_digest_bytes(
             digest.update(value);
         }
         digest.update([code_unit_kind_to_i64(row.kind) as u8]);
+        // Stored with the row, so a change to it alone must change the
+        // digest; otherwise reconciliation keeps the stale flag.
+        digest.update([u8::from(row.requires_imports)]);
     }
     for row in &projection.package_files {
         for value in [row.package_name.as_bytes(), row.rel_path.as_bytes()] {
@@ -2837,16 +3014,7 @@ WHERE endpoints.endpoint_role = 'trait' AND endpoints.endpoint_state = 'unresolv
 impl AnalyzerStore {
     #[doc(hidden)]
     pub fn resolution_shared_name_cache(&self) -> &resolution::SharedNameCache {
-        &self.resolution_shared_name_cache
-    }
-
-    pub(crate) fn go_prepared_context_cache(
-        &self,
-    ) -> &resolution::BoundedResolutionCache<
-        resolution_operation::go_named::GoPreparedContextCacheKey,
-        Arc<resolution_operation::go_named::GoPreparedImportContextSnapshot>,
-    > {
-        &self.go_prepared_context_cache
+        &self.cache_budget
     }
 
     #[doc(hidden)]
@@ -3042,8 +3210,10 @@ impl AnalyzerStore {
         anchors: &[WorkspaceAnchorRow],
         configuration: &[WorkspaceConfigurationInput],
         foreign_source_paths: &[String],
+        refusals: &[WorkspaceSourceRefusalRow],
     ) -> Result<WorkspaceSnapshotId> {
         let configuration = configuration.to_vec();
+        let refusals = refusals.to_vec();
         let foreign_source_paths = foreign_source_paths
             .iter()
             .cloned()
@@ -3090,6 +3260,16 @@ impl AnalyzerStore {
                 .iter()
                 .map(WorkspaceConfigurationInput::row)
                 .collect::<Vec<_>>();
+            // Refusals share the source family's ownership: a content-reading
+            // publisher names the natural files, refused ones included, foreign.
+            let refusal_changes = workspace_inputs::WorkspaceRefusalChanges::replacing(
+                &tx,
+                &workspace_id,
+                lang,
+                generation,
+                &refusals,
+                &foreign_source_paths,
+            )?;
             let (snapshot, inserted) = workspace_inputs::replace_workspace_input_partitions(
                 &tx,
                 &workspace_id,
@@ -3107,6 +3287,7 @@ impl AnalyzerStore {
                         foreign_paths: &crate::hash::HashSet::default(),
                     },
                 ],
+                &refusal_changes,
             )?;
             for ((kind, path), id) in inserted {
                 if kind == workspace_inputs::WorkspaceInputKind::Source {
@@ -3143,6 +3324,7 @@ impl AnalyzerStore {
             package_files,
             package_edges,
             anchors,
+            &[],
             &[],
             &[],
         )
@@ -3318,12 +3500,18 @@ impl AnalyzerStore {
         package_files: &[WorkspacePackageFileRow],
         package_edges: &[WorkspacePackageEdgeRow],
         anchors: &[WorkspaceAnchorRow],
+        refusal: Option<(&str, &WorkspaceSourceRefusalRow)>,
     ) -> Result<WorkspaceSnapshots> {
+        assert!(
+            file_replacement.is_none() || refusal.is_none(),
+            "a live source is either selected or refused: {rel_path}"
+        );
         let workspace_id = workspace_id.clone();
         let base_snapshots = base_snapshots.clone();
         let storage_langs = storage_langs.to_vec();
         let generations = generations.clone();
         let rel_path = rel_path.to_string();
+        let refusal = refusal.map(|(lang, row)| (lang.to_string(), row.clone()));
         let file_replacement = file_replacement.map(|(lang, oid)| (lang.to_string(), oid));
         let path_symbol_replacement =
             path_symbol_replacement.map(|(lang, row)| (lang.to_string(), row.clone()));
@@ -3345,10 +3533,14 @@ impl AnalyzerStore {
             let package_files = package_files.as_slice();
             let package_edges = package_edges.as_slice();
             let anchors = anchors.as_slice();
+            let refusal = refusal.as_ref().map(|(lang, row)| (lang.as_str(), row));
             let tx = conn.transaction()?;
             let mut snapshots = HashMap::default();
+            let live_lang = file_replacement
+                .map(|(lang, _)| lang)
+                .or(refusal.map(|(lang, _)| lang));
             for lang in storage_langs {
-                if let Some((file_lang, _)) = file_replacement
+                if let Some(file_lang) = live_lang
                     && file_lang != lang
                 {
                     // A live file's row under another storage language is a
@@ -3409,6 +3601,16 @@ impl AnalyzerStore {
                 let replacements = replacement
                     .as_ref()
                     .map(|row| (workspace_inputs::WorkspaceInputKind::Source, row));
+                let refusal_changes = workspace_inputs::WorkspaceRefusalChanges::replacing_path(
+                    &tx,
+                    &workspace_id,
+                    lang,
+                    generation,
+                    rel_path,
+                    refusal
+                        .filter(|(refusal_lang, _)| *refusal_lang == lang)
+                        .map(|(_, row)| row),
+                )?;
                 let (snapshot, inserted) = workspace_inputs::publish_workspace_input_changes(
                     &tx,
                     &workspace_id,
@@ -3417,6 +3619,7 @@ impl AnalyzerStore {
                     Some(head_revision),
                     closed.as_slice(),
                     replacements.as_slice(),
+                    &refusal_changes,
                 )?;
                 for id in inserted.into_values() {
                     insert_workspace_file_projection_rows(&tx, id, &replacement_projection)?;
@@ -3495,6 +3698,7 @@ impl AnalyzerStore {
                     Some(head_revision),
                     closed.as_slice(),
                     replacements.as_slice(),
+                    &Default::default(),
                 )?;
                 let rows = tx
                     .prepare_cached(
@@ -3545,6 +3749,7 @@ impl AnalyzerStore {
         reader_source: Option<PathBuf>,
         db_path: Option<PathBuf>,
         ephemeral: Option<EphemeralDb>,
+        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
     ) -> Self {
         resolution_lexical::register_resolution_identity_functions(&conn)
             .expect("configure resolution identity SQL functions");
@@ -3562,10 +3767,7 @@ impl AnalyzerStore {
             #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
-            resolution_shared_name_cache: resolution::SharedNameCache::new(),
-            go_prepared_context_cache: resolution::BoundedResolutionCache::new(128),
-            rust_macro_include_overlay_cache:
-                resolution_operation::SelectedRustMacroIncludeOverlayCache::new(),
+            cache_budget: cache_budget::StoreCacheBudget::new(config.store_cache_budget_bytes()),
             #[cfg(any(test, feature = "test-support"))]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path,
@@ -3597,6 +3799,13 @@ impl AnalyzerStore {
     }
 
     pub fn open_persistent(db_path: &Path) -> Result<Self> {
+        Self::open_persistent_with_config(db_path, &Default::default())
+    }
+
+    pub fn open_persistent_with_config(
+        db_path: &Path,
+        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+    ) -> Result<Self> {
         let (conn, reader_source) = StoreWriter::persistent(db_path)?;
         Ok(Self {
             conn,
@@ -3607,10 +3816,7 @@ impl AnalyzerStore {
             #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
             writer_resolution_selection: Mutex::new(None),
-            resolution_shared_name_cache: resolution::SharedNameCache::new(),
-            go_prepared_context_cache: resolution::BoundedResolutionCache::new(128),
-            rust_macro_include_overlay_cache:
-                resolution_operation::SelectedRustMacroIncludeOverlayCache::new(),
+            cache_budget: cache_budget::StoreCacheBudget::new(config.store_cache_budget_bytes()),
             #[cfg(any(test, feature = "test-support"))]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path: Some(db_path.to_path_buf()),
@@ -3655,9 +3861,15 @@ impl AnalyzerStore {
     /// this platform, fall back to a single in-memory connection whose reads
     /// route through the writer (no read parallelism, but correct).
     pub fn open_ephemeral() -> Result<Self> {
-        match Self::open_ephemeral_temp_file() {
+        Self::open_ephemeral_with_config(&Default::default())
+    }
+
+    pub fn open_ephemeral_with_config(
+        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+    ) -> Result<Self> {
+        match Self::open_ephemeral_temp_file(config) {
             Ok(store) => Ok(store),
-            Err(_) => Self::open_in_memory_single_connection(),
+            Err(_) => Self::open_in_memory_single_connection_with_config(config),
         }
     }
 
@@ -3755,7 +3967,9 @@ impl AnalyzerStore {
         })
     }
 
-    fn open_ephemeral_temp_file() -> Result<Self> {
+    fn open_ephemeral_temp_file(
+        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+    ) -> Result<Self> {
         let path = unique_temp_db_path();
         let conn = crate::cache_db::open_unified_connection(&path).map_err(StoreError::new)?;
         let Some(resolved) = reader_source_path(&conn) else {
@@ -3768,16 +3982,23 @@ impl AnalyzerStore {
             Some(resolved.clone()),
             None,
             Some(EphemeralDb { path: resolved }),
+            config,
         ))
     }
 
     #[doc(hidden)]
     pub fn open_in_memory_single_connection() -> Result<Self> {
+        Self::open_in_memory_single_connection_with_config(&Default::default())
+    }
+
+    pub fn open_in_memory_single_connection_with_config(
+        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+    ) -> Result<Self> {
         let mut conn = crate::cache_db::open_in_memory_store_connection()?;
         crate::cache_db::configure_connection(&mut conn).map_err(StoreError::new)?;
         crate::cache_db::migrate(&mut conn).map_err(StoreError::new)?;
         // `reader_source = None` routes reads back through the writer connection.
-        Ok(Self::from_parts(conn, None, None, None))
+        Ok(Self::from_parts(conn, None, None, None, config))
     }
 
     /// Decode language-owned source rows in one generation-checked snapshot.
@@ -3937,6 +4158,7 @@ impl AnalyzerStore {
         self.workspace_selection_counters
             .selection_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let changes_before = conn.total_changes();
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch("DELETE FROM temp.selected_rust_unit_closure; DELETE FROM temp.selected_rust_unit_summaries;")?;
         tx.prepare_cached("DELETE FROM temp.selected_workspace_revisions")?
@@ -3961,9 +4183,14 @@ impl AnalyzerStore {
         // fill. An external commit after it ends must differ on next checkout.
         let stamp = workspace_selection_stamp(&tx)?;
         tx.commit()?;
+        let application_changes = selection
+            .as_ref()
+            .map_or(0, |selection| selection.application_changes)
+            + (conn.total_changes() - changes_before);
         *selection = Some(AppliedWorkspaceSelection {
             snapshots: snapshots.clone(),
             stamp,
+            application_changes,
         });
         Ok(())
     }
@@ -4013,6 +4240,24 @@ impl AnalyzerStore {
         Ok(conn)
     }
 
+    /// [`Self::active_read_conn_for_resolution`] for a selection opener. The
+    /// in-memory fallback's only connection can be held by another request
+    /// for as long as that request runs, so the wait for it observes
+    /// `cancellation`; `None` means it stopped the wait.
+    fn cancellable_read_conn_for_resolution(
+        &self,
+        key: &resolution_selection::RetainedResolutionSelectionKey,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ReaderGuard<'_>>> {
+        if self.active_readers.source.is_none() {
+            return Ok(self
+                .conn
+                .lock_cancellable(cancellation)
+                .map(|conn| self.writer_reader_guard(conn)));
+        }
+        self.active_read_conn_for_resolution(key).map(Some)
+    }
+
     fn read_conn_with_acquisition<'a>(
         &'a self,
         pool: &'a ReaderPool,
@@ -4058,23 +4303,45 @@ impl AnalyzerStore {
                     reusable: true,
                 })
             }
-            None => Ok(ReaderGuard {
-                inner: ReaderConn::Writer {
-                    conn: self.conn.lock().expect("analyzer store mutex poisoned"),
-                    selection: self
-                        .writer_selection
-                        .lock()
-                        .expect("analyzer store writer selection poisoned"),
-                    resolution_selection: self
-                        .writer_resolution_selection
-                        .lock()
-                        .expect("analyzer store retained resolution selection poisoned"),
-                },
-                checkin_cleanup: None,
-                query_planner_stability_on_checkin: None,
-                restore_reader_mmap_on_checkin: false,
-                reusable: true,
-            }),
+            None => {
+                Ok(self
+                    .writer_reader_guard(self.conn.lock().expect("analyzer store mutex poisoned")))
+            }
+        }
+    }
+
+    /// The in-memory fallback's reader around a held writer connection.
+    fn writer_reader_guard<'a>(
+        &'a self,
+        conn: std::sync::MutexGuard<'a, Connection>,
+    ) -> ReaderGuard<'a> {
+        ReaderGuard {
+            inner: self.writer_reader_conn(conn),
+            checkin_cleanup: None,
+            query_planner_stability_on_checkin: None,
+            restore_reader_mmap_on_checkin: false,
+            reusable: true,
+        }
+    }
+
+    /// The selection mutexes are taken only by a holder of the connection, so
+    /// they never wait once `conn` is held.
+    fn writer_reader_conn<'a>(
+        &'a self,
+        conn: std::sync::MutexGuard<'a, Connection>,
+    ) -> ReaderConn<'a> {
+        ReaderConn::Writer {
+            store: self,
+            conn,
+            selection: self
+                .writer_selection
+                .lock()
+                .expect("analyzer store writer selection poisoned"),
+            resolution_selection: self
+                .writer_resolution_selection
+                .lock()
+                .expect("analyzer store retained resolution selection poisoned"),
+            _exclusive: self.conn.retain_exclusive_reader(),
         }
     }
 
@@ -10849,6 +11116,7 @@ impl PreparedParsedBlob {
             && self.contains_tests == other.contains_tests
             && self.content_package == other.content_package
             && self.resolution == other.resolution
+            && self.semantic_ir == other.semantic_ir
             && self.state.source_facts == other.state.source_facts
             && self.source_declaration_units == other.source_declaration_units
             && self.source_declaration_metadata == other.source_declaration_metadata
@@ -11655,7 +11923,15 @@ fn try_persist_prepared_chunk_tx(
             tx.rollback()?;
             return Err(StoreError::new("prepared blob persistence was cancelled"));
         }
-        write_prepared_blob_rows_tx(&tx, blob, blob.generation, cancellation)?;
+        let blob_id = write_prepared_blob_rows_tx(&tx, blob, blob.generation, cancellation)?;
+        if let Some(support) = store_language_support(blob.resolution.semantic_language()) {
+            support.publish_native_source_rows(
+                &tx,
+                blob_id,
+                &blob.state.resolution_facts,
+                cancellation,
+            )?;
+        }
     }
     if cancellation.is_cancelled() {
         tx.rollback()?;
@@ -12107,7 +12383,7 @@ fn write_prepared_blob_rows_tx(
     blob: &PreparedParsedBlob,
     generation: GenerationId,
     cancellation: &CancellationToken,
-) -> Result<()> {
+) -> Result<i64> {
     let oid = blob.oid_text.as_str();
     let lang = blob.lang.as_str();
     // Every statement in this batch path is connection-cached: a cold reconcile
@@ -12438,7 +12714,7 @@ fn write_prepared_blob_rows_tx(
     for owner in &previous_owners {
         resolution_publication::root_content_tx(tx, owner, blob_id)?;
     }
-    Ok(())
+    Ok(blob_id)
 }
 
 /// The language-specific side-fact tables one language's parse can fill.
@@ -19230,12 +19506,740 @@ pub mod resolution_producer_tests;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[cfg(test)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "2532c07e7fa2: duplicate fragment comparison omitted semantic IR content"
+    )]
+    fn semantic_ir_only_conflicting_fragments_are_rejected() {
+        use self::semantic_ir::SemanticIrMountScope;
+        use crate::analyzer::semantic::{
+            DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, EvidenceId,
+            ProcedureId, ProcedureKind, ProcedureSemanticsParts, SemanticLocator, SemanticRole,
+            SourceAnchor, SourceMappingId, SourcePosition, SourceSpan, WorkspaceMountId,
+            WorkspaceRelativePath,
+        };
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = oid_for(b"semantic IR replacement");
+        let state = Arc::new(FileState {
+            source: Default::default(),
+            package_name: Default::default(),
+            content_qualifier: Default::default(),
+            top_level_declarations: Default::default(),
+            declarations: Default::default(),
+            definition_lookup_units: Default::default(),
+            imports: Default::default(),
+            scala_exports: Default::default(),
+            rust_usage_facts: Default::default(),
+            resolution_facts: Default::default(),
+            source_facts: Default::default(),
+            source_declaration_units: Default::default(),
+            source_declaration_metadata: Default::default(),
+            raw_supertypes: Default::default(),
+            supertype_lookup_paths: Default::default(),
+            type_identifiers: Default::default(),
+            signatures: Default::default(),
+            signature_metadata: Default::default(),
+            signature_metadata_signature_ordinals: Default::default(),
+            cpp_template_metadata: Default::default(),
+            ranges: Default::default(),
+            children: Default::default(),
+            type_aliases: Default::default(),
+            ruby_method_dispatch_modes: Default::default(),
+            scala_traits: Default::default(),
+            contains_tests: Default::default(),
+            test_region_units: Default::default(),
+            materialization_records: Default::default(),
+            parse_errors: Default::default(),
+            additional_projections: Default::default(),
+            parse_complete: true,
+            completeness: crate::analyzer::ParseCompleteness::Complete,
+        });
+        let mount = WorkspaceMountId::from_root(&std::env::temp_dir());
+        let content = ContentIdentity::from_digest(StableDigest::from_array([1; 32]));
+        let make = |filename: &str| {
+            // A neutral storage key avoids the Rust source producer, which
+            // lives in a downstream crate. IR encoding is language-independent.
+            let resolution = PreparedResolutionBundle::new(
+                Language::Python,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            // Rust's inventory includes the live filename in each declaration.
+            // The encoder retains it even though the blob key is content-only.
+            let anchor = SourceAnchor::new(
+                SourceSpan::new(SourcePosition::new(0, 0, 0), SourcePosition::new(1, 0, 1))
+                    .unwrap(),
+                0,
+            );
+            let declaration = DeclarationLocator::new(vec![
+                DeclarationSegment::named(DeclarationSegmentKind::File, filename, anchor, 0)
+                    .unwrap(),
+                DeclarationSegment::named(DeclarationSegmentKind::Function, "f", anchor, 0)
+                    .unwrap(),
+            ])
+            .unwrap();
+            let procedure = ProcedureSemanticsParts::new(
+                ProcedureId::new(0),
+                SemanticLocator::new(
+                    mount,
+                    WorkspaceRelativePath::new(filename).unwrap(),
+                    Language::Rust.into(),
+                    declaration,
+                    SemanticRole::Procedure,
+                    anchor,
+                ),
+                ProcedureKind::Function,
+                SourceMappingId::new(0),
+                EvidenceId::new(0),
+            );
+            let ir = PreparedSemanticIr::prepare(
+                SemanticIrLoweringOutcome::Complete {
+                    parts: vec![procedure],
+                },
+                None,
+                "fragment-comparison-probe",
+                content,
+                0,
+            );
+            let logical_rows = resolution.logical_rows + ir.logical_rows();
+            let payload_bytes = resolution.payload_bytes + ir.payload_bytes();
+            PreparedParsedBlob {
+                oid,
+                oid_text: oid.to_string(),
+                lang: "python".to_owned(),
+                generation: GenerationId::BOOTSTRAP,
+                state: Arc::clone(&state),
+                resolution,
+                semantic_ir: Some(ir),
+                logical_rows,
+                payload_bytes,
+                mutation_logical_rows: logical_rows,
+                mutation_payload_bytes: payload_bytes,
+                units: Default::default(),
+                source_declaration_units: Default::default(),
+                source_declaration_metadata: Default::default(),
+                declaration_visibility_version: Default::default(),
+                java_type_constructor_version: Default::default(),
+                go_source_version: Default::default(),
+                java_source_version: Default::default(),
+                scala_source_version: Default::default(),
+                ruby_source_version: Default::default(),
+                php_source_version: Default::default(),
+                cpp_source_version: Default::default(),
+                source_facts_version: Default::default(),
+                source_storage: Default::default(),
+                metadata_bridges_required: Default::default(),
+                js_ts_source_version: Default::default(),
+                python_source_version: Default::default(),
+                ranges: Default::default(),
+                signatures: Default::default(),
+                signature_metadata: Default::default(),
+                signature_metadata_signature_ordinals: Default::default(),
+                cpp_templates: Default::default(),
+                supertypes: Default::default(),
+                children: Default::default(),
+                imports: Default::default(),
+                scala_exports: Default::default(),
+                rust_facts: Default::default(),
+                type_identifiers: Default::default(),
+                ruby_dispatch_modes: Default::default(),
+                scala_traits: Default::default(),
+                materialization_records: Default::default(),
+                contains_tests: Default::default(),
+                content_package: Default::default(),
+                additional: Default::default(),
+            }
+        };
+        let first = make("a.rs");
+        let later = make("b.rs");
+        assert_eq!(first.logical_rows(), later.logical_rows());
+        assert_eq!(first.payload_bytes(), later.payload_bytes());
+        // Separate writes must replace the IR; they do not use fragment equality.
+        for (fragment, expected) in [(first, "a.rs"), (later, "b.rs")] {
+            let (outcomes, _) =
+                store.persist_prepared_blobs(vec![fragment], PersistBatchTargets::PRODUCTION);
+            assert!(
+                outcomes.iter().all(|outcome| outcome.error.is_none()),
+                "{outcomes:?}"
+            );
+            let publication = store
+                .semantic_ir_publication(oid, "python")
+                .unwrap()
+                .unwrap();
+            let parts = store
+                .read_semantic_ir(
+                    publication.blob_id,
+                    &SemanticIrMountScope {
+                        mount,
+                        path: WorkspaceRelativePath::new(expected).unwrap(),
+                        language: Language::Rust.into(),
+                        content,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                parts[0].locator.declaration().segments()[0].name(),
+                Some(expected)
+            );
+        }
+        // Conflicting duplicates in one call must fail rather than silently
+        // acknowledging both requests while persisting only the first IR.
+        let (outcomes, _) = store.persist_prepared_blobs(
+            vec![make("a.rs"), make("b.rs")],
+            PersistBatchTargets::PRODUCTION,
+        );
+        let publication = store
+            .semantic_ir_publication(oid, "python")
+            .unwrap()
+            .unwrap();
+        let parts = store
+            .read_semantic_ir(
+                publication.blob_id,
+                &SemanticIrMountScope {
+                    mount,
+                    path: WorkspaceRelativePath::new("b.rs").unwrap(),
+                    language: Language::Rust.into(),
+                    content,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                outcomes
+                    .iter()
+                    .filter(|outcome| outcome.error.is_some())
+                    .count(),
+                parts[0].locator.declaration().segments()[0].name(),
+            ),
+            (2, Some("b.rs")),
+            "conflicting IR must be rejected, preserving the previous publication"
+        );
+
+        // Head-only publications must compare their outcome and detail too,
+        // even when neither publication has child rows.
+        let error_oid = oid_for(b"semantic IR error conflict");
+        let errors = ["first", "other"].map(|detail| {
+            let mut fragment = make("a.rs");
+            let ir = PreparedSemanticIr::prepare(
+                SemanticIrLoweringOutcome::Error(detail.to_owned()),
+                None,
+                "fragment-comparison-probe",
+                content,
+                0,
+            );
+            fragment.oid = error_oid;
+            fragment.oid_text = error_oid.to_string();
+            fragment.logical_rows = fragment.resolution.logical_rows + ir.logical_rows();
+            fragment.payload_bytes = fragment.resolution.payload_bytes + ir.payload_bytes();
+            fragment.mutation_logical_rows = fragment.logical_rows;
+            fragment.mutation_payload_bytes = fragment.payload_bytes;
+            fragment.semantic_ir = Some(ir);
+            fragment
+        });
+        assert_eq!(errors[0].logical_rows(), errors[1].logical_rows());
+        assert_eq!(errors[0].payload_bytes(), errors[1].payload_bytes());
+        let (outcomes, _) =
+            store.persist_prepared_blobs(Vec::from(errors), PersistBatchTargets::PRODUCTION);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.error.is_some())
+                .count(),
+            2,
+            "conflicting error details must be rejected: {outcomes:?}"
+        );
+        assert!(
+            store
+                .semantic_ir_publication(error_oid, "python")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[cfg(test)]
     #[cfg(any(test, feature = "test-support"))]
     pub(super) use super::test_support::*;
 
     use super::*;
+
+    /// Persist coordinated import identities alongside legacy scoped imports,
+    /// include bindings and independently classified macros. The producer facts
+    /// are the oracle, including source-derived ranges and aliases.
+    #[test]
+    fn rust_fact_rows_round_trip_imports_includes_and_macro_flags() {
+        use brokk_bifrost_core::analyzer::parsed_file::{SourceImportFact, SourceImportPathFact};
+        use brokk_bifrost_core::analyzer::rust_facts::*;
+        use brokk_bifrost_core::analyzer::source_facts::{
+            SourceDeclaration, SourceDeclarationId, SourceFactRows, SourceImportId,
+            SourceOccurrence, SourceOccurrenceId, SourceOccurrenceProvenance,
+        };
+
+        let occurrence = |start, end| SourceOccurrence {
+            range: Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: 1,
+                end_line: 1,
+            },
+            provenance: SourceOccurrenceProvenance::ExplicitSubspan,
+        };
+        let mut source = ParsedSourceFacts {
+            source_bytes: 200,
+            occurrences: SourceFactRows::new(
+                vec![
+                    occurrence(0, 200),
+                    occurrence(10, 30),
+                    occurrence(40, 60),
+                    occurrence(70, 80),
+                    occurrence(90, 100),
+                    occurrence(110, 120),
+                ],
+                (3..6)
+                    .map(|id| SourceDeclaration {
+                        occurrence: SourceOccurrenceId::new(id),
+                        name: None,
+                    })
+                    .collect(),
+            ),
+            js_ts: None,
+            php: None,
+            cpp: None,
+            go: None,
+            java: None,
+            scala: None,
+            ruby: None,
+            python: None,
+            structural: brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows::new(
+                vec![],
+                brokk_bifrost_core::compact_graph::CompactRows::from_parts(vec![0], vec![]),
+                brokk_bifrost_core::compact_graph::CompactRows::from_parts(vec![0], vec![]),
+                vec![],
+            ),
+            native_site_occurrences: vec![],
+            native_declaration_sources: vec![],
+            declaration_visibilities: None,
+            rust_declaration_properties: vec![],
+            rust_modules: Some(RustModuleSourceFacts {
+                root: SourceOccurrenceId::new(0),
+                declarations: vec![],
+                invocations: vec![],
+                inventory: vec![],
+                scopes: vec![],
+                routes: vec![],
+                inner_attributes: vec![],
+            }),
+            rust_types: vec![],
+            rust_items: Default::default(),
+            imports: vec![],
+            generic_imports: vec![],
+            rust_import_contexts: vec![],
+        };
+        for (index, (identifier, alias, segments)) in [
+            ("m", "module_alias", vec!["outer", "m"]),
+            ("Item", "Item", vec!["outer", "m", "Item"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let declaration = SourceOccurrenceId::new(u32::try_from(index + 1).unwrap());
+            source.imports.push(SourceImportFact {
+                declaration,
+                target: None,
+                alias_occurrence: None,
+                statement: "use outer::m::{self as module_alias, Item};".into(),
+                is_wildcard: false,
+                is_global: false,
+                is_macro_use: false,
+                identifier: Some(identifier.into()),
+                alias: Some(alias.into()),
+                path: Some(SourceImportPathFact {
+                    kind: None,
+                    segments: segments.into_iter().map(str::to_owned).collect(),
+                    lexical_prefixes: vec![],
+                    lexical_scopes: vec![],
+                }),
+            });
+            source.rust_import_contexts.push(RustImportContextFact {
+                declaration,
+                native_scope: None,
+                owner_module: "".into(),
+                owner_scope: None,
+                local_scope: None,
+                visibility: RustVisibility::Public,
+                cfg_condition: RustCfgCondition::Always,
+            });
+        }
+        source.rust_items.syntax.push(RustItemSyntaxFact {
+            occurrence: SourceOccurrenceId::new(0),
+            has_error: false,
+        });
+        source.rust_items.contexts.push(RustSourceContextFact {
+            context: SourceOccurrenceId::new(0),
+            parent: None,
+            owner: None,
+            kind: RustSourceContextKind::FileRoot,
+            expanding_attribute_starts: vec![],
+        });
+        let mut facts = RustUsageFacts::default();
+        for (index, imported) in ["self", "Item"].into_iter().enumerate() {
+            facts.import_targets.push(RustImportTargetFact {
+                native_scope: None,
+                source_import_id: Some(SourceImportId::new(index as u32)),
+                module_path: vec!["outer".into(), "m".into()],
+                bound_name: Some(if index == 0 { "module_alias" } else { "Item" }.into()),
+                imported_name: Some(imported.into()),
+                is_glob: false,
+                leading_absolute: false,
+                is_extern_crate: false,
+                is_macro_use: false,
+                visibility: RustVisibility::Public,
+                cfg_condition: RustCfgCondition::Always,
+                owner_module: "".into(),
+                owner_start: 0,
+                owner_end: 200,
+                local_extent: None,
+                source_occurrences: Some(RustImportSourceOccurrences {
+                    declaration: SourceOccurrenceId::new(index as u32 + 1),
+                    target: None,
+                    alias: None,
+                }),
+            });
+        }
+        let mut local = facts.import_targets[1].clone();
+        local.module_path.clear();
+        local.source_import_id = None;
+        local.source_occurrences = None;
+        local.owner_module = "nested".into();
+        local.owner_start = 61;
+        local.owner_end = 180;
+        local.local_extent = Some((125, 170));
+        let mut legacy = RustUsageFacts::default();
+        legacy.import_targets.push(local);
+        facts.exports = vec![RustExportFact {
+            source_import_id: Some(SourceImportId::new(1)),
+            exported_name: Some("Item".into()),
+            source_path: "outer::m".into(),
+            imported_name: Some("Item".into()),
+            is_glob: false,
+        }];
+        legacy.exports = vec![RustExportFact {
+            source_import_id: None,
+            exported_name: None,
+            source_path: "other".into(),
+            imported_name: None,
+            is_glob: true,
+        }];
+        for (index, (passthrough, arguments_only, declares_no_item, writes_only_impls)) in [
+            (true, false, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let declaration = SourceDeclarationId::new(index as u32);
+            source
+                .rust_items
+                .macro_definitions
+                .push(RustMacroDefinitionSourceFact {
+                    declaration,
+                    context: SourceOccurrenceId::new(0),
+                    is_macro_rules: true,
+                    arms: vec![],
+                });
+            facts
+                .module_routes
+                .item_macros
+                .push(RustRulesItemMacroDefinition {
+                    declaration,
+                    name: format!("macro_{index}"),
+                    visible_after: 80 + index * 20,
+                    scope_start: 0,
+                    scope_end: 200,
+                    passthrough,
+                    arguments_only,
+                    decoration: None,
+                    declares_no_item,
+                    writes_only_impls,
+                    exported: false,
+                });
+        }
+        for (index, names) in [vec!["First", "Second"], vec!["Third"]]
+            .into_iter()
+            .enumerate()
+        {
+            let file_name = format!("part_{index}.rs");
+            legacy.include_edges.push(RustIncludeEdgeFact {
+                relative_path: format!("generated/{file_name}"),
+                file_name,
+                include_start: 140 + index * 10,
+                host_bindings: names
+                    .into_iter()
+                    .map(|name| RustIncludeHostBindingFact {
+                        local_name: name.into(),
+                        module_specifier: "outer::m".into(),
+                        imported_name: Some(name.into()),
+                        scope_start: 125,
+                        kind: RustIncludeBindingKind::Named,
+                    })
+                    .collect(),
+            });
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("facts.db");
+        let oid = Oid::hash_object(git2::ObjectType::Blob, b"rust fact row fixture").unwrap();
+        let legacy_oid =
+            Oid::hash_object(git2::ObjectType::Blob, b"legacy rust fact row fixture").unwrap();
+        {
+            let store = AnalyzerStore::open_persistent(&path).unwrap();
+            let projected = RustFactRows::from_facts(&facts, Some(&source)).unwrap();
+            let projected_legacy = RustFactRows::from_facts(&legacy, None).unwrap();
+            store.conn.execute(move |conn| {
+                let tx = conn.transaction().unwrap();
+                tx.execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 1)",
+                    [oid.to_string()],
+                )
+                .unwrap();
+                let blob = tx.last_insert_rowid();
+                // The source publisher lives above this crate. Seed its relational
+                // inputs in building state; this test exercises Rust projection
+                // rows and their reader, not source publication admission.
+                tx.execute("INSERT INTO blob_meta(blob_id, lang, contains_tests, content_package,
+                    stored_unit_count, range_count, signature_count, signature_metadata_count,
+                    supertype_count, child_count, import_statement_count, type_identifier_count, is_complete)
+                    VALUES(?1, 'rust', 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 0)", [blob]).unwrap();
+                tx.execute(
+                    "INSERT INTO source_fact_manifests(blob_id, facts_version, source_bytes,
+                    occurrence_count, declaration_count, declaration_unit_count, node_count, role_count,
+                    occurrence_role_count, logical_rows, payload_bytes, publication_state)
+                    VALUES(?1, 1, 200, 6, 3, 0, 0, 0, 0, 1, 0, 'building')",
+                    [blob],
+                )
+                .unwrap();
+                for (index, import) in source.imports.iter().enumerate() {
+                    let range = source.occurrences.occurrence(import.declaration).range;
+                    tx.execute(
+                        "INSERT INTO source_imports(blob_id, import_id, statement, is_wildcard,
+                        is_global, identifier, alias, declaration_occurrence_id,
+                        declaration_start_byte, declaration_end_byte)
+                        VALUES(?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            blob,
+                            index as i64,
+                            import.statement,
+                            import.identifier,
+                            import.alias,
+                            import.declaration.get(),
+                            range.start_byte as i64,
+                            range.end_byte as i64
+                        ],
+                    )
+                    .unwrap();
+                    for (ordinal, segment) in import.path.as_ref().unwrap().segments.iter().enumerate()
+                    {
+                        tx.execute(
+                            "INSERT INTO source_import_segments(blob_id, import_id, ordinal, segment)
+                            VALUES(?1, ?2, ?3, ?4)",
+                            params![blob, index as i64, ordinal as i64, segment],
+                        )
+                        .unwrap();
+                    }
+                    tx.execute("INSERT INTO source_rust_import_contexts(blob_id, declaration_occurrence_id,
+                        owner_module, visibility, cfg_condition, declaration_start_byte, declaration_end_byte)
+                        VALUES(?1, ?2, '', 'public', 'always', ?3, ?4)",
+                        params![blob, import.declaration.get(), range.start_byte as i64, range.end_byte as i64]).unwrap();
+                }
+                for (index, declaration) in source.occurrences.declarations().iter().enumerate() {
+                    let range = source.occurrences.occurrence(declaration.occurrence).range;
+                    tx.execute(
+                        "INSERT INTO source_declarations(blob_id, declaration_id, occurrence_id,
+                        start_byte, end_byte, start_line, end_line, provenance)
+                        VALUES(?1, ?2, ?3, ?4, ?5, 1, 1, 1)",
+                        params![
+                            blob,
+                            index as i64,
+                            declaration.occurrence.get(),
+                            range.start_byte as i64,
+                            range.end_byte as i64
+                        ],
+                    )
+                    .unwrap();
+                    tx.execute(
+                        "INSERT INTO source_rust_declaration_properties(blob_id, declaration_id,
+                        visibility, cfg_condition, declaration_kind, macro_exported)
+                        VALUES(?1, ?2, 'private', 'always', 12, 0)",
+                        params![blob, index as i64],
+                    )
+                    .unwrap();
+                }
+                source_facts::rust_items::insert_rust_item_source_facts_tx(
+                    &tx,
+                    blob,
+                    &source,
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+                insert_rust_fact_rows(
+                    &tx,
+                    blob,
+                    "rust",
+                    &projected,
+                )
+                .unwrap();
+                tx.execute("INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 1)", [legacy_oid.to_string()]).unwrap();
+                insert_rust_fact_rows(&tx, tx.last_insert_rowid(), "rust", &projected_legacy).unwrap();
+                let foreign_keys = tx.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert!(foreign_keys.is_empty(), "{foreign_keys:?}");
+                tx.commit().unwrap();
+            });
+        }
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        // Canonical publication admission is owned by the language crate.
+        // Read its source-import view directly at this row-schema boundary.
+        type ImportProjection = (String, Option<String>, Option<String>, i64, i64);
+        let imports: Vec<ImportProjection> = store.conn.execute(|conn| {
+            conn.prepare("SELECT module_path, bound_name, imported_name, owner_start, owner_end
+                FROM source_rust_import_targets WHERE source_import_id IS NOT NULL ORDER BY ordinal")
+                .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        });
+        assert_eq!(
+            imports,
+            facts
+                .import_targets
+                .iter()
+                .map(|target| (
+                    target.module_path.join("::"),
+                    target.bound_name.clone(),
+                    target.imported_name.clone(),
+                    target.owner_start as i64,
+                    target.owner_end as i64,
+                ))
+                .collect::<Vec<_>>()
+        );
+        let macros: Vec<(bool, bool, bool, bool)> = store.conn.execute(|conn| {
+            conn.prepare(
+                "SELECT passthrough, arguments_only, declares_no_item, writes_only_impls
+                FROM rust_item_macros ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        });
+        assert_eq!(
+            macros,
+            facts
+                .module_routes
+                .item_macros
+                .iter()
+                .map(|definition| (
+                    definition.passthrough,
+                    definition.arguments_only,
+                    definition.declares_no_item,
+                    definition.writes_only_impls,
+                ))
+                .collect::<Vec<_>>()
+        );
+        let exports: Vec<(Option<String>, String, Option<String>, bool)> =
+            store.conn.execute(|conn| {
+                conn.prepare(
+                    "SELECT exported_name, source_path, imported_name, is_glob
+                FROM source_rust_exports WHERE source_import_id IS NOT NULL ORDER BY ordinal",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+            });
+        assert_eq!(
+            exports,
+            facts
+                .exports
+                .iter()
+                .map(|export| (
+                    export.exported_name.clone(),
+                    export.source_path.clone(),
+                    export.imported_name.clone(),
+                    export.is_glob,
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(store.rust_usage_facts(legacy_oid, "rust").unwrap(), legacy);
+        let flags: Vec<Option<bool>> = store.conn.execute(|conn| {
+            conn.prepare("SELECT is_glob FROM rust_exports ORDER BY blob_id, ordinal")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        });
+        assert_eq!(flags, vec![None, Some(true)]);
+    }
+
+    #[test]
+    #[ignore = "finds real bug: source-less Rust import paths have no segment rows"]
+    fn rust_fact_rows_round_trip_source_less_module_path() {
+        use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustVisibility};
+
+        let facts = RustUsageFacts {
+            import_targets: vec![RustImportTargetFact {
+                native_scope: None,
+                source_import_id: None,
+                module_path: vec!["outer".into(), "m".into()],
+                bound_name: Some("Item".into()),
+                imported_name: Some("Item".into()),
+                is_glob: false,
+                leading_absolute: false,
+                is_extern_crate: false,
+                is_macro_use: false,
+                visibility: RustVisibility::Private,
+                cfg_condition: RustCfgCondition::Always,
+                owner_module: "".into(),
+                owner_start: 0,
+                owner_end: 200,
+                local_extent: None,
+                source_occurrences: None,
+            }],
+            ..Default::default()
+        };
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = Oid::hash_object(git2::ObjectType::Blob, b"source-less import path").unwrap();
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 1)",
+                [oid.to_string()],
+            )
+            .unwrap();
+            insert_rust_fact_rows(
+                &tx,
+                tx.last_insert_rowid(),
+                "rust",
+                &RustFactRows::from_facts(&facts, None).unwrap(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(store.rust_usage_facts(oid, "rust").unwrap(), facts);
+    }
 
     // The EXPLAIN QUERY PLAN pins below take their SQL and bindings from the
     // pinned-query registry in `planner_statistics`, so each pinned statement
@@ -19319,6 +20323,881 @@ pub mod tests {
         assert_eq!(error.kind(), StoreErrorKind::ResourceBound);
         assert!(error.is_resource_bound());
         assert_eq!(error.to_string(), "repairing blob: over budget");
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn store_error_classification_survives_real_sqlite_errors_and_context() {
+        // Cancellation aborts a statement from a progress handler, as
+        // `with_resolution_progress_handler` does; callers then match
+        // `is_sqlite_interrupted` on the error after adding context.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE unique_key(value INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.progress_handler(1, Some(|| true)).unwrap();
+        let interrupted = StoreError::from(
+            conn.query_row(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n)
+                 SELECT max(i) FROM n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err(),
+        )
+        .context("reading candidates");
+        assert!(interrupted.is_sqlite_interrupted(), "{interrupted}");
+        assert!(!interrupted.is_missing_required_source_facts());
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+
+        conn.execute("INSERT INTO unique_key VALUES (1)", [])
+            .unwrap();
+        let constraint = StoreError::from(
+            conn.execute("INSERT INTO unique_key VALUES (1)", [])
+                .unwrap_err(),
+        )
+        .context("publishing rows");
+        assert_eq!(constraint.kind(), StoreErrorKind::Generic);
+        // 1555 is SQLITE_CONSTRAINT_PRIMARYKEY; diagnostics keep the extended code.
+        assert!(
+            constraint.to_string().contains("extended code: 1555"),
+            "{constraint}"
+        );
+
+        let cancelled = StoreError::cancelled("stopped").context("reading Python inputs");
+        assert!(cancelled.is_cancelled(), "{cancelled}");
+        assert!(!StoreError::new("stopped").is_cancelled());
+        assert!(!interrupted.is_cancelled());
+
+        let missing = StoreError::missing_required_source_facts("no source manifest")
+            .context("hydrating Model.java");
+        assert!(missing.is_missing_required_source_facts());
+        assert!(!missing.is_sqlite_interrupted());
+        assert_eq!(
+            missing.to_string(),
+            "hydrating Model.java: no source manifest"
+        );
+        assert!(
+            !StoreError::new("no source manifest")
+                .context("hydrating Model.java")
+                .is_missing_required_source_facts()
+        );
+    }
+
+    #[cfg(test)]
+    fn empty_publication(oid: Oid, lang: &str) -> PreparedParsedBlob {
+        // A valid empty Java parse with an empty complete resolution interior.
+        // No parser or engine bridge is needed to exercise the SQL envelope.
+        let state = Arc::new(FileState {
+            source: Default::default(),
+            package_name: Default::default(),
+            content_qualifier: Default::default(),
+            top_level_declarations: Default::default(),
+            declarations: Default::default(),
+            definition_lookup_units: Default::default(),
+            imports: Default::default(),
+            scala_exports: Default::default(),
+            rust_usage_facts: Default::default(),
+            resolution_facts: Default::default(),
+            source_facts: Default::default(),
+            source_declaration_units: Default::default(),
+            source_declaration_metadata: Default::default(),
+            raw_supertypes: Default::default(),
+            supertype_lookup_paths: Default::default(),
+            type_identifiers: Default::default(),
+            signatures: Default::default(),
+            signature_metadata: Default::default(),
+            signature_metadata_signature_ordinals: Default::default(),
+            cpp_template_metadata: Default::default(),
+            ruby_method_dispatch_modes: Default::default(),
+            ranges: Default::default(),
+            children: Default::default(),
+            scala_traits: Default::default(),
+            type_aliases: Default::default(),
+            contains_tests: Default::default(),
+            test_region_units: Default::default(),
+            materialization_records: Default::default(),
+            parse_errors: Default::default(),
+            parse_complete: true,
+            completeness: Default::default(),
+            additional_projections: Default::default(),
+        });
+        let resolution = PreparedResolutionBundle::new(
+            Language::Java,
+            Default::default(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+            Vec::new(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let logical_rows = resolution.logical_rows + 3;
+        let payload_bytes = resolution.payload_bytes + lang.len();
+        PreparedParsedBlob {
+            oid,
+            oid_text: oid.to_string(),
+            lang: lang.into(),
+            generation: GenerationId::BOOTSTRAP,
+            state,
+            units: Default::default(),
+            source_declaration_units: Default::default(),
+            source_declaration_metadata: Default::default(),
+            declaration_visibility_version: Default::default(),
+            java_type_constructor_version: Default::default(),
+            go_source_version: Default::default(),
+            java_source_version: Default::default(),
+            scala_source_version: Default::default(),
+            ruby_source_version: Default::default(),
+            php_source_version: Default::default(),
+            cpp_source_version: Default::default(),
+            source_facts_version: Default::default(),
+            source_storage: Default::default(),
+            metadata_bridges_required: Default::default(),
+            js_ts_source_version: Default::default(),
+            python_source_version: Default::default(),
+            ranges: Default::default(),
+            signatures: Default::default(),
+            signature_metadata: Default::default(),
+            signature_metadata_signature_ordinals: Default::default(),
+            cpp_templates: Default::default(),
+            supertypes: Default::default(),
+            children: Default::default(),
+            imports: Default::default(),
+            scala_exports: Default::default(),
+            rust_facts: Default::default(),
+            type_identifiers: Default::default(),
+            ruby_dispatch_modes: Default::default(),
+            scala_traits: Default::default(),
+            materialization_records: Default::default(),
+            contains_tests: Default::default(),
+            content_package: Default::default(),
+            resolution,
+            semantic_ir: Default::default(),
+            logical_rows,
+            payload_bytes,
+            mutation_logical_rows: logical_rows,
+            mutation_payload_bytes: payload_bytes,
+            additional: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn overlapping_publication_envelopes_coalesce_and_conflicts_are_atomic() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = oid_for(b"projection envelope");
+        let envelope = || {
+            let mut root = empty_publication(oid, "java");
+            root.additional
+                .push(empty_publication(oid, "java:projection"));
+            root
+        };
+        let prepared = vec![empty_publication(oid, "java"), envelope(), envelope()];
+        store.ensure_prepared_resolution_epochs(&prepared).unwrap();
+        let (outcomes, _) = store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+        assert_eq!(outcomes.len(), 3);
+        for outcome in outcomes {
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        }
+        assert!(store.contains_parsed_blob(oid, "java").unwrap());
+        assert!(store.contains_parsed_blob(oid, "java:projection").unwrap());
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM blobs WHERE blob_oid=?1",
+                [oid.to_string()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        drop(conn);
+
+        let conflicting_oid = oid_for(b"conflicting test flags");
+        // Both flags are explicit persisted inputs; prove each works alone.
+        for flag in [0, 1] {
+            let mut control = empty_publication(conflicting_oid, "java");
+            control.contains_tests = flag;
+            let (outcomes, _) =
+                store.persist_prepared_blobs(vec![control], PersistBatchTargets::PRODUCTION);
+            assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+            assert_eq!(store.conn.lock().unwrap().query_row("SELECT contains_tests FROM blob_meta JOIN blobs ON blobs.id=blob_meta.blob_id WHERE blob_oid=?1", [conflicting_oid.to_string()], |row| row.get::<_, i64>(0)).unwrap(), flag);
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM blobs WHERE blob_oid=?1",
+                [conflicting_oid.to_string()],
+            )
+            .unwrap();
+        let left = empty_publication(conflicting_oid, "java");
+        let mut right = empty_publication(conflicting_oid, "java");
+        right.contains_tests = 1;
+        let (outcomes, _) =
+            store.persist_prepared_blobs(vec![left, right], PersistBatchTargets::PRODUCTION);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_some()));
+        assert!(!store.contains_blob(conflicting_oid, "java").unwrap());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn requested_projection_repairs_do_not_leak_between_queries() {
+        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let oid = oid_for(b"stale projection");
+        let mut root = empty_publication(oid, "java");
+        root.additional
+            .push(empty_publication(oid, "java:projection"));
+        store
+            .ensure_prepared_resolution_epochs(std::slice::from_ref(&root))
+            .unwrap();
+        let (outcomes, _) =
+            store.persist_prepared_blobs(vec![root], PersistBatchTargets::PRODUCTION);
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+        let conn = store.conn.lock().unwrap();
+        let request = CompleteAnalysisBlobRequest::new(oid, "java", ["java:projection".into()]);
+        assert!(
+            missing_published_complete_analysis_blob_keys_conn(
+                &conn,
+                std::slice::from_ref(&request),
+                Language::Java
+            )
+            .unwrap()
+            .is_empty()
+        );
+        conn.execute("DELETE FROM resolution_fragment_interiors WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='java:projection')", [oid.to_string()]).unwrap();
+        assert_eq!(
+            missing_published_complete_analysis_blob_keys_conn(
+                &conn,
+                std::slice::from_ref(&request),
+                Language::Java
+            )
+            .unwrap(),
+            vec![MissingCompleteAnalysisBlob {
+                oid,
+                storage_language: "java".into(),
+                required_existing_additional_storage_languages: vec!["java:projection".into()]
+            }]
+        );
+        assert!(
+            missing_published_complete_analysis_blob_keys_conn(
+                &conn,
+                &[CompleteAnalysisBlobRequest::new(oid, "java", [])],
+                Language::Java
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            missing_published_complete_analysis_blob_keys_conn(
+                &conn,
+                &[
+                    request,
+                    CompleteAnalysisBlobRequest::new(oid, "java:projection", [])
+                ],
+                Language::Java
+            )
+            .unwrap(),
+            vec![MissingCompleteAnalysisBlob::primary_only(
+                oid,
+                "java:projection".into()
+            )]
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn incomplete_publications_hide_import_and_signature_metadata() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oids = [
+            oid_for(b"complete metadata"),
+            oid_for(b"incomplete metadata"),
+        ];
+        let metadata = SignatureMetadata::new("f()", vec![]);
+        let prepared = oids.map(|oid| {
+            let mut blob = empty_publication(oid, "java");
+            blob.content_package = "pkg".into();
+            blob.contains_tests = 1;
+            blob.units.push(PreparedUnitRow {
+                key: Default::default(),
+                kind: code_unit_kind_to_i64(CodeUnitType::Function),
+                short_name: "f".into(),
+                identifier: "f".into(),
+                content_qualifier: Default::default(),
+                exact_fqn: Some("f".into()),
+                normalized_fqn: Default::default(),
+                simple_type_name: Default::default(),
+                signature: Default::default(),
+                synthetic: Default::default(),
+                is_type_alias: Default::default(),
+                top_level_ordinal: Default::default(),
+                in_declarations: 1,
+                in_definition_lookup: 1,
+                in_test_region: Default::default(),
+                fq_segment_count: Default::default(),
+                fq_segment_bytes: Default::default(),
+                fq_anchor_kind: Default::default(),
+                fq_anchor_pop: Default::default(),
+                fq_package_tail_segments: Default::default(),
+                exact_fqn_tail: Default::default(),
+                normalized_fqn_tail: Default::default(),
+                exact_parent_fqn_tail: Default::default(),
+                normalized_parent_fqn_tail: Default::default(),
+                package_fqn_tail: Default::default(),
+                relational_fq_segments: Default::default(),
+            });
+            blob.signature_metadata.push((
+                0,
+                0,
+                SignatureMetadataColumns::encode(&metadata).unwrap(),
+            ));
+            blob.imports = ImportRows::from_imports(
+                &[ImportInfo {
+                    raw_snippet: "import pkg.Dependency;".into(),
+                    is_wildcard: false,
+                    is_global: false,
+                    identifier: Some("Dependency".into()),
+                    alias: None,
+                    path: None,
+                    binder_span: None,
+                }],
+                None,
+            )
+            .unwrap();
+            blob
+        });
+        store.ensure_prepared_resolution_epochs(&prepared).unwrap();
+        let (outcomes, _) =
+            store.persist_prepared_blobs(prepared.into(), PersistBatchTargets::PRODUCTION);
+        for outcome in outcomes {
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        }
+        let unit = CodeUnit::new(test_blob_file(), CodeUnitType::Function, "", "f");
+        // Positive controls prove that both populated publications are visible.
+        for oid in oids {
+            assert_eq!(
+                store
+                    .signature_metadata_for_unit(oid, "java", GenerationId::BOOTSTRAP, &unit)
+                    .unwrap(),
+                vec![metadata.clone()]
+            );
+        }
+        assert_eq!(
+            store.blobs_with_structured_imports("java", &oids).unwrap(),
+            HashSet::from_iter(oids)
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            let texts = oids.map(|oid| oid.to_string());
+            let expected = texts
+                .iter()
+                .cloned()
+                .map(|oid| (oid, ("pkg".into(), true)))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                read_import_metadata_bulk(&conn, "java", &texts).unwrap(),
+                expected
+            );
+            // Leave declaration visibility available: parse completeness is an
+            // independent witness that each of the three readers must check.
+            conn.execute("UPDATE blob_meta SET is_complete=0 WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1)",[oids[1].to_string()]).unwrap();
+            assert_eq!(
+                read_import_metadata_bulk(&conn, "java", &texts).unwrap(),
+                HashMap::from_iter([(texts[0].clone(), ("pkg".into(), true))])
+            );
+        }
+        assert_eq!(
+            store.blobs_with_structured_imports("java", &oids).unwrap(),
+            HashSet::from_iter([oids[0]])
+        );
+        assert_eq!(
+            store
+                .signature_metadata_for_unit(oids[0], "java", GenerationId::BOOTSTRAP, &unit)
+                .unwrap(),
+            vec![metadata]
+        );
+        assert!(
+            store
+                .signature_metadata_for_unit(oids[1], "java", GenerationId::BOOTSTRAP, &unit)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(test)]
+    fn semantic_error_publication(oid: Oid, detail: &str) -> PreparedParsedBlob {
+        use crate::analyzer::semantic::ContentIdentity;
+        use semantic_ir::SemanticIrLoweringOutcome;
+        let mut blob = empty_publication(oid, "java");
+        let ir = PreparedSemanticIr::prepare(
+            SemanticIrLoweringOutcome::Error(detail.into()),
+            None,
+            "test-error-v1",
+            ContentIdentity::hash_bytes(b"error detail"),
+            12,
+        );
+        blob.payload_bytes += ir.payload_bytes();
+        blob.logical_rows += ir.logical_rows();
+        blob.semantic_ir = Some(ir);
+        blob
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn unequal_semantic_error_payloads_conflict_without_publication() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = oid_for(b"error detail");
+        let prepare = |detail: &str| semantic_error_publication(oid, detail);
+        store
+            .ensure_semantic_ir_producer_epoch("java", "test-error-v1")
+            .unwrap();
+        let control = prepare("short");
+        store
+            .ensure_prepared_resolution_epochs(std::slice::from_ref(&control))
+            .unwrap();
+        let (outcomes, _) =
+            store.persist_prepared_blobs(vec![control], PersistBatchTargets::PRODUCTION);
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row("SELECT detail FROM semantic_ir_publications", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "short"
+            );
+            conn.execute("DELETE FROM blobs WHERE blob_oid=?1", [oid.to_string()])
+                .unwrap();
+        }
+        let left = prepare("short");
+        let right = prepare("a longer error detail");
+        assert_eq!(left.logical_rows, right.logical_rows);
+        assert_ne!(
+            left.persisted_payload_bytes(),
+            right.persisted_payload_bytes()
+        );
+        let (outcomes, _) =
+            store.persist_prepared_blobs(vec![left, right], PersistBatchTargets::PRODUCTION);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_some()));
+        assert!(!store.contains_blob(oid, "java").unwrap());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn active_set_sql_format_transitions_and_corruption() {
+        use SemanticPackActivationSourceKind::{Installed, WorkspaceProduced};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("active.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let members = vec![
+            SemanticPackActiveReference {
+                manifest_digest: "1".repeat(64),
+                source_kind: Installed,
+                source_id: "registry".into(),
+                workspace_produced: false,
+            },
+            SemanticPackActiveReference {
+                manifest_digest: "2".repeat(64),
+                source_kind: WorkspaceProduced,
+                source_id: "workspace".into(),
+                workspace_produced: true,
+            },
+        ];
+        // Independently encoded SHA-256 v1 fixture, including big-endian lengths
+        // and the final one-byte workspace-produced field of each member.
+        let v1_digest = "f7f3316749c38eeddbed6a3c39402ff3996ce37519ff25400a37a9127527845c";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("INSERT INTO semantic_pack_active_state(singleton,active_set_digest,updated_at) VALUES(1,?1,0)", [v1_digest]).unwrap();
+            for (ordinal, digest, kind, source, produced) in [
+                (1, "1".repeat(64), "installed", "registry", false),
+                (0, "2".repeat(64), "workspace_produced", "workspace", true),
+            ] {
+                conn.execute("INSERT INTO semantic_pack_active_members(ordinal,manifest_digest,source_kind,source_id,workspace_produced) VALUES(?1,?2,?3,?4,?5)", params![ordinal,digest,kind,source,produced]).unwrap();
+            }
+        }
+        let mut actual = store.semantic_pack_active_set().unwrap().unwrap();
+        actual.members.sort();
+        assert_eq!(
+            actual,
+            SemanticPackActiveSet {
+                active_set_digest: v1_digest.into(),
+                members: members.clone()
+            }
+        );
+        let mut shared_source = members.clone();
+        shared_source[1].source_id = "registry".into();
+        let replacement = store
+            .replace_semantic_pack_active_set(&shared_source)
+            .unwrap();
+        assert_ne!(replacement.active_set_digest, v1_digest);
+        assert_eq!(replacement.members, shared_source);
+        let mut duplicate = members.clone();
+        duplicate[1].manifest_digest = duplicate[0].manifest_digest.clone();
+        assert!(store.replace_semantic_pack_active_set(&duplicate).is_err());
+        assert_eq!(
+            store.semantic_pack_active_set().unwrap(),
+            Some(replacement.clone())
+        );
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        assert_eq!(
+            store.semantic_pack_active_set().unwrap(),
+            Some(replacement.clone())
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE semantic_pack_active_state SET active_set_digest = ?1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .semantic_pack_active_set()
+                .unwrap_err()
+                .to_string()
+                .contains("digest mismatch")
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE semantic_pack_active_state SET active_set_digest = ?1",
+                [&replacement.active_set_digest],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.semantic_pack_active_set().unwrap(), Some(replacement));
+        let empty = store.replace_semantic_pack_active_set(&[]).unwrap();
+        assert!(empty.members.is_empty());
+        drop(store);
+        assert_eq!(
+            AnalyzerStore::open_persistent(&path)
+                .unwrap()
+                .semantic_pack_active_set()
+                .unwrap(),
+            Some(empty)
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn workspace_projection_permutations_and_semantic_edits_preserve_history() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let workspace = WorkspaceId("e".repeat(64));
+        let file = WorkspaceFileRow {
+            rel_path: "src/a.py".into(),
+            blob_oid: oid_for(b"a"),
+        };
+        let mut symbols = ["pkg.A", "pkg.B"].map(|name| PathSymbolRow {
+            rel_path: file.rel_path.clone(),
+            blob_oid: file.blob_oid,
+            kind: CodeUnitType::Class,
+            package_name: "pkg".into(),
+            short_name: name.into(),
+            exact_fqn: name.into(),
+            normalized_fqn: name.to_lowercase(),
+            requires_imports: false,
+        });
+        let mut anchors = [0, 1].map(|pop| WorkspaceAnchorRow {
+            rel_path: file.rel_path.clone(),
+            anchor: PackageAnchor::OwnModule { pop },
+            package_name: "pkg".into(),
+        });
+        let publish = |symbols: &[PathSymbolRow], anchors: &[WorkspaceAnchorRow]| {
+            store
+                .sync_workspace_snapshot_for_workspace(
+                    &workspace,
+                    "python",
+                    GenerationId::BOOTSTRAP,
+                    std::slice::from_ref(&file),
+                    symbols,
+                    &[],
+                    &[],
+                    &[],
+                    anchors,
+                )
+                .unwrap()
+        };
+        let first = publish(&symbols, &anchors);
+        anchors.reverse();
+        symbols.reverse();
+        assert_eq!(
+            publish(&symbols, &anchors),
+            first,
+            "permutations retain the revision"
+        );
+        symbols[0].normalized_fqn = "changed.normalized".into();
+        let renamed = publish(&symbols, &anchors);
+        assert_eq!(renamed.revision, first.revision + 1);
+        anchors[0].anchor = PackageAnchor::OwnModule { pop: 2 };
+        let moved = publish(&symbols, &anchors);
+        assert_eq!(moved.revision, renamed.revision + 1);
+        let conn = store.conn.lock().unwrap();
+        for (snapshot, expected_names, expected_pops) in [
+            (&first, vec!["pkg.a", "pkg.b"], vec![0, 1]),
+            (&renamed, vec!["changed.normalized", "pkg.a"], vec![0, 1]),
+            (&moved, vec!["changed.normalized", "pkg.a"], vec![0, 2]),
+        ] {
+            store
+                .select_writer_workspace_snapshots(
+                    &conn,
+                    &HashMap::from_iter([("python".into(), snapshot.clone())]),
+                )
+                .unwrap();
+            let names = conn.prepare("SELECT normalized_fqn FROM workspace_file_path_symbol_rows AS names JOIN workspace_files AS files ON files.file_id=names.file_version_id ORDER BY normalized_fqn").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(names, expected_names);
+            let pops = conn
+                .prepare("SELECT anchor_pop FROM workspace_file_anchors ORDER BY anchor_pop")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(pops, expected_pops);
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM workspace_file_versions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            3
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn selected_file_projection_digest_matches_published_workspace_digest() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let workspace_id = WorkspaceId("c".repeat(64));
+        let a = WorkspaceFileRow {
+            rel_path: "src/a.py".into(),
+            blob_oid: oid_for(b"a"),
+        };
+        let b = WorkspaceFileRow {
+            rel_path: "src/b.py".into(),
+            blob_oid: oid_for(b"b"),
+        };
+        let symbol = |file: &WorkspaceFileRow, exact_fqn: &str, kind| PathSymbolRow {
+            rel_path: file.rel_path.clone(),
+            blob_oid: file.blob_oid,
+            kind,
+            package_name: "src".into(),
+            short_name: exact_fqn.rsplit('.').next().unwrap().into(),
+            exact_fqn: exact_fqn.into(),
+            normalized_fqn: exact_fqn.to_lowercase(),
+            requires_imports: false,
+        };
+        let member = |file: &WorkspaceFileRow, package: &str| WorkspacePackageFileRow {
+            package_name: package.into(),
+            rel_path: file.rel_path.clone(),
+        };
+        let edge = |file: &WorkspaceFileRow, parent: &str, child: &str| WorkspacePackageEdgeRow {
+            rel_path: file.rel_path.clone(),
+            parent_package_name: parent.into(),
+            child_package_name: child.into(),
+        };
+        let anchor = |file: &WorkspaceFileRow| WorkspaceAnchorRow {
+            rel_path: file.rel_path.clone(),
+            anchor: PackageAnchor::OwnModule { pop: 1 },
+            package_name: "src".into(),
+        };
+        // The selected operation below receives A's rows out of canonical
+        // order, including two symbols that tie on exact_fqn and differ only
+        // by kind. Publication receives them in the reverse order.
+        let a_symbols = vec![
+            symbol(&a, "src.a.Z", CodeUnitType::Class),
+            symbol(&a, "src.a", CodeUnitType::Module),
+            symbol(&a, "src.a", CodeUnitType::Class),
+        ];
+        let a_members = vec![member(&a, "src.sub"), member(&a, "src")];
+        let a_edges = vec![edge(&a, "src", "src.sub"), edge(&a, "", "src")];
+        let b_symbols = vec![symbol(&b, "src.b", CodeUnitType::Module)];
+        let b_members = vec![member(&b, "src")];
+        let b_edges = vec![edge(&b, "", "src")];
+        fn all<T: Clone>(a_rows: &[T], b_rows: &[T]) -> Vec<T> {
+            [b_rows, a_rows].concat()
+        }
+        fn reversed<T: Clone>(rows: &[T]) -> Vec<T> {
+            rows.iter().rev().cloned().collect()
+        }
+        store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "python",
+                GenerationId::BOOTSTRAP,
+                &[a.clone(), b.clone()],
+                &all(&reversed(&a_symbols), &b_symbols),
+                &[],
+                &all(&reversed(&a_members), &b_members),
+                &all(&reversed(&a_edges), &b_edges),
+                &[anchor(&b), anchor(&a)],
+            )
+            .unwrap();
+        let stored = |rel_path: &str| -> String {
+            let conn = store.conn.lock().expect("store mutex");
+            conn.query_row(
+                "SELECT projection_digest FROM workspace_file_versions
+                 WHERE rel_path = ?1 AND valid_until IS NULL",
+                [rel_path],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let hex = |digest: [u8; 32]| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+
+        // A selected operation passes only the replaced file's rows.
+        let selected = selected_workspace_file_projection_digest(
+            &a,
+            &a_symbols,
+            &a_members,
+            &a_edges,
+            &[anchor(&a)],
+        );
+        assert_eq!(hex(selected), stored(&a.rel_path));
+        // Rows of other files do not belong to A's projection.
+        let with_foreign_rows = selected_workspace_file_projection_digest(
+            &a,
+            &all(&a_symbols, &b_symbols),
+            &all(&a_members, &b_members),
+            &all(&a_edges, &b_edges),
+            &[anchor(&b), anchor(&a)],
+        );
+        assert_eq!(with_foreign_rows, selected);
+        assert_ne!(stored(&a.rel_path), stored(&b.rel_path));
+
+        let mut renamed = a_symbols.clone();
+        renamed[0].short_name = "Y".into();
+        assert_ne!(
+            selected_workspace_file_projection_digest(
+                &a,
+                &renamed,
+                &a_members,
+                &a_edges,
+                &[anchor(&a)],
+            ),
+            selected,
+            "a changed path-symbol row must change the projection identity"
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn configuration_replacement_publishes_the_same_partition_as_a_full_sync() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let workspace_id = WorkspaceId("d".repeat(64));
+        let langs = vec!["java".to_string(), "kotlin".to_string()];
+        let generations = store
+            .ensure_language_epoch_values(&[
+                ("java".into(), "configuration".into()),
+                ("kotlin".into(), "configuration".into()),
+            ])
+            .unwrap();
+        let input = |path: &str, bytes: &str| {
+            WorkspaceConfigurationInput::new(path.into(), bytes.as_bytes().into())
+        };
+        let source = WorkspaceFileRow {
+            rel_path: "src/Main.java".into(),
+            blob_oid: oid_for(b"class Main {}"),
+        };
+        let full_sync = |configuration: &[WorkspaceConfigurationInput]| -> WorkspaceSnapshots {
+            langs
+                .iter()
+                .map(|lang| {
+                    let snapshot = store
+                        .sync_workspace_inputs_for_workspace(
+                            &workspace_id,
+                            lang,
+                            generations[lang],
+                            std::slice::from_ref(&source),
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            configuration,
+                            &[],
+                            &[],
+                        )
+                        .unwrap();
+                    (lang.clone(), snapshot)
+                })
+                .collect()
+        };
+        let base = full_sync(&[
+            input("gradle.properties", "version=1\n"),
+            input("settings.gradle", "include 'app'\n"),
+        ]);
+
+        // One changed input, then one input the base did not have.
+        let (changed, _) = store
+            .replace_configuration_input(
+                &workspace_id,
+                &base,
+                &langs,
+                &generations,
+                input("gradle.properties", "version=2\n"),
+            )
+            .unwrap();
+        let (added, digest) = store
+            .replace_configuration_input(
+                &workspace_id,
+                &changed,
+                &langs,
+                &generations,
+                input("build.gradle", "plugins {}\n"),
+            )
+            .unwrap();
+
+        // The full build digests the complete partition ordered by path.
+        let full = [
+            input("build.gradle", "plugins {}\n"),
+            input("gradle.properties", "version=2\n"),
+            input("settings.gradle", "include 'app'\n"),
+        ];
+        assert_eq!(
+            digest,
+            configuration_digest(
+                full.iter()
+                    .map(|input| (input.relative_path(), input.content_oid()))
+            )
+        );
+        for lang in &langs {
+            assert_eq!(added[lang].revision, base[lang].revision + 2, "{lang}");
+        }
+        assert_eq!(
+            store
+                .workspace_snapshots_for_current_languages(&workspace_id, &langs)
+                .unwrap(),
+            added
+        );
+        // A from-scratch sync of the same inputs finds nothing to publish.
+        assert_eq!(full_sync(&full), added);
+
+        let stale = store
+            .replace_configuration_input(
+                &workspace_id,
+                &base,
+                &langs,
+                &generations,
+                input("gradle.properties", "version=3\n"),
+            )
+            .unwrap_err();
+        assert!(
+            stale.to_string().contains("workspace revision conflict"),
+            "{stale}"
+        );
     }
 
     #[cfg(test)]
@@ -20087,6 +21966,63 @@ pub mod tests {
 
     #[cfg(test)]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4fb16a86137c: mutation review found a flag-only update kept stale import gating"
+    )]
+    fn workspace_projection_updates_requires_imports_with_unchanged_oid() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let mut symbol = PathSymbolRow {
+            rel_path: "pkg/model.py".into(),
+            blob_oid: oid_for(b"class Model:\n    pass\n"),
+            kind: CodeUnitType::Module,
+            package_name: "pkg".into(),
+            short_name: "model".into(),
+            exact_fqn: "pkg.model".into(),
+            normalized_fqn: "pkg.model".into(),
+            requires_imports: false,
+        };
+        let file = WorkspaceFileRow {
+            rel_path: symbol.rel_path.clone(),
+            blob_oid: symbol.blob_oid,
+        };
+        for requires_imports in [false, true] {
+            symbol.requires_imports = requires_imports;
+            store
+                .sync_workspace_snapshot(
+                    "python",
+                    GenerationId::BOOTSTRAP,
+                    std::slice::from_ref(&file),
+                    std::slice::from_ref(&symbol),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            let snapshots = store
+                .workspace_snapshots_for_langs(
+                    &WorkspaceId("a".repeat(64)),
+                    &["python".into()],
+                    &HashMap::from_iter([("python".into(), GenerationId::BOOTSTRAP)]),
+                )
+                .unwrap();
+            let conn = store.read_conn_for_workspace(&snapshots).unwrap();
+            let stored_flag = conn
+                .query_row(
+                    "SELECT symbols.requires_imports
+                     FROM workspace_file_path_symbol_rows AS symbols
+                     JOIN workspace_files AS files ON files.file_id = symbols.file_version_id
+                     WHERE files.rel_path = ?1",
+                    [&file.rel_path],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap();
+            assert_eq!(stored_flag, requires_imports);
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
     fn unchanged_path_symbol_snapshot_skips_table_reconciliation() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let row = PathSymbolRow {
@@ -20403,6 +22339,7 @@ pub mod tests {
                     &[],
                     &[],
                     &[],
+                    None,
                 )
                 .unwrap();
         }
@@ -21716,24 +23653,233 @@ pub mod tests {
         ]
     }
 
+    // Deliberately use a neutral language: these tests exercise relational
+    // storage without a parser or a native resolution producer.
+    #[cfg(test)]
+    pub(super) fn roundtrip_blob_meta(conn: &Connection, blob_id: i64, package: &str) {
+        conn.execute("INSERT INTO blob_meta(blob_id, lang, contains_tests, content_package,
+            stored_unit_count, range_count, signature_count, signature_metadata_count,
+            supertype_count, child_count, import_statement_count, type_identifier_count, is_complete)
+            VALUES(?1, 'fixture', 0, ?2, 0, 0, 0, 0, 0, 0, 0, 0, 1)", params![blob_id, package]).unwrap();
+    }
+
+    #[cfg(test)]
+    fn roundtrip_unit(conn: &Connection, blob_id: i64, key: i64) {
+        conn.execute(
+            "INSERT INTO code_units(blob_id, lang, unit_key, kind, short_name, identifier,
+            content_qualifier, synthetic, is_type_alias, in_declarations, in_definition_lookup)
+            VALUES(?1, 'fixture', ?2, 0, 'item', 'item', 'structured', 0, 0, 1, 0)",
+            params![blob_id, key],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn package_facts_roundtrip_structured_identity_fallback_and_partial_coverage() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oids = [
+            oid_for(b"structured"),
+            oid_for(b"fallback"),
+            oid_for(b"uncovered"),
+        ];
+        {
+            let conn = store.conn.lock().unwrap();
+            for (index, oid) in oids.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'fixture')",
+                    [oid.to_string()],
+                )
+                .unwrap();
+                let blob_id = conn.last_insert_rowid();
+                if index < 2 {
+                    roundtrip_blob_meta(&conn, blob_id, "file-package");
+                }
+                if index == 0 {
+                    roundtrip_unit(&conn, blob_id, 0);
+                    conn.execute(
+                        "UPDATE code_units SET fq_anchor_kind='crate_root', fq_anchor_pop=0,
+                        fq_package_tail_segments=3, package_fqn_tail='z.a.m' WHERE blob_id=?1",
+                        [blob_id],
+                    )
+                    .unwrap();
+                    for (ordinal, segment) in ["z", "a", "m"].iter().enumerate() {
+                        conn.execute("INSERT INTO code_unit_fq_segments(blob_id, lang, unit_key, seg_ordinal, seg_kind, segment)
+                            VALUES(?1, 'fixture', 0, ?2, 'package', ?3)", params![blob_id, ordinal as i64, segment]).unwrap();
+                    }
+                }
+            }
+            conn.execute_batch("PRAGMA reverse_unordered_selects=ON")
+                .unwrap();
+        }
+        let read = |oids: &[Oid]| {
+            store
+                .workspace_content_package_facts(
+                    "fixture",
+                    GenerationId::BOOTSTRAP,
+                    oids,
+                    Some(PackageAnchor::OwnModule { pop: 0 }),
+                )
+                .unwrap()
+        };
+        let covered = read(&oids[..2]);
+        assert!(covered.complete);
+        assert_eq!(covered.facts.len(), 2);
+        let structured = covered
+            .facts
+            .iter()
+            .find(|fact| fact.blob_oid == oids[0])
+            .unwrap();
+        assert_eq!(structured.anchor, Some(PackageAnchor::CrateRoot));
+        assert_eq!(structured.content_qualifier, "structured");
+        let expected = ["z", "a", "m"]
+            .into_iter()
+            .map(|name| segment_interner().intern(name, SegmentKind::Package))
+            .collect::<Vec<_>>();
+        assert_eq!(structured.package_tail.segments(), expected.as_slice());
+        let fallback = covered
+            .facts
+            .iter()
+            .find(|fact| fact.blob_oid == oids[1])
+            .unwrap();
+        assert_eq!(fallback.anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
+        assert_eq!(fallback.content_qualifier, "file-package");
+        assert!(fallback.package_tail.is_empty());
+        assert!(!read(&oids).complete);
+        let empty = read(&[]);
+        assert!(empty.complete);
+        assert!(empty.facts.is_empty());
+    }
+
+    #[test]
+    fn optional_manifest_roundtrip_counts_and_rejects_one_unknown_family() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("optional.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let blob_id = store.conn.execute(|conn| {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'fixture')",
+                [TEST_OID],
+            )
+            .unwrap();
+            let blob_id = tx.last_insert_rowid();
+            roundtrip_blob_meta(&tx, blob_id, "");
+            for key in 0..3 {
+                roundtrip_unit(&tx, blob_id, key);
+            }
+            tx.execute("INSERT INTO unit_cpp_class_templates(blob_id, unit_key, primary_name, primary_fq_name,
+                parameter_count, specialization_argument_count, alias_component_count, alias_argument_count)
+                VALUES(?1, 0, 'Box', 'Box', 0, 0, 0, 0)", [blob_id]).unwrap();
+            for (key, mode) in [(1, 0), (2, 2)] {
+                tx.execute(
+                    "INSERT INTO ruby_method_dispatch_modes(blob_id, lang, unit_key, mode)
+                    VALUES(?1, 'fixture', ?2, ?3)",
+                    params![blob_id, key, mode],
+                )
+                .unwrap();
+            }
+            insert_optional_fact_manifest(&tx, blob_id, optional_fact_counts(1, 2, 0, 0, 0, 0))
+                .unwrap();
+            tx.commit().unwrap();
+            blob_id
+        });
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        store.conn.execute(move |conn| {
+        let read = || {
+            let sql = format!(
+                "SELECT 0, 0, 0, 0, 0, 0, 0, {} FROM blob_optional_fact_manifest AS manifest WHERE blob_id=?1",
+                OPTIONAL_FACT_COUNT_PROJECTION.as_str()
+            );
+            let raw = conn
+                .query_row(&sql, [blob_id], |row| {
+                    raw_side_table_counts_from_row(row, 0)
+                })
+                .unwrap();
+            side_table_counts_from_raw(raw)
+        };
+        let counts = read().unwrap();
+        for (table, kind, expected) in [
+            (
+                "unit_cpp_class_templates",
+                OptionalFactKind::CppClassTemplate,
+                1,
+            ),
+            (
+                "ruby_method_dispatch_modes",
+                OptionalFactKind::RubyMethodDispatchMode,
+                2,
+            ),
+        ] {
+            let actual: usize = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id=?1"),
+                    [blob_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(counts.optional.get(kind), expected);
+        }
+        conn.execute("INSERT INTO blob_optional_fact_manifest(blob_id, fact_kind, row_count) VALUES(?1, 999, 1)", [blob_id]).unwrap();
+        assert!(
+            read()
+                .unwrap_err()
+                .to_string()
+                .contains("unknown optional analyzer fact kinds")
+        );
+        });
+    }
+
+    #[test]
+    fn scalar_imports_roundtrip_independent_flags_aliases_and_binder_ranges() {
+        let mut imports = import_shape_fixture();
+        imports.push(ImportInfo {
+            raw_snippet: "global using Alias = Library;".into(),
+            is_wildcard: false,
+            is_global: true,
+            identifier: Some("Library".into()),
+            alias: Some("Alias".into()),
+            path: None,
+            binder_span: Some(crate::analyzer::structural::facts::Span {
+                start_byte: 13,
+                end_byte: 18,
+            }),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("imports.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        write_import_fixture(&store, "fixture", &imports);
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let conn = store.read_conn().unwrap();
+        assert_eq!(
+            read_import_infos(&conn, TEST_OID, "fixture").unwrap(),
+            imports
+        );
+    }
+
     #[cfg(test)]
     fn write_import_fixture(store: &AnalyzerStore, lang: &str, imports: &[ImportInfo]) {
-        let mut conn = store.conn.lock().expect("store mutex");
-        let tx = conn.transaction().unwrap();
-        tx.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
-            params![TEST_OID, lang],
-        )
-        .unwrap();
-        let blob_id = tx.last_insert_rowid();
-        insert_import_rows(
-            &tx,
-            blob_id,
-            lang,
-            &ImportRows::from_imports(imports, None).unwrap(),
-        )
-        .unwrap();
-        tx.commit().unwrap();
+        let lang = lang.to_owned();
+        let imports = imports.to_vec();
+        store.conn.execute(move |conn| {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
+                params![TEST_OID, lang],
+            )
+            .unwrap();
+            let blob_id = tx.last_insert_rowid();
+            insert_import_rows(
+                &tx,
+                blob_id,
+                &lang,
+                &ImportRows::from_imports(&imports, None).unwrap(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        });
     }
 
     #[cfg(test)]
@@ -21942,5 +24088,989 @@ mod standalone_language_table {
         static TABLE: super::StoreLanguageTable =
             [None; crate::analyzer::Language::ANALYZABLE.len()];
         &TABLE
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_unit_properties {
+    use super::*;
+    use brokk_bifrost_core::analyzer::model::JavaTypeConstructorShape;
+
+    struct Adapter;
+    impl StoreLanguageAdapter for Adapter {
+        fn language(&self) -> Language {
+            Language::Java
+        }
+    }
+
+    fn empty_state() -> FileState {
+        FileState {
+            source: String::new(),
+            package_name: String::new(),
+            content_qualifier: String::new(),
+            top_level_declarations: Vec::new(),
+            declarations: Default::default(),
+            definition_lookup_units: Default::default(),
+            imports: Default::default(),
+            scala_exports: Default::default(),
+            rust_usage_facts: Default::default(),
+            resolution_facts: Default::default(),
+            source_facts: None,
+            source_declaration_units: Vec::new(),
+            source_declaration_metadata: Vec::new(),
+            raw_supertypes: Default::default(),
+            supertype_lookup_paths: Default::default(),
+            type_identifiers: Default::default(),
+            signatures: Default::default(),
+            signature_metadata: Default::default(),
+            signature_metadata_signature_ordinals: Default::default(),
+            cpp_template_metadata: Default::default(),
+            ranges: Default::default(),
+            children: Default::default(),
+            type_aliases: Default::default(),
+            ruby_method_dispatch_modes: Default::default(),
+            scala_traits: Default::default(),
+            contains_tests: false,
+            test_region_units: Default::default(),
+            materialization_records: Default::default(),
+            completeness: Default::default(),
+            parse_errors: None,
+            parse_complete: true,
+            additional_projections: Vec::new(),
+        }
+    }
+
+    fn unit(file: &ProjectFile, name: &str) -> CodeUnit {
+        let mut fq = FqName::new();
+        fq.push(segment_interner().intern(name, SegmentKind::Type));
+        CodeUnit::from_fq(file.clone(), CodeUnitType::Class, fq, 0, None, false)
+    }
+
+    // Store-only tests cannot depend on the engine's parser/preparation bridge.
+    // Feed explicit FileState facts into the relational boundary, using the
+    // production identity and metadata writers and independent manifest counts.
+    fn publish<A: StoreLanguageAdapter>(
+        conn: &Connection,
+        oid: Oid,
+        lang: &str,
+        adapter: &A,
+        state: &FileState,
+    ) {
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 0)",
+            params![oid.to_string(), lang],
+        )
+        .unwrap();
+        let blob_id = conn.last_insert_rowid();
+        let units = collect_stored_units(adapter, state);
+        let keys = stored_unit_keys_from_units(&units);
+        for stored in &units {
+            let unit = &stored.unit;
+            let qualifier = adapter.storage_content_qualifier(unit, "");
+            let prepared = prepare_unit_fq(adapter, unit, &qualifier).unwrap().unwrap();
+            let segment_bytes = prepared
+                .segments
+                .iter()
+                .map(|(_, kind, text)| kind.len() + text.len())
+                .sum::<usize>();
+            conn.execute(
+                "INSERT INTO code_units(
+                   blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
+                   simple_type_name, signature, synthetic, is_type_alias, top_level_ordinal,
+                   in_declarations, in_definition_lookup, in_test_region, fq_anchor_kind, fq_anchor_pop,
+                   fq_package_tail_segments, exact_fqn_tail, normalized_fqn_tail,
+                   exact_parent_fqn_tail, normalized_parent_fqn_tail, package_fqn_tail,
+                   fq_segment_count, fq_segment_bytes
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?9, ?10,
+                          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                params![
+                    blob_id,
+                    lang,
+                    stored.key,
+                    code_unit_kind_to_i64(unit.kind()),
+                    unit.short_name(),
+                    unit.identifier(),
+                    qualifier,
+                    unit.is_class().then(|| adapter.simple_type_name(unit)),
+                    prepared.anchor_kind,
+                    prepared.anchor_pop,
+                    prepared.package_tail_segments,
+                    prepared.exact_tail,
+                    prepared.normalized_tail,
+                    prepared.exact_parent_tail,
+                    prepared.normalized_parent_tail,
+                    prepared.package_tail,
+                    prepared.segments.len(),
+                    segment_bytes,
+                    unit.is_synthetic(),
+                    stored.is_type_alias,
+                    stored.top_level_ordinal.map(|n| n as i64),
+                    stored.in_declarations,
+                    stored.in_definition_lookup,
+                    stored.in_test_region,
+                ],
+            )
+            .unwrap();
+            for (ordinal, kind, text) in &prepared.segments {
+                conn.execute(
+                    "INSERT INTO code_unit_fq_segments(
+                       blob_id, lang, unit_key, seg_ordinal, seg_kind, segment
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![blob_id, lang, stored.key, ordinal, kind, text],
+                )
+                .unwrap();
+            }
+        }
+        for (unit, ranges) in &state.ranges {
+            for (ordinal, range) in ranges.iter().enumerate() {
+                conn.execute("INSERT INTO unit_ranges(blob_id, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![blob_id, lang, keys[unit], ordinal, range.start_byte, range.end_byte, range.start_line, range.end_line]).unwrap();
+            }
+        }
+        for (parent, children) in &state.children {
+            for (ordinal, child) in children.iter().enumerate() {
+                conn.execute("INSERT INTO unit_children(blob_id, lang, parent_key, child_key, ordinal) VALUES(?1, ?2, ?3, ?4, ?5)", params![blob_id, lang, keys[parent], keys[child], ordinal]).unwrap();
+            }
+        }
+        for (unit, supertypes) in &state.raw_supertypes {
+            for (ordinal, raw) in supertypes.iter().enumerate() {
+                conn.execute("INSERT INTO unit_supertypes(blob_id, lang, unit_key, ordinal, raw, lookup_path) VALUES(?1, ?2, ?3, ?4, ?5, ?5)", params![blob_id, lang, keys[unit], ordinal, raw]).unwrap();
+            }
+        }
+        for (unit, metadata) in &state.signature_metadata {
+            for (ordinal, value) in metadata.iter().enumerate() {
+                SignatureMetadataColumns::encode(value)
+                    .unwrap()
+                    .insert(
+                        &mut conn.prepare(signature_metadata_insert_sql()).unwrap(),
+                        blob_id,
+                        lang,
+                        keys[unit],
+                        ordinal as i64,
+                    )
+                    .unwrap();
+            }
+        }
+        for (unit, mode) in &state.ruby_method_dispatch_modes {
+            conn.execute("INSERT INTO ruby_method_dispatch_modes(blob_id, lang, unit_key, mode) VALUES(?1, ?2, ?3, ?4)", params![blob_id, lang, keys[unit], ruby_dispatch_mode_to_i64(*mode)]).unwrap();
+        }
+        conn.execute("INSERT INTO blob_meta(blob_id, lang, contains_tests, content_package, stored_unit_count, range_count, signature_count, signature_metadata_count, supertype_count, child_count, import_statement_count, type_identifier_count, is_complete) VALUES(?1, ?2, 0, '', ?3, ?4, 0, ?5, ?6, ?7, 0, 0, 1)", params![blob_id, lang, units.len(), state.ranges.values().map(Vec::len).sum::<usize>(), state.signature_metadata.values().map(Vec::len).sum::<usize>(), state.raw_supertypes.values().map(Vec::len).sum::<usize>(), state.children.values().map(Vec::len).sum::<usize>()]).unwrap();
+        if !state.ruby_method_dispatch_modes.is_empty() {
+            conn.execute("INSERT INTO blob_optional_fact_manifest(blob_id, fact_kind, row_count) VALUES(?1, ?2, ?3)", params![blob_id, OptionalFactKind::RubyMethodDispatchMode as i64, state.ruby_method_dispatch_modes.len()]).unwrap();
+        }
+    }
+
+    #[test]
+    fn sqlite_unit_membership_and_side_facts_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let file = ProjectFile::new(temp.path().to_path_buf(), "Units.java");
+        let names = [
+            "Declared",
+            "Lookup",
+            "Test",
+            "Ordinary",
+            "OnlyChild",
+            "OtherChild",
+        ];
+        let units = names.map(|name| unit(&file, name));
+        let mut state = empty_state();
+        state.declarations.insert(units[0].clone());
+        state.definition_lookup_units.insert(units[1].clone());
+        state.test_region_units.insert(units[2].clone());
+        state
+            .children
+            .insert(units[0].clone(), vec![units[4].clone(), units[5].clone()]);
+        state
+            .raw_supertypes
+            .insert(units[0].clone(), vec!["Base".to_owned()]);
+        // One range, two edges, one supertype: side counts are deliberately unequal.
+        state.ranges.insert(
+            units[1].clone(),
+            vec![Range {
+                start_byte: 1,
+                end_byte: 9,
+                start_line: 0,
+                end_line: 0,
+            }],
+        );
+        state.type_aliases.insert(units[2].clone());
+        state.type_aliases.insert(units[3].clone());
+        let oid = test_blob_oid(b"membership");
+        {
+            let store = AnalyzerStore::open_persistent(&path).unwrap();
+            let input = state.clone();
+            store
+                .conn
+                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input));
+        }
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let single = store
+            .hydrate_file_state(oid, "java", &Adapter, &file)
+            .unwrap()
+            .expect("complete blob");
+        let bulk = store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                "java",
+                &Adapter,
+                &HashMap::default(),
+            )
+            .unwrap();
+        for actual in [&single, &bulk[&file]] {
+            let mut actual = actual.clone();
+            actual.declarations.retain(|unit| !unit.is_file_scope());
+            actual.ranges.retain(|unit, _| !unit.is_file_scope());
+            assert_eq!(actual.declarations, state.declarations);
+            assert_eq!(
+                actual.definition_lookup_units,
+                state.definition_lookup_units
+            );
+            assert_eq!(actual.test_region_units, state.test_region_units);
+            assert_eq!(actual.children, state.children);
+            assert_eq!(actual.raw_supertypes, state.raw_supertypes);
+            assert_eq!(actual.ranges, state.ranges);
+            assert_eq!(actual.type_aliases, state.type_aliases);
+        }
+        store.conn.execute(move |conn| {
+            // Compare the generated SQL projection and positional decoder with
+            // input memberships, independently keyed by the supplied names.
+            let sql = format!(
+                "SELECT {}, units.short_name FROM blobs AS keys
+                 JOIN code_units AS units ON units.blob_id = keys.id
+                 WHERE keys.blob_oid = ?1 AND keys.lang = 'java'",
+                raw_unit_columns_sql("units")
+            );
+            let memberships = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map([oid.to_string()], |row| {
+                    let raw = raw_unit_row_from_row(row, 0)?;
+                    Ok((
+                        row.get::<_, String>(18)?,
+                        (
+                            raw.in_declarations,
+                            raw.in_definition_lookup,
+                            raw.in_test_region,
+                        ),
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+                .unwrap();
+            let expected = units
+                .iter()
+                .map(|unit| {
+                    (
+                        unit.short_name().to_string(),
+                        (
+                            state.declarations.contains(unit),
+                            state.definition_lookup_units.contains(unit),
+                            state.test_region_units.contains(unit),
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            assert_eq!(memberships, expected);
+
+            let rows = read_unit_rows(conn, &oid.to_string(), "java", &Adapter, &file).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.unit.clone())
+                    .collect::<HashSet<_>>(),
+                units.into_iter().collect()
+            );
+            assert!(
+                enclosing_declarations_for_file_conn(conn, oid, "java", &Adapter, &file)
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute(
+                "UPDATE blob_meta SET stored_unit_count = stored_unit_count + 1",
+                [],
+            )
+            .unwrap();
+            assert!(
+                hydrate_file_state_conn(conn, oid, "java", &Adapter, &file, "")
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_asymmetric_signature_metadata_and_ruby_modes_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let file = ProjectFile::new(temp.path().to_path_buf(), "Facts.java");
+        let mut state = empty_state();
+        let owner = unit(&file, "Owner");
+        let metadata = vec![
+            SignatureMetadata::new("plain", vec![]),
+            SignatureMetadata::new("static", vec![]).with_field_modifiers(true, false),
+            SignatureMetadata::new("final", vec![]).with_field_modifiers(false, true),
+            SignatureMetadata::new("default", vec![])
+                .with_java_type_constructor_shape(JavaTypeConstructorShape::Default),
+            SignatureMetadata::new("none", vec![])
+                .with_java_type_constructor_shape(JavaTypeConstructorShape::NoImplicit),
+            SignatureMetadata::new("optional", vec![])
+                .with_callable_arity(CallableArity::new(1, 3, false)),
+        ];
+        state.signature_metadata.insert(owner, metadata);
+        for (index, mode) in [
+            RubyMethodDispatchMode::Instance,
+            RubyMethodDispatchMode::Singleton,
+            RubyMethodDispatchMode::ModuleFunction,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let method = unit(&file, &format!("ZMethod{index}"));
+            state.ruby_method_dispatch_modes.insert(method, mode);
+        }
+        // Padding ensures every dispatch key is above the mode codes 0..=2.
+        for name in ["APad", "BPad", "CPad", "DPad"] {
+            state.declarations.insert(unit(&file, name));
+        }
+        let oid = test_blob_oid(b"semantic metadata");
+        {
+            let store = AnalyzerStore::open_persistent(&path).unwrap();
+            let input = state.clone();
+            store
+                .conn
+                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input));
+        }
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let single = store
+            .hydrate_file_state(oid, "java", &Adapter, &file)
+            .unwrap()
+            .expect("complete metadata");
+        let bulk = store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                "java",
+                &Adapter,
+                &HashMap::default(),
+            )
+            .unwrap();
+        for actual in [&single, &bulk[&file]] {
+            assert_eq!(actual.signature_metadata, state.signature_metadata);
+            assert_eq!(
+                actual.ruby_method_dispatch_modes,
+                state.ruby_method_dispatch_modes
+            );
+        }
+    }
+    #[test]
+    fn sqlite_candidate_membership_and_multichunk_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path().to_path_buf(), "Candidates.java");
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let mut state = empty_state();
+        let declared = unit(&file, "Foo").with_synthetic(true);
+        let lookup = CodeUnit::from_fq(
+            file.clone(),
+            CodeUnitType::Function,
+            declared.fq().clone(),
+            0,
+            None,
+            false,
+        );
+        state.declarations.insert(declared.clone());
+        state.definition_lookup_units.insert(lookup.clone());
+        state.declarations.insert(unit(&file, "Bar"));
+        // Distinct structured names cross the candidate segment hydration batch.
+        for index in 0..1001 {
+            state
+                .declarations
+                .insert(unit(&file, &format!("Pad{index:04}")));
+        }
+        let oid = test_blob_oid(b"candidates");
+        {
+            let conn = store.conn.lock().unwrap();
+            publish(&conn, oid, "java", &Adapter, &state);
+            let mut other = empty_state();
+            other.declarations.insert(unit(&file, "Foo"));
+            publish(
+                &conn,
+                test_blob_oid(b"other language"),
+                "kotlin",
+                &Adapter,
+                &other,
+            );
+        }
+        let langs = vec!["java".to_owned()];
+        let generations = HashMap::from_iter([
+            ("java".to_owned(), GenerationId::BOOTSTRAP),
+            ("kotlin".to_owned(), GenerationId::BOOTSTRAP),
+        ]);
+        let mounted = |rows: Vec<HydratedCandidateRow>| {
+            rows.into_iter()
+                .map(|row| {
+                    hydrate_mounted_candidate(
+                        &Adapter,
+                        temp.path(),
+                        row,
+                        "Candidates.java".to_owned(),
+                    )
+                    .unwrap()
+                })
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            mounted(
+                store
+                    .declaration_candidate_rows_by_short_name_for_langs(&langs, &generations, "Foo")
+                    .unwrap()
+            ),
+            HashSet::from_iter([declared.clone()])
+        );
+        let both = vec!["java".to_owned(), "kotlin".to_owned()];
+        assert_eq!(
+            store
+                .declaration_candidate_rows_by_short_name_for_langs(&both, &generations, "Foo")
+                .unwrap()
+                .len(),
+            2
+        );
+        let expected = HashSet::from_iter([declared, lookup]);
+        assert_eq!(
+            mounted(
+                store
+                    .declaration_candidate_rows_by_identifier_prefix_for_langs(
+                        &langs,
+                        &generations,
+                        "Foo"
+                    )
+                    .unwrap()
+            ),
+            expected
+        );
+        assert_eq!(
+            mounted(
+                store
+                    .declaration_candidate_rows_by_identifier_for_langs_limited(
+                        &langs,
+                        &generations,
+                        "Foo",
+                        100
+                    )
+                    .unwrap()
+                    .rows
+            ),
+            expected
+        );
+        let conn = store.conn.lock().unwrap();
+        let rows = candidate_rows_for_languages(
+            &conn,
+            ["java"],
+            &limited_identifier_candidate_for_blob_sql(),
+            &[&"Foo", &oid.to_string()],
+        )
+        .unwrap();
+        assert_eq!(mounted(rows), expected);
+        drop(conn);
+        let all = store.declaration_candidate_rows_by_lang("java");
+        assert_eq!(mounted(all.unwrap()), state.declarations);
+    }
+
+    struct AnchoredAdapter;
+    impl StoreLanguageAdapter for AnchoredAdapter {
+        fn language(&self) -> Language {
+            Language::Java
+        }
+        fn default_package_anchor(&self) -> Option<PackageAnchor> {
+            Some(PackageAnchor::OwnModule { pop: 0 })
+        }
+        fn resolve_package_anchor(
+            &self,
+            anchor: PackageAnchor,
+            _: &str,
+            file: &ProjectFile,
+        ) -> Option<FqName> {
+            let name = match anchor {
+                PackageAnchor::CrateRoot => "root",
+                PackageAnchor::OwnModule { .. } => {
+                    if file.rel_path() == "First.java" {
+                        "first"
+                    } else {
+                        "second"
+                    }
+                }
+            };
+            let mut fq = FqName::new();
+            fq.push(segment_interner().intern(name, SegmentKind::Package));
+            Some(fq)
+        }
+    }
+
+    #[test]
+    fn sqlite_companion_and_anchored_identity_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let file = ProjectFile::new(temp.path().to_path_buf(), "First.java");
+        let moved = ProjectFile::new(temp.path().to_path_buf(), "Second.java");
+        let make = |file: &ProjectFile, package: &[&str], kind| {
+            let mut fq = FqName::new();
+            for part in package {
+                fq.push(segment_interner().intern(part, SegmentKind::Package));
+            }
+            fq.push(segment_interner().intern("Object", kind));
+            CodeUnit::from_fq(
+                file.clone(),
+                CodeUnitType::Class,
+                fq,
+                package.len(),
+                None,
+                false,
+            )
+        };
+        let mut state = empty_state();
+        state
+            .declarations
+            .insert(make(&file, &["first"], SegmentKind::Companion));
+        state
+            .declarations
+            .insert(make(&file, &["first", "explicit"], SegmentKind::Type));
+        state.declarations.insert(
+            make(&file, &["root"], SegmentKind::Type).with_package_anchor(PackageAnchor::CrateRoot),
+        );
+        let expected = HashSet::from_iter([
+            make(&moved, &["second"], SegmentKind::Companion),
+            make(&moved, &["first", "explicit"], SegmentKind::Type),
+            make(&moved, &["root"], SegmentKind::Type),
+        ]);
+        let oid = test_blob_oid(b"anchored identities");
+        let conn = store.conn.lock().unwrap();
+        publish(&conn, oid, "java", &AnchoredAdapter, &state);
+        let actual = hydrate_file_state_conn(&conn, oid, "java", &AnchoredAdapter, &moved, "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual
+                .declarations
+                .into_iter()
+                .filter(|unit| !unit.is_file_scope())
+                .collect::<HashSet<_>>(),
+            expected
+        );
+        // The adapter cancels while the only row is being hydrated. This
+        // event is independent of the reader's number of checkpoints.
+        struct CancelOnAnchor(Arc<std::sync::atomic::AtomicBool>);
+        impl StoreLanguageAdapter for CancelOnAnchor {
+            fn language(&self) -> Language {
+                Language::Java
+            }
+            fn resolve_package_anchor(
+                &self,
+                anchor: PackageAnchor,
+                qualifier: &str,
+                file: &ProjectFile,
+            ) -> Option<FqName> {
+                self.0.store(true, Ordering::SeqCst);
+                AnchoredAdapter.resolve_package_anchor(anchor, qualifier, file)
+            }
+        }
+        let mut last = empty_state();
+        last.declarations.insert(
+            make(&file, &["root"], SegmentKind::Type).with_package_anchor(PackageAnchor::CrateRoot),
+        );
+        let last_oid = test_blob_oid(b"last hydration cancellation");
+        publish(&conn, last_oid, "java", &AnchoredAdapter, &last);
+        assert_eq!(
+            read_unit_rows(
+                &conn,
+                &last_oid.to_string(),
+                "java",
+                &AnchoredAdapter,
+                &file
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            read_unit_rows_while(
+                &conn,
+                &last_oid.to_string(),
+                "java",
+                &CancelOnAnchor(Arc::clone(&cancelled)),
+                &file,
+                &|| !cancelled.load(Ordering::SeqCst)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the final hydration hook must run"
+        );
+    }
+}
+
+#[cfg(test)]
+mod generation_liveness_properties {
+    use super::*;
+    use git2::ObjectType;
+
+    struct Adapter;
+    impl StoreLanguageAdapter for Adapter {
+        fn language(&self) -> Language {
+            Language::Java
+        }
+    }
+
+    fn oid(bytes: &[u8]) -> Oid {
+        Oid::hash_object(ObjectType::Blob, bytes).unwrap()
+    }
+
+    // Synthetic legacy publication: two declarations, one parent/child edge,
+    // two imports, and no reference identifiers. No language engine is needed.
+    fn publish(store: &AnalyzerStore, oid: Oid, lang: &str, generation: GenerationId) -> i64 {
+        store.register_blobs(&[oid], lang, generation).unwrap();
+        let lang = lang.to_string();
+        store.conn.execute(move |conn| -> Result<i64> {
+        let tx = conn.transaction().unwrap();
+        let id: i64 = tx
+            .query_row(
+                "SELECT id FROM blobs WHERE blob_oid=?1 AND lang=?2",
+                params![oid.to_string(), lang],
+                |r| r.get(0),
+            )
+            .unwrap();
+        tx.execute(
+            "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,
+            stored_unit_count,range_count,signature_count,signature_metadata_count,
+            supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
+            VALUES(?1,?2,0,'',2,0,0,0,0,1,2,0,1)",
+            params![id, lang],
+        )
+        .unwrap();
+        for (key, name) in [(0, "Parent"), (1, "Child")] {
+            tx.execute(
+                "INSERT INTO code_units(blob_id,lang,unit_key,kind,short_name,identifier,
+                content_qualifier,synthetic,is_type_alias,in_declarations,in_definition_lookup,
+                fq_segment_count,fq_segment_bytes,exact_fqn_tail,fq_package_tail_segments)
+                VALUES(?1,?2,?3,0,?4,?4,'',0,0,1,1,1,?5,?4,0)",
+                params![id, lang, key, name, name.len() + 4],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO code_unit_fq_segments(blob_id,lang,unit_key,seg_ordinal,seg_kind,segment)
+                VALUES(?1,?2,?3,0,'type',?4)",params![id,lang,key,name]).unwrap();
+        }
+        tx.execute(
+            "INSERT INTO unit_children(blob_id,lang,parent_key,ordinal,child_key)
+            VALUES(?1,?2,0,0,1)",
+            params![id, lang],
+        )
+        .unwrap();
+        for (ordinal, statement) in [(0, "import alpha;"), (1, "import beta;")] {
+            tx.execute("INSERT INTO import_statements(blob_id,lang,ordinal,statement,is_wildcard,is_global)
+                VALUES(?1,?2,?3,?4,0,0)",params![id,lang,ordinal,statement]).unwrap();
+        }
+        tx.execute(
+            "INSERT INTO blob_reference_fact_manifests(blob_id,lang,epoch,identifier_count)
+            VALUES(?1,?2,1,0)",
+            params![id, lang],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        Ok(id)
+        }).unwrap()
+    }
+
+    #[test]
+    fn registered_keys_are_language_scoped_sets_and_rotation_preserves_current_facts() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let a = oid(b"a");
+        let b = oid(b"b");
+        let generation = GenerationId::BOOTSTRAP;
+        let id = publish(&store, a, "java", generation);
+        store.register_blobs(&[a, a], "java", generation).unwrap();
+        assert_eq!(
+            store
+                .declaration_candidate_rows_by_short_name("java", "Parent")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.missing_blobs(&[a, a, b, b], "python").unwrap(),
+            vec![a, b]
+        );
+        assert_eq!(store.missing_blobs(&[a, b, b], "java").unwrap(), vec![b]);
+        store.register_blobs(&[a], "python", generation).unwrap();
+        let next = store.ensure_language_epoch_value("java", "next").unwrap();
+        store.register_blobs(&[a, a], "java", next).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let rows = conn
+            .prepare("SELECT lang,generation FROM blobs WHERE blob_oid=?1 ORDER BY lang")
+            .unwrap()
+            .query_map([a.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![("java".into(), next.0), ("python".into(), 0)]);
+        let children: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_units WHERE blob_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 0);
+    }
+
+    #[test]
+    fn parsed_verification_detects_missing_rows_and_deduplicates_repairs() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let good = oid(b"good");
+        let corrupt = oid(b"corrupt");
+        let absent = oid(b"absent");
+        publish(&store, good, "java", GenerationId::BOOTSTRAP);
+        let id = publish(&store, corrupt, "java", GenerationId::BOOTSTRAP);
+        let good = (good, "java".to_string());
+        let corrupt = (corrupt, "java".to_string());
+        let absent = (absent, "java".to_string());
+        assert_eq!(
+            store
+                .parsed_blob_keys(&[good.clone(), corrupt.clone()])
+                .unwrap()
+                .len(),
+            2
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM unit_children WHERE blob_id=?1", [id])
+            .unwrap();
+        let inputs = [
+            good.clone(),
+            corrupt.clone(),
+            absent.clone(),
+            corrupt.clone(),
+            absent.clone(),
+        ];
+        assert_eq!(
+            store.parsed_blob_keys(&inputs).unwrap(),
+            HashSet::from_iter([good])
+        );
+        assert_eq!(
+            store.missing_parsed_blob_keys(&inputs).unwrap(),
+            vec![corrupt, absent]
+        );
+    }
+
+    #[test]
+    fn warm_publication_hydrates_imports_and_children_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let a = oid(b"warm");
+        {
+            let store = AnalyzerStore::open_persistent(&path).unwrap();
+            publish(&store, a, "java", GenerationId::BOOTSTRAP);
+        }
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let file = ProjectFile::new(temp.path().to_path_buf(), "Warm.java");
+        let state = store
+            .hydrate_file_state_with_source(a, "java", GenerationId::BOOTSTRAP, &Adapter, &file, "")
+            .unwrap()
+            .expect("warm hit");
+        assert_eq!(
+            state
+                .imports
+                .iter()
+                .map(|i| i.raw_snippet.as_str())
+                .collect::<Vec<_>>(),
+            vec!["import alpha;", "import beta;"]
+        );
+        let edges = state
+            .children
+            .iter()
+            .flat_map(|(p, cs)| {
+                cs.iter()
+                    .map(move |c| (p.identifier().to_string(), c.identifier().to_string()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(edges, vec![("Parent".into(), "Child".into())]);
+        assert!(state.type_identifiers.is_empty());
+    }
+
+    #[test]
+    fn captured_generations_reject_stale_and_missing_tokens_across_read_surfaces() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path().to_path_buf(), "A.java");
+        let a = oid(b"generation");
+        let old = store.ensure_language_epoch_value("java", "first").unwrap();
+        publish(&store, a, "java", old);
+        let before = store
+            .hydrate_file_state_with_source(a, "java", old, &Adapter, &file, "")
+            .unwrap()
+            .expect("published generation hydrates before rotation");
+        let unit = before
+            .declarations
+            .iter()
+            .find(|u| u.identifier() == "Parent")
+            .unwrap();
+        let current = store.ensure_language_epoch_value("java", "second").unwrap();
+        assert_ne!(old, current);
+        let entries = [(a, "java".to_string())];
+        let langs = ["java".to_string()];
+        let imports = [(file.clone(), a, "java".to_string())];
+        let workspace =
+            WorkspaceId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        for token in [Some(old), None, Some(current)] {
+            let generations = token
+                .map(|g| HashMap::from_iter([("java".into(), g)]))
+                .unwrap_or_default();
+            let results = [
+                (
+                    "parsed",
+                    store
+                        .parsed_blob_keys_at_generations(&entries, &generations)
+                        .map(|_| ()),
+                ),
+                (
+                    "imports",
+                    store
+                        .hydrate_import_facts_by_key(&imports, &generations, &Adapter)
+                        .map(|_| ()),
+                ),
+                (
+                    "candidates",
+                    store
+                        .declaration_candidate_rows_for_langs_by_predicate(
+                            &langs,
+                            &generations,
+                            "units.lang = ?1",
+                            &[],
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "snapshots",
+                    store
+                        .workspace_snapshots_for_langs(&workspace, &langs, &generations)
+                        .map(|_| ()),
+                ),
+                (
+                    "structured imports",
+                    store
+                        .blobs_with_structured_imports_by_keys(&entries, &generations)
+                        .map(|_| ()),
+                ),
+            ];
+            for (surface, result) in results {
+                if token == Some(current) {
+                    result.unwrap_or_else(|e| panic!("{surface}: {e}"));
+                } else {
+                    assert!(
+                        result.expect_err(surface).is_stale_generation(),
+                        "{surface}: {token:?}"
+                    );
+                }
+            }
+        }
+        for generation in [old, current] {
+            let results = [
+                store
+                    .hydrate_file_state_with_source(a, "java", generation, &Adapter, &file, "")
+                    .map(|_| ()),
+                store
+                    .signature_metadata_for_unit_limited(a, "java", generation, unit, 2)
+                    .map(|_| ()),
+            ];
+            for result in results {
+                if generation == current {
+                    result.unwrap();
+                } else {
+                    assert!(result.unwrap_err().is_stale_generation());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_publication_excludes_stale_and_revoked_rows_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        let old = store.ensure_language_epoch_value("java", "first").unwrap();
+        publish(&store, oid(b"old"), "java", old);
+        let current = store.ensure_language_epoch_value("java", "second").unwrap();
+        let live = oid(b"live");
+        publish(&store, live, "java", current);
+        let revoked = publish(&store, oid(b"revoked"), "java", current);
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                conn.execute(
+                    "UPDATE blob_meta SET is_complete=0 WHERE blob_id=?1",
+                    [revoked],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let check = |store: &AnalyzerStore| {
+            let rows = store
+                .declaration_candidate_rows_by_short_name("java", "Parent")
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.blob_oid).collect::<Vec<_>>(),
+                vec![live]
+            );
+        };
+        check(&store);
+        drop(store);
+        check(&AnalyzerStore::open_persistent(&path).unwrap());
+    }
+
+    #[test]
+    fn fallback_snapshot_sync_selects_new_rows_before_any_reader_checkout() {
+        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        for (name, bytes) in [
+            ("A.java", b"first".as_slice()),
+            ("B.java", b"second".as_slice()),
+        ] {
+            let a = oid(bytes);
+            store
+                .sync_workspace_snapshot(
+                    "java",
+                    GenerationId::BOOTSTRAP,
+                    &[WorkspaceFileRow {
+                        rel_path: name.into(),
+                        blob_oid: a,
+                    }],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            let conn = store.conn.lock().unwrap();
+            let rows = conn
+                .prepare("SELECT rel_path,blob_oid FROM workspace_files")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows, vec![(name.into(), a.to_string())]);
+        }
+        let a = oid(b"fallback");
+        publish(&store, a, "java", GenerationId::BOOTSTRAP);
+        assert!(store.contains_parsed_blob(a, "java").unwrap());
+        let conn = store.conn.lock().unwrap();
+        let error=conn.execute("INSERT INTO blob_reference_fact_manifests(blob_id,lang,epoch,identifier_count) VALUES(-1,'java',1,0)",[]).unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
     }
 }

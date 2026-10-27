@@ -84,24 +84,6 @@ const JAVA_CLONE_AST_RULES: CloneNormalizationRules = CloneNormalizationRules {
     ignored_ast_kinds: CLONE_AST_IGNORED_TYPES,
 };
 
-/// The normalized leaf-token stream for `source`.
-pub fn normalized_clone_tokens_java(source: &str) -> Vec<String> {
-    let Some(tree) = parse_clone_tree(source) else {
-        return Vec::new();
-    };
-    let content = SourceContent::new(source);
-    normalized_clone_tokens_from_root(tree.root_node(), content.as_str(), JAVA_CLONE_TOKEN_RULES)
-}
-
-/// The `|`-joined AST-label signature for `source`.
-pub fn build_java_clone_ast_signature(source: &str) -> String {
-    let Some(tree) = parse_clone_tree(source) else {
-        return String::new();
-    };
-    let content = SourceContent::new(source);
-    clone_ast_signature_from_root(tree.root_node(), content.as_str(), JAVA_CLONE_AST_RULES)
-}
-
 /// Parse and prepare one Java clone candidate, stopping before AST-label work
 /// when the normalized token threshold cannot be met.
 pub fn prepare_java_clone(

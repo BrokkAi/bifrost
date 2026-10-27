@@ -1536,8 +1536,8 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                                 python_external_class_artifact_selection(active, owner)
                             {
                                 target.with_python_artifact_selection(
-                                    evidence,
-                                    manifest,
+                                    &evidence,
+                                    &manifest,
                                     &semantic_call.arguments,
                                     &formals,
                                 )
@@ -2227,7 +2227,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     "the call site retains multiple possible local bodies".into();
                 let completeness_reason: Box<str> =
                     "ambiguous call targets do not cover one selected body".into();
-                if let Some(index) = candidate_indexes.get(&target).copied() {
+                if let Some(index) = candidate_indexes.get(&target).cloned() {
                     let candidate = candidates
                         .get_mut(index)
                         .expect("dispatch candidate index points into the candidate list");
@@ -5551,21 +5551,22 @@ pub(crate) fn active_covering_complete_summary(
 }
 
 pub(crate) fn matching_summaries_satisfy(
-    matched: &ProcedureSummaryMatch<'_>,
+    matched: &ProcedureSummaryMatch,
     accepts: impl Fn(&CompiledProcedureSummary) -> bool,
 ) -> bool {
     match matched.disposition {
         SemanticModelMatchDisposition::Unique => {
-            matches!(matched.records.as_slice(), [selected] if accepts(selected.record))
+            matches!(matched.records.as_slice(), [selected] if accepts(&selected.record))
         }
         SemanticModelMatchDisposition::Conflict => {
             let Some((first, rest)) = matched.records.split_first() else {
                 return false;
             };
             !rest.is_empty()
-                && accepts(first.record)
+                && accepts(&first.record)
                 && rest.iter().all(|other| {
-                    accepts(other.record) && compiled_flow_claims_agree(other.record, first.record)
+                    accepts(&other.record)
+                        && compiled_flow_claims_agree(&other.record, &first.record)
                 })
         }
         SemanticModelMatchDisposition::Empty => false,
@@ -5888,24 +5889,25 @@ pub(crate) fn python_external_class_result_call(
                 && class.owner_id.is_none()
                 && expected_constructor_class_id.is_none_or(|symbol_id| class.id == symbol_id) =>
         {
-            Some(*class)
+            Some(std::sync::Arc::clone(class))
         }
         _ => None,
     };
     let function_records = exact_records
         .iter()
-        .copied()
-        .filter(|symbol| {
+        .filter(|&symbol| {
             symbol.kind == SemanticModelSymbolKind::Function
                 && !symbol.has_receiver()
                 && symbol.has_complete_callable_shape_evidence()
                 && symbol.structured_signature().is_some()
         })
+        .cloned()
         .collect::<Vec<_>>();
     let modeled_factory_result = function_records.len() == 1
         && function_records.len() == exact_records.len()
         && python_model_function_returns_one_exact_class(&overlay, &function_records).is_some();
     let class = direct_class
+        .clone()
         .filter(|_| exact_records.len() == 1)
         .or_else(|| {
             modeled_factory_result.then(|| {
@@ -5967,13 +5969,13 @@ pub(crate) fn python_external_class_result_call(
                         target
                     };
                     let artifact_selection =
-                        python_external_class_artifact_selection(active, class);
+                        python_external_class_artifact_selection(active, &class);
                     let target = if target.selected_python_artifact().is_some() {
                         target
                     } else if let Some((evidence, manifest)) = artifact_selection {
                         let selected = target.with_python_artifact_selection(
-                            evidence,
-                            manifest,
+                            &evidence,
+                            &manifest,
                             &semantic_call.arguments,
                             &formals,
                         );
@@ -6021,15 +6023,15 @@ pub(crate) fn python_external_class_result_call(
     Some(PythonExternalClassCall { identity, target })
 }
 
-pub(crate) fn python_external_class_artifact_selection<'a>(
-    active: &'a crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
+pub(crate) fn python_external_class_artifact_selection(
+    active: &crate::analyzer::semantic_model::ResolvedActiveSemanticModels,
     class: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> Option<(
-    &'a crate::analyzer::semantic_model::SemanticModelActivationEvidence,
-    &'a str,
+    crate::analyzer::semantic_model::SemanticModelActivationEvidence,
+    String,
 )> {
-    let mut selections = active
-        .shards()
+    let shards = active.shards();
+    let mut selections = shards
         .iter()
         .filter(|shard| {
             shard.manifest.pack_id == class.provenance.pack_id
@@ -6054,13 +6056,13 @@ pub(crate) fn python_external_class_artifact_selection<'a>(
     let [(evidence, manifest)] = selections.as_slice() else {
         return None;
     };
-    Some((*evidence, *manifest))
+    Some(((*evidence).clone(), (*manifest).to_owned()))
 }
 
-pub(crate) fn python_model_function_returns_one_exact_class<'a>(
-    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
-    records: &[&'a crate::analyzer::semantic_model::SemanticModelSymbol],
-) -> Option<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+pub(crate) fn python_model_function_returns_one_exact_class(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    records: &[Arc<crate::analyzer::semantic_model::SemanticModelSymbol>],
+) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>> {
     let mut classes = records.iter().map(|record| {
         let returns = record.structured_signature()?.returns.as_ref()?;
         let candidates = match returns {
@@ -6089,7 +6091,7 @@ pub(crate) fn python_model_function_returns_one_exact_class<'a>(
                     && !class.provenance.ambiguous
                     && class.provenance.completeness == SemanticModelCompleteness::Complete =>
             {
-                Some(*class)
+                Some(std::sync::Arc::clone(class))
             }
             _ => None,
         }

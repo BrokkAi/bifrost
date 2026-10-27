@@ -1017,3 +1017,57 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod qs3_path_contract {
+    use super::*;
+
+    #[test]
+    fn qs3_manifest_free_mount_identity() {
+        // Authored nearest-src contract, shared by live and selected inputs.
+        for (path, package, root) in [
+            (
+                "src/vendor/src/unit.rs",
+                vec!["src", "vendor", "src", "unit"],
+                vec!["src", "vendor", "src"],
+            ),
+            (
+                "vendor/src/inner/src/lib.rs",
+                vec!["vendor", "src", "inner", "src"],
+                vec!["vendor", "src", "inner", "src"],
+            ),
+            ("src/unit.rs", vec!["unit"], vec![]),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let file = ProjectFile::new(fixture.path(), path);
+            assert_eq!(
+                path_derived_package_components(Path::new(path)),
+                package,
+                "{path}"
+            );
+            assert_eq!(
+                path_derived_crate_root_components(Path::new(path)),
+                root,
+                "{path}"
+            );
+            let selected =
+                RustSelectedCargoNaming::from_selected_inputs([PathBuf::from(path)], &[]).unwrap();
+            let name = selected
+                .resolve_package_anchor(PackageAnchor::OwnModule { pop: 0 }, "", Path::new(path))
+                .unwrap();
+            assert_eq!(
+                name.resolved_segments()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+                package
+            );
+            assert_eq!(
+                crate::declarations::rust_file_package_fq(&file)
+                    .resolved_segments()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+                package
+            );
+        }
+    }
+}

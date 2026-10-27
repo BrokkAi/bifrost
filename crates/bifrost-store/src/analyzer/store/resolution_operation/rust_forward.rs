@@ -197,6 +197,7 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
                 definitions,
                 lexical_definitions,
                 definition_names,
+                diagnostic_identities: Vec::new(),
                 // The reverse-side forward query answers a located reference,
                 // not a presentation route, and never reaches the member
                 // attribution consumer.

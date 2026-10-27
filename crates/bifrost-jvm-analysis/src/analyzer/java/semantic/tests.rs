@@ -919,3 +919,563 @@ fn type_name_prefix_recognizes_qualified_stdlib_types() {
     assert_eq!(java_type_name_prefix_len(&["inheritedField", "nested"]), 0);
     assert_eq!(java_type_name_prefix_len(&["Outer", "Inner"]), 2);
 }
+
+/// Every value flow of `kind` in `procedure`, as the spelling of its source and
+/// its target.
+fn value_flows(
+    procedure: &ProcedureSemantics,
+    source: &str,
+    kind: ValueFlowKind,
+) -> Vec<(String, String)> {
+    procedure
+        .points()
+        .iter()
+        .flat_map(|point| point.events.iter())
+        .filter_map(|event| match event.effect {
+            SemanticEffect::ValueFlow {
+                kind: flow,
+                source: from,
+                target: to,
+            } if flow == kind => Some((
+                value_text(procedure, source, from).to_owned(),
+                value_text(procedure, source, to).to_owned(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `procedure` publishes a flow of `kind` from `from` to `to`.
+fn has_flow(
+    procedure: &ProcedureSemantics,
+    source: &str,
+    kind: ValueFlowKind,
+    from: &str,
+    to: &str,
+) -> bool {
+    value_flows(procedure, source, kind)
+        .iter()
+        .any(|(candidate_from, candidate_to)| candidate_from == from && candidate_to == to)
+}
+
+/// Whether the assignment `to = from` is published, the identity transfer of a
+/// value that passes through unchanged.
+fn has_assignment(procedure: &ProcedureSemantics, source: &str, from: &str, to: &str) -> bool {
+    procedure
+        .points()
+        .iter()
+        .flat_map(|point| point.events.iter())
+        .any(|event| match event.effect {
+            SemanticEffect::Assignment { target, value } => {
+                value_text(procedure, source, value) == from
+                    && value_text(procedure, source, target) == to
+            }
+            _ => false,
+        })
+}
+
+#[test]
+#[hardwon(
+    "#6523: a narrowing or unboxing cast dropped its operand's flow, and a cast publishes only after its check"
+)]
+fn casts_derive_their_result_from_the_operand_after_the_check() {
+    let source = r#"class Fixture {
+  void run(Object value, int wide, int small, Integer boxed) {
+    Object reference = (String) value;
+    byte narrow = (byte) wide;
+    int unboxed = (int) boxed;
+    long widened = (long) small;
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    // A reference cast, a narrowing and an unboxing derive a result from the
+    // operand: a language-defined flow, never an identity transfer.
+    for (operand, result) in [
+        ("value", "(String) value"),
+        ("wide", "(byte) wide"),
+        ("boxed", "(int) boxed"),
+    ] {
+        assert!(
+            has_flow(run, source, ValueFlowKind::LanguageDefined, operand, result),
+            "{result} must derive from {operand}"
+        );
+        assert!(
+            !has_flow(run, source, ValueFlowKind::Local, operand, result),
+            "{result} is not a local copy of {operand}"
+        );
+        assert!(
+            !has_assignment(run, source, operand, result),
+            "{result} is not an assignment from {operand}"
+        );
+    }
+    // A widening cast of a primitive binding still copies it exactly.
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::Local,
+        "small",
+        "(long) small"
+    ));
+    // The result is published after the check: the point that holds the flow
+    // has no exceptional successor, and its only predecessor, the check, does.
+    let flow_point = run
+        .points()
+        .iter()
+        .find(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source: from,
+                        target: to,
+                    } if value_text(run, source, from) == "boxed"
+                        && value_text(run, source, to) == "(int) boxed"
+                )
+            })
+        })
+        .expect("the unboxing flow has a point");
+    assert!(
+        run.successor_edges(flow_point.id)
+            .all(|(_, edge)| edge.kind != ControlEdgeKind::Exceptional),
+        "the flow must not sit on the point that can throw"
+    );
+    let checks = run
+        .predecessor_edges(flow_point.id)
+        .map(|(_, edge)| edge.source_point)
+        .collect::<Vec<_>>();
+    let [check] = checks[..] else {
+        panic!("the flow point has exactly one predecessor: {checks:?}");
+    };
+    assert!(
+        run.successor_edges(check)
+            .any(|(_, edge)| edge.kind == ControlEdgeKind::Exceptional),
+        "the check carries the unboxing NullPointerException edge"
+    );
+    assert!(run.gaps().is_empty(), "{:?}", run.gaps());
+}
+
+#[test]
+#[hardwon("#6523: a conditional-and or conditional-or result had no flow from either operand")]
+fn short_circuit_result_takes_a_flow_from_each_way_out() {
+    let source = r#"class Fixture {
+  void run(boolean first, boolean second, boolean third) {
+    boolean pair = first && second;
+    boolean chain = (first && second) || third;
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    // The left operand decides the short-circuit way out, the right operand
+    // the other one.
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "first",
+        "first && second"
+    ));
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "second",
+        "first && second"
+    ));
+    // A nested left operand is lowered as control flow and has no value of
+    // its own, so its leaves feed the result and the nested node does not.
+    let chain = "(first && second) || third";
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "first",
+        chain
+    ));
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "second",
+        chain
+    ));
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "third",
+        chain
+    ));
+    assert!(
+        value_flows(run, source, ValueFlowKind::LanguageDefined)
+            .iter()
+            .all(|(from, _)| from != "first && second" && from != "(first && second)")
+    );
+}
+
+#[test]
+#[hardwon("#6523: a switch expression's rules and yields had no flow into the switch value")]
+fn switch_rules_and_yields_feed_the_value_of_their_own_switch() {
+    let source = r#"class Fixture {
+  Object run(int selector, Object first, Object second, Object third) {
+    return switch (selector) {
+      case 0 -> first;
+      case 1 -> {
+        yield second;
+      }
+      default -> {
+        Object inner = switch (selector) {
+          case 5 -> third;
+          default -> "other";
+        };
+        yield inner;
+      }
+    };
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    let local = value_flows(run, source, ValueFlowKind::Local);
+    let into = |target_prefix: &str, from: &str| {
+        local
+            .iter()
+            .filter(|(candidate, target)| candidate == from && target.starts_with(target_prefix))
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>()
+    };
+    let outer_first = into("switch (selector) {\n      case 0", "first");
+    let outer_second = into("switch (selector) {\n      case 0", "second");
+    let outer_inner = into("switch (selector) {\n      case 0", "inner");
+    assert_eq!(outer_first.len(), 1, "{local:?}");
+    assert_eq!(outer_second.len(), 1, "{local:?}");
+    assert_eq!(outer_inner.len(), 1, "{local:?}");
+    // The nested switch's own rule feeds the nested switch, and its `yield`
+    // inside the outer rule feeds the outer one.
+    let inner_third = into("switch (selector) {\n          case 5", "third");
+    assert_eq!(inner_third.len(), 1, "{local:?}");
+    assert!(into("switch (selector) {\n          case 5", "inner").is_empty());
+    assert!(into("switch (selector) {\n      case 0", "third").is_empty());
+}
+
+#[test]
+#[hardwon("#6523: a switch block that always yields still reported a missing yield")]
+fn missing_yield_gap_remains_only_when_a_rule_or_group_can_fall_off_its_end() {
+    let source = r#"class Fixture {
+  Object yieldsInRules(int selector, boolean flag, Object first) {
+    return switch (selector) {
+      case 0 -> {
+        yield first;
+      }
+      case 1 -> {
+        if (flag) {
+          yield first;
+        } else {
+          throw new IllegalStateException();
+        }
+      }
+      case 2 -> {
+        try {
+          yield first;
+        } finally {
+          flag = true;
+        }
+      }
+      default -> first;
+    };
+  }
+
+  Object yieldsInGroups(int selector, Object first) {
+    return switch (selector) {
+      case 0:
+        yield first;
+      default:
+        throw new IllegalStateException();
+    };
+  }
+
+  Object fallsOffTheEnd(int selector, boolean flag, Object first) {
+    return switch (selector) {
+      case 0 -> {
+        if (flag) {
+          yield first;
+        }
+      }
+      case 1 -> {
+        try {
+          yield first;
+        } catch (RuntimeException failure) {
+          flag = true;
+        }
+      }
+      default -> first;
+    };
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let missing_yield = |name: &str| {
+        method(&artifact, name)
+            .gaps()
+            .iter()
+            .filter(|gap| gap.detail.contains("without a represented yield"))
+            .count()
+    };
+    assert_eq!(missing_yield("yieldsInRules"), 0);
+    assert_eq!(missing_yield("yieldsInGroups"), 0);
+    assert_eq!(
+        missing_yield("fallsOffTheEnd"),
+        2,
+        "an `if` without `else` and a `catch` that completes normally both fall off the end"
+    );
+}
+
+#[test]
+#[hardwon("#6523: an instanceof result had no flow and a pattern variable's value had no gap")]
+fn instanceof_derives_its_result_and_a_pattern_variable_reference_leaves_a_gap() {
+    let source = r#"class Fixture {
+  void run(Object value) {
+    boolean plain = value instanceof String;
+    boolean matched = value instanceof String text;
+    if (value instanceof String shown) {
+      use(shown);
+    }
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    for result in [
+        "value instanceof String",
+        "value instanceof String text",
+        "value instanceof String shown",
+    ] {
+        assert!(has_flow(
+            run,
+            source,
+            ValueFlowKind::LanguageDefined,
+            "value",
+            result
+        ));
+    }
+    // The tests themselves carry no gap, and neither does a binder nothing
+    // refers to. The reference to `shown` holds a value with no source.
+    let pattern_gaps = run
+        .gaps()
+        .iter()
+        .filter(|gap| gap.detail.contains("pattern variable"))
+        .collect::<Vec<_>>();
+    let [gap] = pattern_gaps[..] else {
+        panic!("expected one gap for the one reference: {pattern_gaps:?}");
+    };
+    assert_eq!(gap.capability, SemanticCapability::Values);
+    assert_eq!(mapping_text(run, source, gap.source), "shown");
+}
+
+#[test]
+#[hardwon("#6523: array creation had no allocation and an array initializer no element stores")]
+fn array_creation_allocates_and_an_initializer_stores_its_elements() {
+    let source = r#"class Fixture {
+  void run(int count, Object first, Object second) {
+    int[] sized = new int[count];
+    Object[] listed = new Object[] { first, second };
+    Object read = listed[1];
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    let allocated = run
+        .allocations()
+        .iter()
+        .map(|allocation| value_text(run, source, allocation.result))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        allocated,
+        ["new int[count]", "{ first, second }"],
+        "the sized array and the initializer's array are the two allocations"
+    );
+    assert!(
+        run.allocations()
+            .iter()
+            .all(|allocation| allocation.kind == AllocationKind::Array)
+    );
+    // The length derives from the dimension expression.
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "count",
+        "new int[count]"
+    ));
+    // `new T[] { ... }` is the array its initializer builds.
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::Local,
+        "{ first, second }",
+        "new Object[] { first, second }"
+    ));
+    // Each element is stored at its own position of the fresh array, and the
+    // constant-index read of position 1 names the location that stored `second`.
+    let index_of = |location: MemoryLocationId| match run
+        .memory_location(location)
+        .expect("location row")
+        .kind
+    {
+        MemoryLocationKind::Index { base, index, .. } => (base, index.expect("element index")),
+        ref other => panic!("not an indexed location: {other:?}"),
+    };
+    let stores = run
+        .points()
+        .iter()
+        .flat_map(|point| point.events.iter())
+        .filter_map(|event| match event.effect {
+            SemanticEffect::MemoryStore {
+                kind: MemoryAccessKind::Index,
+                location,
+                value,
+            } => Some((value_text(run, source, value), index_of(location))),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [
+        (first_text, (first_base, first_index)),
+        (second_text, (second_base, second_index)),
+    ] = stores[..]
+    else {
+        panic!("expected one store per initializer element: {stores:?}");
+    };
+    assert_eq!((first_text, second_text), ("first", "second"));
+    assert_eq!(value_text(run, source, first_base), "{ first, second }");
+    assert_eq!(first_base, second_base);
+    assert_ne!(first_index, second_index);
+    let read_index = run
+        .points()
+        .iter()
+        .flat_map(|point| point.events.iter())
+        .find_map(|event| match event.effect {
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Index,
+                location,
+                ..
+            } => Some(index_of(location).1),
+            _ => None,
+        })
+        .expect("the constant-index read");
+    assert_eq!(read_index, second_index);
+    assert!(run.gaps().is_empty(), "{:?}", run.gaps());
+}
+
+#[test]
+#[hardwon(
+    "#6523: a nested array initializer stored as a bare allocation lost its elements on read"
+)]
+fn nested_array_initializer_is_stored_through_an_identity_transfer() {
+    let source = r#"class Fixture {
+  void run(Object first) {
+    Object[][] grid = { { first } };
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    // The nested initializer is an implicit array creation (JLS 10.6): the
+    // outer array stores the creation's result, which is the nested array
+    // through an identity transfer. Stored as the bare allocation, a read
+    // through both positions finds nothing.
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::Local,
+        "{ first }",
+        "{ { first } }"
+    ));
+    assert!(has_assignment(run, source, "{ first }", "{ { first } }"));
+    assert!(run.gaps().is_empty(), "{:?}", run.gaps());
+}
+
+#[test]
+#[hardwon("#6523: an oversized array initializer must not give one procedure unbounded locations")]
+fn array_initializer_past_the_element_cap_stores_the_cap_and_leaves_a_write_gap() {
+    let elements = (0..1030)
+        .map(|index| format!("\"e{index}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "class Fixture {{\n  void run() {{\n    String[] table = {{ {elements} }};\n  }}\n}}\n"
+    );
+    let artifact = java_semantics(&source);
+    let run = method(&artifact, "run");
+    let stores = run
+        .points()
+        .iter()
+        .flat_map(|point| point.events.iter())
+        .filter(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(stores, 1024);
+    let [gap] = run.gaps() else {
+        panic!("expected exactly the residual write gap: {:?}", run.gaps());
+    };
+    assert_eq!(gap.capability, SemanticCapability::IndexMemory);
+    assert_eq!(
+        gap.impacts,
+        SemanticGapImpacts::single(SemanticGapImpact::HeapWrite)
+    );
+}
+
+#[test]
+#[hardwon("#6523: a string template had no joined result, no processor call and no gap")]
+fn string_template_joins_its_embedded_expressions_and_leaves_a_call_gap() {
+    let source = r#"class Fixture {
+  void run(Object value) {
+    String text = STR."k=\{value}";
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+    let run = method(&artifact, "run");
+    let template = "STR.\"k=\\{value}\"";
+    let fragment = "\"k=\\{value}\"";
+    let embedded = "\\{value}";
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        "value",
+        embedded
+    ));
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        embedded,
+        fragment
+    ));
+    assert!(has_flow(
+        run,
+        source,
+        ValueFlowKind::LanguageDefined,
+        fragment,
+        template
+    ));
+    let [gap] = run.gaps() else {
+        panic!("expected exactly the processor-call gap: {:?}", run.gaps());
+    };
+    assert_eq!(gap.capability, SemanticCapability::Calls);
+    let SemanticGapSubject::Value(subject) = gap.subject else {
+        panic!("the gap names the template result: {gap:?}");
+    };
+    assert_eq!(value_text(run, source, subject), template);
+}

@@ -3495,6 +3495,9 @@ mod outer {
     /// ones. The oracle is a from-scratch build under the new version, whose
     /// live rows the rotated store must reproduce.
     #[test]
+    #[hardwon(
+        "a48b9658c627: crate derivation changes reused stale Rust unit summaries on warm start"
+    )]
     fn warm_derivation_version_rotation_replaces_same_revision_versions() {
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         type VersionRow = (Vec<u8>, i64, Option<i64>, Vec<u8>);
@@ -3533,6 +3536,88 @@ mod outer {
                 .unwrap()
         };
 
+        // Seed a genuinely old summary read set through the real producer,
+        // rather than changing metadata on a current summary digest.
+        use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RustUnitSummaries;
+        use brokk_bifrost_analysis::analyzer::store::unit_summaries::{
+            ConsumedDependency, UnitInputs, UnitOutputs, UnitSummaryLanguage,
+        };
+        struct PreviousCfgSummaryReads;
+        impl UnitSummaryLanguage for PreviousCfgSummaryReads {
+            fn lang(&self) -> &'static str {
+                "rust"
+            }
+            fn unit_kind(&self) -> &'static str {
+                "rust_crate"
+            }
+            fn derivation_version(&self) -> i64 {
+                RustUnitSummaries.derivation_version()
+            }
+            fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+                RustUnitSummaries.stage(conn, snapshot)
+            }
+            fn clear_stage(&self, conn: &Connection) -> Result<()> {
+                RustUnitSummaries.clear_stage(conn)
+            }
+            fn inputs(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit_id: i64,
+            ) -> Result<UnitInputs> {
+                use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+                let removed = ["rust-crate-derivation", "rust-crate-topology"].map(|name| {
+                    let mut hash = CanonicalHasher::new(b"bifrost-unit-summary-read-key:v1");
+                    hash.field("name", name.as_bytes());
+                    hash.finish()
+                });
+                let mut inputs = RustUnitSummaries.inputs(conn, snapshot, unit_id)?;
+                inputs
+                    .reads
+                    .retain(|read| !removed.contains(&read.key_digest));
+                Ok(inputs)
+            }
+            fn derive(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit: &UnitInputs,
+                dependencies: &[ConsumedDependency],
+                producer_epoch: &str,
+            ) -> Result<UnitOutputs> {
+                RustUnitSummaries.derive(conn, snapshot, unit, dependencies, producer_epoch)
+            }
+            fn write_language_rows(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit: &UnitInputs,
+                dependencies: &[ConsumedDependency],
+                summary_id: i64,
+            ) -> Result<usize> {
+                RustUnitSummaries.write_language_rows(
+                    conn,
+                    snapshot,
+                    unit,
+                    dependencies,
+                    summary_id,
+                )
+            }
+            fn write_language_version(
+                &self,
+                conn: &Connection,
+                snapshot: &WorkspaceSnapshotId,
+                unit: &UnitInputs,
+                summary_id: i64,
+            ) -> Result<usize> {
+                RustUnitSummaries.write_language_version(conn, snapshot, unit, summary_id)
+            }
+        }
+        let old_version = RUST_CRATE_DERIVATION_VERSION
+            .split_once("-absent-feature-cfg-inactive-v1")
+            .expect("the upgrade starts with the previous crate derivation version")
+            .0;
+        set_derivation_version(Some(old_version));
         let first = build().expect("the first build succeeds");
         let first_revision = head(&first);
         drop(first);
@@ -3544,6 +3629,57 @@ mod outer {
         let revision = head(&warm);
         assert!(revision > first_revision, "the edit opens a revision");
         let before = versions(&warm);
+        let store = warm.store().unwrap();
+        let snapshot = {
+            let conn = store.read_conn().unwrap();
+            conn.query_row(
+                "SELECT workspace_id, generation, revision FROM workspace_heads WHERE lang='rust'",
+                [],
+                |row| {
+                    Ok(WorkspaceSnapshotId {
+                        workspace_id: brokk_bifrost_analysis::analyzer::store::WorkspaceId(
+                            row.get(0)?,
+                        ),
+                        lang: "rust".into(),
+                        generation:
+                            brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(
+                                row.get(1)?,
+                            ),
+                        revision: row.get(2)?,
+                    })
+                },
+            )
+            .unwrap()
+        };
+        store
+            .conn
+            .execute(|conn| {
+                conn.execute_batch(
+                    "DELETE FROM rust_resolution_unit_summary_versions;
+             DELETE FROM resolution_unit_summary_versions WHERE lang='rust';
+             DELETE FROM resolution_unit_summaries WHERE lang='rust';",
+                )
+            })
+            .unwrap();
+        let legacy = store
+            .reconcile_unit_summaries(
+                &snapshot,
+                PreviousCfgSummaryReads,
+                &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(legacy.failed.is_empty() && legacy.derived > 0, "{legacy:?}");
+        // A header above this high-water mark cannot be a preexisting cache
+        // hit: publish_unit creates a new header only after derive succeeds.
+        let previous_summary_id: i64 = store
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT max(summary_id) FROM resolution_unit_summaries WHERE lang='rust'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         drop(warm);
         let open_before = before
             .iter()
@@ -3556,7 +3692,7 @@ mod outer {
         );
 
         // The rotation, and the oracle derived under the same version.
-        set_derivation_version(Some("crate-derivation-version-warm-rotation"));
+        set_derivation_version(None);
         let rotated = build();
         let scratch = WorkspaceAnalyzer::build_ephemeral_footgun(
             project.project_dyn(),
@@ -3570,6 +3706,37 @@ mod outer {
             revision,
             "the rotation changes no file, so it opens no revision"
         );
+
+        let derived_summary_ids = |analyzer: &WorkspaceAnalyzer| -> Vec<i64> {
+            analyzer
+                .store()
+                .unwrap()
+                .read_conn()
+                .unwrap()
+                .prepare("SELECT summary_id FROM resolution_unit_summaries WHERE lang='rust' AND summary_id>?1 ORDER BY summary_id")
+                .unwrap()
+                .query_map([previous_summary_id], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let derived = derived_summary_ids(&rotated);
+        let live: Vec<i64> = rotated.store().unwrap().read_conn().unwrap()
+            .prepare("SELECT summary_id FROM resolution_unit_summary_versions WHERE lang='rust' AND valid_until IS NULL ORDER BY summary_id")
+            .unwrap().query_map([], |row| row.get(0)).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert!(!live.is_empty(), "the warm upgrade selects Rust summaries");
+        assert!(
+            live.iter().all(|id| derived.contains(id)),
+            "every live summary was derived after reopening the old read set: live={live:?}, derived={derived:?}"
+        );
+        let warm_again = build().expect("a second warm start succeeds");
+        assert_eq!(
+            derived_summary_ids(&warm_again),
+            derived,
+            "the unchanged second warm start derives no additional summaries"
+        );
+        drop(warm_again);
 
         // History: rows closed before stay as they were, a row opened before
         // this revision is closed at it, and a row this revision opened is

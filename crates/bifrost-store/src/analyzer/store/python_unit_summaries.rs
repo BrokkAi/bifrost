@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::StoreError;
+use super::python_binding_rows::{self, EnvironmentSourceRow};
+use crate::hash::{HashMap, HashSet};
+
 use super::AnalyzerStore;
 use super::Result;
 use super::WorkspaceId;
@@ -16,12 +20,12 @@ use super::unit_summaries::{
 };
 use crate::CancellationToken;
 
-use crate::analyzer::{Language, ProjectFile};
+use crate::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    FileResolutionFacts, PythonNativeCuratedSurface, PythonNativeExportOperationKind,
-    PythonNativeImportForm, PythonNativeWildcardPolicy, ResolutionIdentifierRole,
+    PythonNativeCuratedSurface, PythonNativeExportOperationKind, PythonNativeImportForm,
+    PythonNativeWildcardPolicy,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -76,6 +80,26 @@ pub struct PythonSummaryProfile {
     pub python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
 }
 impl PythonSummaryProfile {
+    fn validate(&self) {
+        assert!(!self.ordered || !matches!(self.authority, PythonSummaryAuthority::Workspace));
+        if matches!(
+            self.authority,
+            PythonSummaryAuthority::CheckedRuntime { .. }
+        ) {
+            assert_eq!(
+                self.roots.len(),
+                1,
+                "checked runtime has exactly one source root"
+            );
+        }
+        for root in &self.roots {
+            assert!(root.components().all(|part| matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )));
+        }
+    }
+
     fn digest(&self) -> [u8; 32] {
         let mut hash = CanonicalHasher::new(b"python-environment-profile:v1");
         hash.field("authority", self.authority.label().as_bytes());
@@ -112,7 +136,6 @@ pub struct PythonSummaryReceipt {
 }
 
 const STAGING: &str = "
-CREATE TEMP TABLE IF NOT EXISTS py_env_config(path TEXT PRIMARY KEY, digest BLOB NOT NULL CHECK(length(digest)=32)) WITHOUT ROWID;
 CREATE TEMP TABLE IF NOT EXISTS py_env_files(
  rel_path TEXT PRIMARY KEY, blob_id INTEGER NOT NULL, blob_oid TEXT NOT NULL, scope INTEGER NOT NULL
 ) WITHOUT ROWID;
@@ -147,7 +170,7 @@ CREATE TEMP TABLE IF NOT EXISTS py_env_routes(
 ) WITHOUT ROWID;";
 const CLEAR: &str = "DELETE FROM temp.py_env_routes; DELETE FROM temp.py_env_names;
 DELETE FROM temp.py_env_surfaces; DELETE FROM temp.py_env_segments; DELETE FROM temp.py_env_imports;
-DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM temp.py_env_files; DELETE FROM temp.py_env_config;";
+DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM temp.py_env_files;";
 
 pub fn portable(path: &Path) -> String {
     path.components()
@@ -175,6 +198,122 @@ fn logical_container(module: &str) -> String {
     lower_hex_string(&key(b"python-environment-module:v1", &[module]))
 }
 
+/// One reconcile's selected membership and retained packaging bytes.
+/// Never stored on an analyzer or shared between requests.
+#[derive(Default)]
+pub struct PythonEnvironmentSnapshotInputs {
+    files: HashSet<PathBuf>,
+    configuration: HashMap<PathBuf, String>,
+}
+impl PythonEnvironmentSnapshotInputs {
+    pub fn contains(&self, relative_path: &Path) -> bool {
+        self.files.contains(relative_path)
+    }
+    pub fn configuration_source(&self, relative_path: &Path) -> Option<&str> {
+        self.configuration.get(relative_path).map(String::as_str)
+    }
+    fn read(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        let mut result = Self::default();
+        let mut statement = conn.prepare_cached(SNAPSHOT_INPUTS_SQL)?;
+        let mut rows = statement.query(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision
+        ])?;
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Err(StoreError::cancelled(
+                    python_binding_rows::ENVIRONMENT_SOURCE_CANCELLED,
+                ));
+            }
+            let path: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            if kind == "configuration" {
+                let oid: String = row.get(2)?;
+                let bytes: Option<Vec<u8>> = row.get(3)?;
+                let bytes = bytes.ok_or_else(|| {
+                    StoreError::missing_required_source_facts(format!(
+                        "python_retained_configuration_unavailable: path={path:?} oid={oid:?}"
+                    ))
+                })?;
+                let source = String::from_utf8(bytes).map_err(|error| {
+                    StoreError::missing_required_source_facts(format!(
+                        "python_retained_configuration_invalid: path={path:?} oid={oid:?}: {error}"
+                    ))
+                })?;
+                result.configuration.insert(PathBuf::from(&path), source);
+            }
+            result.files.insert(PathBuf::from(path));
+        }
+        Ok(result)
+    }
+}
+pub(crate) const SNAPSHOT_INPUTS_SQL: &str =
+    "SELECT v.rel_path,v.input_kind,v.blob_oid,retained.source_bytes
+FROM workspace_file_versions AS v
+LEFT JOIN workspace_input_sources AS retained
+ ON retained.content_oid=v.blob_oid AND v.input_kind='configuration'
+WHERE v.workspace_id=?1 AND v.lang='python' AND v.generation=?2
+ AND v.valid_from<=?3 AND (v.valid_until IS NULL OR ?3<v.valid_until)
+ AND (v.input_kind='source' OR (v.input_kind='configuration'
+  AND (v.rel_path IN ('pyproject.toml','setup.py','__init__.py')
+   OR v.rel_path LIKE '%/pyproject.toml' OR v.rel_path LIKE '%/setup.py'
+   OR v.rel_path LIKE '%/__init__.py')))
+ORDER BY v.rel_path,v.input_kind";
+
+impl AnalyzerStore {
+    /// Reconcile one selected environment from retained inputs on one writer job.
+    /// The root hook reads only the supplied operation-local snapshot inputs.
+    pub fn reconcile_python_environment<F>(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        profile: PythonSummaryProfile,
+        workspace_root: F,
+        cancellation: &CancellationToken,
+    ) -> Result<PythonSummaryReceipt>
+    where
+        F: Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PathBuf> + Send + 'static,
+    {
+        profile.validate();
+        let started = Instant::now();
+        let report = self.reconcile_unit_summaries(
+            snapshot,
+            PythonUnitSummaries {
+                profile,
+                staging: Some(PythonEnvironmentStaging {
+                    workspace_root: Box::new(workspace_root),
+                    cancellation: cancellation.clone(),
+                }),
+            },
+            cancellation,
+        );
+        // Only typed cancellation is recoverable here.
+        // Missing retained rows and concurrent SQL errors still propagate.
+        let report = match report {
+            Err(error) if error.is_cancelled() && cancellation.is_cancelled() => {
+                unit_summaries::UnitSummaryReconciliation {
+                    cancelled: true,
+                    ..Default::default()
+                }
+            }
+            other => other?,
+        };
+        Ok(PythonSummaryReceipt {
+            elapsed_micros: started.elapsed().as_micros(),
+            statements: report.statements,
+            rows_written: report.rows_written,
+            derived: report.derived,
+            unchanged: report.unchanged,
+            cancelled: report.cancelled,
+            failed: report.failed,
+        })
+    }
+}
+
 /// Explicit native test path. All source metadata is TEMP and must be restaged
 /// after reconcile; persisted summary outputs can be read without that metadata.
 pub struct PythonEnvironmentPublication {
@@ -183,26 +322,13 @@ pub struct PythonEnvironmentPublication {
     pub profile: PythonSummaryProfile,
 }
 impl PythonEnvironmentPublication {
-    pub fn open(path: &Path, profile: PythonSummaryProfile) -> Result<Self> {
-        assert!(
-            !profile.ordered || !matches!(profile.authority, PythonSummaryAuthority::Workspace)
-        );
-        if matches!(
-            profile.authority,
-            PythonSummaryAuthority::CheckedRuntime { .. }
-        ) {
-            assert_eq!(
-                profile.roots.len(),
-                1,
-                "checked runtime has exactly one source root"
-            );
-        }
-        for root in &profile.roots {
-            assert!(root.components().all(|part| matches!(
-                part,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )));
-        }
+    pub fn open(
+        path: &Path,
+        workspace_root: &Path,
+        source_epoch: &str,
+        profile: PythonSummaryProfile,
+    ) -> Result<Self> {
+        profile.validate();
         let mut store = AnalyzerStore::open_persistent(path)?;
         // Native validation sessions need connection-private TEMP inventories even
         // when another profile uses the same database and persistent writer actor.
@@ -211,22 +337,19 @@ impl PythonEnvironmentPublication {
         );
         *store.crate_statement_counter.lock().expect("counter lock") =
             Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
-        let generation = store
-            .ensure_language_epoch_value("python", "python-native-environment-validation-v1")?;
+        let generation = store.ensure_language_epoch_value("python", source_epoch)?;
         store.ensure_resolution_producer_epoch("python", Language::Python)?;
         let snapshot = WorkspaceSnapshotId {
-            workspace_id: WorkspaceId("e".repeat(64)),
+            workspace_id: WorkspaceId::for_root(workspace_root),
             lang: "python".to_owned(),
             generation,
             revision: 1,
         };
-        let result = Self {
+        Ok(Self {
             store,
             snapshot,
             profile,
-        };
-        result.begin(1)?;
-        Ok(result)
+        })
     }
 
     /// Exact retained environment selection for the dormant source probe.
@@ -236,6 +359,7 @@ impl PythonEnvironmentPublication {
         snapshot.revision = revision;
         let language = PythonUnitSummaries {
             profile: self.profile.clone(),
+            staging: None,
         };
         self.store.conn.execute(move |conn| -> Result<Option<i64>> {
             let epoch: String = conn.query_row(
@@ -246,79 +370,6 @@ impl PythonEnvironmentPublication {
             Ok(language
                 .live_summary(conn, &snapshot, &epoch, &unit_key())?
                 .map(|(id, _)| id))
-        })
-    }
-
-    /// Select a revision and discard the previous pass's TEMP input inventory.
-    pub fn begin(&self, revision: i64) -> Result<()> {
-        let mut snapshot = self.snapshot.clone();
-        snapshot.revision = revision;
-        self.store.conn.execute(move |conn| -> Result<()> {
-            conn.execute_batch(STAGING)?;
-            conn.execute_batch(CLEAR)?;
-            conn.execute("INSERT OR IGNORE INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'python',?2,?3)",
-                params![snapshot.workspace_id.as_str(), snapshot.generation.get(), snapshot.revision])?;
-            Ok(())
-        })
-    }
-
-    pub fn stage_configuration(&self, inputs: Vec<(String, [u8; 32])>) -> Result<()> {
-        self.store.conn.execute(move |conn| -> Result<()> {
-            for (path, digest) in inputs {
-                conn.execute(
-                    "INSERT OR IGNORE INTO temp.py_env_config VALUES(?1,?2)",
-                    params![path, digest.as_slice()],
-                )?;
-                let selected: Vec<u8> = conn.query_row(
-                    "SELECT digest FROM temp.py_env_config WHERE path=?1",
-                    [&path],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(
-                    selected, digest,
-                    "configuration inputs must share one selected Project: {path}"
-                );
-            }
-            Ok(())
-        })
-    }
-
-    pub fn stage_facts(
-        &self,
-        file: ProjectFile,
-        oid: String,
-        blob_id: i64,
-        facts: FileResolutionFacts,
-        roots: Vec<PathBuf>,
-    ) -> Result<()> {
-        self.store
-            .conn
-            .execute(move |conn| stage_file(conn, &file, &oid, blob_id, &facts, &roots))
-    }
-
-    pub fn reconcile(
-        &self,
-        revision: i64,
-        cancellation: &CancellationToken,
-    ) -> Result<PythonSummaryReceipt> {
-        let mut snapshot = self.snapshot.clone();
-        snapshot.revision = revision;
-        let started = Instant::now();
-        let report = self.store.reconcile_unit_summaries(
-            &snapshot,
-            PythonUnitSummaries {
-                profile: self.profile.clone(),
-            },
-            cancellation,
-        )?;
-        Ok(PythonSummaryReceipt {
-            elapsed_micros: started.elapsed().as_micros(),
-            statements: report.statements,
-            rows_written: report.rows_written,
-            derived: report.derived,
-            unchanged: report.unchanged,
-            cancelled: report.cancelled,
-            failed: report.failed,
         })
     }
 
@@ -333,27 +384,23 @@ impl PythonEnvironmentPublication {
     }
 }
 
-fn stage_file(
-    conn: &Connection,
-    file: &ProjectFile,
-    oid: &str,
-    blob_id: i64,
-    facts: &FileResolutionFacts,
-    roots: &[PathBuf],
-) -> Result<()> {
-    let path = portable(file.rel_path());
-    let scope = facts
-        .python_export_surfaces
-        .first()
-        .expect("Python module surface")
-        .module_scope;
+fn stage_file(conn: &Connection, rows: &[EnvironmentSourceRow], roots: &[PathBuf]) -> Result<()> {
+    let EnvironmentSourceRow::File {
+        path,
+        oid,
+        blob: blob_id,
+        curated,
+        wildcard,
+    } = rows.first().expect("nonempty file rows")
+    else {
+        panic!("leading Python file row")
+    };
+    let file_path = Path::new(path);
+    let scope = 0;
     conn.execute(
         "INSERT INTO temp.py_env_files VALUES(?1,?2,?3,?4)",
-        params![path, blob_id, oid, scope.get()],
+        params![path, blob_id, oid, scope],
     )?;
-    let name = |id: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNameId| {
-        &facts.names[id.index()].spelling
-    };
     for (ordinal, root) in roots.iter().enumerate() {
         let root = root
             .components()
@@ -374,7 +421,7 @@ fn stage_file(
             "INSERT OR IGNORE INTO temp.py_env_roots VALUES(?1,?2)",
             params![slot, root_path],
         )?;
-        let Ok(relative) = file.rel_path().strip_prefix(&root) else {
+        let Ok(relative) = file_path.strip_prefix(&root) else {
             continue;
         };
         let is_init = relative.file_stem().is_some_and(|name| name == "__init__");
@@ -424,68 +471,72 @@ fn stage_file(
             kind = "module";
         }
         let module = components.join(".");
-        let provider = container(slot, file.rel_path(), kind);
+        let provider = container(slot, file_path, kind);
         conn.execute("INSERT INTO temp.py_env_candidates(container,module,parent,depth,root,kind,rel_path,blob_id,scope,provider_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![provider,module,parent_module,components.len() as i64,slot,kind,path,blob_id,scope.get(),key(b"python-source-provider:v1", &[&root_path,&path,kind]).as_slice()])?;
+            params![provider,module,parent_module,components.len() as i64,slot,kind,path,blob_id,scope,key(b"python-source-provider:v1", &[&root_path,path,kind]).as_slice()])?;
     }
-    for import in &facts.python_imports {
-        let route = facts
-            .import_routes
-            .iter()
-            .find(|route| route.site == import.import_site)
-            .expect("Python import route");
-        let mut segments: Vec<_> = facts
-            .import_route_segments
-            .iter()
-            .filter(|segment| segment.import_site == import.import_site)
-            .collect();
-        segments.sort_by_key(|segment| segment.ordinal);
-        let requested = if matches!(import.form, PythonNativeImportForm::From) {
-            name(segments[import.module_segment_count as usize].name).as_str()
-        } else {
-            ""
-        };
-        let form = match import.form {
-            PythonNativeImportForm::Module => "module",
-            PythonNativeImportForm::From => "from",
-            PythonNativeImportForm::Star => "star",
-        };
-        conn.execute(
-            "INSERT INTO temp.py_env_imports VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                path,
-                import.import_site.get(),
-                import.relative_level,
+    for row in rows {
+        match row {
+            EnvironmentSourceRow::File { path: selected, .. } => assert_eq!(selected, path),
+            EnvironmentSourceRow::ModuleSlot {
+                path: selected,
+                slot,
+                name,
+            } => {
+                assert_eq!(selected, path);
+                conn.execute(
+                    "INSERT OR IGNORE INTO temp.py_env_names VALUES(?1,'module',?2,?3)",
+                    params![path, name, slot],
+                )?;
+            }
+            EnvironmentSourceRow::Import {
+                path: selected,
+                site,
                 form,
-                requested,
-                route.bound_name.map(name).map(String::as_str).unwrap_or("")
-            ],
-        )?;
-        for segment in segments
-            .into_iter()
-            .take(import.module_segment_count as usize)
-        {
-            conn.execute(
-                "INSERT INTO temp.py_env_segments VALUES(?1,?2,?3,?4)",
-                params![
-                    path,
-                    import.import_site.get(),
-                    segment.ordinal,
-                    name(segment.name)
-                ],
-            )?;
+                relative_level,
+                module_segments,
+                local_name,
+            } => {
+                assert_eq!(selected, path);
+                let mut segments = rows.iter().filter_map(|row| match row {
+                    EnvironmentSourceRow::ImportSegment {
+                        site: segment_site,
+                        ordinal,
+                        spelling,
+                        ..
+                    } if segment_site == site => Some((*ordinal, spelling)),
+                    _ => None,
+                });
+                for (ordinal, spelling) in segments.by_ref().take(*module_segments as usize) {
+                    conn.execute(
+                        "INSERT INTO temp.py_env_segments VALUES(?1,?2,?3,?4)",
+                        params![path, site, ordinal, spelling],
+                    )?;
+                }
+                let requested = if *form == PythonNativeImportForm::From {
+                    segments.next().expect("From requested member").1.as_str()
+                } else {
+                    ""
+                };
+                let form = match form {
+                    PythonNativeImportForm::Module => "module",
+                    PythonNativeImportForm::From => "from",
+                    PythonNativeImportForm::Star => "star",
+                };
+                conn.execute(
+                    "INSERT INTO temp.py_env_imports VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![path, site, relative_level, form, requested, local_name],
+                )?;
+            }
+            _ => {}
         }
     }
-    let surface = facts
-        .python_export_surfaces
-        .first()
-        .expect("module surface");
-    let curated = match surface.curated {
+    let curated = match curated {
         PythonNativeCuratedSurface::Absent => "absent",
         PythonNativeCuratedSurface::Listed => "curated",
         PythonNativeCuratedSurface::Unreadable => "unknown",
     };
-    let wildcard = match surface.wildcard_policy {
+    let wildcard = match wildcard {
         PythonNativeWildcardPolicy::PublicNames => "public_names",
         PythonNativeWildcardPolicy::Curated => "curated",
         PythonNativeWildcardPolicy::Unknown => "unknown",
@@ -500,60 +551,54 @@ fn stage_file(
             params![path, surface, policy],
         )?;
     }
-    for export in &facts.root_exports {
-        let site = facts
-            .sites
-            .iter()
-            .find(|site| site.id == export.declaration)
-            .expect("export slot site");
-        if site.scope != scope {
-            continue;
-        }
-        for identifier in facts.identifiers.iter().filter(|identifier| {
-            identifier.site == site.id && identifier.role == ResolutionIdentifierRole::Declaration
-        }) {
-            conn.execute(
-                "INSERT OR IGNORE INTO temp.py_env_names VALUES(?1,'module',?2,?3)",
-                params![path, name(identifier.name), site.id.get()],
-            )?;
-        }
-    }
     // Only the producer's readable straight-line fold certifies membership.
     // Literal observations inside an unreadable operation are not final names.
     if curated == "curated" {
-        let replacement = facts
-            .python_export_operations
+        let replacement = rows
             .iter()
-            .rposition(|operation| {
-                operation.readable
-                    && matches!(
-                        operation.kind,
-                        PythonNativeExportOperationKind::ReplaceList
-                            | PythonNativeExportOperationKind::ReplaceTuple
-                    )
+            .rposition(|row| {
+                matches!(
+                    row,
+                    EnvironmentSourceRow::ExportOperation {
+                        readable: true,
+                        kind: PythonNativeExportOperationKind::ReplaceList
+                            | PythonNativeExportOperationKind::ReplaceTuple,
+                        ..
+                    }
+                )
             })
             .expect("listed exports have a readable replacement");
-        for operation in &facts.python_export_operations[replacement..] {
-            assert!(operation.readable);
+        for row in &rows[replacement..] {
+            let EnvironmentSourceRow::ExportOperation {
+                ordinal,
+                kind,
+                readable,
+                ..
+            } = row
+            else {
+                continue;
+            };
+            assert!(readable);
             if matches!(
-                operation.kind,
+                kind,
                 PythonNativeExportOperationKind::ReplaceList
                     | PythonNativeExportOperationKind::ReplaceTuple
                     | PythonNativeExportOperationKind::Delete
             ) {
                 conn.execute(
                     "DELETE FROM temp.py_env_names WHERE rel_path=?1 AND surface='curated'",
-                    [&path],
+                    [path],
                 )?;
             }
-            for member in facts
-                .python_export_members
-                .iter()
-                .filter(|member| member.operation_ordinal == operation.ordinal)
-            {
+            for member in rows.iter().filter_map(|row| match row {
+                EnvironmentSourceRow::ExportMember {
+                    operation, name, ..
+                } if operation == ordinal => Some(name),
+                _ => None,
+            }) {
                 conn.execute(
                     "INSERT OR IGNORE INTO temp.py_env_names VALUES(?1,'curated',?2,NULL)",
-                    params![path, name(member.name)],
+                    params![path, member],
                 )?;
             }
         }
@@ -571,8 +616,16 @@ fn stage_file(
     Ok(())
 }
 
+type WorkspaceRoot = dyn Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PathBuf> + Send;
+
+struct PythonEnvironmentStaging {
+    workspace_root: Box<WorkspaceRoot>,
+    cancellation: CancellationToken,
+}
+
 struct PythonUnitSummaries {
     profile: PythonSummaryProfile,
+    staging: Option<PythonEnvironmentStaging>,
 }
 const LIVE: &str = unit_summaries::live_summary_select!("?8");
 impl UnitSummaryLanguage for PythonUnitSummaries {
@@ -612,7 +665,44 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
             )
             .optional()?)
     }
-    fn stage(&self, conn: &Connection, _snapshot: &WorkspaceSnapshotId) -> Result<()> {
+    fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+        conn.execute_batch(STAGING)?;
+        conn.execute_batch(CLEAR)?;
+        let staging = self
+            .staging
+            .as_ref()
+            .expect("Python summary staging operation");
+        let inputs = if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
+            PythonEnvironmentSnapshotInputs::read(conn, snapshot, &staging.cancellation)?
+        } else {
+            PythonEnvironmentSnapshotInputs::default()
+        };
+        let mut file_rows = Vec::new();
+        let flush = |rows: &[EnvironmentSourceRow]| -> Result<()> {
+            if let Some(EnvironmentSourceRow::File { path, .. }) = rows.first() {
+                let roots = if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
+                    vec![(staging.workspace_root)(Path::new(path), &inputs)?]
+                } else {
+                    self.profile.roots.clone()
+                };
+                stage_file(conn, rows, &roots)?;
+            }
+            Ok(())
+        };
+        python_binding_rows::read_environment_source_rows(
+            conn,
+            snapshot,
+            &staging.cancellation,
+            |_, row| {
+                if matches!(row, EnvironmentSourceRow::File { .. }) {
+                    flush(&file_rows)?;
+                    file_rows.clear();
+                }
+                file_rows.push(row);
+                Ok(())
+            },
+        )?;
+        flush(&file_rows)?;
         let members: i64 = conn.query_row("SELECT count(*) FROM temp.py_env_files", [], |row| {
             row.get(0)
         })?;
@@ -963,6 +1053,7 @@ fn render(
     use std::fmt::Write;
     let language = PythonUnitSummaries {
         profile: profile.clone(),
+        staging: None,
     };
     let epoch: String = conn.query_row(
         "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
@@ -1050,6 +1141,7 @@ pub(crate) fn selected_binding_summary(
     )?;
     PythonUnitSummaries {
         profile: profile.clone(),
+        staging: None,
     }
     .live_summary(conn, snapshot, &epoch, &unit_key())
     .map(|selected| selected.map(|(summary, _)| summary))

@@ -816,6 +816,66 @@ fn module_components_prefix(prefix: &[String], module: &[String]) -> bool {
     !prefix.is_empty() && module.starts_with(prefix)
 }
 
+/// Select the production summary profile for one configured source environment.
+/// A declared runtime must verify; its failure never selects workspace authority.
+#[cfg(any(test, feature = "test-support"))]
+pub fn python_production_summary_profile(
+    project: &dyn brokk_bifrost_core::analyzer::project::Project,
+    runtime: Option<&PythonRuntimeEnvironmentConfig>,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Result<
+    brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryProfile,
+    PythonDeclaredEnvironmentError,
+> {
+    use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
+        PythonSummaryAuthority, PythonSummaryObservation, PythonSummaryProfile,
+    };
+    let (authority, roots, ordered) = if let Some(runtime) =
+        runtime.filter(|runtime| runtime.declared_environment.is_some())
+    {
+        let (checked, _, _) =
+            acquire_python_declared_environment(project.root(), runtime, limits, cancellation)?;
+        let digest = brokk_bifrost_core::analyzer::canonical_hash::parse_lower_sha256(
+            &checked.project_config().value,
+        )
+        .expect("verified projectConfig is a SHA-256 digest");
+        // The summary's one source root is the declared Source slot, which
+        // verification bound to runtime.source_root. Standard-library and
+        // installed-distribution slots are external providers, not source roots.
+        let source = runtime
+            .declared_environment
+            .as_ref()
+            .expect("verified descriptor")
+            .root_slots
+            .iter()
+            .find(|slot| {
+                slot.role == brokk_bifrost_core::analyzer::config::PythonDeclaredRootRole::Source
+            })
+            .expect("verification requires exactly one source slot");
+        (
+            PythonSummaryAuthority::CheckedRuntime {
+                project_config_digest: digest,
+            },
+            vec![source.path.clone()],
+            true,
+        )
+    } else {
+        // Workspace roots are a per-file function of the selected snapshot,
+        // which staging derives; the profile carries none.
+        (PythonSummaryAuthority::Workspace, Vec::new(), false)
+    };
+    Ok(PythonSummaryProfile {
+        authority,
+        // Legacy workspace resolution reads .py only; .pyi stubs are external models.
+        observation: PythonSummaryObservation::Runtime,
+        roots,
+        ordered,
+        target_digest: [0; 32],
+        python_version: None,
+    })
+}
+
 /// Produce the portable projectConfig condition for the supported declared
 /// launch inputs and their current root contents. This checks the descriptor
 /// and exact input bytes without executing an interpreter or dependency code.

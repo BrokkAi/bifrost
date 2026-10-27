@@ -6,8 +6,10 @@ use super::demand_closure::*;
 use super::python_lexical::{self, PythonBindingProfile, PythonBindingProofs, PythonLexical};
 use super::*;
 use crate::analyzer::resolution::temporal_binding::{SessionBudget, Stop};
-use crate::analyzer::resolution::{DemandReferenceKey, EndpointSignature};
+use crate::analyzer::resolution::{DemandReferenceKey, EndpointSignature, ResolutionAnswer};
 use crate::analyzer::store::python_binding_rows::{BindingEvent, PythonBindingRows};
+use crate::analyzer::store::selected_read_memo::ExactReadMemo;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBindingEventKind;
 
 /// Survivors receive a cohort only after temporal reduction. Origin and source
 /// byte position are deliberately absent from the ordering.
@@ -31,6 +33,10 @@ pub(super) struct PythonRules<'a, 'store, 'input> {
     // One suspended source close owns these inputs. Remove them at publication;
     // rebuilding its borrowed Half view must perform no context/prefix SQL.
     source_inputs: RefCell<HashMap<CandidatePathIdentity, PythonHalfInputs>>,
+    // One forward operation fixes the store and format; only blob selects rows.
+    binding_rows: RefCell<ExactReadMemo<i64, std::sync::Arc<PythonBindingRows>>>,
+    root_prefixes: RefCell<ExactReadMemo<i64, Vec<PythonRootPrefix>>>,
+    module_sites: RefCell<ExactReadMemo<i64, Option<ResolutionSiteId>>>,
     qualified_members: HashMap<
         crate::analyzer::resolution::QualifiedMemberId,
         super::member_access::QualifiedMemberSlot<
@@ -38,8 +44,166 @@ pub(super) struct PythonRules<'a, 'store, 'input> {
             super::python_members::PythonMemberRow,
         >,
     >,
+    // Attribute inventory and completed mutation proofs live for this forward
+    // operation only. They never become a workspace or cross-request index.
+    pub(super) attribute_hooks: RefCell<HashMap<SemanticId, ResolutionCompletion>>,
+    pub(super) attribute_mutations: RefCell<HashMap<SemanticId, ResolutionCompletion>>,
+    pub(super) attribute_metaclasses: RefCell<HashMap<SemanticId, ResolutionCompletion>>,
     prepared_references: RefCell<HashMap<CandidatePathIdentity, SemanticId>>,
     universe_mutations: RefCell<HashMap<CandidatePathIdentity, UniverseMutationInputs>>,
+    module_mutations: RefCell<HashMap<CandidatePathIdentity, UniverseMutationInputs>>,
+    module_spaces: RefCell<HashMap<String, ResolutionCompletion>>,
+    wildcard_inventories: RefCell<HashMap<String, (bool, bool)>>,
+    import_aliases: RefCell<HashMap<CandidatePathIdentity, Vec<PythonImportAlias>>>,
+}
+
+/// A Python file module is the nameless Value declaration. Anonymous callables
+/// have Callable authority; file paths belong only to selected mounts.
+pub(super) fn module_declaration_site(
+    connection: &rusqlite::Connection,
+    blob: i64,
+) -> Result<Option<ResolutionSiteId>> {
+    let sites = connection.prepare_cached(
+        "SELECT semantic.source_site
+         FROM resolution_semantic_sites semantic
+         JOIN source_native_declaration_bridges bridge
+           ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
+         JOIN source_declarations declaration
+           ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
+         WHERE semantic.blob_id=?1 AND semantic.semantic_role='definition'
+           AND semantic.namespace=?2 AND declaration.name_occurrence_id IS NULL"
+    )?.query_map(rusqlite::params![blob, ResolutionNamespace::Value.label()], |row| {
+        row.get::<_, u32>(0).map(ResolutionSiteId::new)
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        sites.len() <= 1,
+        "one nameless Value module declaration per blob: {sites:?}"
+    );
+    Ok(sites.first().copied())
+}
+
+// Runtime module-object attributes need not have authored bindings. __path__
+// exists only on packages; keeping it open on plain modules is conservative.
+// This predicate is shared by module-attribute and public-name star inventory
+// proofs; both keep names without authored bindings open.
+const MODULE_OBJECT_ATTRIBUTES: &[&str] = &[
+    "__name__",
+    "__file__",
+    "__doc__",
+    "__dict__",
+    "__path__",
+    "__package__",
+    "__spec__",
+    "__loader__",
+    "__cached__",
+];
+
+/// These runtime names cannot be disproved by a closed source-binding inventory.
+/// A child provider can become a package attribute through module loading without
+/// a writer in __init__.py. Module-object dunders likewise need no source writer;
+/// star inventories conservatively retain them, and __path__ is open on modules.
+/// Module/package candidates always carry blob_id from their placed source;
+/// publication maps that blob/path to member_ordinal. Thus selected/alternative
+/// children of these kinds are placed without an extra member_ordinal predicate.
+pub(super) fn module_name_open_without_binding(
+    connection: &rusqlite::Connection,
+    summary: i64,
+    container: &str,
+    name: &str,
+) -> Result<bool> {
+    if MODULE_OBJECT_ATTRIBUTES.contains(&name) {
+        return Ok(true);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM python_unit_summary_providers parent
+           JOIN python_unit_summary_providers child
+             ON child.summary_id=parent.summary_id AND child.root_slot=parent.root_slot
+             AND child.module_name=parent.module_name || '.' || ?3
+           WHERE parent.summary_id=?1 AND parent.container_path=?2
+             AND parent.kind IN ('package','namespace')
+             AND parent.state IN ('selected','alternative')
+             AND child.kind IN ('module','package')
+             AND child.state IN ('selected','alternative'))",
+        rusqlite::params![summary, container, name],
+        |row| row.get(0),
+    )?)
+}
+
+fn cached_module_site(
+    connection: &rusqlite::Connection,
+    blob: i64,
+    memo: &RefCell<ExactReadMemo<i64, Option<ResolutionSiteId>>>,
+) -> Result<Option<ResolutionSiteId>> {
+    if let Some(site) = memo.borrow().get(&blob).copied() {
+        return Ok(site);
+    }
+    let site = module_declaration_site(connection, blob)?;
+    assert!(memo.borrow_mut().insert(blob, site).is_none());
+    Ok(site)
+}
+
+fn is_module_definition(
+    selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+    definition: SemanticId,
+    memo: &RefCell<ExactReadMemo<i64, Option<ResolutionSiteId>>>,
+) -> Result<bool> {
+    let Some(ordinal) = definition.ordinal() else {
+        return Ok(false);
+    };
+    let mount = selection.mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+    if mount.semantic_language != Language::Python {
+        return Ok(false);
+    }
+    let blob = mount.blob_id();
+    let site = cached_module_site(selection.connection(), blob, memo)?;
+    Ok(site.is_some_and(|site| {
+        definition == crate::analyzer::resolution::mounted_site_semantic(mount.fragment_id(), site)
+    }))
+}
+
+pub(in crate::analyzer::store) fn namespace_definition_provider()
+-> Box<dyn super::super::language_support::NamespaceDefinitionClassifier> {
+    struct PythonNamespaces {
+        module_sites: RefCell<ExactReadMemo<i64, Option<ResolutionSiteId>>>,
+    }
+    impl super::super::language_support::NamespaceDefinitionClassifier for PythonNamespaces {
+        fn definitions(
+            &self,
+            selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+            definitions: &[SemanticId],
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<SemanticId>> {
+            let mut namespaces = Vec::new();
+            for &definition in definitions {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                if is_module_definition(selection, definition, &self.module_sites)? {
+                    namespaces.push(definition);
+                }
+            }
+            Ok(namespaces)
+        }
+    }
+    Box::new(PythonNamespaces {
+        module_sites: RefCell::new(ExactReadMemo::default()),
+    })
+}
+
+// Each row is one prerequisite for a selected imported module attribute.
+// The shared prefix scheduler follows the reference, including further aliases
+// and cycles. These rows never implement a route walk or alias resolver.
+struct PythonImportAlias {
+    container: String,
+    name: String,
+    reference: SemanticId,
+}
+struct PythonAliasTargets {
+    container: String,
+    name: String,
+    targets: Vec<SemanticId>,
+    completion: ResolutionCompletion,
 }
 
 /// One source closure's selected mutation candidates. The shared prefix pump
@@ -52,10 +216,11 @@ struct UniverseMutationInputs {
 /// Owned data for one suspended typed group. The rules borrow it only while
 /// polling; no context borrows its containing provider.
 struct PythonQualifiedInputs {
-    rows: PythonBindingRows,
+    rows: std::sync::Arc<PythonBindingRows>,
     blob: i64,
     lookup: ResolutionLookupSemanticRecipe,
     values: Vec<ResolutionSlotValue>,
+    prefix: Option<SemanticId>,
     super_context: Option<super_context::SuperContext>,
     references: super::member_access::QualifiedReferenceInputs,
     super_cursor: Option<super_context::SuperCursor>,
@@ -289,11 +454,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
             let mount = self.ready.inventory.mount_record_by_ordinal(
                 SelectedResolutionMountOrdinal::new(input.fragment.ordinal()),
             )?;
-            let Some(rows) = PythonBindingRows::load(
-                self.ready.inventory.connection(),
-                mount.blob_id(),
-                self.cancellation,
-            )?
+            let Some(rows) = self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))?
             else {
                 return Ok(CloseProgress::Cancelled(cancelled_completion()));
             };
@@ -313,10 +474,47 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                 StoreError::corrupt("typed Python member lacks its selected lookup recipe")
             })?;
             let super_context = super_context::SuperContext::read(self, input.reference.reference)?;
+            let prefix = if input.values.is_empty() {
+                match self.root_prefix(mount.blob_id(), input.reference.reference)? {
+                    Some(prefix) => {
+                        let take = match self.prefix_has_import(&rows, &prefix)? {
+                            Read::Ready { value, .. } => value,
+                            Read::Cancelled(completion) => {
+                                return Ok(CloseProgress::Cancelled(completion));
+                            }
+                            Read::Unavailable { .. } => {
+                                unreachable!("lexical slot reads are local")
+                            }
+                        };
+                        crate::profiling::note_with(|| {
+                            format!(
+                                "python namespace prerequisite blob={} member={} prefix={} profile={:?} take={take}",
+                                mount.blob_id(),
+                                prefix.member,
+                                prefix.site,
+                                self.profile,
+                            )
+                        });
+                        take.then(|| {
+                            SemanticId::local(
+                                input.reference.reference.ordinal().expect("mounted member"),
+                                prefix.prefix,
+                            )
+                        })
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             let references = super::member_access::QualifiedReferenceInputs::new(
-                super_context
-                    .iter()
-                    .flat_map(|context| context.prerequisites())
+                prefix
+                    .into_iter()
+                    .chain(
+                        super_context
+                            .iter()
+                            .flat_map(|context| context.prerequisites()),
+                    )
                     .map(|reference| DemandReferenceKey {
                         reference,
                         environment: input.reference.environment,
@@ -327,6 +525,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                 blob: mount.blob_id(),
                 lookup,
                 values: input.values.clone(),
+                prefix,
                 super_context,
                 references,
                 super_cursor: None,
@@ -372,6 +571,32 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                 unreachable!("reference inventory requests no members")
             }
             CloseProgress::Ready(()) => {
+                if let Some(prefix) = slot.context.prefix {
+                    let binding = slot
+                        .context
+                        .references
+                        .answers()
+                        .find(|(key, _)| key.reference == prefix)
+                        .expect("the selected prefix prerequisite has settled")
+                        .1
+                        .binding();
+                    // Classification deliberately ignores binding completion:
+                    // prefix_selection applies it to the namespace route, so a
+                    // conditional import stays incomplete on that route rather
+                    // than falling back to the typed member path.
+                    let mut namespace = !binding.targets().is_empty();
+                    for &target in binding.targets() {
+                        namespace &= is_module_definition(
+                            &self.ready.inventory,
+                            target,
+                            &self.module_sites,
+                        )?;
+                    }
+                    if namespace {
+                        self.qualified_members.insert(id, slot);
+                        return Ok(CloseProgress::Ready(Outcome::QualifierIsNamespace));
+                    }
+                }
                 if let Some(context) = &slot.context.super_context {
                     slot.context.super_cursor = context
                         .selected(self, &slot.context.references.answers().collect::<Vec<_>>())?;
@@ -469,11 +694,14 @@ pub(super) struct PythonHalf<'a, 'store, 'input> {
     placements: Vec<PythonPlacement>,
     import_site: Option<u32>,
     import_name: Option<String>,
-    pub(super) rows: std::rc::Rc<PythonBindingRows>,
+    pub(super) rows: std::sync::Arc<PythonBindingRows>,
     fragment: BindingFragmentId,
     pub(super) blob: i64,
     reference_site: Option<u32>,
+    prefix: Option<std::rc::Rc<ResolutionAnswer>>,
     universe_unmutated: bool,
+    import_aliases: std::rc::Rc<[PythonAliasTargets]>,
+    module_mutations: std::rc::Rc<[super::python_members::operations::ModuleMutation]>,
     completion: ResolutionCompletion,
     stopped: std::cell::Cell<bool>,
     pub(super) member_observations:
@@ -482,14 +710,20 @@ pub(super) struct PythonHalf<'a, 'store, 'input> {
 }
 
 struct PythonHalfInputs {
+    conditional_imports: Vec<u32>,
+    activation_reasons: Vec<SemanticId>,
+    endpoint_completion: ResolutionCompletion,
     containers: Vec<String>,
     import_site: Option<u32>,
     import_name: Option<String>,
-    rows: std::rc::Rc<PythonBindingRows>,
+    rows: std::sync::Arc<PythonBindingRows>,
     fragment: BindingFragmentId,
     blob: i64,
     reference_site: Option<u32>,
+    prefix: Option<std::rc::Rc<ResolutionAnswer>>,
     universe_unmutated: bool,
+    import_aliases: std::rc::Rc<[PythonAliasTargets]>,
+    module_mutations: std::rc::Rc<[super::python_members::operations::ModuleMutation]>,
     rendered_order: std::rc::Rc<std::cell::Cell<bool>>,
 }
 impl PythonHalfInputs {
@@ -514,12 +748,15 @@ impl PythonHalfInputs {
                 .collect(),
             import_site: self.import_site,
             import_name: self.import_name.clone(),
-            rows: std::rc::Rc::clone(&self.rows),
+            rows: std::sync::Arc::clone(&self.rows),
             fragment: self.fragment,
             blob: self.blob,
             reference_site: self.reference_site,
+            prefix: self.prefix.clone(),
             universe_unmutated: self.universe_unmutated,
-            completion,
+            import_aliases: std::rc::Rc::clone(&self.import_aliases),
+            module_mutations: std::rc::Rc::clone(&self.module_mutations),
+            completion: completion.combine(&self.endpoint_completion),
             stopped: std::cell::Cell::new(false),
             member_observations: RefCell::new(Vec::new()),
             rendered_order: std::rc::Rc::clone(&self.rendered_order),
@@ -529,6 +766,470 @@ impl PythonHalfInputs {
 
 fn open(semantic: SemanticId) -> ResolutionCompletion {
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(semantic)])
+}
+
+#[derive(Clone)]
+struct PythonRootPrefix {
+    member: u32,
+    prefix: u32,
+    site: u32,
+    name: String,
+}
+
+/// Selected route evidence is request-local, not an execution observation.
+pub(super) fn import_route_obligation(
+    ready: &ReadySelectedResolution<'_, '_>,
+    summary: i64,
+    caller: &str,
+    site: u32,
+    state: &str,
+) -> Result<(ResolutionCompletion, String)> {
+    let kind = match state {
+        "relative_context_open" => "python_relative_context_open",
+        "provider_open" => "python_provider_open",
+        _ => unreachable!("only unresolved selected routes have endpoint obligations"),
+    };
+    let (unit, profile): (Vec<u8>, String) = ready.inventory.connection().query_row(
+        "SELECT summary.unit_key,roots.observation FROM resolution_unit_summaries summary JOIN python_unit_summary_roots roots ON roots.summary_id=summary.summary_id WHERE summary.summary_id=?1 LIMIT 1",
+        [summary], |row| Ok((row.get(0)?,row.get(1)?)),
+    )?;
+    let label = format!("{kind}:{caller}:site={site}:{state}");
+    let mut hash = CanonicalHasher::new(b"python-import-route-obligation:v1");
+    hash.field("unit", &unit);
+    hash.field("profile", profile.as_bytes());
+    hash.field("import", label.as_bytes());
+    let reason = ready
+        .context_identities
+        .named_semantic(hash.finish(), kind, &label);
+    Ok((open(reason), label))
+}
+
+type PythonModuleBindings = (u32, i64, std::sync::Arc<PythonBindingRows>);
+
+impl PythonRules<'_, '_, '_> {
+    fn root_prefix(&self, blob: i64, reference: SemanticId) -> Result<Option<PythonRootPrefix>> {
+        if self.root_prefixes.borrow().get(&blob).is_none() {
+            // The source root half retains its positioned prefix in the second
+            // end-stack symbol, as in resolution_lexical::root_prefix_sites.
+            let rows = self.ready.inventory.connection().prepare_cached(
+                "SELECT DISTINCT node.semantic_local_key, semantic.semantic_key, semantic.source_site, name.spelling
+                 FROM resolution_paths path
+                 JOIN resolution_node_catalog node ON node.blob_id=path.blob_id AND node.local_key=path.start_node
+                 JOIN resolution_semantic_sites semantic ON semantic.blob_id=path.blob_id
+                   AND semantic.semantic_role='reference'
+                   AND semantic.semantic_key=CAST(json_extract(path.body,'$[4][1]') AS INTEGER)
+                 JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=semantic.blob_id
+                   AND lookup.semantic_key=semantic.semantic_key
+                 JOIN resolution_identities name ON name.id=lookup.identity_id
+                 WHERE path.blob_id=?1 AND path.end_node=-1 AND path.root_terminal IS NOT NULL
+                   AND node.semantic_local_key IS NOT NULL
+                   AND json_array_length(path.body,'$[4]')=4
+                   AND json_type(path.body,'$[4][1]')='integer'
+                   AND CAST(json_extract(path.body,'$[4][1]') AS INTEGER)>=0
+                 ORDER BY node.semantic_local_key"
+            )?.query_map([blob], |row| Ok(PythonRootPrefix {
+                    member: row.get(0)?, prefix: row.get(1)?, site: row.get(2)?, name: row.get(3)?,
+                }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(self.root_prefixes.borrow_mut().insert(blob, rows).is_none());
+        }
+        let rows = self.root_prefixes.borrow();
+        let rows = rows.get(&blob).expect("root prefix rows loaded");
+        Ok(rows
+            .binary_search_by_key(&reference.local_key().expect("local member"), |row| {
+                row.member
+            })
+            .ok()
+            .map(|index| rows[index].clone()))
+    }
+
+    fn prefix_has_import(
+        &self,
+        rows: &PythonBindingRows,
+        prefix: &PythonRootPrefix,
+    ) -> Result<Read<bool>> {
+        let Some(state) = python_lexical::lexical_selection(
+            rows,
+            prefix.site,
+            &prefix.name,
+            self.profile,
+            PythonBindingProofs::default(),
+        ) else {
+            return Ok(Read::ready(false));
+        };
+        let start = ResolutionScopeId::new(state.start_scope);
+        let state = RefCell::new(state);
+        let imports = std::cell::Cell::new(false);
+        let selected = select_lexical_route_starts::<u32, (), _>(
+            start,
+            |scope| {
+                Ok(
+                    python_lexical::lexical_parent(&state.borrow(), rows, scope.get())
+                        .map(ResolutionScopeId::new),
+                )
+            },
+            |scope, _| {
+                let mut state = state.borrow_mut();
+                let slot = python_lexical::lexical_slot(&state, rows, scope.get())
+                    .map(|slot| (slot.slot, slot.whole_scope));
+                let before = state.selection.selected.len();
+                python_lexical::lexical_tier(
+                    &mut state,
+                    rows,
+                    scope.get(),
+                    &mut SessionBudget {
+                        session: self.session,
+                        cancellation: self.cancellation,
+                    },
+                );
+                if state.selection.stopped.is_some() {
+                    return Ok(Read::Cancelled(cancelled_completion()));
+                }
+                // An ordered class cell can have only future writes here;
+                // its hole continues to an outer slot. Whole-scope locals
+                // still own an early unbound read, including a later import.
+                if let Some((slot, whole_scope)) = slot
+                    && (whole_scope || state.selection.selected.len() > before)
+                {
+                    imports.set(
+                        imports.get()
+                            || rows.events.iter().any(|event| {
+                                event.slot == slot
+                                    && event.kind == ResolutionBindingEventKind::Import
+                            }),
+                    );
+                }
+                Ok(Read::ready(vec![Ok(RankedLexicalTier {
+                    rank: 0,
+                    tier: RouteEdgeTier {
+                        blocks_fallback: true,
+                        ..Default::default()
+                    },
+                    providers: Vec::new(),
+                })]))
+            },
+            |_, _| python_lexical::outer_can_compete(&state.borrow()),
+            |_, _| false,
+            &mut ResolutionCompletion::Complete,
+            self.cancellation,
+        )?;
+        Ok(match selected {
+            Read::Ready { .. } => Read::ready(imports.get()),
+            Read::Cancelled(completion) => Read::Cancelled(completion),
+            Read::Unavailable { .. } => unreachable!("lexical slot reads are local"),
+        })
+    }
+
+    fn import_route_completion(
+        &self,
+        caller: &str,
+        blob: i64,
+        import: &brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportFact,
+    ) -> Result<ResolutionCompletion> {
+        let states = self.ready.inventory.connection().prepare_cached(
+            "SELECT DISTINCT imports.state FROM resolution_unit_summary_members member INDEXED BY resolution_unit_summary_members_blob CROSS JOIN python_unit_summary_imports imports ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal WHERE member.blob_id=?4 AND member.summary_id=?1 AND member.rel_path=?2 AND imports.import_site=?3",
+        )?.query_map(rusqlite::params![self.summary,caller,import.import_site.get(),blob], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut completion = ResolutionCompletion::Complete;
+        for state in states {
+            if matches!(state.as_str(), "relative_context_open" | "provider_open") {
+                completion = completion.combine(
+                    &import_route_obligation(
+                        self.ready,
+                        self.summary,
+                        caller,
+                        import.import_site.get(),
+                        &state,
+                    )?
+                    .0,
+                );
+            }
+        }
+        Ok(completion)
+    }
+
+    /// Provider selection fixes a writer's identity conditional on import success.
+    /// It is neither an execution proof nor authority to close guarded writers.
+    fn conditional_imports(
+        &self,
+        rows: &PythonBindingRows,
+        caller: &str,
+        blob: i64,
+    ) -> Result<Vec<u32>> {
+        let sites = self.ready.inventory.connection().prepare_cached(
+            "SELECT imports.import_site FROM resolution_unit_summary_members member JOIN python_unit_summary_imports imports ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal WHERE member.summary_id=?1 AND member.rel_path=?2 AND member.blob_id=?3 GROUP BY imports.import_site HAVING COUNT(DISTINCT imports.target_container)=1 AND MIN(imports.state='activation_open') AND MIN(EXISTS(SELECT 1 FROM python_unit_summary_providers provider WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container AND provider.state='selected'))",
+        )?.query_map(rusqlite::params![self.summary,caller,blob], |row| row.get::<_,u32>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sites
+            .into_iter()
+            .filter(|site| python_lexical::unconditional_import(rows, *site))
+            .collect())
+    }
+
+    fn import_activation_reasons(
+        &self,
+        blob: i64,
+        ordinal: u32,
+        site: u32,
+    ) -> Result<Vec<SemanticId>> {
+        let origin = crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+            crate::analyzer::resolution::LoweringGapOrigin::Extracted(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnprovenActivation));
+        Ok(self.ready.inventory.connection().prepare_cached(
+            "SELECT reason FROM resolution_gap_reasons WHERE blob_id=?1 AND origin=?3 AND (site=?2 OR site IN (SELECT target_reference FROM resolution_root_import_demands WHERE blob_id=?1 AND import_site=?2 AND target_reference IS NOT NULL))",
+        )?.query_map(rusqlite::params![blob,site,origin], |row| Ok(SemanticId::local(ordinal,row.get(0)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// An alias prerequisite can copy its import's provisional reasons into
+    /// this caller. Carry the same exact selected writer proof to that caller;
+    /// never treat the prerequisite's other incomplete reasons as discharged.
+    fn alias_import_activation_reasons(&self, reference: SemanticId) -> Result<Vec<SemanticId>> {
+        let Some(ordinal) = reference.ordinal() else {
+            return Ok(Vec::new());
+        };
+        let mount = self
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        let blob = mount.blob_id();
+        let site: Option<u32> = self.ready.inventory.connection().query_row(
+            "SELECT source_site FROM resolution_semantic_sites WHERE blob_id=?1 AND semantic_key=?2 AND semantic_role='reference'",
+            rusqlite::params![blob,reference.local_key()], |row|row.get(0)).optional()?;
+        let Some(site) = site else {
+            return Ok(Vec::new());
+        };
+        let sites = self.ready.inventory.connection().prepare_cached(
+            "SELECT DISTINCT import_site FROM resolution_root_import_demands WHERE blob_id=?1 AND target_reference=?2",
+        )?.query_map(rusqlite::params![blob,site], |row|row.get::<_,u32>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if sites.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(rows) = self.load_binding_rows(blob, Some(mount.blob_oid()))? else {
+            return Ok(Vec::new());
+        };
+        let fixed = self.conditional_imports(&rows, mount.persisted_relative_path(), blob)?;
+        let mut reasons = Vec::new();
+        for site in sites.into_iter().filter(|site| fixed.contains(site)) {
+            reasons.extend(self.import_activation_reasons(blob, ordinal, site)?);
+        }
+        Ok(reasons)
+    }
+
+    fn source_import_site(
+        &self,
+        blob: i64,
+        identity: CandidatePathIdentity,
+        token: SemanticId,
+    ) -> Result<Option<u32>> {
+        self.ready
+            .inventory
+            .connection()
+            .query_row(
+                "SELECT import_site FROM main.resolution_root_import_demands
+             WHERE blob_id=?1 AND target_reference=(
+               SELECT reference_source_site FROM main.resolution_root_route_segments
+               WHERE blob_id=?1 AND path_key=?2 AND reference_source_site IS NOT NULL)
+             UNION
+             SELECT import_source_site FROM main.resolution_semantic_catalog
+             WHERE blob_id=?1 AND local_key=?3 AND import_source_site IS NOT NULL",
+                rusqlite::params![blob, identity.path().local_key(), token.local_key()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(super) fn load_binding_rows(
+        &self,
+        blob: i64,
+        oid: Option<git2::Oid>,
+    ) -> Result<Option<std::sync::Arc<PythonBindingRows>>> {
+        if self.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(rows) = self.binding_rows.borrow().get(&blob) {
+            return Ok(Some(std::sync::Arc::clone(rows)));
+        }
+        let Some(rows) = PythonBindingRows::load(
+            self.ready.inventory.connection(),
+            &self.ready.store.cache_budget,
+            blob,
+            oid,
+            self.cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        if self.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        // Suspended halves and qualified inputs retain rows after the memo borrow ends.
+        assert!(
+            self.binding_rows
+                .borrow_mut()
+                .insert(blob, std::sync::Arc::clone(&rows))
+                .is_none()
+        );
+        Ok(Some(rows))
+    }
+
+    fn module_bindings(&self, container: &str) -> Result<Read<Option<PythonModuleBindings>>> {
+        let selected = self.ready.inventory.connection().query_row(
+            "SELECT mounted.mount_ordinal,mounted.blob_id FROM python_unit_summary_providers provider
+             JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+             JOIN selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
+             WHERE provider.summary_id=?1 AND provider.container_path=?2 AND provider.state IN ('selected','alternative')",
+            rusqlite::params![self.summary,container],|row|Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?)),
+        ).optional()?;
+        let Some((mount, blob)) = selected else {
+            return Ok(Read::ready(None));
+        };
+        let rows = self.load_binding_rows(blob, None)?;
+        Ok(Read::ready(rows.map(|rows| (mount, blob, rows))))
+    }
+
+    fn read_import_aliases(&self, reference: SemanticId) -> Result<Read<Vec<PythonImportAlias>>> {
+        let ordinal = reference
+            .ordinal()
+            .expect("authored Python reference mount");
+        let mount = self
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        let blob = mount.blob_id();
+        let lookup = format!(
+            "{} AND NOT EXISTS(SELECT 1 FROM resolution_qualified_routes qualified WHERE qualified.blob_id=?1 AND qualified.reference=?2)",
+            crate::analyzer::store::python_member_rows::UNIVERSE_REFERENCE_NAME_SQL
+        );
+        let Some((name, site)) = self
+            .ready
+            .inventory
+            .connection()
+            .query_row(
+                &lookup,
+                rusqlite::params![blob, reference.local_key()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(Read::ready(Vec::new()));
+        };
+        let Some(rows) = self.load_binding_rows(blob, Some(mount.blob_oid()))? else {
+            return Ok(if self.cancellation.is_cancelled() {
+                Read::Cancelled(cancelled_completion())
+            } else {
+                Read::Unavailable { reason: crate::analyzer::resolution::DemandRootUnavailableReason::MissingSourceProvenance, completion: open(reference) }
+            });
+        };
+        let mut import_sites = self.ready.inventory.connection().prepare_cached(
+            "SELECT DISTINCT import_site FROM resolution_root_import_demands WHERE blob_id=?1 AND target_reference=?2",
+        )?.query_map(rusqlite::params![blob,site],|row|row.get::<_,u32>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if import_sites.is_empty()
+            && let Some(mut state) = python_lexical::lexical_selection(
+                &rows,
+                site,
+                &name,
+                self.profile,
+                PythonBindingProofs::default(),
+            )
+        {
+            python_lexical::select_lexical(
+                &mut state,
+                &rows,
+                &mut SessionBudget {
+                    session: self.session,
+                    cancellation: self.cancellation,
+                },
+                self.cancellation,
+            )?;
+            if state.selection.stopped.is_some() {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            }
+            import_sites.extend(
+                rows.imports
+                    .iter()
+                    .filter(|import| {
+                        import.binding_event.is_some_and(|event| {
+                            state
+                                .selection
+                                .selected
+                                .iter()
+                                .any(|selected| selected.occurrence == event)
+                        })
+                    })
+                    .map(|import| import.import_site.get()),
+            );
+        }
+        let mut aliases = Vec::new();
+        for site in import_sites {
+            let destinations = self.ready.inventory.connection().prepare_cached(
+                "SELECT DISTINCT imported.target_container,imported.requested_name
+                 FROM python_unit_summary_imports imported JOIN resolution_unit_summary_members source
+                   ON source.summary_id=imported.summary_id AND source.member_ordinal=imported.member_ordinal
+                 WHERE imported.summary_id=?1 AND source.blob_id=?2 AND imported.import_site=?3 AND imported.form='from'",
+            )?.query_map(rusqlite::params![self.summary,blob,site],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (container, name) in destinations {
+                if self.cancellation.is_cancelled() || !self.session.scope_step() {
+                    return Ok(Read::Cancelled(cancelled_completion()));
+                }
+                let (target_mount, target_blob, target_rows) =
+                    match self.module_bindings(&container)? {
+                        Read::Ready {
+                            value: Some(value), ..
+                        } => value,
+                        Read::Ready { value: None, .. } => continue,
+                        Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                        Read::Unavailable { reason, completion } => {
+                            return Ok(Read::Unavailable { reason, completion });
+                        }
+                    };
+                let root = target_rows
+                    .scopes
+                    .iter()
+                    .find(|scope| scope.parent.is_none())
+                    .expect("module inventory has a root");
+                let mut state = python_lexical::module_selection(
+                    &target_rows,
+                    root.scope,
+                    &name,
+                    self.profile,
+                    PythonBindingProofs::default(),
+                );
+                python_lexical::lexical_tier(
+                    &mut state,
+                    &target_rows,
+                    root.scope,
+                    &mut SessionBudget {
+                        session: self.session,
+                        cancellation: self.cancellation,
+                    },
+                );
+                if state.selection.stopped.is_some() {
+                    return Ok(Read::Cancelled(cancelled_completion()));
+                }
+                for import in target_rows.imports.iter().filter(|import| {
+                    import.binding_event.is_some_and(|event| {
+                        state
+                            .selection
+                            .selected
+                            .iter()
+                            .any(|selected| selected.occurrence == event)
+                    })
+                }) {
+                    for key in self.ready.inventory.connection().prepare_cached(
+                        "SELECT DISTINCT semantic.semantic_key FROM resolution_root_import_demands demand
+                         JOIN resolution_semantic_sites semantic ON semantic.blob_id=demand.blob_id AND semantic.source_site=demand.target_reference AND semantic.semantic_role='reference'
+                         WHERE demand.blob_id=?1 AND demand.import_site=?2",
+                    )?.query_map(rusqlite::params![target_blob,import.import_site.get()],|row|row.get::<_,u32>(0))? {
+                        aliases.push(PythonImportAlias {container:container.clone(),name:name.clone(),reference:SemanticId::local(target_mount,key?)});
+                    }
+                }
+            }
+        }
+        aliases.sort_by(|a, b| {
+            (&a.container, &a.name, a.reference).cmp(&(&b.container, &b.name, b.reference))
+        });
+        aliases.dedup_by(|a, b| {
+            a.container == b.container && a.name == b.name && a.reference == b.reference
+        });
+        Ok(Read::ready(aliases))
+    }
 }
 
 impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
@@ -692,11 +1393,8 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 let read = if let Some((spelling, site)) = spelling.filter(|(spelling, _)| {
                     brokk_bifrost_python::intrinsics::builtin(spelling).is_some()
                 }) {
-                    let Some(rows) = PythonBindingRows::load(
-                        self.ready.inventory.connection(),
-                        mount.blob_id(),
-                        self.cancellation,
-                    )?
+                    let Some(rows) =
+                        self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))?
                     else {
                         return Ok(if self.cancellation.is_cancelled() {
                             Read::Cancelled(cancelled_completion())
@@ -761,15 +1459,136 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                     }
                 }
             }
+            if !self.import_aliases.borrow().contains_key(identity) {
+                let aliases = match self.read_import_aliases(reference)? {
+                    Read::Ready { value, .. } => value,
+                    Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                    Read::Unavailable { reason, completion } => {
+                        return Ok(Read::Unavailable { reason, completion });
+                    }
+                };
+                self.import_aliases.borrow_mut().insert(*identity, aliases);
+            }
+        }
+        for half in &frame.halves {
+            let (identity, token) = match half {
+                SelectedRootPathHalf::Reference {
+                    identity, token, ..
+                }
+                | SelectedRootPathHalf::Import {
+                    identity, token, ..
+                } => (*identity, *token),
+                SelectedRootPathHalf::Export { .. } => continue,
+            };
+            if self.module_mutations.borrow().contains_key(&identity) {
+                continue;
+            }
+            let mount = SelectedMountTable::new(&self.ready.inventory)
+                .mount_for_fragment(identity.fragment())?
+                .expect("a source half belongs to its selected mount");
+            let blob = self
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())?
+                .blob_id();
+            let needs_attributes = match half {
+                SelectedRootPathHalf::Import { .. } => {
+                    if let Some(site) = self.source_import_site(blob, identity, token)? {
+                        self.ready.inventory.connection().query_row(
+                            "SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports
+                             WHERE summary_id=?1 AND import_site=?2 AND form IN ('from','star')
+                             AND member_ordinal IN (SELECT member_ordinal FROM resolution_unit_summary_members
+                              WHERE summary_id=?1 AND blob_id=?3))",
+                            rusqlite::params![self.summary, site, blob], |row| row.get(0),
+                        )?
+                    } else {
+                        false
+                    }
+                }
+                SelectedRootPathHalf::Reference { .. } => {
+                    let reference = *self
+                        .prepared_references
+                        .borrow()
+                        .get(&identity)
+                        .expect("reference preparation precedes attribute prerequisites");
+                    self.ready.inventory.connection().query_row(
+                        "SELECT EXISTS(SELECT 1 FROM resolution_qualified_routes
+                         WHERE blob_id=?1 AND reference=(SELECT source_site FROM resolution_semantic_sites
+                          WHERE blob_id=?1 AND semantic_key=?2 AND semantic_role='reference'))",
+                        rusqlite::params![blob, reference.local_key()], |row| row.get(0),
+                    )?
+                }
+                SelectedRootPathHalf::Export { .. } => unreachable!(),
+            };
+            let read = if needs_attributes {
+                super::python_members::operations::attribute_source_rows(self, token, &[])?
+            } else {
+                Read::ready(Vec::new())
+            };
+            match read {
+                Read::Ready { value, completion } => {
+                    if needs_attributes {
+                        self.observations.borrow_mut().push(format!(
+                            "module mutation prerequisites half={} operations={}",
+                            if matches!(half, SelectedRootPathHalf::Import { .. }) {
+                                "import"
+                            } else {
+                                "reference"
+                            },
+                            value.len(),
+                        ));
+                    }
+                    self.module_mutations.borrow_mut().insert(
+                        identity,
+                        UniverseMutationInputs {
+                            operations: value,
+                            completion,
+                        },
+                    );
+                }
+                Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                Read::Unavailable { reason, completion } => {
+                    return Ok(Read::Unavailable { reason, completion });
+                }
+            }
         }
         Ok(Read::ready(Vec::new()))
     }
     fn prefix_operands(&self, frame: &RootFrame, caller: EnvironmentId) -> Vec<PrefixOperand> {
         let mut operands = default_prefix_operands(frame, caller);
         for (index, half) in frame.halves.iter().enumerate() {
+            let identity = match half {
+                SelectedRootPathHalf::Reference { identity, .. }
+                | SelectedRootPathHalf::Import { identity, .. } => identity,
+                SelectedRootPathHalf::Export { .. } => continue,
+            };
+            if let Some(mutations) = self.module_mutations.borrow().get(identity) {
+                operands.extend(
+                    mutations
+                        .operations
+                        .iter()
+                        .flat_map(|operation| operation.universe_prerequisites())
+                        .map(|reference| PrefixOperand {
+                            key: DemandReferenceKey {
+                                reference,
+                                environment: caller,
+                            },
+                            source_halves: Box::new([HalfId(index)]),
+                        }),
+                );
+            }
             let SelectedRootPathHalf::Reference { identity, .. } = half else {
                 continue;
             };
+            if let Some(aliases) = self.import_aliases.borrow().get(identity) {
+                operands.extend(aliases.iter().map(|alias| PrefixOperand {
+                    key: DemandReferenceKey {
+                        reference: alias.reference,
+                        environment: caller,
+                    },
+                    source_halves: Box::new([HalfId(index)]),
+                }));
+            }
             if let Some(mutations) = self.universe_mutations.borrow().get(identity) {
                 operands.extend(
                     mutations
@@ -812,11 +1631,11 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         else {
             return Ok(None);
         };
-        let blob = self
+        let mount_record = self
             .ready
             .inventory
-            .mount_record_by_ordinal(mount.ordinal())?
-            .blob_id();
+            .mount_record_by_ordinal(mount.ordinal())?;
+        let blob = mount_record.blob_id();
         let placements = self.ready.inventory.connection().prepare_cached(
             "SELECT providers.container_path
              FROM main.python_unit_summary_providers providers
@@ -830,26 +1649,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         )?.query_map(rusqlite::params![self.summary, mount.ordinal().get()], |row| {
             Ok(PythonPlacement { container: row.get(0)?, universe: std::cell::Cell::new(None), lexical: RefCell::new(None), stars: RefCell::new(HashMap::default()) })
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let import_site = self
-            .ready
-            .inventory
-            .connection()
-            .query_row(
-                "SELECT import_site FROM main.resolution_root_import_demands
-             WHERE blob_id=?1 AND target_reference=(
-               SELECT reference_source_site FROM main.resolution_root_route_segments
-               WHERE blob_id=?1 AND path_key=?2 AND reference_source_site IS NOT NULL)
-             UNION
-             SELECT import_source_site FROM main.resolution_semantic_catalog
-             WHERE blob_id=?1 AND local_key=?3 AND import_source_site IS NOT NULL",
-                rusqlite::params![
-                    blob,
-                    source.identity.path().local_key(),
-                    source.token.local_key()
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let import_site = self.source_import_site(blob, source.identity, source.token)?;
         let import_name = match import_site {
             Some(site) => self.ready.inventory.connection().query_row(
                 "SELECT source_name FROM main.resolution_import_selectors WHERE blob_id=?1 AND site=?2",
@@ -858,9 +1658,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
             ).optional()?.flatten(),
             None => None,
         };
-        let Some(rows) =
-            PythonBindingRows::load(self.ready.inventory.connection(), blob, self.cancellation)?
-        else {
+        let Some(rows) = self.load_binding_rows(blob, Some(mount_record.blob_oid()))? else {
             return Ok(None);
         };
         let reference_site = self.ready.inventory.connection().query_row(
@@ -868,10 +1666,14 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
              UNION SELECT source_site FROM resolution_semantic_sites WHERE blob_id=?1 AND semantic_key=?3 AND semantic_role='reference'",
             rusqlite::params![blob, source.identity.path().local_key(), source.token.local_key()], |row| row.get(0),
         ).optional()?;
-        assert!(
-            source.prefix.is_none(),
-            "Python member receivers enter through the typed qualified-member bridge (QualifiedMemberRegistration); a source half never carries a member receiver here"
-        );
+        let prefix = source.prefix.map(|prefix| {
+            let answer = inputs
+                .iter()
+                .find(|(key, _)| key.reference == prefix)
+                .expect("the shared prefix scheduler supplies the selected operand")
+                .1;
+            std::rc::Rc::new(answer.binding().clone())
+        });
         let mut universe_unmutated = false;
         if let Some(mutations) = self.universe_mutations.borrow().get(&source.identity) {
             universe_unmutated = mutations.completion == ResolutionCompletion::Complete;
@@ -909,18 +1711,81 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 "universe lexical-namespace closed={universe_unmutated} statements=1"
             ));
         }
+        let mut activation_reasons = Vec::new();
+        let import_aliases: std::rc::Rc<[PythonAliasTargets]> = self
+            .import_aliases
+            .borrow()
+            .get(&source.identity)
+            .into_iter()
+            .flatten()
+            .map(|alias| {
+                let answer = inputs
+                    .iter()
+                    .find(|(key, _)| key.reference == alias.reference)
+                    .map(|(_, answer)| *answer);
+                if answer.is_some_and(|answer| answer.binding().targets().len() == 1) {
+                    activation_reasons
+                        .extend(self.alias_import_activation_reasons(alias.reference)?);
+                }
+                Ok(PythonAliasTargets {
+                    container: alias.container.clone(),
+                    name: alias.name.clone(),
+                    targets: answer
+                        .map_or_else(Vec::new, |answer| answer.binding().targets().to_vec()),
+                    completion: answer.map_or_else(
+                        || open(alias.reference),
+                        |answer| answer.binding().completion().clone(),
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into();
+        let module_mutations = self
+            .module_mutations
+            .borrow()
+            .get(&source.identity)
+            .into_iter()
+            .flat_map(|mutations| mutations.operations.iter())
+            .filter_map(|operation| operation.module_receiver(self, inputs).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let endpoint_completion = match import_site {
+            Some(site) => self.import_route_completion(
+                mount_record.persisted_relative_path(),
+                blob,
+                rows.imports
+                    .iter()
+                    .find(|import| import.import_site.get() == site)
+                    .expect("selected import has retained source metadata"),
+            )?,
+            None => ResolutionCompletion::Complete,
+        };
+        let conditional_imports =
+            self.conditional_imports(&rows, mount_record.persisted_relative_path(), blob)?;
+        if let Some(site) = import_site.filter(|site| conditional_imports.contains(site)) {
+            activation_reasons.extend(self.import_activation_reasons(
+                blob,
+                mount.ordinal().get(),
+                site,
+            )?);
+        }
         let prepared = PythonHalfInputs {
+            conditional_imports,
+            activation_reasons,
+            endpoint_completion,
             containers: placements
                 .into_iter()
                 .map(|placement| placement.container)
                 .collect(),
             import_site,
             import_name,
-            rows: std::rc::Rc::new(rows),
+            rows,
             fragment: mount.fragment(),
             blob,
             reference_site,
+            prefix,
             universe_unmutated,
+            import_aliases,
+            module_mutations: module_mutations.into(),
             rendered_order: std::rc::Rc::new(std::cell::Cell::new(false)),
         };
         let view = prepared.view(self, source, frame.completion.clone());
@@ -933,15 +1798,27 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         Ok(Some(view))
     }
     fn activation(&self, frame: &RootFrame, half: HalfId) -> CandidateDecision {
-        let semantic = match &frame.halves[half.0] {
-            SelectedRootPathHalf::Import { token, .. }
-            | SelectedRootPathHalf::Reference { token, .. } => *token,
+        match &frame.halves[half.0] {
+            SelectedRootPathHalf::Import {
+                identity, token, ..
+            } => {
+                let inputs = self.source_inputs.borrow();
+                let prepared = inputs
+                    .get(identity)
+                    .expect("source rows precede candidate admission");
+                if prepared
+                    .import_site
+                    .is_some_and(|site| prepared.conditional_imports.contains(&site))
+                {
+                    CandidateDecision::Open(prepared.endpoint_completion.clone())
+                } else {
+                    CandidateDecision::Open(prepared.endpoint_completion.combine(&open(*token)))
+                }
+            }
+            SelectedRootPathHalf::Reference { .. } => {
+                CandidateDecision::Open(frame.completion.clone())
+            }
             _ => unreachable!("source admission contains source halves"),
-        };
-        if matches!(frame.halves[half.0], SelectedRootPathHalf::Import { .. }) {
-            CandidateDecision::Open(open(semantic))
-        } else {
-            CandidateDecision::Open(frame.completion.clone())
         }
     }
     fn closure_policy(
@@ -949,13 +1826,19 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         frame: &RootFrame,
         facts: &ClosureFacts<'_>,
     ) -> Result<Read<ClosurePolicy>> {
+        let mut activation_reasons = Vec::new();
+        // Binding rows survive publication: selection changes cannot alter a blob's facts.
         for half in &frame.halves {
             match half {
                 SelectedRootPathHalf::Reference { identity, .. }
                 | SelectedRootPathHalf::Import { identity, .. } => {
-                    self.source_inputs.borrow_mut().remove(identity);
+                    if let Some(prepared) = self.source_inputs.borrow_mut().remove(identity) {
+                        activation_reasons.extend(prepared.activation_reasons);
+                    }
                     self.prepared_references.borrow_mut().remove(identity);
                     self.universe_mutations.borrow_mut().remove(identity);
+                    self.module_mutations.borrow_mut().remove(identity);
+                    self.import_aliases.borrow_mut().remove(identity);
                 }
                 SelectedRootPathHalf::Export { .. } => unreachable!("source frame"),
             }
@@ -963,7 +1846,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
         Ok(Read::ready(ClosurePolicy::new(
             ResolutionCompletion::Complete,
             BaseEligibility::Exclude,
-            DemandClosureDischarges::default(),
+            DemandClosureDischarges::exact(activation_reasons),
             facts
                 .generated
                 .iter()
@@ -978,6 +1861,29 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
 }
 
 impl PythonHalf<'_, '_, '_> {
+    fn import_route_completion(&self, site: u32) -> Result<ResolutionCompletion> {
+        let mount = self.rules.ready.inventory.mount_record_by_ordinal(
+            SelectedResolutionMountOrdinal::new(self.fragment.ordinal()),
+        )?;
+        let completion = self.rules.import_route_completion(
+            mount.persisted_relative_path(),
+            self.blob,
+            self.rows
+                .imports
+                .iter()
+                .find(|import| import.import_site.get() == site)
+                .expect("selected import has retained source metadata"),
+        )?;
+        // Empty routes have no candidate witness to retain their evidence.
+        // Keep this selected route's provider/placement evidence until publication.
+        let mut inputs = self.rules.source_inputs.borrow_mut();
+        let prepared = inputs
+            .get_mut(&self.source.identity)
+            .expect("prepared Python source half");
+        prepared.endpoint_completion = prepared.endpoint_completion.combine(&completion);
+        Ok(completion)
+    }
+
     fn authored(&self, fragment: BindingFragmentId, event: &BindingEvent) -> Option<RouteLocation> {
         // Imports select their routed target, never the authored local alias as
         // a substitute for the imported definition. Activation remains open.
@@ -1060,6 +1966,14 @@ impl PythonHalf<'_, '_, '_> {
         {
             proofs.absent_scopes.push(module.scope);
         }
+        let mount = self.rules.ready.inventory.mount_record_by_ordinal(
+            SelectedResolutionMountOrdinal::new(self.fragment.ordinal()),
+        )?;
+        proofs.conditional_imports = self.rules.conditional_imports(
+            &self.rows,
+            mount.persisted_relative_path(),
+            self.blob,
+        )?;
         placement.stars.borrow_mut().clear();
         let mut occurrence = self
             .rows
@@ -1078,6 +1992,8 @@ impl PythonHalf<'_, '_, '_> {
             }
             let site = import.import_site.get();
             let mut starts = Vec::new();
+            let mut absent = proofs.conditional_imports.contains(&site);
+            let mut inventory_closed = proofs.conditional_imports.contains(&site);
             for (location, head) in self.import_starts(placement, site, lookup)? {
                 let RouteLocation::Container { ref container, .. } = location else {
                     unreachable!()
@@ -1086,9 +2002,17 @@ impl PythonHalf<'_, '_, '_> {
                     "SELECT EXISTS(SELECT 1 FROM python_unit_summary_export_names WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard' AND name=?3)",
                     rusqlite::params![self.rules.summary,container,lookup.spelling()], |row|row.get(0),
                 )?;
+                let closed = self.wildcard_inventory_closed(container, lookup.spelling())?;
+                absent &= closed && !present;
+                inventory_closed &= closed;
                 if present {
                     starts.push((location, head.expect("star attribute head")));
                 }
+            }
+            if absent {
+                proofs
+                    .absent_star_members
+                    .push((site, lookup.spelling().to_owned()));
             }
             if !starts.is_empty() {
                 proofs
@@ -1097,8 +2021,13 @@ impl PythonHalf<'_, '_, '_> {
                         occurrence,
                         import_site: site,
                         name: lookup.spelling().to_owned(),
-                        certain: false,
-                        completion: open(self.source.token),
+                        certain: inventory_closed,
+                        completion: if inventory_closed {
+                            self.import_route_completion(site)?
+                        } else {
+                            self.import_route_completion(site)?
+                                .combine(&open(self.source.token))
+                        },
                     });
                 placement.stars.borrow_mut().insert(occurrence, starts);
                 occurrence = occurrence.checked_add(1).expect("star occurrence capacity");
@@ -1106,31 +2035,294 @@ impl PythonHalf<'_, '_, '_> {
         }
         Ok(proofs)
     }
-    fn module_locations(&self, container: &str, name: &str) -> Result<Read<Vec<RouteLocation>>> {
+    // Regular packages/modules have one selected provider. Namespace portions
+    // are closed only when every retained portion belongs to analysis roots.
+    fn provider_completion(&self, container: &str) -> Result<ResolutionCompletion> {
+        if container.is_empty() {
+            return Ok(ResolutionCompletion::Complete);
+        }
+        let mut statement = self.rules.ready.inventory.connection().prepare_cached(
+            "SELECT p.kind,p.state,p.rel_path,root.root_path,
+               EXISTS(SELECT 1 FROM resolution_unit_summary_members member
+                JOIN selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id
+                 AND mounted.persisted_relative_path=member.rel_path
+                WHERE member.summary_id=p.summary_id AND member.member_ordinal=p.member_ordinal)
+             FROM python_unit_summary_providers p
+             JOIN python_unit_summary_roots root ON root.summary_id=p.summary_id AND root.root_slot=p.root_slot
+             WHERE p.summary_id=?1 AND p.module_name=(SELECT module_name
+              FROM python_unit_summary_providers WHERE summary_id=?1 AND container_path=?2)
+              AND p.state IN ('selected','alternative','open')",
+        )?;
+        let mut closed = true;
+        let mut found = false;
+        for row in statement.query_map(rusqlite::params![self.rules.summary, container], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })? {
+            if self.rules.cancellation.is_cancelled() {
+                return Ok(cancelled_completion());
+            }
+            if !self.rules.session.scope_step() {
+                return Ok(ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::TimeBudgetExceeded(self.source.token),
+                ]));
+            }
+            let (kind, state, path, root, mounted) = row?;
+            found = true;
+            closed &= state != "open"
+                && match kind.as_str() {
+                    "namespace" => {
+                        std::path::Path::new(&path).starts_with(std::path::Path::new(&root))
+                    }
+                    "package" | "module" => mounted,
+                    _ => false,
+                };
+        }
+        Ok(if found && closed {
+            ResolutionCompletion::Complete
+        } else {
+            open(self.source.token)
+        })
+    }
+
+    fn wildcard_inventory_closed(&self, container: &str, name: &str) -> Result<bool> {
+        let cached = self
+            .rules
+            .wildcard_inventories
+            .borrow()
+            .get(container)
+            .copied();
+        let (policy_closed, public_names) = if let Some(cached) = cached {
+            cached
+        } else {
+            let inventory = self
+                .rules
+                .ready
+                .inventory
+                .connection()
+                .prepare_cached(
+                    "SELECT policy IN ('curated','public_names'), policy='public_names'
+                 FROM python_unit_summary_surfaces
+                 WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard'",
+                )?
+                .query_row(rusqlite::params![self.rules.summary, container], |row| {
+                    Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
+                })
+                .optional()?
+                .unwrap_or((false, false));
+            self.rules
+                .wildcard_inventories
+                .borrow_mut()
+                .insert(container.to_owned(), inventory);
+            inventory
+        };
+        if !policy_closed
+            || self.module_attribute_space(container)? != ResolutionCompletion::Complete
+        {
+            return Ok(false);
+        }
+        Ok(!public_names
+            || !module_name_open_without_binding(
+                self.rules.ready.inventory.connection(),
+                self.rules.summary,
+                container,
+                name,
+            )?)
+    }
+
+    fn module_attribute_space(&self, container: &str) -> Result<ResolutionCompletion> {
+        let cached = self.rules.module_spaces.borrow().get(container).cloned();
+        let static_completion = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut completion = self.provider_completion(container)?;
+            let module = match self.rules.module_bindings(container)? {
+                Read::Ready {
+                    value,
+                    completion: evidence,
+                } => {
+                    completion = completion.combine(&evidence);
+                    value
+                }
+                Read::Cancelled(evidence)
+                | Read::Unavailable {
+                    completion: evidence,
+                    ..
+                } => {
+                    return Ok(completion
+                        .combine(&evidence)
+                        .combine(&open(self.source.token)));
+                }
+            };
+            if let Some((_, blob, rows)) = module {
+                let root = rows
+                    .scopes
+                    .iter()
+                    .find(|scope| scope.parent.is_none())
+                    .expect("module root");
+                let hook = rows
+                    .slots
+                    .iter()
+                    .any(|slot| slot.scope == root.scope && slot.name == "__getattr__");
+                let origin=crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+                    crate::analyzer::resolution::LoweringGapOrigin::Extracted(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedRoute));
+                let dynamic: bool = self.rules.ready.inventory.connection().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM resolution_gaps gap JOIN resolution_gap_reasons reason ON reason.blob_id=gap.blob_id AND reason.reason=gap.reason WHERE gap.blob_id=?1 AND gap.covers IN (2,5) AND gap.lookup=0 AND reason.origin=?2)", rusqlite::params![blob,origin], |row| row.get(0))?;
+                let unresolved_star: bool = self.rules.ready.inventory.connection().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports imports WHERE imports.summary_id=?1 AND imports.importer_container=?2 AND imports.form='star' AND (imports.state<>'activation_open' OR NOT EXISTS(SELECT 1 FROM python_unit_summary_providers provider WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container AND provider.state IN ('selected','alternative') AND provider.member_ordinal IS NOT NULL)))",
+                    rusqlite::params![self.rules.summary,container], |row|row.get(0))?;
+                self.rules.observations.borrow_mut().push(format!(
+                    "module attribute-space hook={hook} dynamic={dynamic} unresolved-star={unresolved_star}"
+                ));
+                if hook || dynamic || unresolved_star {
+                    let owner = match self.module_owner(container)? {
+                        Some(RouteLocation::Owner { definition, .. }) => definition,
+                        _ => self.source.token,
+                    };
+                    completion = completion.combine(&open(owner));
+                }
+            }
+            self.rules
+                .module_spaces
+                .borrow_mut()
+                .insert(container.to_owned(), completion.clone());
+            completion
+        };
+        let mut completion = static_completion;
+        if let Some(RouteLocation::Owner { definition, .. }) = self.module_owner(container)? {
+            for mutation in self.module_mutations.iter() {
+                completion = completion.combine(&mutation.completion(definition));
+            }
+        } else {
+            // A namespace portion has no authored module declaration. A proved
+            // class or ordinary module receiver is disjoint; an unknown alias
+            // can still denote the namespace object.
+            for mutation in self.module_mutations.iter() {
+                completion = completion.combine(&mutation.namespace_completion(self.source.token));
+            }
+        }
+        Ok(completion)
+    }
+
+    /// Namespace packages have no authored module declaration.
+    fn module_owner(&self, container: &str) -> Result<Option<RouteLocation>> {
         let selected = self.rules.ready.inventory.connection().query_row(
-            "SELECT mounted.mount_ordinal,mounted.blob_id FROM python_unit_summary_providers provider
-             JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
-             JOIN selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
-             WHERE provider.summary_id=?1 AND provider.container_path=?2 AND provider.state IN ('selected','alternative')",
-            rusqlite::params![self.rules.summary, container], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?)),
+            "SELECT mounted.mount_ordinal, member.blob_id
+             FROM python_unit_summary_providers provider
+             JOIN resolution_unit_summary_members member
+               ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+             JOIN selected_resolution_mounts mounted
+               ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
+             WHERE provider.summary_id=?1 AND provider.container_path=?2
+               AND provider.state IN ('selected','alternative') AND provider.kind IN ('module','package')",
+            rusqlite::params![self.rules.summary, container],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)),
         ).optional()?;
         let Some((ordinal, blob)) = selected else {
-            return Ok(Read::Ready {
-                value: Vec::new(),
-                completion: open(self.source.token),
-            });
+            return Ok(None);
         };
-        let Some(rows) = PythonBindingRows::load(
+        let Some(site) = cached_module_site(
             self.rules.ready.inventory.connection(),
             blob,
-            self.rules.cancellation,
+            &self.rules.module_sites,
         )?
         else {
-            return Ok(if self.rules.cancellation.is_cancelled() {
-                Read::Cancelled(cancelled_completion())
-            } else {
-                Read::Unavailable { reason: crate::analyzer::resolution::DemandRootUnavailableReason::MissingSourceProvenance, completion:open(self.source.token) }
-            });
+            return Ok(None);
+        };
+        let mount = SelectedMountTable::new(&self.rules.ready.inventory)
+            .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        Ok(Some(RouteLocation::Owner {
+            definition: crate::analyzer::resolution::mounted_site_semantic(mount.fragment(), site),
+            scope: None,
+        }))
+    }
+
+    /// Invert module_owner for a selected prefix, preserving the selected mount.
+    /// Bare names never pass through this continuation boundary.
+    fn module_container(&self, location: &RouteLocation) -> Result<Option<RouteLocation>> {
+        let RouteLocation::Owner { definition, .. } = location else {
+            return Ok(None);
+        };
+        let Some(ordinal) = definition.ordinal() else {
+            return Ok(None);
+        };
+        let mount = self
+            .rules
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        if !is_module_definition(
+            &self.rules.ready.inventory,
+            *definition,
+            &self.rules.module_sites,
+        )? {
+            return Ok(None);
+        }
+        let containers = self.rules.ready.inventory.connection().prepare_cached(
+            "SELECT provider.container_path
+             FROM python_unit_summary_providers provider
+             JOIN resolution_unit_summary_members member
+               ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+             WHERE provider.summary_id=?1 AND member.blob_id=?2 AND member.rel_path=?3
+               AND provider.state IN ('selected','alternative') AND provider.kind IN ('module','package') LIMIT 2",
+        )?.query_map(
+            rusqlite::params![self.rules.summary, mount.blob_id(), mount.persisted_relative_path()],
+            |row| row.get::<_, String>(0),
+        )?.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Summary production emits one provider per candidate file. The selected
+        // mount fixes both blob and path, so its inverse must be unique.
+        assert!(
+            containers.len() <= 1,
+            "one provider per candidate file: {containers:?}"
+        );
+        let container = containers.into_iter().next();
+        Ok(container.map(|container| RouteLocation::Container {
+            unit: self.rules.summary,
+            container,
+        }))
+    }
+
+    fn module_locations(&self, container: &str, name: &str) -> Result<Read<Vec<RouteLocation>>> {
+        let mut read = self.module_binding_locations(container, name)?;
+        if let Read::Ready { value, completion } = &mut read
+            && value.is_empty()
+            && *completion == ResolutionCompletion::Complete
+            && module_name_open_without_binding(
+                self.rules.ready.inventory.connection(),
+                self.rules.summary,
+                container,
+                name,
+            )?
+        {
+            *completion = completion.combine(&open(self.source.token));
+        }
+        Ok(read)
+    }
+
+    fn module_binding_locations(
+        &self,
+        container: &str,
+        name: &str,
+    ) -> Result<Read<Vec<RouteLocation>>> {
+        let (ordinal, _, rows) = match self.rules.module_bindings(container)? {
+            Read::Ready {
+                value: Some(value), ..
+            } => value,
+            Read::Ready { value: None, .. } => {
+                return Ok(Read::Ready {
+                    value: Vec::new(),
+                    completion: self.provider_completion(container)?,
+                });
+            }
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+            Read::Unavailable { reason, completion } => {
+                return Ok(Read::Unavailable { reason, completion });
+            }
         };
         let Some(root) = rows.scopes.iter().find(|scope| scope.parent.is_none()) else {
             return Ok(Read::Ready {
@@ -1138,13 +2330,21 @@ impl PythonHalf<'_, '_, '_> {
                 completion: open(self.source.token),
             });
         };
-        let mut state = python_lexical::module_selection(
-            &rows,
-            root.scope,
-            name,
-            self.rules.profile,
-            PythonBindingProofs::default(),
-        );
+        let mount_record = self
+            .rules
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        let proofs = PythonBindingProofs {
+            conditional_imports: self.rules.conditional_imports(
+                &rows,
+                mount_record.persisted_relative_path(),
+                mount_record.blob_id(),
+            )?,
+            ..Default::default()
+        };
+        let mut state =
+            python_lexical::module_selection(&rows, root.scope, name, self.rules.profile, proofs);
         python_lexical::lexical_tier(
             &mut state,
             &rows,
@@ -1154,24 +2354,45 @@ impl PythonHalf<'_, '_, '_> {
                 cancellation: self.rules.cancellation,
             },
         );
-        let completion = self.selection_completion(&state);
+        // A complete module cell inventory with no writer proves dictionary
+        // absence. Dynamic hooks/writes and unresolved stars are accounted for
+        // by module_attribute_space below, independently of initialization.
+        if !rows.slots.iter().any(|slot| slot.scope == root.scope && slot.name == name)
+            && !rows.imports.iter().any(|import| import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::Star)
+            && state.selection.stopped.is_none()
+        {
+            debug_assert!(state.selection.selected.is_empty());
+            state.selection.open = false;
+            state.selection.residual.clear();
+        }
+        let mut completion = match self.selection_completion(&state) {
+            Read::Ready { completion, .. } => completion,
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+            Read::Unavailable { .. } => unreachable!("lexical selection cannot be unavailable"),
+        };
         let mount = SelectedMountTable::new(&self.rules.ready.inventory)
             .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
-        let value = if state.selection.stopped.is_some() {
-            Vec::new()
-        } else {
-            state
-                .selection
-                .selected
-                .iter()
-                .filter_map(|selected| {
-                    rows.events
-                        .iter()
-                        .find(|event| event.event == selected.occurrence)
-                })
-                .filter_map(|event| self.authored(mount.fragment(), event))
-                .collect()
-        };
+        let mut value = Vec::new();
+        if state.selection.stopped.is_none() {
+            for selected in &state.selection.selected {
+                let event = rows
+                    .events
+                    .iter()
+                    .find(|event| event.event == selected.occurrence)
+                    .expect("selected event belongs to the module inventory");
+                if let Some(authored) = self.authored(mount.fragment(), event) {
+                    value.push(authored);
+                } else if event.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionBindingEventKind::Import {
+                    for alias in self.import_aliases.iter().filter(|alias| alias.container == container && alias.name == name) {
+                        completion = completion.combine(&alias.completion);
+                        value.extend(alias.targets.iter().map(|definition| RouteLocation::Owner { definition: *definition, scope: None }));
+                    }
+                }
+            }
+        }
+        completion = completion.combine(&self.module_attribute_space(container)?);
+        value.sort();
+        value.dedup();
         Ok(Read::Ready { value, completion })
     }
     /// Mutation authority is the retained operation inventory, confirmed only
@@ -1186,7 +2407,13 @@ impl PythonHalf<'_, '_, '_> {
             && !self.rows.events.iter().any(|event|event.target==site && event.kind!=brokk_bifrost_core::analyzer::resolution_facts::ResolutionBindingEventKind::Augment)
     }
 
-    fn selection_completion(&self, state: &PythonLexical) -> ResolutionCompletion {
+    fn selection_completion(&self, state: &PythonLexical) -> Read<()> {
+        if state.selection.stopped == Some(Stop::Cancelled) {
+            self.rules
+                .observations
+                .borrow_mut()
+                .push("lexical-selection-cancelled".into());
+        }
         let mut completion = state.selection.completion.clone();
         if state.selection.open
             || !state.selection.residual.is_empty()
@@ -1194,15 +2421,19 @@ impl PythonHalf<'_, '_, '_> {
         {
             completion = completion.combine(&open(self.source.token));
         }
-        if let Some(stop) = state.selection.stopped {
-            completion = completion.combine(&match stop {
-                Stop::Cancelled => cancelled_completion(),
-                Stop::Budget => ResolutionCompletion::incomplete([
+        match state.selection.stopped {
+            Some(Stop::Cancelled) => Read::Cancelled(completion.combine(&cancelled_completion())),
+            Some(Stop::Budget) => Read::Ready {
+                value: (),
+                completion: completion.combine(&ResolutionCompletion::incomplete([
                     ResolutionIncompleteReason::TimeBudgetExceeded(self.source.token),
-                ]),
-            });
+                ])),
+            },
+            None => Read::Ready {
+                value: (),
+                completion,
+            },
         }
-        completion
     }
 }
 
@@ -1256,6 +2487,19 @@ impl PythonHalf<'_, '_, '_> {
 }
 
 impl HalfRules for PythonHalf<'_, '_, '_> {
+    fn source_endpoint_completion(
+        &self,
+        source: &SourceHalf,
+        _: &EndpointSignature,
+        _: &ReadySelectedResolution<'_, '_>,
+    ) -> Option<ResolutionCompletion> {
+        let inputs = self.rules.source_inputs.borrow();
+        let completion = &inputs
+            .get(&source.identity)
+            .expect("prepared Python source half")
+            .endpoint_completion;
+        (completion != &ResolutionCompletion::Complete).then(|| completion.clone())
+    }
     fn member_access(
         &self,
     ) -> Option<&dyn super::member_access::MemberAccessRules<Self::MemberRow>> {
@@ -1289,7 +2533,16 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         route: &MemberRouteContext<'_, PythonRank>,
         owner: SemanticId,
     ) -> Result<Read<Vec<Self::MemberRow>>> {
-        let context = self.member_context();
+        let RouteLocation::Owner { definition, .. } = &route.cursor.location else {
+            unreachable!("Python source member requests start at a class owner");
+        };
+        let values = [ResolutionSlotValue::type_object(
+            crate::analyzer::resolution::ResolutionTypeRef::new(*definition, 0),
+        )];
+        let context = super::python_members::PythonMemberContext {
+            member_values: &values,
+            ..self.member_context()
+        };
         super::python_members::member_rows(
             &context,
             &super::python_members::PythonMemberRoute {
@@ -1361,6 +2614,14 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         _: &PythonPlacement,
         facts: &mut PlacementFacts<PythonTarget>,
     ) -> Result<Vec<PlacementStart<(), PythonRank>>> {
+        // Lexical selection owns the source scope, including its uncovered
+        // regions. A parallel environment-root route would reopen closed cells.
+        if self.source.anchor == ResolutionRootImportAnchor::Lexical
+            && !self.source.is_import
+            && self.import_site.is_none()
+        {
+            return Ok(Vec::new());
+        }
         let mut cursor = WalkCursor::container(facts.tag, self.rules.summary, String::new(), 0);
         cursor.namespace = self.source.demand.namespace();
         Ok(vec![PlacementStart::Route {
@@ -1380,6 +2641,37 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             half: self,
             placement,
         }
+    }
+    fn prefix_selection(
+        &mut self,
+        _: &PythonPlacement,
+        facts: &mut PlacementFacts<PythonTarget>,
+    ) -> Result<Option<StartSelection<PythonRank, ()>>> {
+        let Some(prefix) = &self.prefix else {
+            return Ok(None);
+        };
+        facts.completion = facts.completion.combine(prefix.completion());
+        let mut locations = Vec::new();
+        for &definition in prefix.targets() {
+            if let Some(location) = self.module_container(&RouteLocation::Owner {
+                definition,
+                scope: None,
+            })? {
+                locations.push(RankedStart {
+                    location,
+                    rank: Some(PythonRank { cohort: 0 }),
+                    scope: None,
+                });
+            }
+        }
+        Ok(Some(StartSelection {
+            lexical: None,
+            locations,
+            scopes: Vec::new(),
+            blocks_fallback: true,
+            head: None,
+            providers: Vec::new(),
+        }))
     }
     fn prefix_starts(
         &mut self,
@@ -1409,7 +2701,14 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         placement: &PythonPlacement,
         facts: &mut PlacementFacts<PythonTarget>,
     ) -> Result<Option<StartSelection<PythonRank, ()>>> {
-        if self.source.anchor != ResolutionRootImportAnchor::Lexical || self.source.is_import {
+        // An import's source reference names the provider route, not an
+        // importer-local cell (notably `from .model import target as public`).
+        // A qualified read resumes through its prepared prefix prerequisite.
+        if self.source.anchor != ResolutionRootImportAnchor::Lexical
+            || self.import_site.is_some()
+            || self.source.is_import
+            || self.source.prefix.is_some()
+        {
             return Ok(None);
         }
         let lookup = self
@@ -1466,7 +2765,7 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         scope: ResolutionScopeId,
         _: u32,
         lookup: &ResolutionLookupSemanticRecipe,
-    ) -> Result<Self::LexicalTiers> {
+    ) -> Result<Read<Self::LexicalTiers>> {
         let mut state = placement.lexical.borrow_mut();
         let state = state.as_mut().expect("selected lexical state");
         let before = state.selection.selected.len();
@@ -1510,8 +2809,31 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                 self.rules.python_version,
             ));
         }
+        // Closed source and wildcard inventories can prove a missing name.
+        // Residual at the final scope is then absence, not an unknown writer.
+        // LOAD_GLOBAL does not invoke module __getattr__; retain source completion
+        // (including opaque namespace writes) independently of this residual.
+        if !state.selection.open
+            && state.selection.unbound.is_empty()
+            && state.selection.selected.is_empty()
+            && state.selection.stopped.is_none()
+            && python_lexical::lexical_parent(state, &self.rows, scope.get()).is_none()
+            && !self
+                .rows
+                .slots
+                .iter()
+                .any(|slot| slot.scope == scope.get() && slot.name == lookup.spelling())
+            && brokk_bifrost_python::intrinsics::builtin(lookup.spelling()).is_none()
+            && self.builtin_inventory_closed()
+        {
+            state.selection.residual.clear();
+        }
         self.stopped.set(state.selection.stopped.is_some());
-        let mut coverage = self.selection_completion(state);
+        let mut coverage = match self.selection_completion(state) {
+            Read::Ready { completion, .. } => completion,
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+            Read::Unavailable { .. } => unreachable!("lexical selection cannot be unavailable"),
+        };
         // A residual carried to a known semantic parent is not missing evidence.
         // Only an uncovered region at the end of traversal stays open.
         if !state.selection.open
@@ -1551,11 +2873,35 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                         .iter()
                         .find(|import| import.binding_event == Some(event.event))
                     {
+                        // A missing destination still has route-local placement
+                        // evidence; retain it on the final blocker-only tier.
+                        coverage = coverage
+                            .combine(&self.import_route_completion(import.import_site.get())?);
+                        if state.conditional_import_identity(import.import_site.get()) {
+                            let reasons = self.rules.import_activation_reasons(
+                                self.blob,
+                                self.fragment.ordinal(),
+                                import.import_site.get(),
+                            )?;
+                            self.rules
+                                .source_inputs
+                                .borrow_mut()
+                                .get_mut(&self.source.identity)
+                                .expect("prepared Python source half")
+                                .activation_reasons
+                                .extend(reasons);
+                        }
                         for (location, head) in
                             self.import_starts(placement, import.import_site.get(), lookup)?
                         {
                             let mut tier = RouteEdgeTier {
-                                coverage: coverage.combine(&open(self.source.token)),
+                                coverage: if state
+                                    .conditional_import_identity(import.import_site.get())
+                                {
+                                    coverage.clone()
+                                } else {
+                                    coverage.combine(&open(self.source.token))
+                                },
                                 blocks_fallback: true,
                                 ..Default::default()
                             };
@@ -1601,6 +2947,25 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             state.selection.open,
             state.selection.stopped
         ));
+        {
+            let mut inputs = self.rules.source_inputs.borrow_mut();
+            let prepared = inputs
+                .get_mut(&self.source.identity)
+                .expect("prepared Python source half");
+            // Source-row completion still carries its own persisted gaps and
+            // exact discharges. Publish only the temporal endpoint obligation
+            // here; copying that completion would reintroduce discharged gaps.
+            if state.selection.open
+                || !state.selection.unbound.is_empty()
+                || state.selection.stopped.is_some()
+                || (!state.selection.residual.is_empty()
+                    && python_lexical::lexical_parent(state, &self.rows, scope.get()).is_none())
+            {
+                prepared.endpoint_completion = prepared
+                    .endpoint_completion
+                    .combine(&open(self.source.token));
+            }
+        }
         // Retain blockers even when no selected write can produce a target.
         tiers.push(LexicalStartTier {
             ranked: RankedLexicalTier {
@@ -1614,7 +2979,7 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             },
             head: None,
         });
-        Ok(tiers)
+        Ok(Read::ready(tiers))
     }
 
     fn outer_can_compete(
@@ -1696,23 +3061,6 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                     )
                 },
             );
-            let cursor = WalkCursor {
-                tag: (),
-                location: RouteLocation::Container {
-                    unit,
-                    container: container.clone(),
-                },
-                consumed_prefix_segments: self.source.route.len(),
-                start_step: 0,
-                namespace: self.source.demand.namespace(),
-            };
-            // Python's terminal attribute can also name a child module. Read
-            // that one segment, independently of the file's attribute surface.
-            let _child_module = PythonRoute {
-                half: self,
-                placement,
-            }
-            .route_tier(&cursor, &lookup, 0)?;
             let star = match self.import_site {
                 Some(site) if self.source.is_import => self.rules.ready.inventory.connection().query_row(
                     "SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports WHERE summary_id=?1 AND import_site=?2 AND importer_container=?3 AND form='star')",
@@ -1752,7 +3100,10 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             unstaged: if matches!(target, RouteLocation::Owner { .. }) {
                 completion.clone()
             } else {
-                completion.combine(&open(self.source.token))
+                let RouteLocation::Container { ref container, .. } = target else {
+                    unreachable!()
+                };
+                completion.combine(&self.module_attribute_space(container)?)
             },
             coverage: ExportCoverage::default(),
         }))
@@ -1785,17 +3136,70 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                     "SELECT EXISTS(SELECT 1 FROM python_unit_summary_export_names WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard' AND name=?3)",
                     rusqlite::params![self.rules.summary,container,name], |row|row.get::<_,bool>(0),
                 )? {
-                    return Ok(Read::Ready {value:Vec::new(),completion:completion.combine(&open(self.source.token))});
+                    let closed = self.wildcard_inventory_closed(container, name)?;
+                    return Ok(Read::Ready { value:Vec::new(), completion: if closed { completion.clone() } else { completion.combine(&open(self.source.token)) } });
                 }
-                match self.module_locations(container, name)? {
-                    Read::Ready {
-                        value,
-                        completion: read,
-                    } => (value, completion.combine(&read)),
-                    Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
-                    Read::Unavailable { reason, completion } => {
-                        return Ok(Read::Unavailable { reason, completion });
+                let module_import = match self.import_site {
+                    Some(site) if self.source.is_import => self.rules.ready.inventory.connection().query_row(
+                        "SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports WHERE summary_id=?1 AND importer_container=?2 AND import_site=?3 AND form='module')",
+                        rusqlite::params![self.rules.summary, placement.container, site], |row| row.get::<_, bool>(0),
+                    )?,
+                    _ => false,
+                };
+                if module_import
+                    || (!self.source.is_import
+                        && self.source.route.is_empty()
+                        && self.source.prefix.is_none())
+                {
+                    (
+                        self.module_owner(container)?.into_iter().collect(),
+                        completion.clone(),
+                    )
+                } else if star {
+                    match self.module_locations(container, name)? {
+                        Read::Ready {
+                            value,
+                            completion: read,
+                        } => (value, completion.combine(&read)),
+                        Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                        Read::Unavailable { reason, completion } => {
+                            return Ok(Read::Unavailable { reason, completion });
+                        }
                     }
+                } else {
+                    // The same terminal tier supplies both authored attributes
+                    // and child-module providers. Read it once, then project
+                    // source-backed containers through their authored owner.
+                    let cursor = WalkCursor {
+                        tag: (),
+                        location: target.location.clone(),
+                        consumed_prefix_segments: self.source.route.len(),
+                        start_step: 0,
+                        namespace: self.source.demand.namespace(),
+                    };
+                    let lookup = ResolutionLookupSemanticRecipe::new(
+                        Language::Python,
+                        self.source.demand.namespace(),
+                        name,
+                    );
+                    let tier = (PythonRoute {
+                        half: self,
+                        placement,
+                    })
+                    .route_tier(&cursor, &lookup, 0)?
+                    .expect("Python's first container tier is present");
+                    let mut locations = Vec::new();
+                    for location in tier.edges {
+                        match location {
+                            RouteLocation::Container { container, .. } => {
+                                if let Some(owner) = self.module_owner(&container)? {
+                                    locations.push(owner);
+                                }
+                            }
+                            RouteLocation::Owner { .. } => locations.push(location),
+                        }
+                    }
+                    (locations, completion.combine(&tier.coverage))
                 }
             }
         };
@@ -1825,11 +3229,10 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         _: &PythonPlacement,
         target: &PythonTarget,
     ) -> Result<ResolutionCompletion> {
-        Ok(if matches!(target.location, RouteLocation::Owner { .. }) {
-            ResolutionCompletion::Complete
-        } else {
-            open(self.source.token)
-        })
+        match &target.location {
+            RouteLocation::Owner { .. } => Ok(ResolutionCompletion::Complete),
+            RouteLocation::Container { container, .. } => self.provider_completion(container),
+        }
     }
 }
 
@@ -1886,10 +3289,11 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
         start: &WalkCursor<T>,
         completion: &mut ResolutionCompletion,
     ) -> Result<RouteStarts> {
-        if self.half.source.is_import || matches!(start.location, RouteLocation::Container { .. }) {
-            *completion = completion.combine(&open(self.half.source.token));
+        if let RouteLocation::Container { container, .. } = &start.location {
+            *completion = completion.combine(&self.half.provider_completion(container)?);
         }
         if let Some(site) = self.half.import_site {
+            *completion = completion.combine(&self.half.import_route_completion(site)?);
             let destinations = self
                 .half
                 .rules
@@ -1951,7 +3355,16 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
         }
         let RouteLocation::Container { unit, container } = &cursor.location else {
             return Ok(Some(RouteEdgeTier {
-                blockers: open(self.half.source.token),
+                // A class has the member provider above. Other owner values
+                // have no container/member provider proved by this route.
+                blockers: match &cursor.location {
+                    RouteLocation::Owner { definition, .. }
+                        if super::python_members::is_class(self.half.rules.ready, *definition)? =>
+                    {
+                        ResolutionCompletion::Complete
+                    }
+                    _ => open(self.half.source.token),
+                },
                 blocks_fallback: true,
                 ..Default::default()
             }));
@@ -1988,6 +3401,24 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
                 .map(|(_, module, root, kind, path, state)| (module, root, kind, path, state))
                 .collect::<Vec<_>>()
         ));
+        // Python reference 7.11: from-import reads the attribute, then imports a missing package child.
+        let from_import = self.half.import_site.map_or_else(
+            || cursor.consumed_prefix_segments == 0
+                && self.placement.lexical.borrow().as_ref().is_some_and(|state| {
+                !state.selection.selected.is_empty()
+                    && state.selection.selected.iter().all(|selected| self.half.rows.imports.iter().any(|import|
+                        import.binding_event == Some(selected.occurrence)
+                            && import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::From))
+            }),
+            |site| self.half.import_name.as_deref() == Some(segment.spelling())
+                && self.half.rows.imports.iter().any(|import| import.import_site.get() == site
+                    && import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::From),
+        );
+        let from_import_child = from_import
+            && !MODULE_OBJECT_ATTRIBUTES.contains(&segment.spelling())
+            && providers
+                .iter()
+                .any(|(_, _, _, kind, _, _)| matches!(kind.as_str(), "module" | "package"));
         let mut edges: Vec<_> = providers
             .into_iter()
             .map(|(container, ..)| RouteLocation::Container {
@@ -1995,9 +3426,15 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
                 container,
             })
             .collect();
-        let mut coverage = open(self.half.source.token);
+        let mut coverage = self.half.provider_completion(container)?;
         if !container.is_empty() {
-            match self.half.module_locations(container, segment.spelling())? {
+            let locations = if from_import_child {
+                self.half
+                    .module_binding_locations(container, segment.spelling())?
+            } else {
+                self.half.module_locations(container, segment.spelling())?
+            };
+            match locations {
                 Read::Ready { value, completion } => {
                     edges.extend(value);
                     coverage = coverage.combine(&completion);
@@ -2016,11 +3453,13 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
     }
     fn dead_end(
         &self,
-        _: &WalkCursor<T>,
+        cursor: &WalkCursor<T>,
         _: &ResolutionLookupSemanticRecipe,
     ) -> Result<ResolutionCompletion> {
-        let _ = &self.placement;
-        Ok(open(self.half.source.token))
+        match &cursor.location {
+            RouteLocation::Container { container, .. } => self.half.provider_completion(container),
+            RouteLocation::Owner { .. } => Ok(ResolutionCompletion::Complete),
+        }
     }
 }
 
@@ -2120,14 +3559,22 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(output)
     }
 
-    /// Explicit dormant validation assembly. No production query calls this.
-    #[doc(hidden)]
-    pub fn python_native_route_probe(
+    /// One operation and demand cache for a selected Python environment.
+    pub(super) fn with_python_forward_operation<T>(
         &self,
         summary: i64,
         python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
+        blueprint: &SelectedFactOperationBlueprint,
+        session: &ResolutionSession,
         cancellation: &CancellationToken,
-    ) -> Result<String> {
+        run: impl FnOnce(
+            &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+            &mut DemandProvider<SharedDemand<'_, '_, '_, PythonRules<'_, '_, '_>>>,
+            &SelectedResolutionLexicalSource<'_, '_>,
+            &RefCell<ClosedRelations>,
+            &RefCell<Vec<String>>,
+        ) -> Result<T>,
+    ) -> Result<T> {
         let observation: String = self.ready.inventory.connection().query_row(
             "SELECT observation FROM python_unit_summary_roots WHERE summary_id=?1 LIMIT 1",
             [summary],
@@ -2138,12 +3585,85 @@ impl SelectedResolutionOperation<'_, '_> {
             "typing" => PythonBindingProfile::Typing,
             _ => return Err(StoreError::corrupt("invalid Python observation profile")),
         };
-        let session = ResolutionSession::unbounded();
         let paths = self.ready.lexical_source();
         let typed = self.ready.typed_source().with_implicit_environment(
             summary,
             python_version.map(|version| (version.major, version.minor)),
         );
+        let base = blueprint.path_fragment_source(&paths, &paths, Some(session));
+        let arena = RefCell::new(ClosedRelations::default());
+        let observations = RefCell::new(Vec::new());
+        let source = ClosedForwardSource::new(&base, &paths, &arena, session, CALLER_ENVIRONMENT);
+        let mut provider = DemandProvider::new(SharedDemand {
+            source_closures: HashMap::default(),
+            rules: PythonRules {
+                ready: &self.ready,
+                summary,
+                profile,
+                python_version,
+                cancellation,
+                session,
+                observations: &observations,
+                arena: &arena,
+                source_inputs: RefCell::new(HashMap::default()),
+                binding_rows: RefCell::new(ExactReadMemo::default()),
+                root_prefixes: RefCell::new(ExactReadMemo::default()),
+                module_sites: RefCell::new(ExactReadMemo::default()),
+                qualified_members: HashMap::default(),
+                attribute_hooks: RefCell::new(HashMap::default()),
+                attribute_mutations: RefCell::new(HashMap::default()),
+                attribute_metaclasses: RefCell::new(HashMap::default()),
+                prepared_references: RefCell::new(HashMap::default()),
+                universe_mutations: RefCell::new(HashMap::default()),
+                module_mutations: RefCell::new(HashMap::default()),
+                module_spaces: RefCell::new(HashMap::default()),
+                wildcard_inventories: RefCell::new(HashMap::default()),
+                import_aliases: RefCell::new(HashMap::default()),
+            },
+            arena: &arena,
+            paths: &paths,
+            ready: &self.ready,
+            projection_memo: None,
+            base: &paths,
+            session,
+            cancellation,
+            completion: &ResolutionCompletion::Complete,
+        });
+        blueprint.with_forward_operation_in_session(
+            &source,
+            &paths,
+            &typed,
+            cancellation,
+            session,
+            |operation| run(operation, &mut provider, &paths, &arena, &observations),
+        )
+    }
+
+    /// Explicit dormant validation assembly. No production query calls this.
+    #[doc(hidden)]
+    pub fn python_native_route_probe(
+        &self,
+        summary: i64,
+        python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
+        cancellation: &CancellationToken,
+    ) -> Result<String> {
+        self.python_native_route_probe_in_session(
+            summary,
+            python_version,
+            &ResolutionSession::unbounded(),
+            cancellation,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn python_native_route_probe_in_session(
+        &self,
+        summary: i64,
+        python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
+        session: &ResolutionSession,
+        cancellation: &CancellationToken,
+    ) -> Result<String> {
+        let cancellation = session.cancellation().unwrap_or(cancellation);
         let context = empty_contexts_for(
             self.mount_table(),
             &ResolutionCompletion::Complete,
@@ -2153,78 +3673,46 @@ impl SelectedResolutionOperation<'_, '_> {
         let Some(blueprint) = self.prepare_prefix_blueprint(context, cancellation)? else {
             return Err(StoreError::new("cancelled preparing Python route probe"));
         };
-        let base = blueprint.path_fragment_source(&paths, &paths, Some(&session));
-        let arena = RefCell::new(ClosedRelations::default());
-        let observations = RefCell::new(Vec::new());
-        let source = ClosedForwardSource::new(&base, &paths, &arena, &session, CALLER_ENVIRONMENT);
-        let mut provider = DemandProvider::new(SharedDemand {
-            source_closures: HashMap::default(),
-            rules: PythonRules {
-                ready: &self.ready,
-                summary,
-                profile,
-                python_version,
-                cancellation,
-                session: &session,
-                observations: &observations,
-                arena: &arena,
-                source_inputs: RefCell::new(HashMap::default()),
-                qualified_members: HashMap::default(),
-                prepared_references: RefCell::new(HashMap::default()),
-                universe_mutations: RefCell::new(HashMap::default()),
-            },
-            arena: &arena,
-            paths: &paths,
-            ready: &self.ready,
-            base: &paths,
-            session: &session,
-            cancellation,
-            completion: &ResolutionCompletion::Complete,
-        });
-        let mut roots = Vec::new();
-        let outcome = visit_selected_root_import_half_pages(
-            &self.ready.context_identities,
-            &paths,
-            &paths,
-            None,
-            cancellation,
-            &mut FactPageVisitor::new(&mut |halves| {
-                roots.extend(halves.iter().filter_map(|half| match half {
-                    SelectedRootPathHalf::Import {
-                        identity, token, ..
-                    } => Some((*identity, *token)),
-                    SelectedRootPathHalf::Reference { .. } => None,
-                    SelectedRootPathHalf::Export { .. } => unreachable!("root import inventory"),
-                }));
-                Ok(true)
-            }),
-        )?;
-        if outcome.is_cancelled() {
-            return Err(StoreError::new("cancelled reading Python route roots"));
-        }
-        let root_paths = paths.hydrate_candidate_paths(
-            &roots.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            cancellation,
-        )?;
-        let references = self.ready.inventory.connection().prepare_cached(
-            "SELECT mounted.mount_ordinal, mounted.persisted_relative_path, sites.source_site,
-                    reference.start_byte,reference.end_byte
-             FROM temp.selected_resolution_mounts mounted
-             JOIN resolution_semantic_sites sites ON sites.blob_id=mounted.blob_id AND sites.semantic_role='reference'
-             JOIN resolution_sites reference ON reference.blob_id=sites.blob_id AND reference.site=sites.source_site
-             WHERE mounted.semantic_language='python'
-             ORDER BY mounted.persisted_relative_path,reference.start_byte,sites.source_site",
-        )?.query_map([], |row| Ok((
-            row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?,
-            row.get::<_, usize>(3)?, row.get::<_, usize>(4)?,
-        )))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        blueprint.with_forward_operation_in_session(
-            &source,
-            &paths,
-            &typed,
-            cancellation,
-            &session,
-            |operation| {
+        self.with_python_forward_operation(
+            summary, python_version, &blueprint, session, cancellation,
+            |operation, provider, paths, arena, observations| {
+                let mut roots = Vec::new();
+                let outcome = visit_selected_root_import_half_pages(
+                    &self.ready.context_identities,
+                    paths,
+                    paths,
+                    None,
+                    cancellation,
+                    &mut FactPageVisitor::new(&mut |halves| {
+                        roots.extend(halves.iter().filter_map(|half| match half {
+                            SelectedRootPathHalf::Import {
+                                identity, token, ..
+                            } => Some((*identity, *token)),
+                            SelectedRootPathHalf::Reference { .. } => None,
+                            SelectedRootPathHalf::Export { .. } => unreachable!("root import inventory"),
+                        }));
+                        Ok(true)
+                    }),
+                )?;
+                if outcome.is_cancelled() {
+                    return Err(StoreError::new("cancelled reading Python route roots"));
+                }
+                let root_paths = paths.hydrate_candidate_paths(
+                    &roots.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    cancellation,
+                )?;
+                let references = self.ready.inventory.connection().prepare_cached(
+                    "SELECT mounted.mount_ordinal, mounted.persisted_relative_path, sites.source_site,
+                            reference.start_byte,reference.end_byte
+                     FROM temp.selected_resolution_mounts mounted
+                     JOIN resolution_semantic_sites sites ON sites.blob_id=mounted.blob_id AND sites.semantic_role='reference'
+                     JOIN resolution_sites reference ON reference.blob_id=sites.blob_id AND reference.site=sites.source_site
+                     WHERE mounted.semantic_language='python'
+                     ORDER BY mounted.persisted_relative_path,reference.start_byte,sites.source_site",
+                )?.query_map([], |row| Ok((
+                    row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?,
+                    row.get::<_, usize>(3)?, row.get::<_, usize>(4)?,
+                )))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut output = String::new();
                 for (identity, path) in root_paths {
                     let token = roots
@@ -2233,7 +3721,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .expect("root source token")
                         .1;
                     let completion =
-                        operation.prepare_relation_for_test(path.end(), token, &mut provider)?;
+                        operation.prepare_relation_for_test(path.end(), token, &mut *provider)?;
                     use std::fmt::Write;
                     let mount = self
                         .mount_table()
@@ -2266,7 +3754,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .and_then(|seed| seed.site_metadata())
                         .is_some_and(|metadata| !metadata.is_callable_reference());
                     if standalone {
-                        let prerequisite = operation.resolve_prerequisite_for_test(reference, &mut provider)?;
+                        let prerequisite = operation.resolve_prerequisite_for_test(reference, &mut *provider)?;
                         if let Some((_, _, Some(entry))) = arena.borrow().selected_universe.get(&reference) {
                             assert!(prerequisite.as_ref().is_some_and(|answer|
                                 answer.binding().completion() == &ResolutionCompletion::Complete
@@ -2277,7 +3765,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         }
                     }
                     let answer =
-                        match operation.resolve_reference_by_demand(reference, &mut provider)? {
+                        match operation.resolve_reference_by_demand(reference, &mut *provider)? {
                             FactDemandResolution::Ready(answer) => answer,
                             FactDemandResolution::Cancelled(completion) => {
                                 return Err(StoreError::new(format!(
@@ -2293,7 +3781,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     }
                     let mut selected = Vec::new();
                     for target in answer.binding().targets() {
-                        if let Some(entry) = crate::analyzer::resolution::universe_entry_for_identity(&paths, *target, cancellation)? {
+                        if let Some(entry) = crate::analyzer::resolution::universe_entry_for_identity(paths, *target, cancellation)? {
                             selected.push(format!("predeclared:{}", entry.identity_spelling));
                             continue;
                         }
@@ -2303,8 +3791,11 @@ impl SelectedResolutionOperation<'_, '_> {
                         let target_mount = self.mount_table().mount_for_fragment(provenance.mount().fragment())?.expect("selected target mount");
                         let node = paths.lookup_definition_node(*target, cancellation)?.expect("selected target definition");
                         let site = paths.definition_source_site(target_mount.ordinal(), node, cancellation)?.flatten().expect("authored target site");
+                        // Nameless declarations, including file modules, use
+                        // their authored occurrence as the diagnostic anchor.
                         let (begin, finish): (usize,usize) = self.ready.inventory.connection().query_row(
-                            "SELECT declaration.name_start_byte,declaration.name_end_byte
+                            "SELECT COALESCE(declaration.name_start_byte,declaration.start_byte),
+                                    COALESCE(declaration.name_end_byte,declaration.end_byte)
                              FROM source_native_declaration_bridges bridge
                              JOIN source_declarations declaration ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
                              WHERE bridge.blob_id=?1 AND bridge.source_site=?2",

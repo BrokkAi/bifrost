@@ -1,3 +1,4 @@
+//! Java grammar and source authority for the shared incoming-call projection.
 //! Test-support Java incoming-call projection from selected inverse rows.
 //!
 //! The inverse resolver owns target identity, including overload selection.
@@ -13,15 +14,11 @@ use crate::analyzer::java::selected_reverse::java_selected_inverse_detailed_for;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
-use brokk_bifrost_analysis::analyzer::structural::facts::FileFacts;
-
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
 
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeDerivationResult;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProofAuthority;
-
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallArgument;
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnostic;
 
@@ -33,15 +30,11 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvid
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallSite;
-
 use brokk_bifrost_analysis::analyzer::usages::call_relations::is_call_relation_unit;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSyntaxKind;
-
-use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::call_site_syntax_for_reference;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -55,8 +48,11 @@ use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
 use brokk_bifrost_core::hash::HashMap;
 
-use brokk_bifrost_core::hash::HashSet;
-use std::sync::Arc;
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow;
+use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
+    IncomingCallProjection, IncomingFile, IncomingFileBudget, IncomingProjectionIssue,
+    finish_incoming_sites, project_selected_incoming,
+};
 use tree_sitter::{Node, Tree};
 
 /// Native Java incoming calls, kept outside production dispatch.
@@ -109,7 +105,8 @@ impl CallRelationProvider for JavaNativeCallRelations {
         };
         let selected = match java_selected_inverse_detailed_for(java, java, target, &cancellation) {
             JavaSelectedReverseOutcome::Ready(answer) => answer,
-            JavaSelectedReverseOutcome::Unavailable(reason) => {
+            JavaSelectedReverseOutcome::Unavailable(reason)
+            | JavaSelectedReverseOutcome::TargetUncovered(reason) => {
                 return unavailable(
                     format!("selected Java inverse is unavailable: {reason}"),
                     target,
@@ -182,15 +179,16 @@ fn project_incoming_calls(
             ))
     });
 
-    let mut files = HashMap::<ProjectFile, (String, Option<Arc<FileFacts>>, Tree)>::default();
-    let mut rejected_files = HashSet::default();
-    let mut source_bytes = 0usize;
-    for edge in selected_edges {
+    let mut rows = Vec::new();
+    for edge in &selected_edges {
         if cancellation.is_cancelled() {
-            result.sites.clear();
             result.cancelled = true;
             return result;
         }
+        assert_eq!(
+            &edge.target, target,
+            "reverse batch preserves target identity"
+        );
         let binding_target_count = selected.binding_target_count(&edge.site);
         if binding_target_count != Some(1) {
             let (code, reason) = if binding_target_count.is_some() {
@@ -215,119 +213,122 @@ fn project_incoming_calls(
             ));
             continue;
         }
-        if !files.contains_key(&edge.site.file) {
-            if rejected_files.contains(&edge.site.file) {
-                continue;
-            }
-            if files.len() >= limits.max_files {
-                result.truncated = true;
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            let Some(source) = java.indexed_source(&edge.site.file) else {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!(
-                        "selected Java call source is unavailable: {}",
-                        edge.site.file
-                    ),
-                    edge.site.file.to_string(),
-                    "native_call_source_unavailable",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            };
-            if source.len() > limits.max_source_bytes.saturating_sub(source_bytes) {
-                result.truncated = true;
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            let Some(tree) = brokk_bifrost_jvm::java::declarations::parse_tree(&source) else {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::ParseFailed,
-                    format!("cannot parse selected Java call source: {}", edge.site.file),
-                    edge.site.file.to_string(),
-                    "native_call_parse_failed",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            };
-            if !java
-                .inner
-                .source_matches_selected_native_content(&edge.site.file, &source)
-            {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!("selected Java call source changed: {}", edge.site.file),
-                    edge.site.file.to_string(),
-                    "native_call_source_stale",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            let facts = java
-                .structural_fact_providers()
-                .into_iter()
-                .find_map(|provider| provider.structural_facts(&edge.site.file));
-            if facts
-                .as_ref()
-                .is_some_and(|facts| facts.source() != source.as_str())
-            {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!(
-                        "selected Java structural source changed: {}",
-                        edge.site.file
-                    ),
-                    edge.site.file.to_string(),
-                    "native_call_source_stale",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            source_bytes += source.len();
-            result.work.scanned_files += 1;
-            result.work.scanned_source_bytes += source.len();
-            files.insert(edge.site.file.clone(), (source, facts, tree));
+        rows.push((edge, ()));
+    }
+    let projected = project_selected_incoming(
+        &mut JavaIncomingProjection {
+            java,
+            trees: HashMap::default(),
+        },
+        target,
+        rows,
+        limits,
+        cancellation,
+        &mut result,
+    );
+    if let Some(sites) = projected.unwrap_or_else(|never| match never {}) {
+        finish_incoming_sites(sites, &mut result);
+    }
+    // Constructor identity is a Java rule; raw_call_site preserves syntax kind.
+    if target.is_class()
+        || java
+            .signature_metadata(target)
+            .iter()
+            .any(|metadata| metadata.callable_is_constructor())
+    {
+        for site in &mut result.sites {
+            site.kind = CallSyntaxKind::Constructor;
         }
-        let Some((_, Some(facts), tree)) = files.get(&edge.site.file) else {
-            if !result.diagnostics.iter().any(|item| {
-                item.context == edge.site.file.to_string()
-                    && item.reason_kind.as_deref() == Some("native_call_facts_unavailable")
-            }) {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!(
-                        "Java structural call facts are unavailable: {}",
-                        edge.site.file
-                    ),
-                    edge.site.file.to_string(),
-                    "native_call_facts_unavailable",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-            }
-            continue;
+    }
+    result
+}
+
+struct JavaIncomingProjection<'a> {
+    java: &'a JavaAnalyzer,
+    trees: HashMap<ProjectFile, Tree>,
+}
+
+impl IncomingCallProjection for JavaIncomingProjection<'_> {
+    type Error = std::convert::Infallible;
+
+    fn load_file(
+        &mut self,
+        file: &ProjectFile,
+        budget: &mut IncomingFileBudget<'_>,
+        diagnostics: &mut Vec<CallRelationDiagnostic>,
+    ) -> Result<IncomingFile, Self::Error> {
+        if budget.file_capacity_exhausted() {
+            return Ok(IncomingFile::Rejected);
+        }
+        let Some(source) = self.java.indexed_source(file) else {
+            diagnostics.push(diagnostic(
+                CallRelationDiagnosticCode::AnalysisFailed,
+                format!("selected Java call source is unavailable: {}", file),
+                file.to_string(),
+                "native_call_source_unavailable",
+            ));
+            return Ok(IncomingFile::Rejected);
         };
-        let Some(syntax) = call_site_syntax_for_reference(
-            facts,
+        if !budget.source_fits(source.len()) {
+            return Ok(IncomingFile::Rejected);
+        }
+        let Some(tree) = brokk_bifrost_jvm::java::declarations::parse_tree(&source) else {
+            diagnostics.push(diagnostic(
+                CallRelationDiagnosticCode::ParseFailed,
+                format!("cannot parse selected Java call source: {}", file),
+                file.to_string(),
+                "native_call_parse_failed",
+            ));
+            return Ok(IncomingFile::Rejected);
+        };
+        if !self
+            .java
+            .inner
+            .source_matches_selected_native_content(file, &source)
+        {
+            diagnostics.push(diagnostic(
+                CallRelationDiagnosticCode::AnalysisFailed,
+                format!("selected Java call source changed: {}", file),
+                file.to_string(),
+                "native_call_source_stale",
+            ));
+            return Ok(IncomingFile::Rejected);
+        }
+        let facts = self
+            .java
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(file));
+        if facts
+            .as_ref()
+            .is_some_and(|facts| facts.source() != source.as_str())
+        {
+            diagnostics.push(diagnostic(
+                CallRelationDiagnosticCode::AnalysisFailed,
+                format!("selected Java structural source changed: {}", file),
+                file.to_string(),
+                "native_call_source_stale",
+            ));
+            return Ok(IncomingFile::Rejected);
+        }
+        assert!(
+            budget.admit_source(source.len()),
+            "prechecked source fits the unchanged budget"
+        );
+        self.trees.insert(file.clone(), tree);
+        Ok(IncomingFile::Loaded(facts))
+    }
+
+    fn accept_reference(&self, edge: &ReferenceEdgeRow, _syntax: &CallSiteSyntax) -> bool {
+        is_java_invocation_reference(
+            self.trees[&edge.site.file].root_node(),
             edge.site.range.start_byte,
             edge.site.range.end_byte,
-        ) else {
-            continue;
-        };
-        if !is_java_invocation_reference(
-            tree.root_node(),
-            edge.site.range.start_byte,
-            edge.site.range.end_byte,
-        ) {
-            continue;
-        }
-        if result.work.examined_candidates >= limits.max_candidates {
-            result.truncated = true;
-            continue;
-        }
-        result.work.examined_candidates += 1;
-        let caller = java
+        )
+    }
+
+    fn caller(&self, edge: &ReferenceEdgeRow, syntax: &CallSiteSyntax) -> Option<CodeUnit> {
+        self.java
             .structural_fact_providers()
             .into_iter()
             .find_map(|provider| {
@@ -336,43 +337,24 @@ fn project_incoming_calls(
                     .and_then(|mut owners| owners.pop().flatten())
             })
             .or(edge.site.enclosing.clone())
-            .filter(is_call_relation_unit);
-        let Some(caller) = caller else {
-            result.diagnostics.push(diagnostic(
+    }
+
+    fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {
+        match issue {
+            IncomingProjectionIssue::FactsUnavailable(file) => diagnostic(
+                CallRelationDiagnosticCode::AnalysisFailed,
+                format!("Java structural call facts are unavailable: {file}"),
+                file.to_string(),
+                "native_call_facts_unavailable",
+            ),
+            IncomingProjectionIssue::OwnerUnavailable(edge) => diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
                 format!("selected Java call has no callable owner: {:?}", edge.site),
                 edge.site.file.to_string(),
                 "native_call_owner_unavailable",
-            ));
-            continue;
-        };
-        let constructor = target.is_class()
-            || java
-                .signature_metadata(target)
-                .iter()
-                .any(|metadata| metadata.callable_is_constructor());
-        result.sites.push(make_call_site(
-            edge.site.file,
-            caller,
-            target,
-            syntax,
-            edge.proof,
-            constructor,
-        ));
+            ),
+        }
     }
-    result.sites.sort_by(|left, right| {
-        (&left.file, left.range.start_byte, left.range.end_byte).cmp(&(
-            &right.file,
-            right.range.start_byte,
-            right.range.end_byte,
-        ))
-    });
-    result.sites.dedup_by(|left, right| {
-        left.file == right.file
-            && left.range.start_byte == right.range.start_byte
-            && left.range.end_byte == right.range.end_byte
-    });
-    result
 }
 
 fn is_java_invocation_reference(root: Node<'_>, start_byte: usize, end_byte: usize) -> bool {
@@ -418,44 +400,6 @@ fn is_java_invocation_reference(root: Node<'_>, start_byte: usize, end_byte: usi
         // A method reference names a callable value; it does not invoke it.
         "method_reference" => false,
         _ => unreachable!("Java invocation candidates were restricted above"),
-    }
-}
-
-fn make_call_site(
-    file: ProjectFile,
-    caller: CodeUnit,
-    target: &CodeUnit,
-    syntax: CallSiteSyntax,
-    proof: brokk_bifrost_core::analyzer::usages::model::UsageProof,
-    constructor: bool,
-) -> CallSite {
-    let arguments = syntax
-        .arguments
-        .into_iter()
-        .map(|argument| CallArgument {
-            range: argument.range,
-            name: argument.name,
-            position: argument.position,
-            formal_index: None,
-            formal_name: None,
-            variadic: false,
-            spread: argument.spread,
-        })
-        .collect();
-    CallSite {
-        file,
-        range: syntax.range,
-        callee_range: syntax.callee_range,
-        caller,
-        callee: target.clone(),
-        kind: if constructor {
-            CallSyntaxKind::Constructor
-        } else {
-            syntax.kind
-        },
-        proof,
-        receiver: syntax.receiver,
-        arguments,
     }
 }
 

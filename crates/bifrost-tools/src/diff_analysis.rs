@@ -2292,6 +2292,70 @@ fn workspace_subtree<'repo>(
     commit_id: Oid,
     revision: &str,
 ) -> Result<git2::Tree<'repo>, String> {
+    let prefix = workspace_prefix(repo, workspace_root)?;
+    let commit_tree = repo
+        .find_commit(commit_id)
+        .and_then(|commit| commit.tree())
+        .map_err(|err| format!("unable to read tree for commit {commit_id}: {err}"))?;
+    if prefix.as_os_str().is_empty() {
+        return Ok(commit_tree);
+    }
+    commit_tree
+        .get_path(&prefix)
+        .map_err(|err| {
+            format!(
+                "revision `{revision}` has no entry for workspace directory `{}`: {err}",
+                prefix.display()
+            )
+        })?
+        .to_object(repo)
+        .and_then(|object| object.peel_to_tree())
+        .map_err(|err| {
+            format!(
+                "workspace directory `{}` at revision `{revision}` is not a directory: {err}",
+                prefix.display()
+            )
+        })
+}
+
+/// Whether the work tree holds exactly what `HEAD` commits at each of
+/// `rel_paths` beneath `workspace_root`: nothing there is staged, modified,
+/// deleted, untracked or ignored. A path names a file or a directory, and a
+/// directory is compared recursively.
+pub fn worktree_paths_match_head(
+    workspace_root: &Path,
+    rel_paths: &[&str],
+) -> Result<bool, String> {
+    let repository = Repository::discover(workspace_root).map_err(|err| {
+        format!(
+            "workspace root {} is not inside a git repository: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let prefix = workspace_prefix(&repository, workspace_root)?;
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(true)
+        .recurse_ignored_dirs(true)
+        .exclude_submodules(true);
+    for rel_path in rel_paths {
+        // A pathspec is relative to the work tree and always uses `/`.
+        let pathspec = prefix.join(rel_path).to_string_lossy().replace('\\', "/");
+        options.pathspec(pathspec);
+    }
+    let statuses = repository
+        .statuses(Some(&mut options))
+        .map_err(|err| format!("unable to read the work tree status: {err}"))?;
+    Ok(statuses
+        .iter()
+        .all(|entry| entry.status() == git2::Status::CURRENT))
+}
+
+/// Where `workspace_root` lies beneath the work tree of `repo`, as a
+/// work-tree-relative path that is empty for the work-tree root itself.
+fn workspace_prefix(repo: &Repository, workspace_root: &Path) -> Result<PathBuf, String> {
     let workdir = repo.workdir().ok_or_else(|| {
         format!(
             "repository for {} has no working tree",
@@ -2310,34 +2374,14 @@ fn workspace_subtree<'repo>(
             workspace_root.display()
         )
     })?;
-    let prefix = workspace_root.strip_prefix(&workdir).map_err(|_| {
-        format!(
-            "workspace root {} is outside the repository work tree {}",
-            workspace_root.display(),
-            workdir.display()
-        )
-    })?;
-    let commit_tree = repo
-        .find_commit(commit_id)
-        .and_then(|commit| commit.tree())
-        .map_err(|err| format!("unable to read tree for commit {commit_id}: {err}"))?;
-    if prefix.as_os_str().is_empty() {
-        return Ok(commit_tree);
-    }
-    commit_tree
-        .get_path(prefix)
-        .map_err(|err| {
+    workspace_root
+        .strip_prefix(&workdir)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
             format!(
-                "revision `{revision}` has no entry for workspace directory `{}`: {err}",
-                prefix.display()
-            )
-        })?
-        .to_object(repo)
-        .and_then(|object| object.peel_to_tree())
-        .map_err(|err| {
-            format!(
-                "workspace directory `{}` at revision `{revision}` is not a directory: {err}",
-                prefix.display()
+                "workspace root {} is outside the repository work tree {}",
+                workspace_root.display(),
+                workdir.display()
             )
         })
 }

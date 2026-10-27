@@ -21,7 +21,7 @@ use crate::CancellationToken;
 use crate::hash::HashMap;
 use crate::hash::HashSet;
 
-use super::fact_lowering::LoweredSemanticRole;
+use super::fact_lowering::{LoweredSemanticRole, LoweringGapOrigin};
 
 use super::fact_source::ResolutionIdentityDomain;
 use super::fact_source::language_identity_domain;
@@ -1891,6 +1891,7 @@ pub struct ResolutionIdentityCatalogBuilder<'a> {
     /// is its only reader.
     shared_name_digests: HashMap<SharedNameId, [u8; 32]>,
     semantics: HashMap<SemanticId, ResolutionSemanticIdentity>,
+    gap_reasons: HashMap<SemanticId, (ResolutionSiteId, LoweringGapOrigin)>,
     semantics_by_identity: HashMap<ResolutionSemanticIdentity, SemanticId>,
     lookup_recipes: HashMap<SemanticId, ResolutionLookupSemanticRecipe>,
     lookup_semantics_by_recipe: HashMap<ResolutionLookupSemanticRecipe, SemanticId>,
@@ -1966,6 +1967,7 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
             names,
             shared_name_digests: HashMap::default(),
             semantics: HashMap::default(),
+            gap_reasons: HashMap::default(),
             semantics_by_identity: HashMap::default(),
             lookup_recipes: HashMap::default(),
             lookup_semantics_by_recipe: HashMap::default(),
@@ -2025,6 +2027,25 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
             || identity.mounted(UNMOUNTED_ORDINAL, next_identity_provisional(provisional, 0)),
             "semantic",
         )
+    }
+
+    /// Record authority when a reason is minted, even if it covers no frontier.
+    pub(crate) fn gap_reason(
+        &mut self,
+        site: ResolutionSiteId,
+        origin: LoweringGapOrigin,
+    ) -> SemanticId {
+        let reason = self.semantic(super::fact_lowering::gap_reason_semantic_identity(
+            site, origin,
+        ));
+        if let Some(previous) = self.gap_reasons.insert(reason, (site, origin)) {
+            assert_eq!(
+                previous,
+                (site, origin),
+                "one gap reason retains one exact lowering provenance"
+            );
+        }
+        reason
     }
 
     /// The digest that names one shared name this blob mentions.
@@ -2405,6 +2426,7 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
             site_span,
             shared_name_digests: self.shared_name_digests,
             semantics: MountedIdentities::new(semantics),
+            gap_reasons: self.gap_reasons,
             lookup_recipes: MountedIdentities::new(canonical_recipe_entries(self.lookup_recipes)),
             precedence_namespaces: self.precedence_namespaces,
             go_spelling_choices: self.go_spelling_choices,
@@ -2708,6 +2730,8 @@ pub struct ResolutionIdentityCatalog {
     shared_name_digests: HashMap<SharedNameId, [u8; 32]>,
     #[doc(hidden)]
     pub semantics: MountedIdentities<SemanticId, ResolutionSemanticIdentity>,
+    // One blob's construction authority, never a retained workspace index.
+    pub(crate) gap_reasons: HashMap<SemanticId, (ResolutionSiteId, LoweringGapOrigin)>,
     #[doc(hidden)]
     pub lookup_recipes: MountedIdentities<SemanticId, ResolutionLookupSemanticRecipe>,
     precedence_namespaces: HashMap<PrecedenceStep, ResolutionNamespace>,
@@ -2975,6 +2999,7 @@ impl ResolutionIdentityCatalog {
             site_span: _,
             shared_name_digests,
             semantics,
+            gap_reasons,
             lookup_recipes,
             precedence_namespaces,
             go_spelling_choices,
@@ -2986,6 +3011,7 @@ impl ResolutionIdentityCatalog {
         } = self;
         semantics
             .estimated_retained_bytes(|_| 0)
+            .saturating_add(brokk_bifrost_core::hash::map_slot_bytes(gap_reasons))
             .saturating_add(lookup_recipes.estimated_retained_bytes(|recipe| recipe.owned_bytes()))
             .saturating_add(brokk_bifrost_core::hash::map_slot_bytes(
                 precedence_namespaces,
@@ -3033,6 +3059,7 @@ impl ResolutionIdentityCatalog {
             site_span,
             shared_name_digests,
             semantics,
+            gap_reasons,
             lookup_recipes,
             precedence_namespaces,
             go_spelling_choices,
@@ -3149,6 +3176,10 @@ impl ResolutionIdentityCatalog {
                 site_span,
                 shared_name_digests,
                 semantics: MountedIdentities::new(semantics),
+                gap_reasons: gap_reasons
+                    .into_iter()
+                    .map(|(reason, provenance)| (semantic_translation[&reason], provenance))
+                    .collect(),
                 lookup_recipes: MountedIdentities::new(lookup_recipes),
                 precedence_namespaces,
                 go_spelling_choices,
@@ -3221,6 +3252,7 @@ impl ResolutionIdentityCatalog {
             site_span,
             shared_name_digests,
             semantics,
+            gap_reasons,
             lookup_recipes,
             precedence_namespaces,
             go_spelling_choices,
@@ -3232,6 +3264,10 @@ impl ResolutionIdentityCatalog {
         } = self;
         Self {
             fragment: assigned.fragment(fragment),
+            gap_reasons: gap_reasons
+                .into_iter()
+                .map(|(reason, provenance)| (assigned.semantic(reason), provenance))
+                .collect(),
             site_span,
             shared_name_digests,
             semantics: MountedIdentities::new(
@@ -3571,6 +3607,7 @@ impl ResolutionIdentityCatalog {
             site_span,
             shared_name_digests,
             semantics,
+            gap_reasons,
             lookup_recipes,
             precedence_namespaces,
             go_spelling_choices,
@@ -3727,6 +3764,10 @@ impl ResolutionIdentityCatalog {
                 site_span,
                 shared_name_digests,
                 semantics: MountedIdentities::new(remounted_semantics),
+                gap_reasons: gap_reasons
+                    .into_iter()
+                    .map(|(reason, provenance)| (translation.semantic(reason), provenance))
+                    .collect(),
                 lookup_recipes: MountedIdentities::new(remounted_lookup_recipes),
                 precedence_namespaces: remounted_precedence_namespaces,
                 go_spelling_choices: remounted_go_spelling_choices,

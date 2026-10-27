@@ -8,15 +8,11 @@ use crate::analyzer::go::selected_reverse::go_selected_inverse_for;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
-use brokk_bifrost_analysis::analyzer::structural::facts::FileFacts;
-
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
 
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeDerivationResult;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProofAuthority;
-
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallArgument;
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnostic;
 
@@ -28,15 +24,9 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvid
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallSite;
-
 use brokk_bifrost_analysis::analyzer::usages::call_relations::is_call_relation_unit;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
-
-use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSyntaxKind;
-
-use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::call_site_syntax_for_reference;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -48,10 +38,11 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
-use brokk_bifrost_core::hash::HashMap;
-
-use brokk_bifrost_core::hash::HashSet;
-use std::sync::Arc;
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow;
+use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
+    IncomingCallProjection, IncomingFile, IncomingFileBudget, IncomingProjectionIssue,
+    finish_incoming_sites, project_selected_incoming,
+};
 
 /// Native Go call-relation projection used by Go production dispatch.
 pub struct GoNativeCallRelations;
@@ -103,7 +94,8 @@ impl CallRelationProvider for GoNativeCallRelations {
         };
         let selected = match go_selected_inverse_for(go, target, &cancellation) {
             GoSelectedReverseOutcome::Ready(answer) => answer,
-            GoSelectedReverseOutcome::Unavailable(reason) => {
+            GoSelectedReverseOutcome::Unavailable(reason)
+            | GoSelectedReverseOutcome::TargetUncovered(reason) => {
                 return unavailable(
                     format!("selected Go inverse is unavailable: {reason}"),
                     target,
@@ -191,105 +183,85 @@ fn project_incoming_calls(
             ))
     });
 
-    let mut files = HashMap::<ProjectFile, (String, Option<Arc<FileFacts>>)>::default();
-    let mut rejected_files = HashSet::default();
-    let mut source_bytes = 0usize;
-    for edge in selected.edges {
-        if cancellation.is_cancelled() {
-            result.sites.clear();
-            result.cancelled = true;
-            return result;
+    let projected = project_selected_incoming(
+        &mut GoIncomingProjection { go, target },
+        target,
+        selected.edges.iter().map(|edge| (edge, ())),
+        limits,
+        cancellation,
+        &mut result,
+    );
+    if let Some(sites) = projected.unwrap_or_else(|never| match never {}) {
+        finish_incoming_sites(sites, &mut result);
+    }
+    result
+}
+
+struct GoIncomingProjection<'a> {
+    go: &'a GoAnalyzer,
+    target: &'a CodeUnit,
+}
+
+impl IncomingCallProjection for GoIncomingProjection<'_> {
+    type Error = std::convert::Infallible;
+
+    fn load_file(
+        &mut self,
+        file: &ProjectFile,
+        budget: &mut IncomingFileBudget<'_>,
+        diagnostics: &mut Vec<CallRelationDiagnostic>,
+    ) -> Result<IncomingFile, Self::Error> {
+        if budget.file_capacity_exhausted() {
+            return Ok(IncomingFile::Rejected);
         }
-        if !files.contains_key(&edge.site.file) {
-            if rejected_files.contains(&edge.site.file) {
-                continue;
-            }
-            if files.len() >= limits.max_files {
-                result.truncated = true;
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            let Some(source) = go.indexed_source(&edge.site.file) else {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!("selected Go call source is unavailable: {}", edge.site.file),
-                    target.fq_name().to_string(),
-                    "native_call_source_unavailable",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            };
-            if source.len() > limits.max_source_bytes.saturating_sub(source_bytes) {
-                result.truncated = true;
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            if !go
-                .inner
-                .source_matches_selected_native_content(&edge.site.file, &source)
-            {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!("selected Go call source changed: {}", edge.site.file),
-                    target.fq_name().to_string(),
-                    "native_call_source_stale",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            let facts = go
-                .structural_fact_providers()
-                .into_iter()
-                .find_map(|provider| provider.structural_facts(&edge.site.file));
-            if facts
-                .as_ref()
-                .is_some_and(|facts| facts.source() != source.as_str())
-            {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!("selected Go structural source changed: {}", edge.site.file),
-                    target.fq_name().to_string(),
-                    "native_call_source_stale",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            source_bytes += source.len();
-            result.work.scanned_files += 1;
-            result.work.scanned_source_bytes += source.len();
-            files.insert(edge.site.file.clone(), (source, facts));
-        }
-        let Some((_, Some(facts))) = files.get(&edge.site.file) else {
-            if !result.diagnostics.iter().any(|diagnostic| {
-                diagnostic.context == edge.site.file.to_string()
-                    && diagnostic.reason_kind.as_deref() == Some("native_call_facts_unavailable")
-            }) {
-                result.diagnostics.push(diagnostic(
-                    CallRelationDiagnosticCode::AnalysisFailed,
-                    format!(
-                        "Go structural call facts are unavailable: {}",
-                        edge.site.file
-                    ),
-                    edge.site.file.to_string(),
-                    "native_call_facts_unavailable",
-                ));
-                rejected_files.insert(edge.site.file.clone());
-            }
-            continue;
+        let Some(source) = self.go.indexed_source(file) else {
+            diagnostics.push(diagnostic(
+                format!("selected Go call source is unavailable: {file}"),
+                self.target.fq_name().to_string(),
+                "native_call_source_unavailable",
+            ));
+            return Ok(IncomingFile::Rejected);
         };
-        let Some(syntax) = call_site_syntax_for_reference(
-            facts,
-            edge.site.range.start_byte,
-            edge.site.range.end_byte,
-        ) else {
-            continue;
-        };
-        if result.work.examined_candidates >= limits.max_candidates {
-            result.truncated = true;
-            continue;
+        if !budget.source_fits(source.len()) {
+            return Ok(IncomingFile::Rejected);
         }
-        result.work.examined_candidates += 1;
-        let caller = go
+        if !self
+            .go
+            .inner
+            .source_matches_selected_native_content(file, &source)
+        {
+            diagnostics.push(diagnostic(
+                format!("selected Go call source changed: {file}"),
+                self.target.fq_name().to_string(),
+                "native_call_source_stale",
+            ));
+            return Ok(IncomingFile::Rejected);
+        }
+        let facts = self
+            .go
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(file));
+        if facts
+            .as_ref()
+            .is_some_and(|facts| facts.source() != source.as_str())
+        {
+            diagnostics.push(diagnostic(
+                format!("selected Go structural source changed: {file}"),
+                self.target.fq_name().to_string(),
+                "native_call_source_stale",
+            ));
+            return Ok(IncomingFile::Rejected);
+        }
+        assert!(
+            budget.admit_source(source.len()),
+            "prechecked source fits the unchanged budget"
+        );
+        Ok(IncomingFile::Loaded(facts))
+    }
+
+    fn caller(&self, edge: &ReferenceEdgeRow, syntax: &CallSiteSyntax) -> Option<CodeUnit> {
+        self.go
             .structural_fact_providers()
             .into_iter()
             .find_map(|provider| {
@@ -298,73 +270,21 @@ fn project_incoming_calls(
                     .and_then(|mut owners| owners.pop().flatten())
             })
             .or(edge.site.enclosing.clone())
-            .filter(is_call_relation_unit);
-        let Some(caller) = caller else {
-            result.diagnostics.push(diagnostic(
-                CallRelationDiagnosticCode::AnalysisFailed,
+    }
+
+    fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {
+        match issue {
+            IncomingProjectionIssue::FactsUnavailable(file) => diagnostic(
+                format!("Go structural call facts are unavailable: {file}"),
+                file.to_string(),
+                "native_call_facts_unavailable",
+            ),
+            IncomingProjectionIssue::OwnerUnavailable(edge) => diagnostic(
                 format!("selected Go call has no callable owner: {:?}", edge.site),
                 edge.site.file.to_string(),
                 "native_call_owner_unavailable",
-            ));
-            continue;
-        };
-        result.sites.push(make_call_site(
-            edge.site.file,
-            caller,
-            target,
-            syntax,
-            edge.proof,
-        ));
-    }
-    result.sites.sort_by(|left, right| {
-        (&left.file, left.range.start_byte, left.range.end_byte).cmp(&(
-            &right.file,
-            right.range.start_byte,
-            right.range.end_byte,
-        ))
-    });
-    result.sites.dedup_by(|left, right| {
-        left.file == right.file
-            && left.range.start_byte == right.range.start_byte
-            && left.range.end_byte == right.range.end_byte
-    });
-    result
-}
-
-fn make_call_site(
-    file: ProjectFile,
-    caller: CodeUnit,
-    target: &CodeUnit,
-    syntax: CallSiteSyntax,
-    proof: brokk_bifrost_core::analyzer::usages::model::UsageProof,
-) -> CallSite {
-    let arguments = syntax
-        .arguments
-        .into_iter()
-        .map(|argument| CallArgument {
-            range: argument.range,
-            name: argument.name,
-            position: argument.position,
-            formal_index: None,
-            formal_name: None,
-            variadic: false,
-            spread: argument.spread,
-        })
-        .collect();
-    CallSite {
-        file,
-        range: syntax.range,
-        callee_range: syntax.callee_range,
-        caller,
-        callee: target.clone(),
-        kind: if target.is_class() || target.kind().display_lowercase() == "constructor" {
-            CallSyntaxKind::Constructor
-        } else {
-            syntax.kind
-        },
-        proof,
-        receiver: syntax.receiver,
-        arguments,
+            ),
+        }
     }
 }
 
@@ -379,7 +299,6 @@ fn incomplete_diagnostics(
         .iter()
         .map(|reason| {
             diagnostic(
-                CallRelationDiagnosticCode::AnalysisFailed,
                 format!(
                     "selected Go incoming-call inventory is incomplete for {}: {reason:?}",
                     target.fq_name()
@@ -395,7 +314,6 @@ fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationRes
     CallRelationResult {
         proof_authority: UsageProofAuthority::Native,
         diagnostics: vec![diagnostic(
-            CallRelationDiagnosticCode::AnalysisFailed,
             message.into(),
             target.fq_name().to_string(),
             "native_call_unavailable",
@@ -404,16 +322,6 @@ fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationRes
     }
 }
 
-fn diagnostic(
-    code: CallRelationDiagnosticCode,
-    message: String,
-    context: String,
-    reason_kind: &str,
-) -> CallRelationDiagnostic {
-    CallRelationDiagnostic {
-        code,
-        message,
-        context,
-        reason_kind: Some(reason_kind.to_owned()),
-    }
+fn diagnostic(message: String, context: String, reason_kind: &str) -> CallRelationDiagnostic {
+    CallRelationDiagnostic::analysis_failed(message, context, reason_kind.to_owned())
 }

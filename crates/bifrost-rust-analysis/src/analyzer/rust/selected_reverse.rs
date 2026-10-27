@@ -62,8 +62,6 @@ use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
-
 use brokk_bifrost_core::analyzer::model::Language;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
@@ -480,25 +478,6 @@ fn with_rust_selected_reverse_reference_admission<T>(
     if cancellation.is_cancelled() {
         return RustSelectedReverseOutcome::Cancelled;
     }
-    // The in-memory store fallback serializes reads through its writer
-    // connection. A selected reverse operation retains that connection while
-    // it forward-confirms candidate sites; forward analysis can request
-    // structural facts from Rayon workers, which would otherwise wait on the
-    // connection held by their caller. Warm the bounded candidate set before
-    // opening the operation so those workers hit the analyzer's fact cache.
-    if rust.inner.analyzer_store().uses_single_connection_reads()
-        && let Some(files) = admitted_files
-    {
-        let providers = rust.structural_fact_providers();
-        for provider in providers {
-            for file in files {
-                if cancellation.is_cancelled() {
-                    return RustSelectedReverseOutcome::Cancelled;
-                }
-                let _ = provider.structural_facts(file);
-            }
-        }
-    }
     let snapshots = rust.inner.selected_workspace_snapshots();
     let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
     let (masks, content_mounts) = match rust
@@ -642,7 +621,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "finds real bug: #6018 writer-only projection re-enters the selected operation's writer"]
     #[hardwon("#6018: writer-only macro confirmation recursively acquires the selected writer")]
     fn reverse_macro_generated_callers_equal_across_worker_counts_writer_only() {
         check_reverse_macro_generated_callers(
@@ -811,7 +789,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "finds real bug: #6018 writer-only projection re-enters the selected operation's writer"]
     #[hardwon("#6018: writer-only incoming projection recursively acquires the selected writer")]
     fn incoming_call_recheck_keeps_budget_stopped_sites_unproven_writer_only() {
         check_incoming_call_recheck(

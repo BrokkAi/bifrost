@@ -38,12 +38,18 @@ use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
 use brokk_bifrost_core::analyzer::model::Range;
 
+use crate::analyzer::usages::cpp_graph::CppDispatch;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+use brokk_bifrost_core::analyzer::model::CallableLinkage;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::resolver::{VisibilityIndex, same_logical_symbol};
 use brokk_bifrost_cpp::graph_support::CppSource;
-use brokk_bifrost_cpp::identity::{CppOccurrenceRole, cpp_occurrence_role_for_range};
+use brokk_bifrost_cpp::identity::{
+    CppOccurrenceRole, cpp_indexed_callable_linkage, cpp_occurrence_role_for_range,
+    cpp_source_path_is_header,
+};
 
 #[doc(hidden)]
 pub fn cpp_header_body_files_are_related(
@@ -58,20 +64,55 @@ pub fn cpp_header_body_files_are_related(
     brokk_bifrost_cpp::identity::cpp_header_body_files_are_related(cpp, token, left, right)
 }
 
+/// The string-form identity evidence, plus the identical-class bridge the
+/// resolved variant below applies: a header member declaration and a body
+/// whose translation unit includes only another, identical definition of the
+/// class are one member
+/// ([`VisibilityIndex::member_declaration_bridges_to_body`]). Without the
+/// bridge here the inverse scan would never visit the files that see the
+/// other copy, so a body found forward would report no references.
 pub(crate) fn cpp_callable_definitions_share_identity_evidence(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     left: &CodeUnit,
     right: &CodeUnit,
 ) -> bool {
-    brokk_bifrost_cpp::identity::cpp_callable_definitions_share_identity_evidence(
-        analyzer,
-        left,
-        right,
-        |left_source, right_source| {
-            cpp_header_body_files_are_related(analyzer, token, left_source, right_source)
-        },
-    )
+    let related = |left_source: &ProjectFile, right_source: &ProjectFile| {
+        cpp_header_body_files_are_related(analyzer, token, left_source, right_source)
+    };
+    if brokk_bifrost_cpp::identity::cpp_callable_definitions_share_identity_evidence(
+        analyzer, left, right, related,
+    ) {
+        return true;
+    }
+    if !same_logical_symbol(left, right)
+        || left.source() == right.source()
+        || ![left, right].into_iter().all(|callable| {
+            matches!(
+                cpp_indexed_callable_linkage(analyzer, callable),
+                Some(CallableLinkage::External)
+            )
+        })
+    {
+        return false;
+    }
+    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        return false;
+    };
+    let header_member = |callable: &CodeUnit| {
+        cpp_source_path_is_header(callable.source())
+            && cpp
+                .structural_parent_of(token, callable)
+                .is_some_and(|owner| owner.is_class())
+    };
+    if !header_member(left) && !header_member(right) {
+        return false;
+    }
+    let dispatch = CppDispatch::new(analyzer, token);
+    let graph = dispatch.source();
+    let visibility = VisibilityIndex::build(cpp, token, &graph, &HashSet::default());
+    visibility.member_declaration_bridges_to_body(&graph, left, right, &related)
+        || visibility.member_declaration_bridges_to_body(&graph, right, left, &related)
 }
 
 /// The #2010 variant, which decides the parameter lists by resolving the names

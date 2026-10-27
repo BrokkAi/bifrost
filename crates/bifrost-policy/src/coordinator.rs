@@ -52,12 +52,12 @@ use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_tools::diff_analysis::{
     RevisionExport, RevisionWorkspace, changed_buffer_ranges, export_revision,
-    resolve_revision_subtree,
+    resolve_revision_subtree, worktree_paths_match_head,
 };
 
 use super::baseline::{
-    PolicyBaselineDocument, PolicyBaselineEntryReview, PolicyBaselineMatchState,
-    PolicyBaselineOptions, PolicyBaselineReview, PolicyFindingBaseline,
+    DEFAULT_POLICY_BASELINE_PATH, PolicyBaselineDocument, PolicyBaselineEntryReview,
+    PolicyBaselineMatchState, PolicyBaselineOptions, PolicyBaselineReview, PolicyFindingBaseline,
     load_policy_baseline_from_root,
 };
 use super::builtin::BuiltInPolicySelectionRecord;
@@ -95,19 +95,19 @@ use super::resolved::{
 };
 use super::retained::{RetainedSize, retained_extra};
 use super::scope::{
-    PolicyScopeDocument, PolicyScopeDocumentState, PolicyScopeOptions, PolicyScopeReview,
-    PolicyScopeSource, load_policy_scope_from_root,
+    DEFAULT_POLICY_SCOPE_PATH, PolicyScopeDocument, PolicyScopeDocumentState, PolicyScopeOptions,
+    PolicyScopeReview, PolicyScopeSource, load_policy_scope_from_root,
 };
 use super::source::{
     PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
     PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
 };
 use super::suppression::{
-    MAX_SUPPRESSION_REKEY_CANDIDATES, PolicyEvaluationDate, PolicyReportEvaluationContext,
-    PolicySuppressionDocument, PolicySuppressionDocumentState, PolicySuppressionMatchState,
-    PolicySuppressionOptions, PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
-    PolicySuppressionPreflight, PolicySuppressionRecord, PolicySuppressionReview,
-    PolicySuppressionSourceState, PolicySuppressionTemporalState,
+    CONVENTIONAL_POLICY_SUPPRESSION_PATHS, MAX_SUPPRESSION_REKEY_CANDIDATES, PolicyEvaluationDate,
+    PolicyReportEvaluationContext, PolicySuppressionDocument, PolicySuppressionDocumentState,
+    PolicySuppressionMatchState, PolicySuppressionOptions, PolicySuppressionOrphanState,
+    PolicySuppressionPolicyHashState, PolicySuppressionPreflight, PolicySuppressionRecord,
+    PolicySuppressionReview, PolicySuppressionSourceState, PolicySuppressionTemporalState,
     load_policy_suppressions_from_root,
 };
 use super::units::{
@@ -181,9 +181,9 @@ pub struct PolicyEvaluationOptions {
     fail_on: PolicyFailOn,
     diff_base: Option<String>,
     /// Whether this batch may publish or reuse complete policy units in the
-    /// repository's analyzer cache. A full scan publishes fresh units; a diff
-    /// scan verifies inputs before reuse. `false` evaluates in full and skips
-    /// policy-unit cache access on either path.
+    /// repository's analyzer cache. Either kind of scan verifies a unit's
+    /// inputs before reuse and publishes the units it recomputes. `false`
+    /// evaluates in full and skips policy-unit cache access on either path.
     incremental: bool,
     /// Record each policy's evaluation wall time as the
     /// [`EVALUATION_ELAPSED_METRIC`] work metric of its run. Off by default:
@@ -373,7 +373,9 @@ impl PolicyBatchOutcome {
     }
 
     /// What this batch reused, per policy, or `None` when it could not reuse
-    /// anything: no diff base, or `incremental` off.
+    /// anything: `incremental` off, or a workspace that states no snapshot
+    /// identity. A full scan reports its base as `evaluated`, because it has
+    /// none to replay.
     pub const fn incremental(&self) -> Option<&PolicyIncrementalReview> {
         self.incremental.as_ref()
     }
@@ -1686,31 +1688,26 @@ fn procedure_summary_match_evidence(
     let mut counts = BTreeMap::<(String, String), u64>::new();
     let mut target_member_identifiers = HashSet::new();
     let mut summaries_by_key = HashMap::<ModeledProcedureKey, Vec<(String, String)>>::new();
-    for shard in active.shards() {
-        if let Some(summaries) = shard.shard.payload().procedure_summaries() {
-            for summary in summaries {
-                if let Some((owner, member)) =
-                    authored_procedure_target_identity(&summary.target.path, &summary.target.symbol)
-                {
-                    target_member_identifiers.insert(member.to_owned());
-                    summaries_by_key
-                        .entry(ModeledProcedureKey {
-                            language: shard.manifest.language.clone(),
-                            owner: owner.into_owned(),
-                            member: member.to_owned(),
-                            has_receiver: summary.target.has_receiver,
-                            parameter_count: summary.target.parameter_count,
-                        })
-                        .or_default()
-                        .push((shard.manifest.content_sha256.clone(), summary.id.clone()));
-                }
-                counts.insert(
-                    (shard.manifest.content_sha256.clone(), summary.id.clone()),
-                    0,
-                );
+    active.visit_procedure_summary_targets(|manifest_digest, language, targets| {
+        for (id, target) in targets {
+            if let Some((owner, member)) =
+                authored_procedure_target_identity(&target.path, &target.symbol)
+            {
+                target_member_identifiers.insert(member.to_owned());
+                summaries_by_key
+                    .entry(ModeledProcedureKey {
+                        language: language.to_owned(),
+                        owner: owner.into_owned(),
+                        member: member.to_owned(),
+                        has_receiver: target.has_receiver,
+                        parameter_count: target.parameter_count,
+                    })
+                    .or_default()
+                    .push((manifest_digest.to_owned(), id.to_owned()));
             }
+            counts.insert((manifest_digest.to_owned(), id.to_owned()), 0);
         }
-    }
+    });
     // The candidate set is already narrowed to declarations whose terminal name
     // one active summary names. The canonical key is what decides the rest, so
     // there is no second owner derivation here to disagree with it -- the
@@ -1732,25 +1729,20 @@ fn procedure_summary_match_evidence(
     }
 
     let mut evidence = BTreeMap::<String, Vec<PolicyPackProcedureSummaryEvidence>>::new();
-    for shard in active.shards() {
-        let Some(summaries) = shard.shard.payload().procedure_summaries() else {
-            continue;
-        };
-        let entries = evidence
-            .entry(shard.manifest.content_sha256.clone())
-            .or_default();
-        for summary in summaries {
+    active.visit_procedure_summary_targets(|manifest_digest, _language, targets| {
+        let entries = evidence.entry(manifest_digest.to_owned()).or_default();
+        for (id, target) in targets {
             let match_count = counts
-                .get(&(shard.manifest.content_sha256.clone(), summary.id.clone()))
+                .get(&(manifest_digest.to_owned(), id.to_owned()))
                 .copied()
                 .unwrap_or(0);
             entries.push(PolicyPackProcedureSummaryEvidence::new(
-                summary.id.clone(),
-                summary.target.symbol.clone(),
+                id.to_owned(),
+                target.symbol.clone(),
                 match_count,
             ));
         }
-    }
+    });
     evidence
 }
 
@@ -1817,14 +1809,14 @@ fn active_workspace_model_zero_match_diagnostics(
     let Some(analyzer) = analyzer else {
         return Ok(Vec::new());
     };
+    let shards = active.shards();
     let workspace_files = analyzer.analyzed_files();
     let mut diagnostics = Vec::new();
     for model in &activation.workspace_models {
         let Some(entries) = summary_evidence.get(&model.manifest_digest) else {
             continue;
         };
-        let Some(shard) = active
-            .shards()
+        let Some(shard) = shards
             .iter()
             .find(|shard| shard.manifest.content_sha256 == model.manifest_digest)
         else {
@@ -1837,13 +1829,20 @@ fn active_workspace_model_zero_match_diagnostics(
             if entry.match_count() != 0 {
                 continue;
             }
-            let summary = active
-                .shards()
+            let summary = shards
                 .iter()
-                .filter(|shard| shard.manifest.content_sha256 == model.manifest_digest)
-                .filter_map(|shard| shard.shard.payload().procedure_summaries())
-                .flatten()
-                .find(|summary| summary.id == entry.summary_id())
+                .filter(|shard| {
+                    shard.manifest.content_sha256 == model.manifest_digest
+                        && shard.descriptor.payload_kind
+                            == brokk_bifrost_analysis::analyzer::semantic_model::PayloadKind::ProcedureSummaries
+                })
+                .find_map(|shard| {
+                    active
+                        .procedure_summary_family(shard, [entry.summary_id()])
+                        .iter()
+                        .find(|summary| summary.id == entry.summary_id())
+                        .cloned()
+                })
                 .expect("every summary review entry has an active summary");
             // A qualified target's path is provenance, not its identity.
             // An artifact owner remains external even when that display path
@@ -1851,22 +1850,13 @@ fn active_workspace_model_zero_match_diagnostics(
             let external_owner =
                 authored_procedure_target_identity(&summary.target.path, &summary.target.symbol)
                     .is_some_and(|(owner, _)| {
-                        active
-                            .shards()
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.manifest.language == shard.manifest.language
-                            })
-                            .filter_map(|candidate| candidate.shard.payload().declaration_facts())
-                            .flat_map(|(types, _, _)| types)
-                            .any(|fact| {
-                                (fact.name == owner
-                                    || fact.aliases.iter().any(|alias| alias == &owner))
-                                    && matches!(
-                                        &fact.locator,
-                                        Locator::Artifact { .. } | Locator::Interchange { .. }
-                                    )
-                            })
+                        active.all_type_records_named(&owner).any(|candidate| {
+                            candidate.shard.manifest.language == shard.manifest.language
+                                && matches!(
+                                    &candidate.record.locator,
+                                    Locator::Artifact { .. } | Locator::Interchange { .. }
+                                )
+                        })
                     });
             if external_owner {
                 continue;
@@ -2011,12 +2001,12 @@ fn pack_activation_review(
     }
     match &activation.outcome.runtime {
         Some(SemanticModelRuntimeOutcome::Ready { active, .. }) => {
-            record_active_shards(&mut decisions, active.shards(), summary_evidence);
+            record_active_shards(&mut decisions, &active.shards(), summary_evidence);
             record_explanations(&mut decisions, &active.activation_report().explanations);
         }
         Some(SemanticModelRuntimeOutcome::Incomplete { usable, report }) => {
             if let Some(active) = usable {
-                record_active_shards(&mut decisions, active.shards(), summary_evidence);
+                record_active_shards(&mut decisions, &active.shards(), summary_evidence);
             }
             record_explanations(&mut decisions, &report.explanations);
         }
@@ -2220,7 +2210,7 @@ fn workspace_model_warning(
 
 fn record_active_shards(
     decisions: &mut Vec<PolicyPackDecision>,
-    shards: &[ActiveSemanticModelShard],
+    shards: &[Arc<ActiveSemanticModelShard>],
     summary_evidence: Option<&BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>>,
 ) {
     for shard in shards {
@@ -2356,29 +2346,32 @@ fn record_unmodeled_node_builtins(
 }
 
 /// The packs the semantic-model runtime itself recorded a decision for.
-fn runtime_decided_packs(runtime: Option<&SemanticModelRuntimeOutcome>) -> HashSet<&str> {
+fn runtime_decided_packs(runtime: Option<&SemanticModelRuntimeOutcome>) -> HashSet<String> {
     let (shards, explanations) = match runtime {
         Some(SemanticModelRuntimeOutcome::Ready { active, .. }) => (
             active.shards(),
             active.activation_report().explanations.as_slice(),
         ),
         Some(SemanticModelRuntimeOutcome::Incomplete { usable, report }) => (
-            usable.as_ref().map_or(&[][..], |active| active.shards()),
+            usable
+                .as_ref()
+                .map(|active| active.shards())
+                .unwrap_or_default(),
             report.explanations.as_slice(),
         ),
         Some(
             SemanticModelRuntimeOutcome::Cancelled(report)
             | SemanticModelRuntimeOutcome::Unavailable(report),
-        ) => (&[][..], report.explanations.as_slice()),
-        None => (&[][..], &[][..]),
+        ) => (Vec::new(), report.explanations.as_slice()),
+        None => (Vec::new(), &[][..]),
     };
     shards
         .iter()
-        .map(|shard| shard.manifest.pack_id.as_str())
+        .map(|shard| shard.manifest.pack_id.clone())
         .chain(
             explanations
                 .iter()
-                .filter_map(|explanation| explanation.pack_id.as_deref()),
+                .filter_map(|explanation| explanation.pack_id.clone()),
         )
         .collect()
 }
@@ -2490,12 +2483,15 @@ fn declared_standard_library_runtime_decision(
             active.activation_report().explanations.as_slice(),
         ),
         SemanticModelRuntimeOutcome::Incomplete { usable, report } => (
-            usable.as_ref().map_or(&[][..], |active| active.shards()),
+            usable
+                .as_ref()
+                .map(|active| active.shards())
+                .unwrap_or_default(),
             report.explanations.as_slice(),
         ),
         SemanticModelRuntimeOutcome::Cancelled(report)
         | SemanticModelRuntimeOutcome::Unavailable(report) => {
-            (&[][..], report.explanations.as_slice())
+            (Vec::new(), report.explanations.as_slice())
         }
     };
 
@@ -3419,8 +3415,8 @@ fn evaluate_prepared_policy_inputs(
     // no matching `enable` entry is inert by design, so it is reported as a
     // warning the author can read rather than as a failed run.
     if let Some(active) = activation_for_report.and_then(usable_active_semantic_models) {
-        let packs = active
-            .shards()
+        let shards = active.shards();
+        let packs = shards
             .iter()
             .filter(|shard| shard.approximate)
             .map(|shard| (&shard.manifest.pack_id, &shard.manifest.version))
@@ -3646,9 +3642,13 @@ fn evaluate_prepared_policy_inputs(
         );
     }
 
-    // A diff head verifies against the exact base. A full scan computes every
-    // unit afresh and publishes only complete products; it cannot infer the
-    // provenance of an older unit by comparing the workspace with itself.
+    // A diff head verifies against the exact base. A full scan compares its
+    // workspace with itself: that proves the name-index reads of a unit an
+    // earlier scan computed on this same snapshot, every other read is checked
+    // against the workspace, and a unit with index reads from any other
+    // snapshot is recomputed. What a full scan publishes carries the scanned
+    // snapshot's identity, so a later diff run whose base is this tree
+    // verifies it too.
     let publication_changed = (unit_store.is_some() && diff_baseline.is_none()).then(|| {
         ChangedFacts::between(
             workspace.expect("a policy store requires a workspace"),
@@ -3672,14 +3672,15 @@ fn evaluate_prepared_policy_inputs(
             })
         }
         (Some(store), None, Some(head), Some(head_snapshot)) => {
-            Some(PolicyIncrementalContext::for_publication(
+            Some(PolicyIncrementalContext::new(
                 store.units(),
                 head,
                 publication_changed
                     .as_ref()
                     .expect("a full policy scan has its own facts"),
                 WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
-                head_snapshot,
+                IncrementalBaseState::Evaluated,
+                UnitSnapshots::of(head_snapshot),
             ))
         }
         _ => None,
@@ -4267,6 +4268,33 @@ fn evaluate_prepared_policy_inputs(
     let report = builder.finish().map_err(|error| {
         PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
     })?;
+    // A complete head over a workspace that holds exactly what `HEAD` commits
+    // is the answer a later diff base at that commit needs, so it is recorded
+    // as one. Only a head this run owns: the base half of a diff run is
+    // handed its caller's context and evaluates an exported tree.
+    if deadline_stage.is_none()
+        && let Some(store) = unit_store.as_ref()
+        && store.persisted().is_some()
+        && let Some(incremental) = head_incremental_owned.as_ref()
+        && let Some(head) = workspace
+        && let Some(publication) = head_evaluation_publication(
+            root,
+            head,
+            options,
+            base_evaluation_key(
+                options,
+                scope_document.as_ref(),
+                batch_budget,
+                registry_limits,
+                WorkspaceUnitInputs::of(head, icfg_active_semantic_model_snapshot.as_deref()),
+            ),
+            incremental,
+            &report,
+            &runnable_policies,
+        )
+    {
+        store.publish_evaluation(&publication);
+    }
     let taint_findings = taint.take_public_findings();
     let taint_analysis_results = taint.take_retained_analyses();
     let exit_status = report_exit_status(&report, threshold_exceeded);
@@ -4278,7 +4306,14 @@ fn evaluate_prepared_policy_inputs(
         exit_status,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
-        incremental: incremental_review,
+        // A full scan's review stays out of the report, which carries the
+        // section only for diff runs, but a caller can still read what the
+        // scan reused.
+        incremental: incremental_review.or_else(|| {
+            head_incremental_owned
+                .as_ref()
+                .map(PolicyIncrementalContext::review)
+        }),
     })
 }
 
@@ -4537,7 +4572,9 @@ fn reuse_persisted_diff_baseline(
     Some(PolicyDiffBaselineOutcome {
         baseline: PolicyDiffBaseline {
             requested_revision: revision.to_string(),
-            resolved_commit: evaluation.resolved_commit.clone(),
+            // The row is keyed by tree, and another commit with the same tree
+            // may have recorded it; the review names the commit asked about.
+            resolved_commit: subtree.commit_id().to_string(),
             identities,
             unqualified_policies: unqualified,
             aggregate_unreliable,
@@ -4963,64 +5000,20 @@ fn evaluate_policy_diff_baseline(
         return Ok(DiffBaselinePhase::DeadlineReached);
     }
     let report = outcome.report();
-    let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
     let report_evidence_incomplete =
         report.execution().termination().is_some() || report.diagnostics_truncated();
-    for run in report.runs() {
-        if report_evidence_incomplete
-            || !run.completion().is_exhaustive()
-            || run.diagnostics_truncated()
-            || run.obligations_truncated()
-        {
-            continue;
-        }
-        // Presence of this entry records a complete empty answer when the
-        // policy found no strong identities.
-        let policy_id = run.policy_id().clone();
-        identities.entry(policy_id.clone()).or_default();
-        for finding in run.findings() {
-            // Weak identities are snapshot-local by construction and can never
-            // equal a head identity, so only strong ones enter the join set.
-            if finding.identity_stability() == FindingIdentityStability::Strong {
-                identities
-                    .entry(policy_id.clone())
-                    .or_default()
-                    .insert(finding.id());
-            }
-        }
-    }
+    let identities = if report_evidence_incomplete {
+        HashMap::new()
+    } else {
+        exhaustive_run_identities(report.runs())
+    };
     // Computed here, while both analyzers are alive: the head verifies its
     // units against it after the base analyzer and its export are gone.
     let comparison = base_snapshot.map(|snapshot| BaseComparison {
         changed: ChangedFacts::between(base.workspace(), head_workspace),
         snapshot,
     });
-    let base_runs = report
-        .runs()
-        .iter()
-        .map(|run| (run.policy_id(), run))
-        .collect::<HashMap<_, _>>();
-    let unqualified_policies = policies
-        .iter()
-        .filter(|policy| !identities.contains_key(&policy.definition().metadata.id))
-        .map(|policy| {
-            let policy_id = policy.definition().metadata.id.clone();
-            let Some(run) = base_runs.get(&policy_id) else {
-                return PolicyDiffUnqualifiedPolicy::new(
-                    policy_id,
-                    "missing",
-                    MISSING_BASE_POLICY_DETAIL,
-                    Vec::new(),
-                );
-            };
-            PolicyDiffUnqualifiedPolicy::new(
-                policy_id,
-                run.completion().label(),
-                base_run_unqualified_detail(report, run),
-                base_run_diagnostics(report, run),
-            )
-        })
-        .collect::<Vec<_>>();
+    let unqualified_policies = unqualified_base_policies(policies, report, &identities);
     let aggregate_unreliable = outcome.exit_status() == POLICY_EXIT_UNRELIABLE;
     let unreliable_detail = aggregate_unreliable.then(|| diff_base_unreliable_detail(report));
     let baseline = PolicyDiffBaseline {
@@ -5060,6 +5053,122 @@ fn evaluate_policy_diff_baseline(
             base_review,
         },
     )))
+}
+
+/// What a run records about its own head for a later run whose diff base is
+/// the commit this head holds, or `None` when the head is not that commit's
+/// answer (#6638).
+///
+/// A base evaluation answers one question about one tree: what the policies
+/// conclude over its committed bytes, in the head's execution domain, with the
+/// conventional suppression and baseline documents and no gate. A head answers
+/// the same question when nothing it read differs from `HEAD`: every analyzed
+/// file holds the committed blob, the documents and reviewed models under
+/// `.bifrost/` are committed and unmodified, the run used the conventional
+/// documents, and it evaluated every endpoint rather than a changed range.
+/// Without this, only a diff run that evaluated a base recorded one, so a full
+/// scan never seeded the next check's base and a check's head never seeded
+/// the check after it: each check evaluated its base again.
+///
+/// The head's report is read exactly as a base evaluation's report is, except
+/// for what it says about its own diff base, which describes another tree. A
+/// head whose semantic sources failed to activate records nothing, because a
+/// base evaluation that met the same failure concludes no identity at all.
+fn head_evaluation_publication(
+    root: &Path,
+    head: &WorkspaceAnalyzer,
+    options: &PolicyEvaluationOptions,
+    key: PolicyEvaluationRowKey,
+    incremental: &PolicyIncrementalContext<'_>,
+    report: &PolicyReportDocument,
+    policies: &[&LoadedPolicy],
+) -> Option<PolicyEvaluationRow> {
+    let base_options = PolicyEvaluationOptions::new(options.evaluation_date());
+    if *options.range() != PolicyRangeRequest::Workspace
+        || options.suppressions() != base_options.suppressions()
+        || options.baseline() != base_options.baseline()
+        || report.execution().termination().is_some()
+        || report.diagnostics_truncated()
+        || tree_diagnostics(report).any(|diagnostic| {
+            matches!(
+                diagnostic.code(),
+                PolicyReportDiagnosticCode::PacksLoadFailed
+                    | PolicyReportDiagnosticCode::PackActivationFailed
+                    | PolicyReportDiagnosticCode::WorkspaceModelLoadFailed
+            )
+        })
+    {
+        return None;
+    }
+    let subtree = match resolve_revision_subtree(root, "HEAD") {
+        Ok(subtree) => subtree,
+        Err(error) => {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units head_unrecorded head_unresolved={error}")
+            });
+            return None;
+        }
+    };
+    let changed =
+        ChangedFacts::from_committed_tree(head, subtree.blobs(), &|blob| subtree.source(blob));
+    if !changed.is_complete() || changed.changed_path_count() != 0 {
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "policy.units head_unrecorded changed_paths={} complete={}",
+                changed.changed_path_count(),
+                changed.is_complete()
+            )
+        });
+        return None;
+    }
+    let committed_documents = [
+        WORKSPACE_PACKS_DOCUMENT_PATH,
+        WORKSPACE_SEMANTIC_MODEL_DIRECTORY,
+        DEFAULT_POLICY_BASELINE_PATH,
+        DEFAULT_POLICY_SCOPE_PATH,
+    ]
+    .into_iter()
+    .chain(CONVENTIONAL_POLICY_SUPPRESSION_PATHS)
+    .collect::<Vec<_>>();
+    match worktree_paths_match_head(root, &committed_documents) {
+        Ok(true) => {}
+        Ok(false) => {
+            brokk_bifrost_analysis::profiling::note(
+                "policy.units head_unrecorded documents_differ",
+            );
+            return None;
+        }
+        Err(error) => {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units head_unrecorded status_failed={error}")
+            });
+            return None;
+        }
+    }
+    let identities = exhaustive_run_identities(report.runs());
+    // The base run gates nothing, so only an orphaned suppression exceeds its
+    // threshold.
+    let aggregate_unreliable = report_unreliable(
+        report,
+        tree_diagnostics(report),
+        report_has_orphaned_suppression(report),
+    );
+    let baseline = PolicyDiffBaseline {
+        requested_revision: "HEAD".to_string(),
+        resolved_commit: subtree.commit_id().to_string(),
+        unqualified_policies: unqualified_base_policies(policies, report, &identities),
+        identities,
+        aggregate_unreliable,
+        unreliable_detail: aggregate_unreliable.then(|| diff_base_unreliable_detail(report)),
+    };
+    base_evaluation_publication(
+        incremental,
+        key,
+        subtree.tree_id(),
+        report,
+        policies,
+        &baseline,
+    )
 }
 
 /// What this base evaluation records for a later run to substitute for
@@ -5165,6 +5274,68 @@ fn base_evaluation_publication(
     })
 }
 
+/// The strong finding identities of every run whose evidence is exhaustive,
+/// keyed by policy. A policy is present with an empty set when it concluded no
+/// strong identity, which is a complete answer; a run that is not exhaustive is
+/// absent, because its findings cannot support a diff decision.
+fn exhaustive_run_identities<'a>(
+    runs: impl IntoIterator<Item = &'a PolicyRun>,
+) -> HashMap<PolicyId, HashSet<PolicyFindingId>> {
+    let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+    for run in runs {
+        if !run.completion().is_exhaustive()
+            || run.diagnostics_truncated()
+            || run.obligations_truncated()
+        {
+            continue;
+        }
+        let policy_identities = identities.entry(run.policy_id().clone()).or_default();
+        for finding in run.findings() {
+            // Weak identities are snapshot-local by construction and can never
+            // equal a head identity, so only strong ones enter the join set.
+            if finding.identity_stability() == FindingIdentityStability::Strong {
+                policy_identities.insert(finding.id());
+            }
+        }
+    }
+    identities
+}
+
+/// Every loaded policy whose base evaluation concluded no identities, with
+/// the reason it cannot classify head findings.
+fn unqualified_base_policies(
+    policies: &[&LoadedPolicy],
+    report: &PolicyReportDocument,
+    identities: &HashMap<PolicyId, HashSet<PolicyFindingId>>,
+) -> Vec<PolicyDiffUnqualifiedPolicy> {
+    let runs = report
+        .runs()
+        .iter()
+        .map(|run| (run.policy_id(), run))
+        .collect::<HashMap<_, _>>();
+    policies
+        .iter()
+        .filter(|policy| !identities.contains_key(&policy.definition().metadata.id))
+        .map(|policy| {
+            let policy_id = policy.definition().metadata.id.clone();
+            let Some(run) = runs.get(&policy_id) else {
+                return PolicyDiffUnqualifiedPolicy::new(
+                    policy_id,
+                    "missing",
+                    MISSING_BASE_POLICY_DETAIL,
+                    Vec::new(),
+                );
+            };
+            PolicyDiffUnqualifiedPolicy::new(
+                policy_id,
+                run.completion().label(),
+                base_run_unqualified_detail(report, run),
+                base_run_diagnostics(report, run),
+            )
+        })
+        .collect()
+}
+
 /// Why one base policy run cannot classify head findings, naming the first
 /// reason in the order a reader would act on it.
 fn base_run_unqualified_detail(report: &PolicyReportDocument, run: &PolicyRun) -> String {
@@ -5197,7 +5368,7 @@ fn base_run_diagnostics(report: &PolicyReportDocument, run: &PolicyRun) -> Vec<S
     run.diagnostics()
         .iter()
         .map(|diagnostic| serde_json::to_string(diagnostic).expect("policy diagnostic serializes"))
-        .chain(report.diagnostics().iter().map(|diagnostic| {
+        .chain(tree_diagnostics(report).map(|diagnostic| {
             serde_json::to_string(diagnostic).expect("report diagnostic serializes")
         }))
         .chain(
@@ -5214,6 +5385,25 @@ fn base_run_diagnostics(report: &PolicyReportDocument, run: &PolicyRun) -> Vec<S
                 .then(|| "policy obligation collection was truncated".to_string()),
         )
         .collect()
+}
+
+/// The report diagnostics that describe the tree `report` evaluated.
+///
+/// A diff head's report also states what happened to its base, which is
+/// another tree; a base evaluation's report never does. Recording a head as a
+/// later run's base therefore reads exactly what a base evaluation of the same
+/// tree would have reported.
+fn tree_diagnostics(
+    report: &PolicyReportDocument,
+) -> impl Iterator<Item = &PolicyReportDiagnostic> + '_ {
+    report.diagnostics().iter().filter(|diagnostic| {
+        !matches!(
+            diagnostic.code(),
+            PolicyReportDiagnosticCode::DiffBaseDeadlineExceeded
+                | PolicyReportDiagnosticCode::DiffBaseUnreliable
+                | PolicyReportDiagnosticCode::DiffBasePolicyUnqualified
+        )
+    })
 }
 
 fn unqualified_without_run(
@@ -5257,12 +5447,10 @@ fn diff_base_unreliable_detail(report: &PolicyReportDocument) -> String {
     if let Some(termination) = report.execution().termination() {
         parts.push(format!("execution terminated ({termination:?})"));
     }
-    if !report.diagnostics().is_empty() {
-        let codes = report
-            .diagnostics()
-            .iter()
-            .map(PolicyReportDiagnostic::code)
-            .collect::<Vec<_>>();
+    let codes = tree_diagnostics(report)
+        .map(PolicyReportDiagnostic::code)
+        .collect::<Vec<_>>();
+    if !codes.is_empty() {
         parts.push(format!("base report diagnostics {codes:?}"));
     }
     if report.diagnostics_truncated() {
@@ -6223,11 +6411,32 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
     // starts gating as new on exactly one push, and after any merge or
     // projection whose base already contains the rotation it goes quiet again
     // with the dead record still in the document.
-    let threshold_exceeded = threshold_exceeded
-        || report
-            .suppressions()
-            .iter()
-            .any(PolicySuppressionReview::is_orphaned);
+    let threshold_exceeded = threshold_exceeded || report_has_orphaned_suppression(report);
+    if report_unreliable(report, report.diagnostics(), threshold_exceeded) {
+        return POLICY_EXIT_UNRELIABLE;
+    }
+    if threshold_exceeded {
+        POLICY_EXIT_FINDING
+    } else {
+        POLICY_EXIT_CLEAN
+    }
+}
+
+fn report_has_orphaned_suppression(report: &PolicyReportDocument) -> bool {
+    report
+        .suppressions()
+        .iter()
+        .any(PolicySuppressionReview::is_orphaned)
+}
+
+/// Whether `report` cannot be trusted, judged by `diagnostics` as its report
+/// diagnostics. `threshold_exceeded` is whether the run gates on a finding,
+/// orphaned suppressions included.
+fn report_unreliable<'a>(
+    report: &PolicyReportDocument,
+    diagnostics: impl IntoIterator<Item = &'a PolicyReportDiagnostic>,
+    threshold_exceeded: bool,
+) -> bool {
     // A report diagnostic condemns the run when it is an error. Every load,
     // parse, and activation failure is one, so this is the same rule the
     // report has always applied. Advisory report diagnostics -- today only the
@@ -6243,10 +6452,9 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
     // coverage obligations or the unreliable exit status.
     // The marker is set only on an `Inconclusive` run, so a failed or
     // unsupported run still exits unreliable whatever the policy declared.
-    let unreliable = report.execution().termination().is_some()
-        || report
-            .diagnostics()
-            .iter()
+    report.execution().termination().is_some()
+        || diagnostics
+            .into_iter()
             .any(|diagnostic| diagnostic.severity() == PolicyDiagnosticSeverity::Error)
         || report.diagnostics_truncated()
         || report.runs().iter().any(|run| {
@@ -6263,15 +6471,7 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
                         run.unknown_verdict(),
                         Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
                     )
-            }));
-    if unreliable {
-        return POLICY_EXIT_UNRELIABLE;
-    }
-    if threshold_exceeded {
-        POLICY_EXIT_FINDING
-    } else {
-        POLICY_EXIT_CLEAN
-    }
+            }))
 }
 
 fn report_diagnostic(

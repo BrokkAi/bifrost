@@ -98,17 +98,6 @@ pub fn parse_cpp_file_in_dialect(
     parse_cpp_file_from_root(file, source, root, &ancestry, dialect)
 }
 
-/// Extract the primary dialect from a caller-owned tree and parent index.
-pub fn parse_cpp_file_with_ancestry<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'tree>,
-    ancestry: &ParentIndex<'tree>,
-) -> ParsedFile {
-    let dialect = LanguageDialect::for_path(Language::Cpp, file.rel_path());
-    parse_cpp_file_from_root(file, source, root, ancestry, dialect)
-}
-
 fn parse_cpp_file_from_root<'tree>(
     file: &ProjectFile,
     source: &str,
@@ -224,6 +213,200 @@ pub fn is_numeric_initializer_data(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn numeric_initializer_grammar_and_cancellation() {
+        use crate::grammar_test_support::{SOURCE, at, field, nodes, tree};
+
+        use std::ops::ControlFlow;
+        let parsed = tree(SOURCE);
+        // Independent, complete preorder manifests (unnamed punctuation included).
+        // `polls` is the admissible prefix plus its first rejected node, or the
+        // whole manifest for an admitted initializer. Comments conservatively
+        // prevent numeric-data pruning; identifiers, calls and recovery do too.
+        let cases = [
+            (
+                499..517,
+                true,
+                16,
+                &[
+                    ("initializer_list", 499..517),
+                    ("{", 499..500),
+                    ("initializer_list", 500..507),
+                    ("{", 500..501),
+                    ("number_literal", 501..502),
+                    (",", 502..503),
+                    ("number_literal", 504..506),
+                    ("}", 506..507),
+                    (",", 507..508),
+                    ("initializer_list", 509..516),
+                    ("{", 509..510),
+                    ("number_literal", 510..512),
+                    (",", 512..513),
+                    ("number_literal", 514..515),
+                    ("}", 515..516),
+                    ("}", 516..517),
+                ][..],
+            ),
+            (
+                535..552,
+                false,
+                5,
+                &[
+                    ("initializer_list", 535..552),
+                    ("{", 535..536),
+                    ("number_literal", 536..537),
+                    (",", 537..538),
+                    ("comment", 539..549),
+                    ("number_literal", 550..551),
+                    ("}", 551..552),
+                ][..],
+            ),
+            (
+                568..575,
+                false,
+                3,
+                &[
+                    ("initializer_list", 568..575),
+                    ("{", 568..569),
+                    ("identifier", 569..574),
+                    ("}", 574..575),
+                ][..],
+            ),
+            (
+                591..599,
+                false,
+                3,
+                &[
+                    ("initializer_list", 591..599),
+                    ("{", 591..592),
+                    ("call_expression", 592..598),
+                    ("identifier", 592..596),
+                    ("argument_list", 596..598),
+                    ("(", 596..597),
+                    (")", 597..598),
+                    ("}", 598..599),
+                ][..],
+            ),
+            (
+                616..622,
+                false,
+                5,
+                &[
+                    ("initializer_list", 616..622),
+                    ("{", 616..617),
+                    ("number_literal", 617..618),
+                    (",", 618..619),
+                    ("ERROR", 620..621),
+                    ("ERROR", 620..621),
+                    ("}", 621..622),
+                ][..],
+            ),
+            (
+                640..645,
+                false,
+                4,
+                &[
+                    ("initializer_list", 640..645),
+                    ("{", 640..641),
+                    ("number_literal", 641..642),
+                    ("ERROR", 643..644),
+                    ("number_literal", 643..644),
+                    ("}", 644..645),
+                ][..],
+            ),
+            (
+                662..672,
+                true,
+                10,
+                &[
+                    ("initializer_list", 662..672),
+                    ("{", 662..663),
+                    ("unary_expression", 663..666),
+                    ("-", 663..664),
+                    ("number_literal", 665..666),
+                    (",", 666..667),
+                    ("unary_expression", 668..671),
+                    ("+", 668..669),
+                    ("number_literal", 670..671),
+                    ("}", 671..672),
+                ][..],
+            ),
+            (
+                696..704,
+                false,
+                3,
+                &[
+                    ("initializer_list", 696..704),
+                    ("{", 696..697),
+                    ("call_expression", 697..703),
+                    ("identifier", 697..701),
+                    ("argument_list", 701..703),
+                    ("(", 701..702),
+                    ("number_literal", 702..703),
+                    (")", 703..703),
+                    ("}", 703..704),
+                ][..],
+            ),
+        ];
+        for (span, admitted, polls, manifest) in cases {
+            let initializer = at(parsed.root_node(), "initializer_list", span.clone());
+            let actual = nodes(initializer);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|node| (node.kind(), node.byte_range()))
+                    .collect::<Vec<_>>(),
+                manifest
+            );
+            for (index, node) in actual.iter().enumerate() {
+                if node.kind() == "unary_expression" {
+                    let (operator_kind, operator_span) = &manifest[index + 1];
+                    field(*node, "operator", operator_kind, operator_span.clone());
+                    field(
+                        *node,
+                        "argument",
+                        "number_literal",
+                        manifest[index + 2].1.clone(),
+                    );
+                    assert!(!node.child_by_field_name("operator").unwrap().is_named());
+                }
+                if node.kind() == "number_literal" && admitted {
+                    assert!(matches!(
+                        node.parent().unwrap().kind(),
+                        "initializer_list" | "unary_expression"
+                    ));
+                    assert_eq!(node.child_count(), 0);
+                }
+                if node.kind() == ")" && node.start_byte() == node.end_byte() {
+                    assert!(node.is_missing());
+                    assert_eq!(node.parent().unwrap().kind(), "argument_list");
+                }
+            }
+            let mut visited = 0;
+            assert_eq!(
+                crate::adapter::is_numeric_initializer_data(initializer, &mut || {
+                    visited += 1;
+                    false
+                }),
+                ControlFlow::Continue(admitted)
+            );
+            assert_eq!(visited, polls, "poll manifest for {span:?}");
+            for cancel_at in 1..=polls {
+                let mut visited = 0;
+                assert_eq!(
+                    crate::adapter::is_numeric_initializer_data(initializer, &mut || {
+                        visited += 1;
+                        visited == cancel_at
+                    }),
+                    ControlFlow::Break(()),
+                    "cancel at {cancel_at} in {span:?}"
+                );
+                assert_eq!(visited, cancel_at);
+            }
+        }
+    }
+
     use super::*;
     use brokk_bifrost_core::analyzer::resolution_facts::{ResolutionNameFact, ResolutionNameId};
     use tree_sitter::Parser;

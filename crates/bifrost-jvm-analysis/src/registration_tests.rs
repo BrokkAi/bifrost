@@ -372,38 +372,32 @@ mod fact_resolution {
                 constructor_site,
                 LoweredSemanticRole::Definition,
             );
-            let signature_reason = fixture
-                .lexical
-                .gaps()
-                .iter()
-                .find(|gap| {
-                    gap.site() == constructor_site
-                        && gap.origin()
-                            == LoweringGapOrigin::Extracted(
-                                ResolutionGapKind::UnsupportedCallApplicability,
-                            )
-                })
-                .expect("compact constructor signature inventory gap")
-                .reason_semantic();
             let signature = fixture
                 .typed
                 .callable_signatures()
                 .iter()
                 .find(|signature| signature.definition() == constructor)
                 .expect("compact constructor signature header");
-            assert!(signature.parameters().is_empty());
-            assert_incomplete_with_reason(signature.completion(), signature_reason);
+            // JLS 8.10.4.2: the compact canonical constructor takes the
+            // header's component parameters, despite writing no formal list.
+            assert_eq!(signature.parameters().len(), 1);
+            assert_eq!(signature.completion(), &ResolutionCompletion::Complete);
 
             let constructor_reference =
                 source.rfind("new R(1)").expect("compact constructor call") + "new ".len();
             let (answer, applicability_reason) =
                 resolve_java_constructor_call_at(&fixture, constructor_reference);
             assert_eq!(answer.binding().targets(), &[constructor]);
-            assert_incomplete_with_reason(answer.completion(), applicability_reason);
+            assert!(
+                !answer.completion().contains_reason(
+                    ResolutionIncompleteReason::UnsupportedSemantic(applicability_reason)
+                ),
+                "applicability must be proven; independent preload context gaps remain honest: {answer:?}"
+            );
         }
         #[cfg(test)]
         #[test]
-        fn generic_headers_and_explicit_type_arguments_remain_unresolved() {
+        fn generic_headers_without_inference_and_ignored_type_arguments_are_proven() {
             let source = "class A { <T> void generic() {} void plain() {} void g(A a) { generic(); a.<String>plain(); } }";
             let fixture = parsed_java_service_fixture(source, b"fixed-call-generic-unknown");
             for (call, declaration) in [("generic();", "generic"), ("plain();", "plain")] {
@@ -411,10 +405,17 @@ mod fact_resolution {
                     &fixture,
                     source.find(declaration).expect("callable declaration name"),
                 );
-                let (answer, reason) =
+                let (answer, applicability_reason) =
                     resolve_java_call_at(&fixture, source.rfind(call).expect("generic call"));
                 assert_eq!(answer.binding().targets(), &[declaration]);
-                assert_incomplete_with_reason(answer.completion(), reason);
+                // JLS 15.12.2.2/18.5.1: no formal mentions T, so inference
+                // is unnecessary. JLS 15.12.2.1 ignores type args on plain().
+                assert!(
+                    !answer.completion().contains_reason(
+                        ResolutionIncompleteReason::UnsupportedSemantic(applicability_reason)
+                    ),
+                    "applicability must be proven; independent preload context gaps remain honest: {answer:?}"
+                );
             }
         }
         #[cfg(test)]
@@ -481,10 +482,17 @@ mod fact_resolution {
                 &fixture,
                 source.find("void f").expect("method f") + "void ".len(),
             );
-            let (answer, reason) =
+            let (answer, applicability_reason) =
                 resolve_java_call_at(&fixture, source.rfind("f(true)").expect("call f"));
             assert_eq!(answer.binding().targets(), &[declaration]);
-            assert_incomplete_with_reason(answer.completion(), reason);
+            // JLS 15.12.2.4: true converts to the repeated boolean
+            // component; the variable-arity applicability obligation is closed.
+            assert!(
+                !answer.completion().contains_reason(
+                    ResolutionIncompleteReason::UnsupportedSemantic(applicability_reason)
+                ),
+                "applicability must be proven; independent preload context gaps remain honest: {answer:?}"
+            );
         }
         #[cfg(test)]
         #[test]

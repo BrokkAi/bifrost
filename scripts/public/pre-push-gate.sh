@@ -2,7 +2,7 @@
 # Local pre-push validation gate (#1454).
 #
 # Composition follows .agents/docs/testing-and-rust-validation.md:
-# fmt, the featureless workspace test suites, and the isolated-target
+# fmt, the workspace test suites including developer tools, and the isolated-target
 # all-features workspace clippy. Two structural changes cut the wall clock
 # roughly in half versus running the same steps by hand:
 #
@@ -102,13 +102,13 @@ step "all-features clippy started concurrently (log: ${clippy_log})"
 "${clippy_cmd[@]}" >"${clippy_log}" 2>&1 &
 clippy_pid=$!
 
-# One scheduler across every featureless test binary in the workspace:
+# One scheduler across every selected test binary in the workspace:
 # the facade suites, the crates' lib tests, and the kept-standalone
 # process-isolation binaries (each test already runs in its own process
 # under nextest, which only strengthens their isolation assumptions).
-step "cargo nextest run --workspace --max-fail 100"
+step "cargo nextest run --workspace --features brokk-bifrost/devtools --max-fail 100"
 nextest_status=0
-BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}" cargo nextest run --workspace --max-fail 100 || nextest_status=$?
+BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}" cargo nextest run --workspace --features brokk-bifrost/devtools --max-fail 100 || nextest_status=$?
 
 step "cargo test --workspace --doc"
 doc_status=0

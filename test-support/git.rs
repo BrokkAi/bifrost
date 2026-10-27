@@ -100,12 +100,24 @@ pub fn commit_all_with_deletions(
     message: &str,
     signature: &Signature<'_>,
 ) -> Oid {
+    let workdir = repo
+        .workdir()
+        .expect("fixture repository workdir")
+        .to_path_buf();
     let mut index = repo.index().expect("repository index");
     index
         .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
         .expect("stage fixture");
+    // Unstage only entries whose working-tree file is gone. `Index::update_all`
+    // would do this through libgit2's index-to-workdir diff, which on
+    // aarch64-pc-windows-msvc under `core.ignorecase` (the Windows default)
+    // reports a staged non-ASCII path such as `caf\u{e9}/x.txt` as deleted
+    // while it is still on disk, so the commit silently dropped it (#6710).
+    let mut keep_present = |path: &Path, _matched_pathspec: &[u8]| {
+        i32::from(workdir.join(path).symlink_metadata().is_ok())
+    };
     index
-        .update_all(["*"].iter(), None)
+        .remove_all(["*"].iter(), Some(&mut keep_present))
         .expect("stage fixture deletions");
     commit_index(repo, index, message, signature)
 }

@@ -1497,15 +1497,12 @@ mod jvm_extraction_tests {
                 Ok(true)
             })
             .unwrap();
-        let mut expected = identities[..2].to_vec();
-        expected.sort_unstable();
-        assert_eq!(
-            found, expected,
-            "root coarse stream ignores scoped mismatch and includes no-fixed wildcard"
-        );
+        // The inherited exact root seek rejects scoped mismatch and a shorter
+        // closed empty stack; neither candidate admits this closed request.
+        assert!(found.is_empty());
         let session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
+                max_scope_nodes: 0,
                 ..ReceiverAnalysisBudget::default()
             },
             None,
@@ -1525,14 +1522,19 @@ mod jvm_extraction_tests {
                 },
             )
             .unwrap();
-        assert!(found.is_empty(), "budget break drops pending context page");
+        // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
+        assert_eq!(
+            found, expected,
+            "reader does not consume an engine admission budget"
+        );
+        assert_eq!(session.finish(()).work().scope_nodes, 0);
         assert!(
             stopped
                 .unconditional_completion()
                 .contains_reason(base_reason)
         );
         assert!(
-            stopped
+            !stopped
                 .unconditional_completion()
                 .contains_reason(ResolutionIncompleteReason::Cancelled)
         );

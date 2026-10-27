@@ -21,6 +21,262 @@ use brokk_bifrost_core::analyzer::definition_lookup::RelationalDefinitionValue;
 use brokk_bifrost_test_macros::hardwon;
 use std::collections::BTreeSet;
 
+// Producer/store boundary: raw and structured bases, namespace source extents,
+// and recovery windows retain the same evidence after reopening SQLite.
+#[test]
+fn aggregate_base_spellings_survive_store_reload() {
+    const SOURCE: &str = r#"
+namespace ns { struct Base {}; }
+namespace outer::inner { struct Item {}; }
+struct Mixin {};
+class ClassDerived : public ns::Base, private Mixin {};
+struct StructDerived : ns::Base, Mixin {};
+template<class T> struct Dependent : T::Base, ns::Base {};
+class EXPORT(2,0) VirtualKey : public virtual ns::Base{ public: void own(); };
+class EXPORT(3,6) Split final :
+    public ns::Base { public: void own(); };
+namespace winrt::{{ namespaceCpp }} { struct Generated {}; }
+"#;
+    const SENTINEL: &str = concat!(
+        "BEGIN_NS\n",
+        "namespace demo {\n",
+        "struct Widget {\n",
+        "    void doWork();\n",
+        "};\n",
+        "}\n",
+        "END_NS\n",
+        "void callWidget() {}\n",
+    );
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("bases.cpp", SOURCE)
+        .file("sentinel.cpp", SENTINEL)
+        .file("sentinel-crlf.cpp", SENTINEL.replace('\n', "\r\n"))
+        .build();
+    let project = fixture.project_dyn();
+    let start =
+        || {
+            let store = Arc::new(
+                brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_persistent(
+                    &fixture.root().join("bases.db"),
+                )
+                .expect("persistent store"),
+            );
+            CppAnalyzer::new_with_config_store_context(
+            Arc::clone(&project), AnalyzerConfig::default(),
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::revision_image_store_context(
+                project.as_ref(), store,
+            ), None,
+        ).expect("analyzer over persisted base rows")
+        };
+    for phase in ["cold publication", "store reload"] {
+        let analyzer = start();
+        let declarations = analyzer.get_all_declarations();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        for (name, expected, bases) in [
+            (
+                "ClassDerived",
+                vec!["ns::Base", "Mixin"],
+                vec![(vec!["ns", "Base"], false), (vec!["Mixin"], false)],
+            ),
+            (
+                "StructDerived",
+                vec!["ns::Base", "Mixin"],
+                vec![(vec!["ns", "Base"], false), (vec!["Mixin"], false)],
+            ),
+            (
+                "Dependent",
+                vec!["T::Base", "ns::Base"],
+                vec![(vec!["T", "Base"], false), (vec!["ns", "Base"], false)],
+            ),
+            (
+                "VirtualKey",
+                vec!["ns::Base"],
+                vec![(vec!["ns", "Base"], true)],
+            ),
+            ("Split", vec!["ns::Base"], vec![(vec!["ns", "Base"], false)]),
+        ] {
+            let unit = declarations
+                .iter()
+                .find(|unit| unit.fq_name() == name)
+                .unwrap_or_else(|| panic!("{phase}: missing {name}: {declarations:?}"));
+            assert_eq!(
+                analyzer.inner.raw_supertypes_of(unit),
+                expected,
+                "{phase}: {name}"
+            );
+            let occurrences =
+                brokk_bifrost_cpp::graph_support::CppSource::declaration_source_occurrences(
+                    &analyzer,
+                    scope.token(),
+                    unit,
+                )
+                .expect("persisted base facts");
+            let actual = occurrences
+                .iter()
+                .flat_map(|occurrence| &occurrence.fact.bases)
+                .map(|base| {
+                    (
+                        base.components
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        base.is_virtual,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, bases, "{phase}: structured bases for {name}");
+        }
+        for (identifier, name, text) in [
+            ("ns", "ns", "namespace ns { struct Base {}; }"),
+            (
+                "outer",
+                "outer",
+                "namespace outer::inner { struct Item {}; }",
+            ),
+            (
+                "outer::inner",
+                "inner",
+                "namespace outer::inner { struct Item {}; }",
+            ),
+        ] {
+            let unit = declarations
+                .iter()
+                .find(|unit| unit.is_module() && unit.fq_name() == identifier)
+                .unwrap_or_else(|| {
+                    panic!("{phase}: missing namespace {identifier}: {declarations:?}")
+                });
+            let occurrences =
+                brokk_bifrost_cpp::graph_support::CppSource::declaration_source_occurrences(
+                    &analyzer,
+                    scope.token(),
+                    unit,
+                )
+                .expect("persisted namespace occurrences");
+            let excerpts = occurrences
+                .iter()
+                .map(|occurrence| {
+                    let name = occurrence.name_range.expect("namespace name token");
+                    (
+                        &SOURCE[occurrence.range.start_byte..occurrence.range.end_byte],
+                        &SOURCE[name.start_byte..name.end_byte],
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(excerpts, [(text, name)], "{phase}: {identifier}");
+        }
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_module() && unit.identifier() == "winrt"),
+            "{phase}: malformed namespace must retain its structurally proven owner: {declarations:?}"
+        );
+        // The sentinel's interpreted namespace window starts immediately
+        // after BEGIN_NS (byte 8), and ends at its physical close on line 6.
+        // Five CRLF terminators add five bytes without changing either line.
+        for (path, end_byte) in [("sentinel.cpp", 65), ("sentinel-crlf.cpp", 70)] {
+            use brokk_bifrost_core::analyzer::structural::materialization::MaterializationRecord;
+            let mut windows = analyzer
+                .materialization_records(&fixture.file(path))
+                .into_iter()
+                .filter_map(|record| match record {
+                    MaterializationRecord::RecoveredDeclaration { recovery, unit } => Some((
+                        unit.fq_name(),
+                        recovery.start_byte,
+                        recovery.end_byte,
+                        recovery.start_line,
+                        recovery.end_line,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            windows.sort();
+            let expected = ["demo", "demo.Widget", "demo.Widget.doWork"]
+                .map(|name| (name.to_owned(), 8, end_byte, 1, 6));
+            assert_eq!(windows, expected, "{phase}: {path}");
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "5e79db920891: quicksilver round 4 survivor tests: empty exported classes lose declaration identity"
+)]
+fn empty_export_class_identity() {
+    // Retain the all-empty neighbor context. Giving these recovered classes
+    // members, or adding an ordinary class afterward, disambiguates the parse.
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "compact.cpp",
+            r#"
+namespace ns { struct Base {}; }
+namespace outer::inner { struct Item {}; }
+struct Mixin {};
+class ClassDerived : public ns::Base, private Mixin {};
+struct StructDerived : ns::Base, Mixin {};
+template<class T> struct Dependent : T::Base, ns::Base {};
+class EXPORT(2,0) Compact final : public ns::Base{};
+class EXPORT(2,0) VirtualKey : public virtual ns::Base{};
+class EXPORT(3,6) Split final :
+    public ns::Base {};
+namespace winrt::{{ namespaceCpp }} { struct Generated {}; }
+"#,
+        )
+        .build();
+    let project = fixture.project_dyn();
+    let store = Arc::new(
+        brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_persistent(
+            &fixture.root().join("compact.db"),
+        )
+        .expect("persistent store"),
+    );
+    let analyzer = CppAnalyzer::new_with_config_store_context(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::revision_image_store_context(
+            project.as_ref(),
+            store,
+        ),
+        None,
+    )
+    .expect("analyzer over persisted compact class rows");
+    let declarations = analyzer.get_all_declarations();
+    for (name, bases) in [
+        ("ClassDerived", vec!["ns::Base", "Mixin"]),
+        ("Compact", vec!["ns::Base"]),
+        ("VirtualKey", vec!["ns::Base"]),
+        ("Split", vec!["ns::Base"]),
+    ] {
+        let unit = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == name)
+            .unwrap_or_else(|| panic!("missing {name}: {declarations:?}"));
+        assert_eq!(analyzer.inner.raw_supertypes_of(unit), bases);
+    }
+}
+
+#[test]
+#[hardwon(
+    "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: include comments redirected macro field donors"
+)]
+fn macro_field_donors_use_canonical_include_paths() {
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("fields.h", "#define OWNER_FIELDS int value;\n")
+        .file(
+            "owner.c",
+            "#include <fields.h> // \"not-a-header.h\"\nstruct Owner { OWNER_FIELDS };\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let fields = analyzer.macro_composed_fields(&fixture.file("owner.c"));
+    assert_eq!(
+        fields
+            .iter()
+            .map(|field| field.unit.fq_name())
+            .collect::<Vec<_>>(),
+        ["Owner.value"]
+    );
+}
+
 fn macro_composed_fields_fixture() -> (
     crate::inline_project::BuiltInlineTestProject,
     ProjectFile,
@@ -1891,4 +2147,41 @@ fn canonical_member_reads_preserve_physical_facts_and_cancelled_reads_do_not_poi
         scope.read_completion(),
         Err(brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::Cancelled)
     ));
+}
+
+#[test]
+#[hardwon(
+    "#7001: every assertion-smell report reparsed each C++ test file, making fmt-cpp's report 19 times its baseline"
+)]
+fn repeated_assertion_smell_reports_reuse_the_prepared_tree() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+    use brokk_bifrost_core::analyzer::model::TestAssertionWeights;
+
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "suite_test.cpp",
+            "#include <gtest/gtest.h>\n\nTEST(Suite, NoAssertions) {\n    int value = 42;\n    value++;\n}\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let file = fixture.file("suite_test.cpp");
+    analyzer.reset_prepared_syntax_parse_counts_for_test();
+
+    let first = analyzer.find_test_assertion_smells(&file, TestAssertionWeights::defaults());
+    let second = analyzer.find_test_assertion_smells(&file, TestAssertionWeights::defaults());
+
+    assert_eq!(
+        first
+            .iter()
+            .map(|smell| smell.assertion_kind.as_str())
+            .collect::<Vec<_>>(),
+        ["no-assertions"],
+        "{first:?}"
+    );
+    assert_eq!(first, second);
+    assert_eq!(
+        analyzer.prepared_syntax_parse_count_for_test(&file),
+        1,
+        "both reports must read the one retained prepared tree"
+    );
 }

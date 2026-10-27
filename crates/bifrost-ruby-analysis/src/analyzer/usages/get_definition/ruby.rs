@@ -36,6 +36,7 @@ use brokk_bifrost_ruby::graph::syntax::{
     method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
+use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::RubyAnalyzer;
@@ -277,7 +278,7 @@ fn ruby_unshadowed_external_type<'a>(
     session: &ResolutionSession,
     constants: RubyOverlayConstants<'a>,
     qualified_name: &str,
-) -> Option<&'a brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol> {
+) -> Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol>> {
     let result = constants.unique_type(qualified_name)?;
     let workspace_owners = session.query_limited_rows(|limit| {
         ruby.declaration_candidates_by_identifier_limited(&result.name, limit, || {
@@ -1392,11 +1393,11 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
             && self.provider.fqn(&receiver.owner_fq_name).is_empty()
         {
             let member =
-                constants.callable(owner, method_name, ruby_positional_argument_count(call)?)?;
+                constants.callable(&owner, method_name, ruby_positional_argument_count(call)?)?;
             if member.is_static() != (receiver.mode == RubyReceiverMode::Class) {
                 return None;
             }
-            let result = constants.declared_result(member)?;
+            let result = constants.declared_result(&member)?;
             return Some(RubyReceiverType {
                 owner_fq_name: result.qualified_name.clone(),
                 mode: RubyReceiverMode::Instance,
@@ -2238,7 +2239,7 @@ pub(crate) fn exact_ruby_external_call(
         }
         let constants = RubyOverlayConstants::new(overlay.as_deref());
         let owner = ruby_unshadowed_external_type(ruby, &session, constants, "Kernel")?;
-        let member = constants.callable(owner, "system", parameter_count)?;
+        let member = constants.callable(&owner, "system", parameter_count)?;
         let proof = ExactExternalCallProof::ruby_bound_external_member(
             &owner.qualified_name,
             &member.name,
@@ -2280,7 +2281,7 @@ pub(crate) fn exact_ruby_external_call(
     // The declared result can name a different class from the constructor's
     // owner, so check this result identity independently.
     let owner = ruby_unshadowed_external_type(ruby, &session, constants, &receiver.owner_fq_name)?;
-    let member = constants.callable(owner, member_name, parameter_count)?;
+    let member = constants.callable(&owner, member_name, parameter_count)?;
     if member.is_static() != (receiver.mode == RubyReceiverMode::Class) {
         return None;
     }

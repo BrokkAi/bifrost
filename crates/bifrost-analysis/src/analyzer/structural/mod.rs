@@ -48,6 +48,8 @@ pub mod provider;
 pub mod qualified_paths;
 pub mod reference_edges;
 pub mod rewrite_paths;
+#[doc(hidden)]
+pub mod selected_inverse;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;

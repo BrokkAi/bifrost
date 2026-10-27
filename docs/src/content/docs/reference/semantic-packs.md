@@ -20,7 +20,7 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `18`, inclusive. Its newest version is `18`. Version `1` and
+through `19`, inclusive. Its newest version is `19`. Version `1` and
 any other value fail with `schema.unsupported_version`. The field is
 required; there is no default.
 
@@ -29,7 +29,8 @@ artifact at the lowest version its content needs: the highest version gate in
 the table below that the content meets, and never below `8`. A pack that uses
 no field newer than version 8 is written as version 8, so a reader that predates
 later fields still accepts it. A pack loaded from an `authored_semantic_model`
-spec keeps the version its author declared.
+spec keeps the version its author declared. Current artifact producers supply
+schema-19 extraction authority, so their output requires version 19.
 
 A field is accepted only in a pack whose `schema_version` is at least the
 version that introduced it. A pack that declares an earlier version and uses
@@ -54,16 +55,17 @@ of an older version parse every pack that it accepts by number.
 | 16 | Non-empty `exact_return_classes` on members. | `declaration.exact_return_classes_schema_version` |
 | 17 | Ordered, exhaustive `runtime_bases` on Python class facts. | `declaration.runtime_bases_schema_version` |
 | 18 | Rust generic defaults, implemented-trait facts and associated bindings, generic forwarding impls, self forms, and associated-type projections. | `declaration.rust_contract_schema_version` |
+| 19 | Rust implementation-inventory coverage, negative impls and conditional bounds; producer-only extraction authority in compiled manifests and shards. | `declaration.impl_inventory_schema_version`, `declaration.impl_conditions_schema_version`, `declaration.impl_self_schema_version`, `extraction.schema_version` |
 
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v18.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v18.schema.json).
+[`schemas/semantic-model-pack-v19.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v19.schema.json).
 `cargo run --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `18`. It requires `compatibility.bifrost` for versions `2` through
+`2` through `19`. It requires `compatibility.bifrost` for versions `2` through
 `7` and forbids it for versions `8` and newer. It does not express the other
 per-field version gates in the table above; the validator enforces them.
 
@@ -78,7 +80,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 18 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 19 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -93,6 +95,15 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 | `cpp_portability` | object | no | Exact C and C++ resolver evidence imported from CSMI. See [C++ portability evidence](#c-portability-evidence). |
 | `python_correspondence` | object | no | Python declaration-to-runtime correspondence imported from CSMI. See [Python correspondence evidence](#python-correspondence-evidence). |
 | `shards` | list of shards | yes | At least one shard (`pack.no_shards`), at most 4,096. See [Shards](#shards). |
+
+Compiled schema-19 manifests and shard envelopes may contain `extraction`:
+`{kind, inputs}`, where `kind` identifies the artifact producer and `inputs` is
+`{kind: "single", sha256}` or `{kind: "source_set", digest}`. Only production
+paths supply this claim in memory; authored documents reject the field. Every
+shard must agree with its manifest. Both semantic digests include the claim,
+and older or curated packs without it have no extraction authority. The
+[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v19.schema.json)
+describes this envelope separately from the authoring format.
 
 A **stable ID** is 1 to 256 bytes of lowercase ASCII letters, digits, `.`,
 `-`, and `_`. It must start and end with a letter or digit. Pack IDs, shard
@@ -182,8 +193,10 @@ otherwise it is a language selector. See
 | `has_explicit_type_terms` | boolean | `false` | 2 | The type is a Go interface that lists explicit type terms (a type-set constraint). |
 | `type_parameters` | list of names | `[]` | 2 | Generic parameter names, in order. Names must be unique. |
 | `type_parameter_defaults` | list of optional defaults | `[]` | 18 | Rust defaults parallel to `type_parameters`, excluding lifetimes. A default is `{kind: type, type: TypeRef}` or `{kind: const, value: text}`; null means no default, and an empty list means unreviewed. |
-| `implemented_traits` | list of implemented-trait facts | `[]` | 18 | Rust trait identities and structured associated-type bindings, retained even when no method is overridden. Negative impls contribute nothing. |
-| `generic_trait_impls` | list of generic impl facts | `[]` | 18 | Rust forwarding rules owned by the implemented trait: `type_parameters`, structured `self_pattern`, `bounds`, and `implementation`. |
+| `implemented_traits` | list of implemented-trait facts | `[]` | 18 | Rust trait identities and structured associated-type bindings, retained even when no method is overridden. Schema 19 adds `is_negative`, impl-local `type_parameters`, an exact `self_pattern`, and conditional `bounds`. |
+| `generic_trait_impls` | list of generic impl facts | `[]` | 18 | Rust rules owned by the implemented trait: `type_parameters`, structured `self_pattern`, `bounds`, and `implementation`. Schema 19 also retains bare-parameter and negative rules; implicit `Self` denotes the instantiated self pattern. |
+| `implemented_traits_complete` | boolean | `false` | 19 | Exhaustive direct implementations of traits in the same artifact source set. Does not close blanket rules. |
+| `generic_trait_impls_complete` | boolean | `false` | 19 | Exhaustive trait-owned generic rules in the source set. Compiler-derived auto traits never claim completeness. |
 | `type_parameter_constraints` | list of [`TypeParameterConstraint`](#small-declaration-types) | `[]` | 2 | Constraints on the type parameters. One per parameter at most. |
 | `underlying_type` | [`StructuredTypeExpression`](#small-declaration-types) | absent | 2 | The underlying type of a defined type, such as a Go named type. |
 | `value_semantics` | [`TypeValueSemantics`](#value-semantics) | absent | 2 | Reviewed copy and move behavior. Absence means not reviewed, not "no operations". |

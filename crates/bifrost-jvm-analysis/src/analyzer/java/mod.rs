@@ -1030,6 +1030,8 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.working_tree_identity()
     }
 
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     fn begin_query(
         &self,
         context: &Arc<brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext>,
@@ -1552,6 +1554,78 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Java
 pub struct JavaSupport;
 
 impl LanguageSupport for JavaSupport {
+    fn formal_parameter_owner_kinds(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "method_declaration",
+            "constructor_declaration",
+            "compact_constructor_declaration",
+            "record_declaration",
+        ])
+    }
+
+    fn formal_parameter_source_owner<'tree>(
+        &self,
+        owner: tree_sitter::Node<'tree>,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if owner.kind() != "compact_constructor_declaration" {
+            return Some(owner);
+        }
+        if !scope_step() {
+            return None;
+        }
+        let body = owner.parent();
+        if !scope_step() {
+            return None;
+        }
+        // Parser recovery can put a compact constructor outside a record.
+        // It has no inherited header; only budget exhaustion stops traversal.
+        Some(
+            body.and_then(|body| body.parent())
+                .filter(|record| record.kind() == "record_declaration")
+                .unwrap_or(owner),
+        )
+    }
+
+    fn parameter_owner_has_lexical_bindings(&self, owner: tree_sitter::Node<'_>) -> bool {
+        // JLS 8.10.4: only the canonical constructor owns these parameters.
+        owner.kind() != "record_declaration"
+    }
+
+    fn implicit_callable_parameter_layout(
+        &self,
+        unit: &CodeUnit,
+        root: tree_sitter::Node<'_>,
+        source: &str,
+        range: &Range,
+    ) -> Option<brokk_bifrost_analysis::analyzer::lexical_definitions::FormalParameterLayout> {
+        use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
+        use brokk_bifrost_jvm::java::declarations::{
+            java_record_components, java_record_declares_accessor,
+        };
+        if !unit.is_callable() {
+            return None;
+        }
+        let node = node_for_exact_range(root, range)?;
+        let parameters = node.parent()?;
+        let record = parameters.parent()?;
+        if parameters.kind() != "formal_parameters" || record.kind() != "record_declaration" {
+            return None;
+        }
+        let components = java_record_components(parameters).ok()?;
+        let component = components.iter().find(|component| component.node == node)?;
+        let name = brokk_bifrost_jvm::java::declarations::node_text(component.name, source);
+        if unit.identifier() != name || java_record_declares_accessor(record, name, source) {
+            return None;
+        }
+        Some(
+            brokk_bifrost_analysis::analyzer::lexical_definitions::FormalParameterLayout {
+                slots: Vec::new(),
+                python_binding: None,
+            },
+        )
+    }
+
     fn analyze_receiver_query(
         &self,
         service: &brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverQueryService<
@@ -1873,8 +1947,10 @@ impl LanguageSupport for JavaSupport {
     /// ran, so a same-named local won the call site (#2046).
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
         !focus.parent().is_some_and(|parent| {
-            parent.kind() == "method_invocation"
-                && parent.child_by_field_name("name") == Some(focus)
+            (parent.kind() == "method_invocation"
+                && parent.child_by_field_name("name") == Some(focus))
+                || (parent.kind() == "field_access"
+                    && parent.child_by_field_name("field") == Some(focus))
         })
     }
 
@@ -1986,7 +2062,13 @@ impl LanguageSupport for JavaSupport {
     fn reference_graph_backend(
         &self,
     ) -> brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend {
-        brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(&JavaEdgePass)
+        if super::jvm::native_graph::native_jvm_graph_selected() {
+            brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Native(
+                &super::jvm::native_graph::JVM_NATIVE_GRAPH,
+            )
+        } else {
+            brokk_bifrost_analysis::analyzer::languages::LanguageGraphBackend::Legacy(&JavaEdgePass)
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]

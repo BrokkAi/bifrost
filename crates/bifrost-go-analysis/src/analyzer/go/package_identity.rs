@@ -14,6 +14,7 @@
 
 use brokk_bifrost_analysis::analyzer::semantic::{IndexedLocationIdentity, MemoryValueCopy};
 use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
+use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCompleteness;
 
@@ -215,7 +216,7 @@ impl<'a> GoOverlayPackages<'a> {
     fn unique_symbol_across_names<'b>(
         &self,
         qualified_names: impl IntoIterator<Item = &'b str>,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let overlay = self.overlay?;
         let mut selected = None;
         for qualified_name in qualified_names {
@@ -229,7 +230,7 @@ impl<'a> GoOverlayPackages<'a> {
                         .expect("a unique overlay match contains one record");
                     match selected {
                         None => selected = Some(candidate),
-                        Some(existing) if std::ptr::eq(existing, candidate) => {}
+                        Some(ref existing) if Arc::ptr_eq(existing, &candidate) => {}
                         Some(_) => return None,
                     }
                 }
@@ -243,7 +244,7 @@ impl<'a> GoOverlayPackages<'a> {
     /// A name that more than one activated pack claims is deliberately not
     /// unique: the overlay marks it `Conflict` and this returns `None`, so
     /// neither navigation nor a diagnostic picks an arbitrary winner.
-    pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
+    pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?.symbols_named(qualified_name).unique()
     }
 
@@ -282,7 +283,7 @@ impl<'a> GoOverlayPackages<'a> {
         &self,
         owner: &SemanticModelSymbol,
         member: &str,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let mut candidates = self
             .overlay?
             .members_of(&owner.id)
@@ -301,7 +302,7 @@ impl<'a> GoOverlayPackages<'a> {
     /// declaration. A name several packs publish, or one whose only records
     /// are unexported, resolves to nothing.
     #[doc(hidden)]
-    pub fn visible_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
+    pub fn visible_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?.visible_public_symbol(qualified_name, "go")
     }
 
@@ -311,12 +312,12 @@ impl<'a> GoOverlayPackages<'a> {
     /// This prevents a conflicting pack from turning a structured Declared
     /// result reference into an arbitrary source type identity.
     #[doc(hidden)]
-    pub fn declared_type_qualified_name(&self, id: &str) -> Option<&'a str> {
+    pub fn declared_type_qualified_name(&self, id: &str) -> Option<String> {
         let matched = self.overlay?.symbols_with_id(id);
         if matched.disposition != SemanticModelOverlayDisposition::Unique {
             return None;
         }
-        let declared = matched.records.first().copied()?;
+        let declared = matched.records.first().cloned()?;
         let named = self.unique_symbol(&declared.qualified_name)?;
         (named.id == declared.id
             && declared.language == "go"
@@ -324,7 +325,7 @@ impl<'a> GoOverlayPackages<'a> {
             && go_declared_type_kind(declared.kind)
             && declared.visibility == Visibility::Public
             && !declared.provenance.ambiguous)
-            .then_some(declared.qualified_name.as_str())
+            .then(|| declared.qualified_name.clone())
     }
 
     /// The `package` clause name an exact API pack records for `import_path`.
@@ -385,11 +386,11 @@ impl<'a> GoOverlayPackages<'a> {
         &self,
         import_path: &str,
         member: &str,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let qualified_names = Self::member_candidates(import_path, member);
         let symbol = self.unique_symbol_across_names(qualified_names.iter().map(String::as_str))?;
         self.visible_symbol(&symbol.qualified_name)
-            .filter(|visible| std::ptr::eq(*visible, symbol))
+            .filter(|visible| Arc::ptr_eq(visible, &symbol))
     }
 
     /// Whether the packs publish `member` as a visible, public declaration of
@@ -484,7 +485,7 @@ impl<'a> GoOverlayPackages<'a> {
         &self,
         import_path: &str,
         member: &str,
-    ) -> Option<Result<&'a SemanticModelSymbol, GoModeledPackageCallResolution>> {
+    ) -> Option<Result<Arc<SemanticModelSymbol>, GoModeledPackageCallResolution>> {
         let overlay = self.overlay?;
         let symbols = Self::member_candidates(import_path, member)
             .iter()
@@ -517,7 +518,7 @@ impl<'a> GoOverlayPackages<'a> {
         {
             return Some(Err(GoModeledPackageCallResolution::Unproven));
         }
-        Some(Ok(symbol))
+        Some(Ok(Arc::clone(symbol)))
     }
 
     /// The unique modeled method selected by one exact concrete Go receiver.
@@ -534,7 +535,7 @@ impl<'a> GoOverlayPackages<'a> {
         member: &str,
         pointer_receivers: bool,
         parameter_count: usize,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let owner = self.unique_symbol(owner_fqn)?;
         if owner.language != "go"
             || owner.owner_id.is_some()
@@ -567,7 +568,7 @@ impl<'a> GoOverlayPackages<'a> {
         owner_fqn: &str,
         member: &str,
         parameter_count: usize,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let owner = self.unique_symbol(owner_fqn)?;
         if owner.language != "go"
             || owner.owner_id.is_some()
@@ -576,7 +577,7 @@ impl<'a> GoOverlayPackages<'a> {
         {
             return None;
         }
-        let method = self.unique_go_owner_member(owner, member)?;
+        let method = self.unique_go_owner_member(&owner, member)?;
         (method.kind == SemanticModelSymbolKind::Method
             && method.visibility == Visibility::Public
             && method.owner_id.as_deref() == Some(owner.id.as_str())
@@ -598,7 +599,7 @@ impl<'a> GoOverlayPackages<'a> {
         &self,
         owner_fqn: &str,
         member: &str,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let owner = self.unique_symbol(owner_fqn)?;
         if owner.language != "go"
             || owner.owner_id.is_some()
@@ -609,7 +610,7 @@ impl<'a> GoOverlayPackages<'a> {
             return None;
         }
 
-        let field = self.unique_go_owner_member(owner, member)?;
+        let field = self.unique_go_owner_member(&owner, member)?;
         (field.kind == SemanticModelSymbolKind::Field
             && field.visibility == Visibility::Public
             && !field.is_static()
@@ -668,7 +669,7 @@ impl<'a> GoOverlayPackages<'a> {
             parameter_count,
             result_ordinal,
         )?;
-        let (declared_id, pointer) = match result {
+        let (declared_id, pointer) = match &result {
             TypeRef::Declared {
                 id,
                 arguments,
@@ -688,7 +689,7 @@ impl<'a> GoOverlayPackages<'a> {
         if matched.disposition != SemanticModelOverlayDisposition::Unique {
             return None;
         }
-        let declared = matched.records.first().copied()?;
+        let declared = matched.records.first().cloned()?;
         if self
             .unique_symbol(&declared.qualified_name)
             .is_none_or(|named| named.id != declared.id)
@@ -721,7 +722,7 @@ impl<'a> GoOverlayPackages<'a> {
         has_receiver: bool,
         parameter_count: usize,
         result_ordinal: usize,
-    ) -> Option<&'a TypeRef> {
+    ) -> Option<TypeRef> {
         let owner = self.unique_symbol(owner_fqn)?;
         if owner.language != "go"
             || owner.owner_id.is_some()
@@ -732,7 +733,7 @@ impl<'a> GoOverlayPackages<'a> {
             return None;
         }
 
-        let callable = self.unique_go_owner_member(owner, member)?;
+        let callable = self.unique_go_owner_member(&owner, member)?;
         if callable.visibility != Visibility::Public
             || callable.has_receiver() != has_receiver
             || callable.is_static() == has_receiver
@@ -749,11 +750,14 @@ impl<'a> GoOverlayPackages<'a> {
             return None;
         }
         let signature = callable.structured_signature()?;
-        Some(match signature.returns.as_ref()? {
-            TypeRef::Tuple { elements } => elements.get(result_ordinal)?,
-            result if result_ordinal == 0 => result,
-            _ => return None,
-        })
+        Some(
+            match signature.returns.as_ref()? {
+                TypeRef::Tuple { elements } => elements.get(result_ordinal)?,
+                result if result_ordinal == 0 => result,
+                _ => return None,
+            }
+            .clone(),
+        )
     }
 }
 
@@ -774,7 +778,7 @@ fn go_field_value_copy(field_type: &TypeRef, overlay: &SemanticModelOverlay) -> 
             if matched.disposition != SemanticModelOverlayDisposition::Unique {
                 return MemoryValueCopy::Unknown;
             }
-            let Some(symbol) = matched.records.first().copied() else {
+            let Some(symbol) = matched.records.first().cloned() else {
                 return MemoryValueCopy::Unknown;
             };
             if symbol.language == "go"

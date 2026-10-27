@@ -331,8 +331,8 @@ class Outer {
         source_facts
             .native_declaration_sources
             .iter()
-            .all(|(_, source)| *source != declaration),
-        "{kind} {name} must retain independent native suppression",
+            .any(|(_, source)| *source == declaration),
+        "{kind} {name} must publish its native record field",
     );
     for (kind, name) in [
         ("enum_constant", "ONE"),
@@ -483,5 +483,235 @@ fn malformed_field_without_admitted_declarator_does_not_panic_or_publish_metadat
             .source_declaration_metadata
             .iter()
             .all(|link| !link.unit.is_field())
+    );
+}
+
+// These tables pin the released Java grammar/API boundary, independently of
+// name binding and type inference. Expected spellings follow JLS source forms.
+#[test]
+fn java_written_declaration_grammar_boundary() {
+    use super::declarations::{collect_type_identifiers, is_declaration_parent};
+    use brokk_bifrost_core::hash::HashSet;
+    let source = "class C<T extends Number> { java.util.List<String> values; T[] array; int primitive; void f() { int local = 0; try (Reader input = open()) { use(input); } catch (Exception caught) {} for (String item : values) {} } }";
+    let tree = super::declarations::parse_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let mut names = HashSet::default();
+    collect_type_identifiers(tree.root_node(), source, &mut names);
+    let mut names = names.into_iter().collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "Exception",
+            "List",
+            "Number",
+            "Reader",
+            "String",
+            "T",
+            "java",
+            "java.util",
+            "java.util.List",
+            "util"
+        ]
+    );
+    for (kind, spelling) in [
+        ("variable_declarator", "local"),
+        ("resource", "input"),
+        ("catch_formal_parameter", "caught"),
+        ("enhanced_for_statement", "item"),
+    ] {
+        let parent = named_node(tree.root_node(), source, kind, spelling);
+        let name = parent.child_by_field_name("name").unwrap();
+        assert_eq!(name.kind(), "identifier");
+        assert_eq!(&source[name.byte_range()], spelling);
+        assert!(is_declaration_parent(parent.kind()), "{kind}");
+    }
+    let uses =
+        super::test_support::named_nodes(tree.root_node(), source, "method_invocation", "use");
+    let argument = uses[0]
+        .child_by_field_name("arguments")
+        .unwrap()
+        .named_child(0)
+        .unwrap();
+    assert_eq!(&source[argument.byte_range()], "input");
+    assert!(!is_declaration_parent(argument.parent().unwrap().kind()));
+}
+
+#[test]
+fn java_binary_name_boundary() {
+    // JLS 13.1: member classes use a named suffix; anonymous classes a digit suffix.
+    for (name, anonymous) in [
+        ("p.Outer", false),
+        ("p.Outer$Inner", false),
+        ("p.Outer$1Local", false),
+        ("p.Outer$1", true),
+        ("p.Outer$12", true),
+        ("p.Outer$Inner$2", true),
+        ("p.Outer$anon$3", true),
+    ] {
+        assert_eq!(
+            super::declarations::is_java_anonymous_structure(name),
+            anonymous,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn java_import_grammar_boundary() {
+    use super::imports::{import_package, parse_import_info};
+    // Prefixes are purely written paths: static imports include their owner.
+    for (source, segments, prefix) in [
+        ("import a.b.C;", vec!["a", "b", "C"], Some("a.b")),
+        ("import a.b.*;", vec!["a", "b"], Some("a.b")),
+        ("import C;", vec!["C"], None),
+        (
+            "import static a.b.C.member;",
+            vec!["a", "b", "C", "member"],
+            Some("a.b.C"),
+        ),
+        ("import static a.b.C.*;", vec!["a", "b", "C"], Some("a.b.C")),
+    ] {
+        let tree = super::declarations::parse_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(node.kind(), "import_declaration");
+        let info = parse_import_info(node, source, source.to_owned());
+        assert_eq!(info.path.as_ref().unwrap().segments, segments);
+        assert_eq!(import_package(&info).as_deref(), prefix, "{source}");
+    }
+}
+
+#[test]
+fn java_receiver_and_construct_grammar_boundary() {
+    use super::structural::{JAVA_STRUCTURAL_SPEC, expression_name_node};
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    let source = "class C { void f() { super.run(); this.run(); other.run(); Runnable a = super::run; Runnable b = this::run; Runnable c = C::run; Object d = new C(); } }";
+    let tree = super::declarations::parse_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let mut receivers = Vec::new();
+    let mut constructs = Vec::new();
+    walk_named_tree_preorder(tree.root_node(), true, |node| {
+        if node.kind() == "method_invocation" {
+            let receiver = node.child_by_field_name("object").unwrap();
+            let name = expression_name_node(receiver).unwrap();
+            assert_eq!(name.byte_range(), receiver.byte_range());
+            receivers.push(source[name.byte_range()].to_owned());
+        }
+        if matches!(
+            node.kind(),
+            "method_reference" | "object_creation_expression"
+        ) {
+            constructs.push((
+                node.kind(),
+                JAVA_STRUCTURAL_SPEC.generator_construct(
+                    node,
+                    brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Call,
+                    source,
+                ),
+            ));
+        }
+        WalkControl::Continue
+    });
+    assert_eq!(receivers, ["super", "this", "other"]);
+    assert_eq!(
+        constructs,
+        [
+            ("method_reference", Some("java_method_reference")),
+            ("method_reference", Some("java_method_reference")),
+            ("method_reference", Some("java_method_reference")),
+            ("object_creation_expression", Some("java_object_creation"))
+        ]
+    );
+}
+
+#[test]
+fn java_switch_statement_grammar_boundary() {
+    use super::structural::{
+        JavaCallResultUse, java_call_result_use, java_switch_rule_value_expression_statement,
+    };
+    // The grammar calls both constructs switch_expression; their parent fields
+    // distinguish JLS 14.11 statements from JLS 15.28 value expressions.
+    let source = "class C { int f(int n) { switch(n) { case 1 -> discard(); default -> discard(); } int v = switch(n) { case 1 -> consume(); default -> consume(); }; return switch(n) { case 1 -> result(); default -> result(); }; } }";
+    let tree = super::declarations::parse_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let mut arms = Vec::new();
+    walk_named_tree_preorder(tree.root_node(), true, |node| {
+        if node.kind() == "expression_statement" && node.parent().unwrap().kind() == "switch_rule" {
+            let call = node.named_child(0).unwrap();
+            assert_eq!(call.kind(), "method_invocation");
+            let name = call.child_by_field_name("name").unwrap();
+            arms.push((
+                source[name.byte_range()].to_owned(),
+                java_switch_rule_value_expression_statement(node),
+                java_call_result_use(call),
+            ));
+        }
+        WalkControl::Continue
+    });
+    assert_eq!(
+        arms,
+        [
+            (
+                "discard".to_owned(),
+                false,
+                Some(JavaCallResultUse::Discarded)
+            ),
+            (
+                "discard".to_owned(),
+                false,
+                Some(JavaCallResultUse::Discarded)
+            ),
+            (
+                "consume".to_owned(),
+                true,
+                Some(JavaCallResultUse::OtherContext)
+            ),
+            (
+                "consume".to_owned(),
+                true,
+                Some(JavaCallResultUse::OtherContext)
+            ),
+            (
+                "result".to_owned(),
+                true,
+                Some(JavaCallResultUse::OtherContext)
+            ),
+            (
+                "result".to_owned(),
+                true,
+                Some(JavaCallResultUse::OtherContext)
+            )
+        ]
+    );
+}
+
+#[test]
+fn java_pattern_binder_grammar_boundary() {
+    use super::structural::java_pattern_binding_name;
+    let source = "class C { int f(Object o) { if (o instanceof String text) {} return switch(o) { case String value -> 1; case Box(String outer, Box(int nested)) -> 2; default -> 0; }; } }";
+    let tree = super::declarations::parse_tree(source).unwrap();
+    assert!(!tree.root_node().has_error());
+    let mut bindings = Vec::new();
+    walk_named_tree_preorder(tree.root_node(), true, |node| {
+        if matches!(
+            node.kind(),
+            "instanceof_expression" | "type_pattern" | "record_pattern_component"
+        ) {
+            let name = java_pattern_binding_name(node).expect("typed pattern carries a binder");
+            assert_eq!(name.kind(), "identifier");
+            assert_eq!(name.parent().unwrap().id(), node.id());
+            bindings.push((node.kind(), source[name.byte_range()].to_owned()));
+        }
+        WalkControl::Continue
+    });
+    assert_eq!(
+        bindings,
+        [
+            ("instanceof_expression", "text".to_owned()),
+            ("type_pattern", "value".to_owned()),
+            ("record_pattern_component", "outer".to_owned()),
+            ("record_pattern_component", "nested".to_owned())
+        ]
     );
 }

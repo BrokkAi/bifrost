@@ -7,6 +7,18 @@ pub use crate::analyzer::store::model_provenance::{
 };
 
 pub use brokk_bifrost_semantic::analyzer::semantic_model::overlay::*;
+// Root suites run this harness over the private golden corpus, which crate
+// tests must not read.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod catalog_row_parity;
+#[doc(hidden)]
+pub mod composition;
+pub use composition::SemanticModelCompositionDiagnostic;
+#[doc(hidden)]
+pub mod locations;
+mod row_entry_points;
+use locations::SemanticModelLocations;
 pub(crate) mod java_functional;
 #[doc(hidden)]
 pub mod java_hierarchy;
@@ -42,11 +54,14 @@ use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct SemanticModelOverlay {
+    row_source: Option<row_entry_points::RowOverlay>,
     active_model_set_hash: String,
-    extraction_gaps: Vec<ActivePackExtractionGap>,
+    composition_diagnostics: Vec<Arc<SemanticModelCompositionDiagnostic>>,
+    extraction_gaps: Vec<Arc<ActivePackExtractionGap>>,
     extraction_gap_by_declaration: HashMap<String, usize>,
     /// The manifest languages of the active shards that carry declaration
     /// facts, deduplicated. An overlay can be built entirely from
@@ -60,9 +75,9 @@ pub struct SemanticModelOverlay {
     /// the language's declarations, so a consumer that needs exhaustive
     /// coverage must ask for this list instead.
     complete_declaration_surface_languages: Vec<String>,
-    symbols: Vec<SemanticModelSymbol>,
+    symbols: Vec<Arc<SemanticModelSymbol>>,
     generated_function_languages: HashSet<String>,
-    relations: Vec<SemanticModelRelation>,
+    relations: Vec<Arc<SemanticModelRelation>>,
     java_hierarchy: HashMap<String, (Vec<String>, Vec<HierarchyFact>)>,
     symbols_by_id: HashMap<String, Vec<usize>>,
     symbols_by_name: HashMap<String, Vec<usize>>,
@@ -71,20 +86,70 @@ pub struct SemanticModelOverlay {
     symbols_by_owner: HashMap<String, Vec<usize>>,
     relations_from: HashMap<String, Vec<usize>>,
     relations_to: HashMap<String, Vec<usize>>,
-    runtime_values: Vec<RuntimeValueContracts>,
-    collection_flows: Vec<CollectionFlowContract>,
+    runtime_values: Vec<Arc<RuntimeValueContracts>>,
+    collection_flows: Vec<Arc<CollectionFlowContract>>,
     collection_flows_by_callable: HashMap<String, Vec<usize>>,
-    conditional_type_refinements: Vec<ConditionalTypeRefinementContract>,
+    conditional_type_refinements: Vec<Arc<ConditionalTypeRefinementContract>>,
     conditional_types_by_callable: HashMap<String, Vec<usize>>,
-    deferred_yields: Vec<DeferredYieldContract>,
+    deferred_yields: Vec<Arc<DeferredYieldContract>>,
     deferred_yields_by_scope: HashMap<(String, String, String), Vec<usize>>,
+}
+
+/// Preserve ranked curated selection, but include every active extraction
+/// contributor before structural composition (#6542). An installed or embedded
+/// artifact does not lose authority to an ephemeral curated stub's source rank.
+fn with_artifact_declarations<T: PartialEq>(
+    mut matched: SemanticModelMatch<T>,
+    records: impl Iterator<Item = crate::analyzer::semantic_model::ActivatedSemanticModelRecord<T>>,
+) -> SemanticModelMatch<T> {
+    for record in records.filter(|r| r.shard.manifest.extraction.is_some()) {
+        if matched.records.iter().any(|existing| {
+            Arc::ptr_eq(&existing.record, &record.record)
+                && Arc::ptr_eq(&existing.shard, &record.shard)
+        }) {
+            continue;
+        }
+        if matched
+            .records
+            .iter()
+            .any(|existing| existing.record != record.record)
+        {
+            matched.disposition = SemanticModelMatchDisposition::Conflict;
+        }
+        matched.records.push(record);
+    }
+    matched
+}
+
+/// Qualification uses the ranked, guarded owner surface, including extraction
+/// contributors. Ambiguity leaves the member's raw owner ID as its spelling.
+fn qualified_owner_name(matched: &SemanticModelMatch<TypeFact>) -> Option<&str> {
+    (!type_declaration_records_conflict(matched))
+        .then(|| matched.records.last().map(|r| r.record.name.as_str()))
+        .flatten()
+}
+
+/// #6542: structural facts belong to the selected declaration's pack, not
+/// every raw record sharing its local ID. Contributor records retain semantic
+/// provenance but cannot reintroduce sparse type parameters or hierarchy.
+pub fn owner_declaration(
+    active: &ResolvedActiveSemanticModels,
+    symbol: &SemanticModelSymbol,
+) -> Option<Arc<TypeFact>> {
+    if symbol.provenance.ambiguous {
+        return None;
+    }
+    active
+        .all_type_records_with_id(&symbol.id)
+        .find(|record| record.shard.manifest.semantic_sha256 == symbol.provenance.pack_digest)
+        .map(|record| record.record)
 }
 
 impl SemanticModelOverlay {
     #[doc(hidden)]
     pub fn build(
         analyzer: &dyn IAnalyzer,
-        active: &ResolvedActiveSemanticModels,
+        active: &Arc<ResolvedActiveSemanticModels>,
         cancellation: &crate::CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Self, SemanticModelOverlayBuildError> {
@@ -92,9 +157,11 @@ impl SemanticModelOverlay {
         // traverse a large analyzer to derive facts for an empty model set.
         if active.shards().is_empty() {
             return Ok(Self {
+                row_source: None,
                 active_model_set_hash: active.active_model_set_hash().to_string(),
+                composition_diagnostics: Vec::new(),
                 extraction_gaps: active.extraction_gaps().to_vec(),
-                extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
+                extraction_gap_by_declaration: extraction_gap_index(&active.extraction_gaps()),
                 declaration_surface_languages: Vec::new(),
                 complete_declaration_surface_languages: Vec::new(),
                 symbols: Vec::new(),
@@ -126,24 +193,37 @@ impl SemanticModelOverlay {
         let mut deferred_yields = Vec::new();
         let mut declaration_surface_languages: Vec<String> = Vec::new();
         let mut complete_declaration_surface_languages: Vec<String> = Vec::new();
-        for shard in active.shards() {
+        for shard in &active.shards() {
             if cancellation.is_cancelled() {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
             }
-            if let Some(payload) = shard.shard.runtime_values() {
+            if shard.descriptor.payload_kind == super::PayloadKind::DeclarationFacts {
+                if !declaration_surface_languages.contains(&shard.manifest.language) {
+                    declaration_surface_languages.push(shard.manifest.language.clone());
+                }
+                if shard.manifest.completeness == Completeness::Complete
+                    && !complete_declaration_surface_languages.contains(&shard.manifest.language)
+                {
+                    complete_declaration_surface_languages.push(shard.manifest.language.clone());
+                }
+            }
+            if shard.decoded.is_none() {
+                continue;
+            }
+            if let Some(payload) = shard.decoded().runtime_values() {
                 runtime_values.push(RuntimeValueContracts {
-                    provenance: provenance(
+                    provenance: Arc::new(provenance(
                         active,
                         shard,
                         "runtime-values",
                         &model_location(shard, "runtime-values", "runtime-values"),
                         None,
                         false,
-                    ),
+                    )),
                     payload: payload.clone(),
                 });
             }
-            if let Some(payload) = shard.shard.collection_flows() {
+            if let Some(payload) = shard.decoded().collection_flows() {
                 for flow in &payload.flows {
                     collection_flows.push(CollectionFlowContract {
                         provenance: provenance(
@@ -160,7 +240,7 @@ impl SemanticModelOverlay {
                     });
                 }
             }
-            if let Some(payload) = shard.shard.conditional_type_refinements() {
+            if let Some(payload) = shard.decoded().conditional_type_refinements() {
                 for fact in &payload.refinements {
                     conditional_type_refinements.push(ConditionalTypeRefinementContract {
                         provenance: provenance(
@@ -180,7 +260,7 @@ impl SemanticModelOverlay {
                     });
                 }
             }
-            if let Some(payload) = shard.shard.deferred_yields() {
+            if let Some(payload) = shard.decoded().deferred_yields() {
                 for contract in &payload.yields {
                     deferred_yields.push(DeferredYieldContract {
                         provenance: provenance(
@@ -199,17 +279,8 @@ impl SemanticModelOverlay {
                     });
                 }
             }
-            if shard.shard.payload().declaration_facts().is_some() {
-                if !declaration_surface_languages.contains(&shard.manifest.language) {
-                    declaration_surface_languages.push(shard.manifest.language.clone());
-                }
-                if shard.manifest.completeness == Completeness::Complete
-                    && !complete_declaration_surface_languages.contains(&shard.manifest.language)
-                {
-                    complete_declaration_surface_languages.push(shard.manifest.language.clone());
-                }
-            }
-            if let Some((types, members, relations)) = shard.shard.payload().declaration_facts() {
+            if let Some((types, members, relations)) = shard.decoded().payload().declaration_facts()
+            {
                 // A guarded record the pinned activation coordinates exclude
                 // is not in the matcher indexes, so collecting its identity
                 // here would only resolve to nothing (#1899).
@@ -235,122 +306,66 @@ impl SemanticModelOverlay {
         relation_ids.sort_unstable();
         relation_ids.dedup();
 
-        let mut symbols = Vec::new();
-        let mut hierarchy_relations = Vec::new();
+        let (mut symbols, mut relations) = overlay_declarations(
+            analyzer,
+            active,
+            cancellation,
+            type_ids,
+            member_ids,
+            relation_ids,
+        )?;
+        let row_source = active
+            .shards
+            .iter()
+            .any(|shard| shard.decoded.is_none())
+            .then(|| {
+                let generated = symbols
+                    .iter()
+                    .filter(|s| s.provenance.rule_id.is_some())
+                    .cloned()
+                    .collect();
+                let generated_relations = relations
+                    .iter()
+                    .filter(|r| r.provenance.rule_id.is_some())
+                    .cloned()
+                    .collect();
+                row_entry_points::RowOverlay::new(
+                    analyzer,
+                    active,
+                    generated,
+                    generated_relations,
+                    analyzer
+                        .snapshot_caches()
+                        .and_then(|c| c.semantic_models().native_inventory_store())
+                        .map(|store| store.cache_budget.clone()),
+                )
+            });
+        if let Some(rows) = &row_source {
+            rows.mark_identity_conflicts(&mut symbols);
+            symbols.retain(|symbol| !rows.row_language(&symbol.language));
+            relations.retain(|relation| {
+                !active.shards.iter().any(|shard| {
+                    shard.decoded.is_none()
+                        && shard.manifest.semantic_sha256 == relation.provenance.pack_digest
+                })
+            });
+        }
         let mut java_hierarchy = HashMap::default();
-        let mut qualified_types = HashMap::default();
-        for id in type_ids {
-            if cancellation.is_cancelled() {
-                return Err(SemanticModelOverlayBuildError::Cancelled);
-            }
-            let matched = active.types_with_id(&id);
-            let ambiguous = type_declaration_records_conflict(&matched);
-            for (index, activated) in matched.records.iter().enumerate() {
-                // Runtime claims are adjudicated by the ancestry consumer. Do
-                // not manufacture duplicate declaration identities from them.
-                // Raw active records remain available with their provenance.
-                if matched.records[..index].iter().any(|earlier| {
-                    earlier.record.runtime_bases != activated.record.runtime_bases
-                        && type_declarations_equivalent(earlier.record, activated.record)
-                }) {
-                    continue;
-                }
-                let symbol = type_symbol(
-                    analyzer,
-                    active,
-                    activated.shard,
-                    activated.record,
-                    ambiguous,
+        let composition_diagnostics =
+            composition::compose_eager(&mut symbols, &mut relations, active, cancellation)?;
+        // Read the selected owner after shared composition. A curated stub
+        // may share its local ID with the artifact and disagree structurally.
+        for symbol in symbols
+            .iter()
+            .filter(|s| s.language == "java" && s.owner_id.is_none())
+        {
+            if let Some(record) = owner_declaration(active, symbol) {
+                java_hierarchy.insert(
+                    symbol.id.clone(),
+                    (record.type_parameters.clone(), record.hierarchy.clone()),
                 );
-                if symbol.language == "java" && !ambiguous {
-                    java_hierarchy.insert(
-                        symbol.id.clone(),
-                        (
-                            activated.record.type_parameters.clone(),
-                            activated.record.hierarchy.clone(),
-                        ),
-                    );
-                }
-                if !ambiguous {
-                    qualified_types.insert(symbol.id.clone(), symbol.qualified_name.clone());
-                }
-                hierarchy_relations.extend(activated.record.hierarchy.iter().map(|hierarchy| {
-                    hierarchy_relation(
-                        active,
-                        activated.shard,
-                        &activated.record.id,
-                        hierarchy,
-                        ambiguous,
-                    )
-                }));
-                symbols.push(symbol);
             }
         }
-        for id in member_ids {
-            if cancellation.is_cancelled() {
-                return Err(SemanticModelOverlayBuildError::Cancelled);
-            }
-            let matched = active.members_with_id(&id);
-            let ambiguous = declaration_records_conflict(&matched);
-            for activated in matched.records {
-                symbols.push(member_symbol(
-                    analyzer,
-                    active,
-                    activated.shard,
-                    activated.record,
-                    qualified_types
-                        .get(&activated.record.owner)
-                        .map(String::as_str),
-                    ambiguous,
-                ));
-            }
-        }
-        let generated = generated_overlay_facts(analyzer, active, cancellation)?;
-        symbols.extend(generated.symbols);
-        mark_symbol_identity_conflicts(&mut symbols);
-        augment_go_overlay_surface(&mut symbols, &mut hierarchy_relations, cancellation)?;
-        mark_symbol_identity_conflicts(&mut symbols);
-        symbols.sort_by(|left, right| {
-            left.qualified_name
-                .cmp(&right.qualified_name)
-                .then_with(|| left.id.cmp(&right.id))
-                .then_with(|| {
-                    left.provenance
-                        .pack_digest
-                        .cmp(&right.provenance.pack_digest)
-                })
-        });
-
-        let mut relations = hierarchy_relations;
-        relations.extend(generated.relations);
-        for id in relation_ids {
-            if cancellation.is_cancelled() {
-                return Err(SemanticModelOverlayBuildError::Cancelled);
-            }
-            let matched = active.relations_with_id(&id);
-            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
-            for activated in matched.records {
-                relations.push(relation(
-                    active,
-                    activated.shard,
-                    activated.record,
-                    ambiguous,
-                ));
-            }
-        }
-        relations.sort_by(|left, right| {
-            left.from
-                .cmp(&right.from)
-                .then_with(|| {
-                    left.declaration_ordinal
-                        .is_some()
-                        .cmp(&right.declaration_ordinal.is_some())
-                })
-                .then_with(|| left.declaration_ordinal.cmp(&right.declaration_ordinal))
-                .then_with(|| left.to.cmp(&right.to))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
         let mut collection_flows_by_callable = HashMap::default();
         for (index, flow) in collection_flows.iter().enumerate() {
             collection_flows_by_callable
@@ -377,9 +392,11 @@ impl SemanticModelOverlay {
                 .push(index);
         }
         let mut overlay = Self {
+            row_source,
             active_model_set_hash: active.active_model_set_hash().to_string(),
+            composition_diagnostics: composition_diagnostics.into_iter().map(Arc::new).collect(),
             extraction_gaps: active.extraction_gaps().to_vec(),
-            extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
+            extraction_gap_by_declaration: extraction_gap_index(&active.extraction_gaps()),
             declaration_surface_languages,
             complete_declaration_surface_languages,
             generated_function_languages: symbols
@@ -387,8 +404,8 @@ impl SemanticModelOverlay {
                 .filter(|s| s.is_rule_generated_function())
                 .map(|s| s.language.clone())
                 .collect(),
-            symbols,
-            relations,
+            symbols: symbols.into_iter().map(Arc::new).collect(),
+            relations: relations.into_iter().map(Arc::new).collect(),
             java_hierarchy,
             symbols_by_id: HashMap::default(),
             symbols_by_name: HashMap::default(),
@@ -397,12 +414,15 @@ impl SemanticModelOverlay {
             symbols_by_owner: HashMap::default(),
             relations_from: HashMap::default(),
             relations_to: HashMap::default(),
-            runtime_values,
-            collection_flows,
+            runtime_values: runtime_values.into_iter().map(Arc::new).collect(),
+            collection_flows: collection_flows.into_iter().map(Arc::new).collect(),
             collection_flows_by_callable,
-            conditional_type_refinements,
+            conditional_type_refinements: conditional_type_refinements
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
             conditional_types_by_callable,
-            deferred_yields,
+            deferred_yields: deferred_yields.into_iter().map(Arc::new).collect(),
             deferred_yields_by_scope,
         };
         overlay.rebuild_indexes(cancellation)?;
@@ -414,6 +434,15 @@ impl SemanticModelOverlay {
             return Err(SemanticModelOverlayBuildError::RetainedBytesExceeded);
         }
         Ok(overlay)
+    }
+
+    pub fn composition_diagnostics(&self) -> Vec<Arc<SemanticModelCompositionDiagnostic>> {
+        let mut diagnostics = self.composition_diagnostics.clone();
+        if let Some(rows) = &self.row_source {
+            diagnostics.extend(rows.diagnostics());
+            composition::normalize_diagnostics(&mut diagnostics);
+        }
+        diagnostics
     }
 
     pub fn active_model_set_hash(&self) -> &str {
@@ -442,17 +471,17 @@ impl SemanticModelOverlay {
             .any(|surface| surface == language)
     }
 
-    pub fn gapped(&self, declaration: &str) -> Option<&ActivePackExtractionGap> {
+    pub fn gapped(&self, declaration: &str) -> Option<Arc<ActivePackExtractionGap>> {
         self.extraction_gap_by_declaration
             .get(declaration)
-            .map(|index| &self.extraction_gaps[*index])
+            .map(|index| Arc::clone(&self.extraction_gaps[*index]))
     }
 
     pub fn gapped_member_surface(
         &self,
         owner: &str,
         member: &str,
-    ) -> Option<&ActivePackExtractionGap> {
+    ) -> Option<Arc<ActivePackExtractionGap>> {
         let declaration = format!("{owner}.{member}");
         self.gapped(&declaration).or_else(|| self.gapped(owner))
     }
@@ -460,39 +489,148 @@ impl SemanticModelOverlay {
     #[doc(hidden)]
     pub fn has_generated_functions(&self, language: &str) -> bool {
         self.generated_function_languages.contains(language)
+            || self
+                .row_source
+                .as_ref()
+                .is_some_and(|rows| rows.has_generated_functions(language))
     }
 
-    pub fn symbols(&self) -> &[SemanticModelSymbol] {
-        &self.symbols
+    pub fn symbols(&self) -> Vec<Arc<SemanticModelSymbol>> {
+        match &self.row_source {
+            Some(rows) => crate::analyzer::store::active_models::merge_ordered_semantic_results(
+                self.symbols.clone(),
+                rows.symbols(None).0,
+                |a, b| composition::symbol_source_order(a, b),
+            ),
+            None => self.symbols.clone(),
+        }
     }
 
-    pub fn relations(&self) -> &[SemanticModelRelation] {
-        &self.relations
+    pub fn relations(&self) -> Vec<Arc<SemanticModelRelation>> {
+        match &self.row_source {
+            Some(rows) => crate::analyzer::store::active_models::merge_ordered_semantic_results(
+                self.relations.clone(),
+                rows.relations(),
+                |a, b| composition::relation_source_order(a, b),
+            ),
+            None => self.relations.clone(),
+        }
     }
 
     /// Runtime-value contracts retained from the same immutable active-model
     /// publication as declaration symbols. Callers must inspect each record's
     /// typed coverage and activation evidence before claiming an exact read.
-    pub fn runtime_value_contracts(&self) -> &[RuntimeValueContracts] {
-        &self.runtime_values
+    pub fn runtime_value_contracts(&self) -> Vec<Arc<RuntimeValueContracts>> {
+        match &self.row_source {
+            Some(rows) => {
+                rows.merge_contracts(self.runtime_values.clone(), rows.runtime_values(), |r| {
+                    &r.provenance
+                })
+            }
+            None => self.runtime_values.clone(),
+        }
     }
 
-    pub fn collection_flow_contracts(&self) -> &[CollectionFlowContract] {
-        &self.collection_flows
+    pub fn collection_flow_contracts(&self) -> Vec<Arc<CollectionFlowContract>> {
+        match &self.row_source {
+            Some(rows) => rows.merge_contracts(self.collection_flows.clone(),rows.collection_flows("ALL_COLLECTION_FLOWS",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::ALL_COLLECTION_FLOWS,[]),|r|&r.provenance),
+            None => self.collection_flows.clone(),
+        }
     }
 
     pub fn collection_flows_for(
         &self,
         callable: &str,
-    ) -> SemanticModelOverlayMatch<'_, CollectionFlowContract> {
-        self.collection_flow_match(self.collection_flows_by_callable.get(callable))
+    ) -> SemanticModelOverlayMatch<CollectionFlowContract> {
+        if let Some(rows) = &self.row_source {
+            let symbols = self.symbols_with_id(callable);
+            let contributors = symbols
+                .records
+                .iter()
+                .flat_map(|s| &s.semantic_contributors)
+                .collect::<Vec<_>>();
+            let mut ids = contributors
+                .iter()
+                .map(|c| c.record_id.clone())
+                .collect::<Vec<_>>();
+            ids.push(callable.to_owned());
+            ids.sort_unstable();
+            ids.dedup();
+            let facts = rows.merge_contracts(self.collection_flows.iter().filter(|f|ids.contains(&f.callable)).cloned().collect(), rows.collection_flows("COLLECTION_FLOWS",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::COLLECTION_FLOWS,rusqlite::named_params! { ":callable_ids":serde_json::to_string(&ids).expect("IDs serialize") }),|r|&r.provenance);
+            let contributed = contributors
+                .into_iter()
+                .flat_map(|c| {
+                    facts
+                        .iter()
+                        .filter(move |f| {
+                            f.callable == c.record_id
+                                && c.pack_digest == f.provenance.pack_digest
+                                && c.activation == f.provenance.activation
+                        })
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            let has_contributors = !contributed.is_empty();
+            let records = if contributed.is_empty() {
+                facts
+                    .into_iter()
+                    .filter(|f| f.callable == callable)
+                    .collect()
+            } else {
+                contributed
+            };
+            let disposition = if records.is_empty() {
+                SemanticModelOverlayDisposition::Empty
+            } else if records.len() > 1
+                || (!has_contributors && records.iter().any(|f| f.provenance.ambiguous))
+            {
+                SemanticModelOverlayDisposition::Conflict
+            } else {
+                SemanticModelOverlayDisposition::Unique
+            };
+            return SemanticModelOverlayMatch {
+                records,
+                disposition,
+            };
+        }
+        let symbols = self.symbols_with_id(callable);
+        let contributors = symbols
+            .records
+            .iter()
+            .flat_map(|symbol| &symbol.semantic_contributors)
+            .collect::<Vec<_>>();
+        let contributed = contributors
+            .into_iter()
+            .flat_map(|contributor| {
+                self.collection_flows_by_callable
+                    .get(&contributor.record_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|index| Arc::clone(&self.collection_flows[*index]))
+                    .filter(move |flow| {
+                        contributor.pack_digest == flow.provenance.pack_digest
+                            && contributor.activation == flow.provenance.activation
+                    })
+            })
+            .collect::<Vec<_>>();
+        if contributed.is_empty() {
+            return self.collection_flow_match(self.collection_flows_by_callable.get(callable));
+        }
+        SemanticModelOverlayMatch {
+            disposition: if contributed.len() == 1 {
+                SemanticModelOverlayDisposition::Unique
+            } else {
+                SemanticModelOverlayDisposition::Conflict
+            },
+            records: contributed,
+        }
     }
 
     #[doc(hidden)]
     pub fn unique_complete_collection_flow(
         &self,
         callable: &str,
-    ) -> Option<&CollectionFlowContract> {
+    ) -> Option<Arc<CollectionFlowContract>> {
         let flows = self.collection_flows_for(callable);
         if flows.disposition != SemanticModelOverlayDisposition::Unique {
             return None;
@@ -500,28 +638,87 @@ impl SemanticModelOverlay {
         let [flow] = flows.records.as_slice() else {
             return None;
         };
-        flow.is_complete().then_some(flow)
+        flow.is_complete().then(|| Arc::clone(flow))
     }
 
     /// Local declaration IDs are meaningful only within the publishing pack.
     pub fn conditional_type_refinements_for<'a>(
         &'a self,
         callable: &'a SemanticModelSymbol,
-    ) -> impl Iterator<Item = &'a ConditionalTypeRefinementContract> + 'a {
-        self.conditional_types_by_callable
-            .get(&callable.id)
-            .into_iter()
-            .flatten()
-            .map(|index| &self.conditional_type_refinements[*index])
-            .filter(|fact| {
-                fact.provenance.pack_digest == callable.provenance.pack_digest
-                    && fact.provenance.pack_id == callable.provenance.pack_id
-                    && fact.provenance.activation == callable.provenance.activation
-            })
+    ) -> impl Iterator<Item = Arc<ConditionalTypeRefinementContract>> + 'a {
+        let row_records = self.row_source.as_ref().map(|rows| {
+            let contributors = std::iter::once(&callable.provenance)
+                .chain(&callable.semantic_contributors)
+                .collect::<Vec<_>>();
+            let mut ids = contributors
+                .iter()
+                .map(|c| c.record_id.clone())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            let facts = rows.merge_contracts(
+                self.conditional_type_refinements
+                    .iter()
+                    .filter(|f| ids.contains(&f.payload.callable))
+                    .cloned()
+                    .collect(),
+                rows.refinements(&ids),
+                |r| &r.provenance,
+            );
+            contributors
+                .into_iter()
+                .flat_map(|c| {
+                    facts
+                        .iter()
+                        .filter(move |f| {
+                            f.payload.callable == c.record_id
+                                && f.provenance.pack_digest == c.pack_digest
+                                && f.provenance.pack_id == c.pack_id
+                                && f.provenance.activation == c.activation
+                        })
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        });
+        crate::analyzer::store::active_models::query_or_posting(
+            row_records,
+            std::iter::once(&callable.provenance)
+                .chain(&callable.semantic_contributors)
+                .flat_map(move |contributor| {
+                    self.conditional_types_by_callable
+                        .get(&contributor.record_id)
+                        .into_iter()
+                        .flatten()
+                        .map(|index| Arc::clone(&self.conditional_type_refinements[*index]))
+                        .filter(move |fact| {
+                            fact.provenance.pack_digest == contributor.pack_digest
+                                && fact.provenance.pack_id == contributor.pack_id
+                                && fact.provenance.activation == contributor.activation
+                        })
+                }),
+        )
     }
 
-    pub fn deferred_yield_contracts(&self) -> &[DeferredYieldContract] {
-        &self.deferred_yields
+    fn has_semantic_contributor(
+        &self,
+        symbol_id: &str,
+        record_id: &str,
+        provenance: &SemanticModelProvenance,
+    ) -> bool {
+        self.symbol_candidates_with_id(symbol_id).any(|symbol| {
+            symbol.semantic_contributors.iter().any(|contributor| {
+                contributor.record_id == record_id
+                    && contributor.pack_digest == provenance.pack_digest
+                    && contributor.activation == provenance.activation
+            })
+        })
+    }
+
+    pub fn deferred_yield_contracts(&self) -> Vec<Arc<DeferredYieldContract>> {
+        match &self.row_source {
+            Some(rows) => rows.merge_contracts(self.deferred_yields.clone(),rows.deferred_yields("ALL_DEFERRED_YIELDS",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::ALL_DEFERRED_YIELDS,[]),|r|&r.provenance),
+            None => self.deferred_yields.clone(),
+        }
     }
 
     pub fn deferred_yields_for(
@@ -529,23 +726,93 @@ impl SemanticModelOverlay {
         factory: &str,
         resume: &str,
         handle_type: &str,
-    ) -> SemanticModelOverlayMatch<'_, DeferredYieldContract> {
-        self.deferred_yield_match(self.deferred_yields_by_scope.get(&(
-            factory.to_owned(),
-            resume.to_owned(),
-            handle_type.to_owned(),
-        )))
+    ) -> SemanticModelOverlayMatch<DeferredYieldContract> {
+        if let Some(rows) = &self.row_source {
+            let symbols = self.symbols_with_id(factory);
+            let mut ids = symbols
+                .records
+                .iter()
+                .flat_map(|s| &s.semantic_contributors)
+                .map(|c| c.record_id.clone())
+                .collect::<Vec<_>>();
+            ids.push(factory.to_owned());
+            ids.sort_unstable();
+            ids.dedup();
+            let facts = rows.merge_contracts(self.deferred_yields.iter().filter(|f|ids.contains(&f.factory) && f.resume==resume && f.handle_type==handle_type).cloned().collect(),rows.deferred_yields("DEFERRED_YIELDS",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::DEFERRED_YIELDS,rusqlite::named_params!{ ":factory_ids":serde_json::to_string(&ids).expect("IDs serialize"),":resume":resume,":handle_type":handle_type }),|r|&r.provenance);
+            let contributed = facts
+                .iter()
+                .filter(|f| self.has_semantic_contributor(factory, &f.factory, &f.provenance))
+                .cloned()
+                .collect::<Vec<_>>();
+            let records = if contributed.is_empty() {
+                facts.into_iter().filter(|f| f.factory == factory).collect()
+            } else {
+                contributed
+            };
+            return Self::deferred_records_match(records);
+        }
+        let contributed = self
+            .deferred_yields
+            .iter()
+            .enumerate()
+            .filter(|(_, contract)| {
+                contract.resume == resume
+                    && contract.handle_type == handle_type
+                    && self.has_semantic_contributor(
+                        factory,
+                        &contract.factory,
+                        &contract.provenance,
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if contributed.is_empty() {
+            self.deferred_yield_match(self.deferred_yields_by_scope.get(&(
+                factory.to_owned(),
+                resume.to_owned(),
+                handle_type.to_owned(),
+            )))
+        } else {
+            self.deferred_yield_match(Some(&contributed))
+        }
     }
 
     pub fn deferred_yields_for_factory(
         &self,
         factory: &str,
-    ) -> SemanticModelOverlayMatch<'_, DeferredYieldContract> {
-        let mut records = self
-            .deferred_yields
+    ) -> SemanticModelOverlayMatch<DeferredYieldContract> {
+        let facts = match &self.row_source {
+            Some(rows) => {
+                let symbols = self.symbols_with_id(factory);
+                let mut ids = symbols
+                    .records
+                    .iter()
+                    .flat_map(|s| &s.semantic_contributors)
+                    .map(|c| c.record_id.clone())
+                    .collect::<Vec<_>>();
+                ids.push(factory.to_owned());
+                ids.sort_unstable();
+                ids.dedup();
+                rows.merge_contracts(self.deferred_yields.iter().filter(|f|ids.contains(&f.factory)).cloned().collect(), rows.deferred_yields("DEFERRED_YIELDS_BY_FACTORY",brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::DEFERRED_YIELDS_BY_FACTORY,rusqlite::named_params! { ":factory_ids":serde_json::to_string(&ids).expect("IDs serialize") }),|r|&r.provenance)
+            }
+            None => self.deferred_yields.clone(),
+        };
+        let contributed = facts
             .iter()
-            .filter(|contract| contract.factory == factory)
+            .filter(|contract| {
+                self.has_semantic_contributor(factory, &contract.factory, &contract.provenance)
+            })
+            .cloned()
             .collect::<Vec<_>>();
+        let mut records = if contributed.is_empty() {
+            facts
+                .iter()
+                .filter(|contract| contract.factory == factory)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            contributed
+        };
         records.sort_by(|left, right| {
             (&left.resume, &left.handle_type).cmp(&(&right.resume, &right.handle_type))
         });
@@ -564,8 +831,9 @@ impl SemanticModelOverlay {
         &self,
         binding_name: &str,
         language: &str,
-    ) -> Vec<(&RuntimeGlobalExposure, &SemanticModelProvenance)> {
-        self.runtime_values
+    ) -> Vec<(Arc<RuntimeGlobalExposure>, Arc<SemanticModelProvenance>)> {
+        let decoded = self
+            .runtime_values
             .iter()
             .flat_map(|contracts| {
                 contracts
@@ -578,42 +846,137 @@ impl SemanticModelOverlay {
                                 .iter()
                                 .any(|candidate| candidate == language)
                     })
-                    .map(move |exposure| (exposure, &contracts.provenance))
+                    .map(move |exposure| (Arc::clone(exposure), Arc::clone(&contracts.provenance)))
             })
+            .collect::<Vec<_>>();
+        match &self.row_source {
+            None => decoded,
+            Some(rows) => rows
+                .merge_contracts(
+                    decoded.into_iter().map(Arc::new).collect(),
+                    rows.runtime_exposures(binding_name, language)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect(),
+                    |r| &r.1,
+                )
+                .into_iter()
+                .map(Arc::unwrap_or_clone)
+                .collect(),
+        }
+    }
+
+    pub fn symbols_with_id(&self, id: &str) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let decoded = self.symbol_match(self.symbols_by_id.get(id));
+        match &self.row_source {
+            Some(rows) => Self::merge_symbol_answers(decoded, rows.symbols_with_id(id)),
+            None => decoded,
+        }
+    }
+
+    pub fn symbols_named(&self, name: &str) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let decoded = self.symbol_match(self.symbols_by_name.get(name));
+        match &self.row_source {
+            Some(rows) => Self::merge_symbol_answers(decoded, rows.symbols_named(name)),
+            None => decoded,
+        }
+    }
+
+    fn merge_symbol_answers(
+        decoded: SemanticModelOverlayMatch<SemanticModelSymbol>,
+        rows: Vec<Arc<SemanticModelSymbol>>,
+    ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let records = crate::analyzer::store::active_models::merge_ordered_semantic_results(
+            decoded.records,
+            rows,
+            |a, b| composition::symbol_source_order(a, b),
+        );
+        SemanticModelOverlayMatch {
+            disposition: disposition(&records, |record| record.provenance.ambiguous),
+            records,
+        }
+    }
+
+    /// Trait owners with a direct callable member of this exact name, in
+    /// overlay symbol order. Aliases and inherited members do not qualify.
+    pub fn trait_owners_with_callable_member(&self, name: &str) -> Vec<Arc<SemanticModelSymbol>> {
+        if self.row_source.is_some() {
+            let mut owners = Vec::new();
+            for member in self.symbol_candidates_named(name) {
+                if member.name != name || !symbol_kind_is_callable(member.kind) {
+                    continue;
+                }
+                if let Some(owner) = &member.owner_id {
+                    owners
+                        .extend(self.symbol_candidates_with_id(owner).filter(|s| {
+                            s.id == *owner && s.kind == SemanticModelSymbolKind::Trait
+                        }));
+                }
+            }
+            owners.sort_by(|a, b| composition::symbol_source_order(a, b));
+            owners.dedup_by(|a, b| a == b);
+            return owners;
+        }
+        let mut owners = Vec::new();
+        for member in self.symbol_candidates_named(name) {
+            if member.name != name || !symbol_kind_is_callable(member.kind) {
+                continue;
+            }
+            let Some(owner_id) = member.owner_id.as_deref() else {
+                continue;
+            };
+            if let Some(indices) = self.symbols_by_id.get(owner_id) {
+                owners.extend(indices.iter().copied().filter(|index| {
+                    let owner = &self.symbols[*index];
+                    owner.id == owner_id && owner.kind == SemanticModelSymbolKind::Trait
+                }));
+            }
+        }
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+            .into_iter()
+            .map(|index| Arc::clone(&self.symbols[index]))
             .collect()
-    }
-
-    pub fn symbols_with_id(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
-        self.symbol_match(self.symbols_by_id.get(id))
-    }
-
-    pub fn symbols_named(&self, name: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
-        self.symbol_match(self.symbols_by_name.get(name))
     }
 
     /// Streaming access to existing unique postings. Callers with a query
     /// ledger charge each candidate before retaining or selecting it.
-    pub(crate) fn symbol_candidates_named<'a>(
-        &'a self,
+    pub(crate) fn symbol_candidates_named(
+        &self,
         name: &str,
-    ) -> impl Iterator<Item = &'a SemanticModelSymbol> + 'a {
-        self.symbols_by_name
-            .get(name)
-            .into_iter()
-            .flatten()
-            .map(move |index| &self.symbols[*index])
+    ) -> impl Iterator<Item = Arc<SemanticModelSymbol>> {
+        let rows = self
+            .row_source
+            .as_ref()
+            .map(|_| self.symbols_named(name).records);
+        crate::analyzer::store::active_models::query_or_posting(
+            rows,
+            self.symbols_by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(move |index| Arc::clone(&self.symbols[*index])),
+        )
     }
 
     #[doc(hidden)]
-    pub fn symbol_candidates_with_id<'a>(
-        &'a self,
+    pub fn symbol_candidates_with_id(
+        &self,
         id: &str,
-    ) -> impl Iterator<Item = &'a SemanticModelSymbol> + 'a {
-        self.symbols_by_id
-            .get(id)
-            .into_iter()
-            .flatten()
-            .map(move |index| &self.symbols[*index])
+    ) -> impl Iterator<Item = Arc<SemanticModelSymbol>> {
+        let rows = self
+            .row_source
+            .as_ref()
+            .map(|_| self.symbols_with_id(id).records);
+        crate::analyzer::store::active_models::query_or_posting(
+            rows,
+            self.symbols_by_id
+                .get(id)
+                .into_iter()
+                .flatten()
+                .map(move |index| Arc::clone(&self.symbols[*index])),
+        )
     }
 
     #[doc(hidden)]
@@ -621,12 +984,12 @@ impl SemanticModelOverlay {
         &self,
         qualified_name: &str,
         language: &str,
-    ) -> Option<&SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let matched = self.symbols_named(qualified_name);
         let symbol = (matched.disposition == SemanticModelOverlayDisposition::Unique)
-            .then(|| matched.records.first().copied())
+            .then(|| matched.records.first().cloned())
             .flatten()?;
-        Self::symbol_is_visible_public(symbol, language).then_some(symbol)
+        Self::symbol_is_visible_public(&symbol, language).then_some(symbol)
     }
 
     #[doc(hidden)]
@@ -634,19 +997,31 @@ impl SemanticModelOverlay {
         symbol.language == language && symbol.visibility == Visibility::Public
     }
 
-    pub fn symbols_at_uri(&self, uri: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
-        self.symbol_match(self.symbols_by_uri.get(uri))
+    pub fn symbols_at_uri(&self, uri: &str) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let decoded = self.symbol_match(self.symbols_by_uri.get(uri));
+        match &self.row_source {
+            Some(rows) => Self::merge_symbol_answers(decoded, rows.symbols_at_uri(uri)),
+            None => decoded,
+        }
     }
 
     pub fn symbols_at_authored_path(
         &self,
         path: &str,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
-        self.symbol_match(self.symbols_by_authored_path.get(path))
+    ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let decoded = self.symbol_match(self.symbols_by_authored_path.get(path));
+        match &self.row_source {
+            Some(rows) => Self::merge_symbol_answers(decoded, rows.symbols_at_authored_path(path)),
+            None => decoded,
+        }
     }
 
-    pub fn members_of(&self, owner_id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
-        self.symbol_match(self.symbols_by_owner.get(owner_id))
+    pub fn members_of(&self, owner_id: &str) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let decoded = self.symbol_match(self.symbols_by_owner.get(owner_id));
+        match &self.row_source {
+            Some(rows) => Self::merge_symbol_answers(decoded, rows.members_of(owner_id)),
+            None => decoded,
+        }
     }
 
     /// Return owner members with this exact symbol name and their disposition.
@@ -654,7 +1029,7 @@ impl SemanticModelOverlay {
         &self,
         owner_id: &str,
         name: &str,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+    ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
         let records = self
             .members_of(owner_id)
             .records
@@ -684,7 +1059,7 @@ impl SemanticModelOverlay {
         &self,
         owner_id: &str,
         member_name: &str,
-    ) -> SemanticModelMemberTargetMatch<'_> {
+    ) -> SemanticModelMemberTargetMatch {
         let owners = self.symbols_with_id(owner_id);
         if owners.disposition == SemanticModelOverlayDisposition::Conflict
             || owners.records.len() > 1
@@ -793,7 +1168,7 @@ impl SemanticModelOverlay {
         &self,
         owner_id: &str,
         operation: &ImplicitOperation,
-    ) -> SemanticModelMemberTargetMatch<'_> {
+    ) -> SemanticModelMemberTargetMatch {
         self.role_member_target_on_owner(owner_id, &|member: &SemanticModelSymbol| {
             member.implicit_operation.as_ref() == Some(operation)
         })
@@ -820,7 +1195,7 @@ impl SemanticModelOverlay {
         owner_id: &str,
         name: &str,
         argument_count: usize,
-    ) -> SemanticModelExplicitOperationMatch<'_> {
+    ) -> SemanticModelExplicitOperationMatch {
         let owners = self.symbols_with_id(owner_id);
         if owners.disposition == SemanticModelOverlayDisposition::Conflict
             || owners.records.len() > 1
@@ -914,7 +1289,7 @@ impl SemanticModelOverlay {
         &self,
         owner_id: &str,
         selects: &dyn Fn(&SemanticModelSymbol) -> bool,
-    ) -> SemanticModelMemberTargetMatch<'_> {
+    ) -> SemanticModelMemberTargetMatch {
         let owners = self.symbols_with_id(owner_id);
         if owners.disposition == SemanticModelOverlayDisposition::Conflict
             || owners.records.len() > 1
@@ -999,7 +1374,7 @@ impl SemanticModelOverlay {
         &self,
         receiver: &str,
         member: &str,
-    ) -> Option<&SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let reference = format!("{receiver}.{member}");
         let mut direct = self
             .symbols_named(&reference)
@@ -1016,7 +1391,7 @@ impl SemanticModelOverlay {
         direct.sort_by(|left, right| left.id.cmp(&right.id));
         direct.dedup_by(|left, right| left.id == right.id);
         if let [symbol] = direct.as_slice() {
-            return Some(*symbol);
+            return Some(Arc::clone(symbol));
         }
         if !direct.is_empty() {
             return None;
@@ -1082,7 +1457,7 @@ impl SemanticModelOverlay {
         members.sort_by(|left, right| left.id.cmp(&right.id));
         members.dedup_by(|left, right| left.id == right.id);
         match members.as_slice() {
-            [symbol] => Some(*symbol),
+            [symbol] => Some(Arc::clone(symbol)),
             _ => None,
         }
     }
@@ -1095,7 +1470,7 @@ impl SemanticModelOverlay {
     pub fn callable_for_target(
         &self,
         key: SemanticModelCallableKey<'_>,
-    ) -> SemanticModelCallableMatch<'_> {
+    ) -> SemanticModelCallableMatch {
         let application = SemanticModelCallApplication::positional(key.parameter_count);
         self.callable_for_application(key, &application)
     }
@@ -1164,12 +1539,12 @@ impl SemanticModelOverlay {
     /// original declaration facts retain generic arguments erased by name edges.
     /// Rust ranks all visible traits, whereas JVM consumers retain first match.
     #[doc(hidden)]
-    pub fn callable_owners_on_surface<'a>(
-        &'a self,
+    pub fn callable_owners_on_surface(
+        &self,
         active: &ResolvedActiveSemanticModels,
-        owner: &'a SemanticModelSymbol,
+        owner: &Arc<SemanticModelSymbol>,
         member: &str,
-    ) -> Option<Vec<SemanticModelCallableOwner<'a>>> {
+    ) -> Option<Vec<SemanticModelCallableOwner>> {
         let surface = self.owner_surface(owner);
         if surface.gaps.iter().any(|gap| {
             matches!(
@@ -1182,14 +1557,14 @@ impl SemanticModelOverlay {
         }
         // Partial inventories retain positive typed implementation paths. The
         // callable matcher, not whole-pack absence, certifies a complete family.
-        let mut candidates: Vec<SemanticModelCallableOwner<'_>> = Vec::new();
-        let mut pending = vec![(owner, Vec::<HierarchyFact>::new())];
+        let mut candidates: Vec<SemanticModelCallableOwner> = Vec::new();
+        let mut pending = vec![(Arc::clone(owner), Vec::<HierarchyFact>::new())];
         let mut expanded = HashSet::default();
         while let Some((declaring, path)) = pending.pop() {
             // Expand an instantiated owner once. Retaining every route through
             // a diamond would grow exponentially even though it adds no member.
             if !expanded.insert((
-                declaring.id.as_str(),
+                declaring.id.clone(),
                 path.last().map(|edge| edge.target.clone()),
             )) {
                 continue;
@@ -1206,39 +1581,37 @@ impl SemanticModelOverlay {
                 })
             {
                 candidates.push(SemanticModelCallableOwner {
-                    owner: declaring,
+                    owner: Arc::clone(&declaring),
                     hierarchy: path.clone(),
                 });
             }
-            let ancestors = self.direct_ancestors_of(declaring);
-            let declarations = active.types_with_id(&declaring.id);
-            for declaration in declarations.records {
-                for edge in &declaration.record.hierarchy {
-                    let target = match &edge.target {
-                        TypeRef::Named { name, .. } => name,
-                        TypeRef::Declared { id, .. } => id,
-                        _ => return None,
-                    };
-                    let resolved = self.resolve_edge_target(
-                        target,
-                        &declaring.language,
-                        HierarchyTargetShape::Type,
-                    );
-                    if resolved.defect.is_some() {
-                        return None;
+            let ancestors = self.direct_ancestors_of(&declaring);
+            let declaration = owner_declaration(active, &declaring)?;
+            for edge in &declaration.hierarchy {
+                let target = match &edge.target {
+                    TypeRef::Named { name, .. } => name,
+                    TypeRef::Declared { id, .. } => id,
+                    _ => return None,
+                };
+                let resolved = self.resolve_edge_target(
+                    target,
+                    &declaring.language,
+                    HierarchyTargetShape::Type,
+                );
+                if resolved.defect.is_some() {
+                    return None;
+                }
+                for ancestor in resolved.records {
+                    if !ancestors
+                        .records
+                        .iter()
+                        .any(|allowed| allowed.id == ancestor.id)
+                    {
+                        continue;
                     }
-                    for ancestor in resolved.records {
-                        if !ancestors
-                            .records
-                            .iter()
-                            .any(|allowed| allowed.id == ancestor.id)
-                        {
-                            continue;
-                        }
-                        let mut hierarchy = path.clone();
-                        hierarchy.push(edge.clone());
-                        pending.push((ancestor, hierarchy));
-                    }
+                    let mut hierarchy = path.clone();
+                    hierarchy.push(edge.clone());
+                    pending.push((ancestor, hierarchy));
                 }
             }
         }
@@ -1258,7 +1631,7 @@ impl SemanticModelOverlay {
         &self,
         key: SemanticModelCallableKey<'_>,
         application: &SemanticModelCallApplication,
-    ) -> SemanticModelCallableMatch<'_> {
+    ) -> SemanticModelCallableMatch {
         let Some((_, _, has_spread)) = application.written() else {
             return SemanticModelCallableMatch {
                 records: Vec::new(),
@@ -1293,8 +1666,8 @@ impl SemanticModelOverlay {
             for member in self.members_of(owner_id).records {
                 if member.language != key.language
                     || member.name != key.member
-                    || !member_is_callable(member)
-                    || member_has_receiver(member) != key.has_receiver
+                    || !member_is_callable(&member)
+                    || member_has_receiver(&member) != key.has_receiver
                 {
                     continue;
                 }
@@ -1400,12 +1773,19 @@ impl SemanticModelOverlay {
                         && member_is_callable(member)
                         && member_has_receiver(member) == key.has_receiver
                 })
-                .eq(candidates.iter().copied());
+                .eq(candidates.iter().cloned());
+        // Rust trait declarations enumerate their own methods even in a partial
+        // artifact pack. This closes declaration binding, never implementation dispatch.
+        let rust_trait_declaration_is_closed = key.language == "rust"
+            && owners.len() == 1
+            && owners[0].kind == SemanticModelSymbolKind::Trait
+            && candidates.len() == 1;
         let disposition = if owner_model_is_ambiguous || candidate_model_is_ambiguous {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::AmbiguousModel,
             )
         } else if !python_single_declaration_has_shape
+            && !rust_trait_declaration_is_closed
             && ((owner_model_is_partial && !callable_family_is_complete)
                 || candidate_model_is_partial)
         {
@@ -1467,31 +1847,32 @@ impl SemanticModelOverlay {
     fn callable_owner_candidates(
         &self,
         key: SemanticModelCallableKey<'_>,
-    ) -> Vec<&SemanticModelSymbol> {
+    ) -> Vec<Arc<SemanticModelSymbol>> {
         let owners = self
             .symbols_named(key.owner)
             .records
             .into_iter()
             .filter(|owner| {
                 owner.owner_id.is_none()
-                    && owner.qualified_name == key.owner
+                    && (owner.qualified_name == key.owner
+                        || owner.aliases.iter().any(|alias| alias == key.owner))
                     && owner.language == key.language
             })
             .collect::<Vec<_>>();
         let matching = owners
             .iter()
-            .copied()
-            .filter(|owner| {
+            .filter(|&owner| {
                 self.members_of(&owner.id)
                     .records
                     .into_iter()
                     .any(|member| {
                         member.language == key.language
                             && member.name == key.member
-                            && member_is_callable(member)
-                            && member_has_receiver(member) == key.has_receiver
+                            && member_is_callable(&member)
+                            && member_has_receiver(&member) == key.has_receiver
                     })
             })
+            .cloned()
             .collect::<Vec<_>>();
         if matching.is_empty() {
             owners
@@ -1500,32 +1881,47 @@ impl SemanticModelOverlay {
         }
     }
 
-    pub fn search<'a>(
-        &'a self,
+    pub fn search(
+        &self,
         patterns: &crate::analyzer::SearchSymbolPatternBatch,
-    ) -> Vec<&'a SemanticModelSymbol> {
+    ) -> Vec<Arc<SemanticModelSymbol>> {
         self.search_with_limit(patterns, usize::MAX, None).0
     }
 
-    pub fn search_with_limit<'a>(
-        &'a self,
+    pub fn search_with_limit(
+        &self,
         patterns: &crate::analyzer::SearchSymbolPatternBatch,
         limit: usize,
         cancellation: Option<&crate::CancellationToken>,
-    ) -> (Vec<&'a SemanticModelSymbol>, usize, bool) {
+    ) -> (Vec<Arc<SemanticModelSymbol>>, usize, bool) {
         self.search_with_limit_filter(patterns, limit, cancellation, |_| true)
     }
 
-    pub fn search_with_limit_filter<'a>(
-        &'a self,
+    pub fn search_with_limit_filter(
+        &self,
         patterns: &crate::analyzer::SearchSymbolPatternBatch,
         limit: usize,
         cancellation: Option<&crate::CancellationToken>,
         include: impl Fn(&SemanticModelSymbol) -> bool,
-    ) -> (Vec<&'a SemanticModelSymbol>, usize, bool) {
+    ) -> (Vec<Arc<SemanticModelSymbol>>, usize, bool) {
         let mut records = Vec::new();
         let mut total = 0usize;
-        for symbol in &self.symbols {
+        let row_records = self
+            .row_source
+            .as_ref()
+            .map(|rows| rows.search_symbols(patterns, cancellation));
+        let complete = row_records.as_ref().is_none_or(|(_, complete)| *complete);
+        let candidates = match row_records {
+            Some((rows, _)) => {
+                crate::analyzer::store::active_models::merge_ordered_semantic_results(
+                    self.symbols.clone(),
+                    rows,
+                    |a, b| composition::symbol_source_order(a, b),
+                )
+            }
+            None => self.symbols.clone(),
+        };
+        for symbol in &candidates {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return (records, total, false);
             }
@@ -1535,36 +1931,74 @@ impl SemanticModelOverlay {
             if matched && symbol.externally_visible() && include(symbol) {
                 total = total.saturating_add(1);
                 if records.len() < limit {
-                    records.push(symbol);
+                    records.push(Arc::clone(symbol));
                 }
             }
         }
-        (records, total, true)
+        (records, total, complete)
     }
 
-    pub fn relations_from(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelRelation> {
-        self.relation_match(self.relations_from.get(id))
+    pub fn relations_from(&self, id: &str) -> SemanticModelOverlayMatch<SemanticModelRelation> {
+        let decoded = self.relation_match(self.relations_from.get(id));
+        match &self.row_source {
+            Some(rows) => Self::merge_relation_answers(decoded, rows.relations_from(id)),
+            None => decoded,
+        }
     }
 
-    pub fn relations_to(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelRelation> {
-        self.relation_match(self.relations_to.get(id))
+    pub fn relations_to(&self, id: &str) -> SemanticModelOverlayMatch<SemanticModelRelation> {
+        let decoded = self.relation_match(self.relations_to.get(id));
+        match &self.row_source {
+            Some(rows) => Self::merge_relation_answers(decoded, rows.relations_to(id)),
+            None => decoded,
+        }
+    }
+
+    fn merge_relation_answers(
+        decoded: SemanticModelOverlayMatch<SemanticModelRelation>,
+        rows: Vec<Arc<SemanticModelRelation>>,
+    ) -> SemanticModelOverlayMatch<SemanticModelRelation> {
+        let records = crate::analyzer::store::active_models::merge_ordered_semantic_results(
+            decoded.records,
+            rows,
+            |a, b| composition::relation_source_order(a, b),
+        );
+        let disposition = if records.is_empty() {
+            SemanticModelOverlayDisposition::Empty
+        } else if records.iter().any(|r| r.provenance.ambiguous) {
+            SemanticModelOverlayDisposition::Conflict
+        } else {
+            SemanticModelOverlayDisposition::Unique
+        };
+        SemanticModelOverlayMatch {
+            records,
+            disposition,
+        }
     }
 
     /// Resolve a model type's transitive ancestors without materializing
     /// universal-root edges for every declaration in the overlay.
-    pub fn ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry<'_> {
+    pub fn ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry {
         let mut records = Vec::new();
         let mut defects = Vec::new();
-        let mut queue = VecDeque::from([symbol]);
-        let mut seen = HashSet::from_iter([symbol.id.as_str()]);
+        let mut queue = VecDeque::new();
+        let mut seed = Some(symbol);
+        let mut seen = HashSet::from_iter([symbol.id.clone()]);
         let mut conflict = symbol.provenance.ambiguous;
-        while let Some(current) = queue.pop_front() {
-            let direct = self.direct_ancestors_of(current);
+        while let Some(direct) = seed
+            .take()
+            .map(|s| self.direct_ancestors_of(s))
+            .or_else(|| {
+                queue
+                    .pop_front()
+                    .map(|s: Arc<SemanticModelSymbol>| self.direct_ancestors_of(&s))
+            })
+        {
             conflict |= direct.disposition == SemanticModelOverlayDisposition::Conflict;
             defects.extend(direct.defects);
             for ancestor in direct.records {
-                if seen.insert(&ancestor.id) {
-                    records.push(ancestor);
+                if seen.insert(ancestor.id.clone()) {
+                    records.push(Arc::clone(&ancestor));
                     queue.push_back(ancestor);
                 }
             }
@@ -1589,13 +2023,10 @@ impl SemanticModelOverlay {
     /// The owner leads the closure because its own members are part of the
     /// surface, and its own provenance is subject to the same gate as every
     /// ancestor's.
-    pub fn owner_surface<'a>(
-        &'a self,
-        owner: &'a SemanticModelSymbol,
-    ) -> SemanticModelOwnerSurface<'a> {
+    pub fn owner_surface(&self, owner: &Arc<SemanticModelSymbol>) -> SemanticModelOwnerSurface {
         let ancestry = self.ancestors_of(owner);
         let mut closure = Vec::with_capacity(ancestry.records.len().saturating_add(1));
-        closure.push(owner);
+        closure.push(Arc::clone(owner));
         closure.extend(ancestry.records);
         // Edges first: a base nothing published is the most specific reason a
         // surface is short, and the one a suppression detail should name.
@@ -1629,14 +2060,14 @@ impl SemanticModelOverlay {
     pub fn universal_root_for_language(
         &self,
         language: &str,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+    ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
         let Some(root) = universal_root_name_for_language(language) else {
             return self.symbol_match(None);
         };
         self.symbols_named(root)
     }
 
-    fn direct_ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry<'_> {
+    fn direct_ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry {
         let hierarchy = self
             .relations_from(&symbol.id)
             .records
@@ -1701,7 +2132,7 @@ impl SemanticModelOverlay {
             records.extend(resolved.records);
         }
         let mut seen = HashSet::default();
-        records.retain(|record| seen.insert(record.id.as_str()));
+        records.retain(|record| seen.insert(record.id.clone()));
         SemanticModelAncestry {
             disposition: if conflict {
                 SemanticModelOverlayDisposition::Conflict
@@ -1717,15 +2148,19 @@ impl SemanticModelOverlay {
 
     /// Same-qualified-name class records describe one class. Prefer a complete
     /// surface, then the smallest ID, as in external class identity (#4942).
-    pub(crate) fn class_representative<'a>(
+    pub(crate) fn class_representative(
         &self,
-        records: impl IntoIterator<Item = &'a SemanticModelSymbol>,
-    ) -> Option<&'a SemanticModelSymbol> {
-        records.into_iter().min_by_key(|record| {
+        records: impl IntoIterator<Item = Arc<SemanticModelSymbol>>,
+    ) -> Option<Arc<SemanticModelSymbol>> {
+        records.into_iter().min_by(|left, right| {
             (
-                record.provenance.completeness != SemanticModelCompleteness::Complete,
-                &record.id,
+                left.provenance.completeness != SemanticModelCompleteness::Complete,
+                &left.id,
             )
+                .cmp(&(
+                    right.provenance.completeness != SemanticModelCompleteness::Complete,
+                    &right.id,
+                ))
         })
     }
 
@@ -1782,7 +2217,7 @@ impl SemanticModelOverlay {
         target: &str,
         language: &str,
         shape: HierarchyTargetShape,
-    ) -> ResolvedEdgeTarget<'_> {
+    ) -> ResolvedEdgeTarget {
         let mut by_id = self.symbols_with_id(target);
         by_id.records.retain(|record| {
             shape.admits(record) && record.owner_id.is_none() && record.language == language
@@ -1807,12 +2242,12 @@ impl SemanticModelOverlay {
         let exact = by_name
             .records
             .iter()
-            .copied()
-            .filter(|record| {
+            .filter(|&record| {
                 record.qualified_name == target
                     || (record.language == language
                         && record.aliases.iter().any(|alias| alias == target))
             })
+            .cloned()
             .collect::<Vec<_>>();
         // Same-qualified-name class records describe one class (#4942), so a
         // class base that several packs publish resolves to one representative
@@ -1864,6 +2299,9 @@ impl SemanticModelOverlay {
             push_unique_posting(&mut self.symbols_by_id, &symbol.id, index);
             push_unique_posting(&mut self.symbols_by_name, &symbol.name, index);
             push_unique_posting(&mut self.symbols_by_name, &symbol.qualified_name, index);
+            for contributor in &symbol.semantic_contributors {
+                push_unique_posting(&mut self.symbols_by_id, &contributor.record_id, index);
+            }
             for alias in &symbol.aliases {
                 push_unique_posting(&mut self.symbols_by_name, alias, index);
             }
@@ -1914,6 +2352,7 @@ impl SemanticModelOverlay {
                     .saturating_add(symbol.owner_id.as_ref().map_or(0, String::capacity))
                     .saturating_add(symbol.name.capacity())
                     .saturating_add(symbol.qualified_name.capacity())
+                    .saturating_add(semantic_symbol_source_key(symbol).0.len())
                     .saturating_add(symbol.rust_generated_scope.as_ref().map_or(0, |scope| {
                         std::mem::size_of_val(scope.as_ref())
                             .saturating_add(scope.module.capacity())
@@ -1930,6 +2369,16 @@ impl SemanticModelOverlay {
                         SemanticModelLocation::Model(location) => location.uri.capacity(),
                     })
                     .saturating_add(symbol.provenance.retained_string_bytes())
+                    .saturating_add(
+                        symbol
+                            .semantic_contributors
+                            .iter()
+                            .map(|contributor| {
+                                std::mem::size_of::<SemanticModelProvenance>()
+                                    + contributor.retained_string_bytes()
+                            })
+                            .sum::<usize>(),
+                    )
             })
             .sum::<usize>();
         let relation_bytes = self
@@ -1941,6 +2390,8 @@ impl SemanticModelOverlay {
                     .saturating_add(relation.kind.capacity())
                     .saturating_add(relation.from.capacity())
                     .saturating_add(relation.to.capacity())
+                    .saturating_add(semantic_relation_source_key(relation).0.len())
+                    .saturating_add(semantic_relation_source_key(relation).3.len())
                     .saturating_add(relation.provenance.retained_string_bytes())
             })
             .sum::<usize>();
@@ -2011,6 +2462,21 @@ impl SemanticModelOverlay {
         }
         u64::try_from(
             std::mem::size_of::<Self>()
+                .saturating_add(
+                    self.composition_diagnostics
+                        .iter()
+                        .map(|diagnostic| {
+                            std::mem::size_of::<SemanticModelCompositionDiagnostic>()
+                                + diagnostic.pack_id.capacity()
+                                + diagnostic.declaration_id.capacity()
+                                + diagnostic.artifact_id.capacity()
+                                + diagnostic
+                                    .conflicting_artifact_id
+                                    .as_ref()
+                                    .map_or(0, String::capacity)
+                        })
+                        .sum::<usize>(),
+                )
                 .saturating_add(symbol_bytes)
                 .saturating_add(relation_bytes)
                 .saturating_add(hierarchy_bytes)
@@ -2024,11 +2490,11 @@ impl SemanticModelOverlay {
     fn symbol_match(
         &self,
         posting: Option<&Vec<usize>>,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+    ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
         let records = posting
             .into_iter()
             .flatten()
-            .map(|index| &self.symbols[*index])
+            .map(|index| Arc::clone(&self.symbols[*index]))
             .collect::<Vec<_>>();
         SemanticModelOverlayMatch {
             disposition: disposition(&records, |record| record.provenance.ambiguous),
@@ -2039,11 +2505,11 @@ impl SemanticModelOverlay {
     fn collection_flow_match(
         &self,
         posting: Option<&Vec<usize>>,
-    ) -> SemanticModelOverlayMatch<'_, CollectionFlowContract> {
+    ) -> SemanticModelOverlayMatch<CollectionFlowContract> {
         let records = posting
             .into_iter()
             .flatten()
-            .map(|index| &self.collection_flows[*index])
+            .map(|index| Arc::clone(&self.collection_flows[*index]))
             .collect::<Vec<_>>();
         let disposition = if records.is_empty() {
             SemanticModelOverlayDisposition::Empty
@@ -2061,7 +2527,7 @@ impl SemanticModelOverlay {
     fn deferred_yield_match(
         &self,
         indexes: Option<&Vec<usize>>,
-    ) -> SemanticModelOverlayMatch<'_, DeferredYieldContract> {
+    ) -> SemanticModelOverlayMatch<DeferredYieldContract> {
         let Some(indexes) = indexes else {
             return SemanticModelOverlayMatch {
                 records: Vec::new(),
@@ -2070,8 +2536,14 @@ impl SemanticModelOverlay {
         };
         let records = indexes
             .iter()
-            .map(|index| &self.deferred_yields[*index])
+            .map(|index| Arc::clone(&self.deferred_yields[*index]))
             .collect::<Vec<_>>();
+        Self::deferred_records_match(records)
+    }
+
+    fn deferred_records_match(
+        records: Vec<Arc<DeferredYieldContract>>,
+    ) -> SemanticModelOverlayMatch<DeferredYieldContract> {
         let disposition = match records.first() {
             None => SemanticModelOverlayDisposition::Empty,
             Some(first)
@@ -2095,11 +2567,11 @@ impl SemanticModelOverlay {
     fn relation_match(
         &self,
         posting: Option<&Vec<usize>>,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelRelation> {
+    ) -> SemanticModelOverlayMatch<SemanticModelRelation> {
         let records = posting
             .into_iter()
             .flatten()
-            .map(|index| &self.relations[*index])
+            .map(|index| Arc::clone(&self.relations[*index]))
             .collect::<Vec<_>>();
         SemanticModelOverlayMatch {
             disposition: if records.is_empty() {
@@ -2114,19 +2586,17 @@ impl SemanticModelOverlay {
     }
 }
 
-pub(crate) fn type_declaration_records_conflict(
-    matched: &SemanticModelMatch<'_, TypeFact>,
-) -> bool {
+pub(crate) fn type_declaration_records_conflict(matched: &SemanticModelMatch<TypeFact>) -> bool {
     declaration_records_conflict(matched)
         && matched.records.first().is_some_and(|first| {
             matched
                 .records
                 .iter()
-                .any(|candidate| !type_declarations_equivalent(first.record, candidate.record))
+                .any(|candidate| !type_declarations_equivalent(&first.record, &candidate.record))
         })
 }
 
-pub(crate) fn declaration_records_conflict<T>(matched: &SemanticModelMatch<'_, T>) -> bool {
+pub(crate) fn declaration_records_conflict<T>(matched: &SemanticModelMatch<T>) -> bool {
     if matched.disposition != SemanticModelMatchDisposition::Conflict {
         return false;
     }
@@ -2157,17 +2627,8 @@ pub fn explain_semantic_model_site(
         diagnostics: Vec::new(),
     };
     let mut rule_ids = active
-        .shards()
-        .iter()
-        .flat_map(|shard| {
-            shard
-                .shard
-                .payload()
-                .generator_rules()
-                .into_iter()
-                .flatten()
-                .map(|rule| rule.id.clone())
-        })
+        .generator_rules()
+        .map(|activated| activated.record.id.clone())
         .filter(|id| rule_id.is_none_or(|requested| requested == id))
         .collect::<Vec<_>>();
     rule_ids.sort_unstable();
@@ -2209,7 +2670,7 @@ pub fn explain_semantic_model_site(
             let mut explanation = SemanticModelRuleExplanation {
                 pack_id: activated.shard.manifest.pack_id.clone(),
                 pack_version: activated.shard.manifest.version.clone(),
-                shard_id: activated.shard.shard.shard_id.clone(),
+                shard_id: activated.shard.descriptor.shard_id.clone(),
                 rule_id: activated.record.id.clone(),
                 source_kind: source_kind(activated.shard.source_kind).to_owned(),
                 source_id: activated.shard.source_id.clone(),
@@ -2234,8 +2695,8 @@ pub fn explain_semantic_model_site(
             evaluate_explanation_at_site(
                 analyzer,
                 active,
-                activated.shard,
-                activated.record,
+                &activated.shard,
+                &activated.record,
                 &site,
                 &mut explanation,
             );
@@ -2414,8 +2875,8 @@ pub fn preview_semantic_model_emissions(
     let mut aliases = Vec::new();
     emit_rule_match(
         active,
-        activated.shard,
-        activated.record,
+        &activated.shard,
+        &activated.record,
         &captures,
         &mut report.emitted_symbols,
         &mut report.emitted_relations,
@@ -2527,19 +2988,10 @@ pub fn scan_unmapped_semantic_model_sites(
 
 pub(crate) fn unique_active_rules(
     active: &ResolvedActiveSemanticModels,
-) -> Vec<(&ActiveSemanticModelShard, &GeneratorRule)> {
+) -> Vec<(Arc<ActiveSemanticModelShard>, Arc<GeneratorRule>)> {
     let mut rule_ids = active
-        .shards()
-        .iter()
-        .flat_map(|shard| {
-            shard
-                .shard
-                .payload()
-                .generator_rules()
-                .into_iter()
-                .flatten()
-                .map(|rule| rule.id.clone())
-        })
+        .generator_rules()
+        .map(|record| record.record.id.clone())
         .collect::<Vec<_>>();
     rule_ids.sort_unstable();
     rule_ids.dedup();
@@ -2550,14 +3002,14 @@ pub(crate) fn unique_active_rules(
             let [activated] = matched.records.as_slice() else {
                 return None;
             };
-            Some((activated.shard, activated.record))
+            Some((Arc::clone(&activated.shard), Arc::clone(&activated.record)))
         })
         .collect()
 }
 
 pub fn run_semantic_model_conformance(
     analyzer: &dyn IAnalyzer,
-    active: &ResolvedActiveSemanticModels,
+    active: &Arc<ResolvedActiveSemanticModels>,
     fixture: &SemanticModelConformanceFixture,
     cancellation: &crate::CancellationToken,
     max_assertions: usize,
@@ -2602,9 +3054,11 @@ pub fn run_semantic_model_conformance(
             return report;
         }
     };
+    let symbols = overlay.symbols();
+    let relations = overlay.relations();
     for expected in &fixture.symbols {
         report.checked_assertions += 1;
-        let matched = overlay.symbols.iter().any(|symbol| {
+        let matched = symbols.iter().any(|symbol| {
             symbol.id == expected.id
                 && symbol.owner_id == expected.owner_id
                 && symbol.name == expected.name
@@ -2625,7 +3079,7 @@ pub fn run_semantic_model_conformance(
     }
     for expected in &fixture.relationships {
         report.checked_assertions += 1;
-        if !overlay.relations.iter().any(|relation| {
+        if !relations.iter().any(|relation| {
             relation.id == expected.id
                 && relation.kind == expected.kind
                 && relation.from == expected.from
@@ -2638,7 +3092,7 @@ pub fn run_semantic_model_conformance(
     }
     for expected in &fixture.forward_definitions {
         report.checked_assertions += 1;
-        if !overlay.relations.iter().any(|relation| {
+        if !relations.iter().any(|relation| {
             relation.kind == "navigates_to"
                 && relation.from == expected.from
                 && relation.to == expected.to
@@ -2651,7 +3105,7 @@ pub fn run_semantic_model_conformance(
     }
     for expected in &fixture.inverse_usages {
         report.checked_assertions += 1;
-        if !overlay.relations.iter().any(|relation| {
+        if !relations.iter().any(|relation| {
             relation.kind == "references"
                 && relation.from == expected.from
                 && relation.to == expected.to
@@ -2739,10 +3193,10 @@ pub(crate) fn generated_overlay_facts(
         }
         let rules = active_rules
             .iter()
-            .copied()
-            .filter(|(shard, _)| {
+            .filter(|&(shard, _)| {
                 shard.manifest.language == provider.structural_language().config_label()
             })
+            .cloned()
             .collect::<Vec<_>>();
         if rules.is_empty() {
             continue;
@@ -2771,10 +3225,10 @@ pub(crate) fn generated_overlay_facts(
                         .expect("structural fact IDs are bounded to u32 by FileFacts");
                     let matching_rules = rules
                         .iter()
-                        .copied()
-                        .filter(|(_, rule)| {
+                        .filter(|&(_, rule)| {
                             rule_trigger_matches(analyzer, file, &rule.trigger, &facts, node_id)
                         })
+                        .cloned()
                         .collect::<Vec<_>>();
                     if matching_rules.is_empty() {
                         continue;
@@ -2785,7 +3239,7 @@ pub(crate) fn generated_overlay_facts(
                     for (shard, rule) in matching_rules {
                         let Ok(captures) = rule_capture_values(
                             analyzer,
-                            rule,
+                            &rule,
                             &facts,
                             node_id,
                             file,
@@ -2796,8 +3250,8 @@ pub(crate) fn generated_overlay_facts(
                         for captures in &captures {
                             emit_rule_match(
                                 active,
-                                shard,
-                                rule,
+                                &shard,
+                                &rule,
                                 captures,
                                 &mut generated.symbols,
                                 &mut generated.relations,
@@ -3471,6 +3925,8 @@ pub(crate) fn emit_rule_match(
                         is_sealed,
                         ..
                     } => SemanticModelSymbol {
+                        pre_composition_qualified_name: None,
+                        semantic_contributors: Vec::new(),
                         jvm_owner_family_enumerated: false,
                         non_overridable: None,
                         ambient_use: None,
@@ -3534,6 +3990,8 @@ pub(crate) fn emit_rule_match(
                             .as_ref()
                             .is_some_and(signature_has_complete_callable_shape);
                         SemanticModelSymbol {
+                            pre_composition_qualified_name: None,
+                            semantic_contributors: Vec::new(),
                             jvm_owner_family_enumerated: false,
                             non_overridable: None,
                             ambient_use: None,
@@ -3610,6 +4068,7 @@ pub(crate) fn emit_rule_match(
                 let mut model_provenance = provenance(active, shard, &id, &location, None, false);
                 model_provenance.rule_id = Some(rule.id.clone());
                 relations.push(SemanticModelRelation {
+                    pre_composition_endpoints: None,
                     id,
                     kind: relation_kind_label(*relation_kind).to_string(),
                     from,
@@ -3623,7 +4082,7 @@ pub(crate) fn emit_rule_match(
 }
 
 pub(crate) fn type_symbol(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &(impl SemanticModelLocations + ?Sized),
     active: &ResolvedActiveSemanticModels,
     shard: &ActiveSemanticModelShard,
     record: &TypeFact,
@@ -3638,6 +4097,8 @@ pub(crate) fn type_symbol(
         &record.id,
     );
     SemanticModelSymbol {
+        pre_composition_qualified_name: None,
+        semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: shard.independently_enumerates_jvm_owner(record),
         non_overridable: None,
         id: record.id.clone(),
@@ -3687,7 +4148,7 @@ pub(crate) fn type_symbol(
 }
 
 pub(crate) fn member_symbol(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &(impl SemanticModelLocations + ?Sized),
     active: &ResolvedActiveSemanticModels,
     shard: &ActiveSemanticModelShard,
     record: &MemberFact,
@@ -3708,6 +4169,8 @@ pub(crate) fn member_symbol(
         &record.id,
     );
     SemanticModelSymbol {
+        pre_composition_qualified_name: None,
+        semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
         non_overridable: record.non_overridable,
         id: record.id.clone(),
@@ -3771,6 +4234,7 @@ pub(crate) fn relation(
 ) -> SemanticModelRelation {
     let location = model_location(shard, "relation", &record.id);
     SemanticModelRelation {
+        pre_composition_endpoints: None,
         id: record.id.clone(),
         kind: relation_kind_label(record.relation_kind).to_string(),
         from: record.from.clone(),
@@ -3787,48 +4251,34 @@ pub(crate) fn hierarchy_relation(
     hierarchy: &HierarchyFact,
     ambiguous: bool,
 ) -> SemanticModelRelation {
-    // Schema validation rejects unknown hierarchy targets, which must never
-    // be converted into a rendered edge identity.
-    debug_assert!(!hierarchy.target.contains_unknown());
-    let target = match &hierarchy.target {
-        TypeRef::Declared { id, .. } => id.clone(),
-        TypeRef::Named { name, .. } => name.clone(),
-        other => render_type_ref(other),
-    };
-    let kind = hierarchy_kind_label(hierarchy.hierarchy_kind).to_string();
-    let id = format!("hierarchy:{owner_id}:{kind}:{target}");
-    let location = model_location(shard, "hierarchy", &id);
+    let edge = project_hierarchy_relation(owner_id, hierarchy);
+    let location = model_location(shard, "hierarchy", &edge.id);
+    let provenance = provenance(active, shard, &edge.id, &location, None, ambiguous);
     SemanticModelRelation {
-        id: id.clone(),
-        kind,
-        from: owner_id.to_string(),
-        to: target,
-        declaration_ordinal: hierarchy.declaration_ordinal,
-        provenance: provenance(active, shard, &id, &location, None, ambiguous),
+        pre_composition_endpoints: None,
+        id: edge.id,
+        kind: edge.kind.to_owned(),
+        from: edge.from,
+        to: edge.to,
+        declaration_ordinal: edge.declaration_ordinal,
+        provenance,
     }
 }
 
 pub(crate) fn location(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &(impl SemanticModelLocations + ?Sized),
     shard: &ActiveSemanticModelShard,
     locator: &Locator,
     fallback_symbol: &str,
     record_kind: &str,
     record_id: &str,
 ) -> SemanticModelLocation {
-    authored_anchor(
-        analyzer,
-        &shard.manifest.carried_sources,
-        locator,
-        fallback_symbol,
-    )
-    .map(SemanticModelLocation::Authored)
-    .unwrap_or_else(|| model_location(shard, record_kind, record_id))
+    analyzer.record_location(shard, locator, fallback_symbol, record_kind, record_id)
 }
 
 #[doc(hidden)]
 pub fn authored_anchor(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &(impl IAnalyzer + ?Sized),
     carried_sources: &[String],
     locator: &Locator,
     fallback_symbol: &str,
@@ -3912,6 +4362,8 @@ pub fn activated_type_provenance<E>(
 pub mod tests {
     #[cfg(test)]
     use crate::analyzer::semantic_model::overlay::go_extra_support_0::*;
+    #[cfg(test)]
+    use std::sync::Arc;
 
     #[cfg(test)]
     use crate::analyzer::semantic_model::SemanticModelCallableMatch;
@@ -3921,10 +4373,7 @@ pub mod tests {
         SemanticModelCallableKey::new("java", "pkg.Owner", "run", true, parameter_count)
     }
     #[cfg(test)]
-    fn lookup(
-        overlay: &SemanticModelOverlay,
-        parameter_count: u32,
-    ) -> SemanticModelCallableMatch<'_> {
+    fn lookup(overlay: &SemanticModelOverlay, parameter_count: u32) -> SemanticModelCallableMatch {
         overlay.callable_for_target(callable_key(parameter_count))
     }
 
@@ -4050,7 +4499,7 @@ pub mod tests {
             false,
         );
         let mut overlay = overlay(Vec::new(), Vec::new());
-        overlay.collection_flows.push(contract);
+        overlay.collection_flows.push(Arc::new(contract));
         overlay
             .collection_flows_by_callable
             .insert("callable.normalize".to_owned(), vec![0]);
@@ -4065,11 +4514,13 @@ pub mod tests {
             SemanticModelOverlayDisposition::Empty
         );
 
-        overlay.collection_flows.push(collection_flow_contract(
-            "callable.normalize",
-            SemanticModelCompleteness::Complete,
-            false,
-        ));
+        overlay
+            .collection_flows
+            .push(Arc::new(collection_flow_contract(
+                "callable.normalize",
+                SemanticModelCompleteness::Complete,
+                false,
+            )));
         overlay
             .collection_flows_by_callable
             .insert("callable.normalize".to_owned(), vec![0, 1]);
@@ -4160,10 +4611,7 @@ pub mod tests {
     }
 
     #[cfg(test)]
-    fn named<'a>(
-        overlay: &'a SemanticModelOverlay,
-        qualified_name: &str,
-    ) -> &'a SemanticModelSymbol {
+    fn named(overlay: &SemanticModelOverlay, qualified_name: &str) -> Arc<SemanticModelSymbol> {
         overlay
             .symbols_named(qualified_name)
             .records
@@ -4173,7 +4621,7 @@ pub mod tests {
     }
 
     #[cfg(test)]
-    fn closure_names<'a>(surface: &'a SemanticModelOwnerSurface<'a>) -> Vec<&'a str> {
+    fn closure_names(surface: &SemanticModelOwnerSurface) -> Vec<&str> {
         surface
             .closure
             .iter()
@@ -4566,7 +5014,7 @@ pub mod tests {
             Some("fcntl.open".to_owned())
         );
         assert_eq!(
-            overlay.callable_family_id_for_symbol(records[0]),
+            overlay.callable_family_id_for_symbol(&records[0]),
             Some("fcntl.open".to_owned())
         );
     }
@@ -4729,8 +5177,8 @@ pub mod tests {
         assert_eq!(
             resolved_overlay
                 .typescript_global_member_target("Array", "isArray")
-                .map(|symbol| symbol.id.as_str()),
-            Some("typescript-array-is-array")
+                .map(|symbol| symbol.id.clone()),
+            Some("typescript-array-is-array".to_owned())
         );
         assert!(
             resolved_overlay
@@ -4843,8 +5291,8 @@ pub mod tests {
             assert_eq!(
                 model
                     .java_functional_method(
-                        named(&model, "fixture.Action"),
-                        named(&model, "java.lang.Object"),
+                        &named(&model, "fixture.Action"),
+                        &named(&model, "java.lang.Object"),
                         &mut work,
                         &cancellation
                     )
@@ -4860,8 +5308,8 @@ pub mod tests {
             assert!(
                 model
                     .java_functional_method(
-                        named(&model, "fixture.Action"),
-                        named(&model, "java.lang.Object"),
+                        &named(&model, "fixture.Action"),
+                        &named(&model, "java.lang.Object"),
                         &mut 0,
                         &cancellation
                     )
@@ -4876,8 +5324,8 @@ pub mod tests {
         assert!(
             model
                 .java_functional_method(
-                    named(&model, "fixture.Action"),
-                    named(&model, "java.lang.Object"),
+                    &named(&model, "fixture.Action"),
+                    &named(&model, "java.lang.Object"),
                     &mut 1000,
                     &brokk_bifrost_core::cancellation::CancellationToken::default()
                 )
@@ -4889,8 +5337,8 @@ pub mod tests {
         assert!(
             model
                 .java_functional_method(
-                    named(&model, "fixture.Action"),
-                    named(&model, "java.lang.Object"),
+                    &named(&model, "fixture.Action"),
+                    &named(&model, "java.lang.Object"),
                     &mut 1000,
                     &brokk_bifrost_core::cancellation::CancellationToken::default()
                 )
@@ -4949,8 +5397,8 @@ pub mod tests {
         assert_eq!(
             model
                 .java_functional_method(
-                    named(&model, "fixture.Child"),
-                    named(&model, "java.lang.Object"),
+                    &named(&model, "fixture.Child"),
+                    &named(&model, "java.lang.Object"),
                     &mut 1000,
                     &brokk_bifrost_core::cancellation::CancellationToken::default()
                 )
@@ -4967,8 +5415,8 @@ pub mod tests {
         assert!(
             model
                 .java_functional_method(
-                    named(&model, "fixture.Child"),
-                    named(&model, "java.lang.Object"),
+                    &named(&model, "fixture.Child"),
+                    &named(&model, "java.lang.Object"),
                     &mut 1000,
                     &brokk_bifrost_core::cancellation::CancellationToken::default()
                 )
@@ -5009,13 +5457,13 @@ pub mod tests {
         assert_eq!(
             model
                 .java_single_instance_method(
-                    named(&model, "fixture.Child"),
+                    &named(&model, "fixture.Child"),
                     "consume",
                     &mut 1000,
                     &cancellation
                 )
-                .map(|method| method.id.as_str()),
-            Some("parent.consume")
+                .map(|method| method.id.clone()),
+            Some("parent.consume".to_owned())
         );
         let model = overlay(
             vec![parent.clone(), child.clone(), inherited.clone(), overload],
@@ -5024,7 +5472,7 @@ pub mod tests {
         assert!(
             model
                 .java_single_instance_method(
-                    named(&model, "fixture.Child"),
+                    &named(&model, "fixture.Child"),
                     "consume",
                     &mut 1000,
                     &cancellation
@@ -5036,7 +5484,7 @@ pub mod tests {
         assert!(
             model
                 .java_single_instance_method(
-                    named(&model, "fixture.Child"),
+                    &named(&model, "fixture.Child"),
                     "consume",
                     &mut 1000,
                     &cancellation
@@ -5056,7 +5504,7 @@ pub mod tests {
         let edge = extends(&child, "vendor.Base");
         let overlay = overlay(vec![child], vec![edge]);
 
-        let ancestry = overlay.ancestors_of(named(&overlay, "pkg.Child"));
+        let ancestry = overlay.ancestors_of(&named(&overlay, "pkg.Child"));
 
         assert!(ancestry.records.is_empty(), "{ancestry:#?}");
         assert_eq!(
@@ -5143,7 +5591,7 @@ pub mod tests {
         let middle_edge = extends(&middle, "vendor.Missing");
         let overlay = overlay(vec![child, middle], vec![child_edge, middle_edge]);
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Child"));
 
         assert!(!surface.proves_absence(), "{surface:#?}");
         assert_eq!(
@@ -5182,7 +5630,7 @@ pub mod tests {
             ],
         );
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Uses"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Uses"));
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(
             vec!["pkg.Uses", "typing.MutableSet", "builtins.object"],
@@ -5214,7 +5662,7 @@ pub mod tests {
             vec![extends(&child, "Base")],
         );
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Child"));
         assert!(
             !surface.proves_absence(),
             "a bare export spelling from another language is a guess: {surface:#?}"
@@ -5479,7 +5927,7 @@ pub mod tests {
         let edge = extends(&child, "Base");
         let overlay = overlay(vec![child, base], vec![edge]);
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Child"));
 
         assert_eq!(
             vec!["pkg.Child", "pkg.Base"],
@@ -5513,7 +5961,7 @@ pub mod tests {
         let edge = extends(&child, "pkg.Base");
         let overlay = overlay(vec![child, base], vec![edge]);
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Child"));
 
         assert_eq!(
             vec![SemanticModelSurfaceGap::PartialType {
@@ -5529,7 +5977,7 @@ pub mod tests {
         let klass = class("theta.Klass", "python");
         let overlay = overlay(vec![klass], Vec::new());
 
-        let surface = overlay.owner_surface(named(&overlay, "theta.Klass"));
+        let surface = overlay.owner_surface(&named(&overlay, "theta.Klass"));
 
         assert_eq!(
             vec![SemanticModelSurfaceGap::UnresolvedEdge(
@@ -5576,8 +6024,8 @@ pub mod tests {
     fn java_hierarchy_witness_retains_exact_path() {
         let result = java_hierarchy_fixture();
         let answer = result.java_reference_widening(
-            named(&result, "example.Child"),
-            named(&result, "example.Parent"),
+            &named(&result, "example.Child"),
+            &named(&result, "example.Parent"),
             8,
             None,
         );
@@ -5586,8 +6034,8 @@ pub mod tests {
         assert!(
             result
                 .java_reference_widening(
-                    named(&result, "example.Parent"),
-                    named(&result, "example.Child"),
+                    &named(&result, "example.Parent"),
+                    &named(&result, "example.Child"),
                     8,
                     None
                 )
@@ -5606,10 +6054,10 @@ pub mod tests {
             .iter_mut()
             .find(|symbol| symbol.qualified_name == "example.Child")
             .unwrap();
-        child.provenance.completeness = SemanticModelCompleteness::Partial;
+        Arc::make_mut(child).provenance.completeness = SemanticModelCompleteness::Partial;
         let answer = result.java_reference_widening(
-            named(&result, "example.Child"),
-            named(&result, "example.Parent"),
+            &named(&result, "example.Child"),
+            &named(&result, "example.Parent"),
             8,
             None,
         );
@@ -5644,19 +6092,15 @@ pub mod tests {
                         .push("T".into());
                 }
                 JavaHierarchyIncomplete::Ambiguous => {
-                    result
-                        .symbols
-                        .iter_mut()
-                        .find(|s| s.id == id)
-                        .unwrap()
+                    Arc::make_mut(result.symbols.iter_mut().find(|s| s.id == id).unwrap())
                         .provenance
                         .ambiguous = true;
                 }
                 _ => unreachable!(),
             }
             let answer = result.java_reference_widening(
-                named(&result, "example.Child"),
-                named(&result, "example.Parent"),
+                &named(&result, "example.Child"),
+                &named(&result, "example.Parent"),
                 8,
                 None,
             );
@@ -5671,18 +6115,20 @@ pub mod tests {
     fn java_hierarchy_implements_and_unrelated_types_keep_distinct_proof() {
         let mut result = java_hierarchy_fixture();
         let parent_id = named(&result, "example.Parent").id.clone();
-        result
-            .symbols
-            .iter_mut()
-            .find(|s| s.id == parent_id)
-            .unwrap()
-            .kind = SemanticModelSymbolKind::Interface;
+        Arc::make_mut(
+            result
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == parent_id)
+                .unwrap(),
+        )
+        .kind = SemanticModelSymbolKind::Interface;
         let child_id = named(&result, "example.Child").id.clone();
         result.java_hierarchy.get_mut(&child_id).unwrap().1[0].hierarchy_kind =
             HierarchyKind::Implements;
         let answer = result.java_reference_widening(
-            named(&result, "example.Child"),
-            named(&result, "example.Parent"),
+            &named(&result, "example.Child"),
+            &named(&result, "example.Parent"),
             8,
             None,
         );
@@ -5693,8 +6139,8 @@ pub mod tests {
         assert!(
             result
                 .java_reference_widening(
-                    named(&result, "example.Other"),
-                    named(&result, "example.Parent"),
+                    &named(&result, "example.Other"),
+                    &named(&result, "example.Parent"),
                     8,
                     None
                 )
@@ -5773,7 +6219,7 @@ pub mod tests {
         let root = class("pkg.Root", "php");
         let overlay = overlay(vec![root], Vec::new());
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Root"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Root"));
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["pkg.Root"], closure_names(&surface));
@@ -5793,7 +6239,7 @@ pub mod tests {
         let edge = extends(&child, "pkg.Base");
         let overlay = overlay(vec![child, base], vec![edge]);
 
-        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+        let surface = overlay.owner_surface(&named(&overlay, "pkg.Child"));
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
@@ -5875,7 +6321,7 @@ pub mod tests {
         let object = class("builtins.object", "python");
         let overlay = overlay(vec![klass, object], Vec::new());
 
-        let surface = overlay.owner_surface(named(&overlay, "theta.Klass"));
+        let surface = overlay.owner_surface(&named(&overlay, "theta.Klass"));
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(
@@ -5891,7 +6337,7 @@ pub mod tests {
         let object = class("builtins.object", "python");
         let overlay = overlay(vec![object], Vec::new());
 
-        let surface = overlay.owner_surface(named(&overlay, "builtins.object"));
+        let surface = overlay.owner_surface(&named(&overlay, "builtins.object"));
 
         assert!(surface.proves_absence(), "{surface:#?}");
         assert_eq!(vec!["builtins.object"], closure_names(&surface));
@@ -5903,8 +6349,8 @@ pub mod tests {
     #[test]
     fn java_hierarchy_budget_and_cancellation_stay_typed() {
         let result = java_hierarchy_fixture();
-        let source = named(&result, "example.Child");
-        let target = named(&result, "example.Parent");
+        let source = &named(&result, "example.Child");
+        let target = &named(&result, "example.Parent");
         let answer = result.java_reference_widening(source, target, 0, None);
         assert_eq!(
             answer.incomplete,
@@ -6079,6 +6525,7 @@ pub mod go_extra_support_0 {
         let mut overlay =
             go_callback_field_test_overlay(artifact_sha256, Visibility::Public, false);
         for symbol in &mut overlay.symbols {
+            let symbol = Arc::make_mut(symbol);
             symbol.locator_path = Some("api.go".to_owned());
             symbol.locator_symbol = Some(if symbol.owner_id.is_none() {
                 "example.test/ssh.Config".to_owned()
@@ -6128,3 +6575,119 @@ pub mod go_extra_support_0 {
 
 #[doc(hidden)]
 pub mod jvm_external;
+
+/// Shared eager declaration publication, before alias-group composition.
+fn overlay_declarations(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    cancellation: &crate::CancellationToken,
+    type_ids: Vec<String>,
+    member_ids: Vec<String>,
+    relation_ids: Vec<String>,
+) -> Result<(Vec<SemanticModelSymbol>, Vec<SemanticModelRelation>), SemanticModelOverlayBuildError>
+{
+    let mut symbols = Vec::new();
+    let mut hierarchy_relations = Vec::new();
+    let mut qualified_types = HashMap::default();
+    for id in type_ids {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let matched = with_artifact_declarations(
+            active.types_with_id(&id),
+            active.all_type_records_with_id(&id),
+        );
+        let ambiguous = type_declaration_records_conflict(&matched);
+        if let Some(owner) = qualified_owner_name(&matched) {
+            qualified_types.insert(id.clone(), owner.to_owned());
+        }
+        for (index, activated) in matched.records.iter().enumerate() {
+            // Runtime claims are adjudicated by the ancestry consumer. Do
+            // not manufacture duplicate declaration identities from them.
+            // Raw active records remain available with their provenance.
+            if matched.records[..index].iter().any(|earlier| {
+                earlier.record.runtime_bases != activated.record.runtime_bases
+                    && type_declarations_equivalent(&earlier.record, &activated.record)
+            }) {
+                continue;
+            }
+            let symbol = type_symbol(
+                analyzer,
+                active,
+                &activated.shard,
+                &activated.record,
+                ambiguous,
+            );
+            hierarchy_relations.extend(activated.record.hierarchy.iter().map(|hierarchy| {
+                hierarchy_relation(
+                    active,
+                    &activated.shard,
+                    &activated.record.id,
+                    hierarchy,
+                    ambiguous,
+                )
+            }));
+            symbols.push(symbol);
+        }
+    }
+    for id in member_ids {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let matched = with_artifact_declarations(
+            active.members_with_id(&id),
+            active.all_member_records_with_id(&id),
+        );
+        let ambiguous = declaration_records_conflict(&matched);
+        for activated in matched.records {
+            symbols.push(member_symbol(
+                analyzer,
+                active,
+                &activated.shard,
+                &activated.record,
+                qualified_types
+                    .get(&activated.record.owner)
+                    .map(String::as_str),
+                ambiguous,
+            ));
+        }
+    }
+    let generated = generated_overlay_facts(analyzer, active, cancellation)?;
+    symbols.extend(generated.symbols);
+    mark_symbol_identity_conflicts(&mut symbols);
+    augment_go_overlay_surface(&mut symbols, &mut hierarchy_relations, cancellation)?;
+    mark_symbol_identity_conflicts(&mut symbols);
+    symbols.sort_by(composition::symbol_source_order);
+
+    let mut relations = hierarchy_relations;
+    relations.extend(generated.relations);
+    for id in relation_ids {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let matched = active.relations_with_id(&id);
+        let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+        for activated in matched.records {
+            relations.push(relation(
+                active,
+                &activated.shard,
+                &activated.record,
+                ambiguous,
+            ));
+        }
+    }
+    relations.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then_with(|| {
+                left.declaration_ordinal
+                    .is_some()
+                    .cmp(&right.declaration_ordinal.is_some())
+            })
+            .then_with(|| left.declaration_ordinal.cmp(&right.declaration_ordinal))
+            .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    Ok((symbols, relations))
+}

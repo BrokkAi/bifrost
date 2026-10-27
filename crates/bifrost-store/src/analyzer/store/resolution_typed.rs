@@ -31,7 +31,6 @@ use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
 use crate::analyzer::resolution::BindingFragmentId;
 use crate::analyzer::resolution::BindingNodeId;
-use crate::analyzer::resolution::CompanionTypeRelation;
 use crate::analyzer::resolution::DeferredMemberOwnerLookupName;
 use crate::analyzer::resolution::LoweredBindingProjection;
 use crate::analyzer::resolution::LoweredCallApplicabilityObligation;
@@ -81,9 +80,11 @@ use crate::analyzer::resolution::TypedFactReadOutcome;
 use crate::analyzer::resolution::TypedFactRequest;
 use crate::analyzer::resolution::language_identity_domain;
 use crate::analyzer::resolution::language_type_qualifiers_search_companion_members;
+use crate::analyzer::resolution::{CompanionTypeRelation, JvmAliasProperty};
 
 use super::resolution::TypedFactRelation;
 use super::resolution::json_array;
+use super::resolution::json_pair_array;
 use super::resolution::mount_ordinal;
 use super::resolution::nonnegative_i64;
 use super::resolution::read_resolution_statement;
@@ -109,12 +110,12 @@ pub(in crate::analyzer::store) const INVOCATION_ROLES_FOR_REFERENCES_SQL: &str =
      CROSS JOIN main.resolution_invocation_roles role ON role.blob_id=site.blob_id \
          AND role.site=site.source_site";
 
-// TEMP request tables have no corpus statistics. CROSS JOIN keeps the small
+// JSON request arrays have no corpus statistics. CROSS JOIN keeps the small
 // request outermost even when SQLite estimates the corpus as cheaper (#5658).
 pub(super) const GENERIC_PARAMETER_DECLARATIONS_SQL: &str = r#"
-    SELECT request.mount_ordinal, request.key0
-    FROM temp.selected_resolution_typed_requests_1 AS request
-    CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.mount_ordinal=request.mount_ordinal
+    SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]')
+    FROM json_each(?1) AS request
+    CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.mount_ordinal=json_extract(request.value, '$[0]')
     CROSS JOIN main.resolution_fragment_interiors AS interior
       ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
      AND interior.semantic_language=mount.semantic_language
@@ -122,7 +123,7 @@ pub(super) const GENERIC_PARAMETER_DECLARATIONS_SQL: &str = r#"
      AND interior.publication_state='complete'
     CROSS JOIN main.resolution_semantic_sites AS semantic
       ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
-     AND semantic.semantic_key=request.key0 AND semantic.namespace='type'
+     AND semantic.semantic_key=json_extract(request.value, '$[1]') AND semantic.namespace='type'
     CROSS JOIN main.source_native_declaration_bridges AS bridge
       ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
     CROSS JOIN main.source_declarations AS declaration
@@ -165,7 +166,12 @@ pub const FRONTIER_SOURCE_READY_SQL: &str =
     "SELECT 1 FROM main.source_fact_readiness WHERE blob_id=?1 AND available=1";
 
 pub(super) trait GoDefinitionContextBinder {
-    fn bind_context(&self, path: &str) -> StoreResult<Option<super::GoContextIdentity>>;
+    fn bind_context(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+        path: &str,
+        candidates: &[SemanticId],
+    ) -> StoreResult<Option<super::GoContextIdentity>>;
 }
 
 /// Operation-local typed reader over one retained selected inventory.
@@ -184,6 +190,12 @@ pub struct SelectedResolutionTypedSource<'selection, 'store> {
         Option<std::sync::Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>>,
     go_context_binder: Option<&'selection dyn GoDefinitionContextBinder>,
     go_owner_proofs: std::cell::RefCell<go_members::OwnerProofMemo>,
+    external_signatures: std::cell::RefCell<external_owners::ExternalSignatureMemo>,
+    // One classifier per opted-in storage language, not per mount or definition.
+    namespace_classifiers: Vec<(
+        String,
+        Box<dyn super::language_support::NamespaceDefinitionClassifier>,
+    )>,
 }
 
 impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
@@ -210,6 +222,12 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             external_models: None,
             go_context_binder: None,
             go_owner_proofs: Default::default(),
+            external_signatures: Default::default(),
+            namespace_classifiers: selection
+                .namespace_definition_providers()
+                .iter()
+                .map(|(language, _, provider)| (language.clone(), provider()))
+                .collect(),
         }
     }
 
@@ -789,7 +807,14 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             else {
                 return Ok(None);
             };
-            if provenance.is_none() {
+            if provenance.is_none()
+                && !(self
+                    .selection
+                    .stage_family_is_globally_empty(super::resolution_stage::StageFamily::Nodes)?
+                    && self.selection.stage_family_is_globally_empty(
+                        super::resolution_stage::StageFamily::NodeCoordinates,
+                    )?)
+            {
                 let Some(registered) = self.read_statement(cancellation, |connection| {
                     Ok(Some(connection.prepare_cached(
                         "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_stage_nodes WHERE node=?1) \
@@ -1721,16 +1746,15 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             if coordinates.is_empty() {
                 continue;
             }
-            if !self
-                .selection
-                .replace_resolution_requests_1(coordinates.keys().copied(), cancellation)?
-            {
-                return Ok(None);
-            }
+            let requests = json_pair_array(
+                coordinates
+                    .keys()
+                    .map(|(mount, key)| (i64::from(mount.get()), *key)),
+            );
             let Some(rows) = self.read_statement(cancellation, |connection| {
                 let mut statement =
                     connection.prepare_cached(GENERIC_PARAMETER_DECLARATIONS_SQL)?;
-                let mut rows = statement.query([])?;
+                let mut rows = statement.query([&requests])?;
                 let mut result = Vec::new();
                 while let Some(row) = rows.next()? {
                     if cancellation.is_cancelled() {
@@ -1758,7 +1782,33 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<bool>>> {
-        go_members::participation(self, definitions, cancellation)
+        Ok(
+            go_members::source_participation(self, definitions, cancellation)?.map(|roles| {
+                roles
+                    .into_iter()
+                    .map(|role| role.as_deref() != Some("ignored"))
+                    .collect()
+            }),
+        )
+    }
+
+    fn go_package_member_sources(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<Option<Vec<SemanticId>>>>> {
+        go_members::package_member_sources(self, definitions, cancellation)
+    }
+
+    fn go_source_placement_proofs(
+        &self,
+        sources: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<bool>>> {
+        Ok(
+            go_members::source_participation(self, sources, cancellation)?
+                .map(|roles| roles.into_iter().map(|role| role.is_some()).collect()),
+        )
     }
 
     fn deferred_member_owner_proofs(
@@ -1816,7 +1866,16 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         definitions: &[SemanticId],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<crate::analyzer::resolution::JavaInheritanceDeclaration>>> {
-        java_inheritance::read(self, definitions, cancellation)
+        let Some(mut declarations) = java_inheritance::read(self, definitions, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let Some(external) = self.external_inheritance_declarations(definitions, cancellation)?
+        else {
+            return Ok(None);
+        };
+        declarations.extend(external);
+        Ok(Some(declarations))
     }
 
     fn rust_supertrait_owners(
@@ -1908,6 +1967,44 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             (local.mount().ordinal(), local.local_key().get()),
             cancellation,
         )
+    }
+
+    fn namespace_definitions(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        // Most languages do not opt in. In particular, JVM/Rust/Go-only
+        // selections must not even read a mount for namespace classification.
+        if self.namespace_classifiers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut batches = vec![Vec::new(); self.namespace_classifiers.len()];
+        for &definition in definitions {
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            let Some(ordinal) = definition.ordinal() else {
+                continue;
+            };
+            let mount = self.selection.mount_record_by_ordinal(
+                crate::analyzer::resolution::SelectedResolutionMountOrdinal::new(ordinal),
+            )?;
+            if let Some(index) = self
+                .namespace_classifiers
+                .iter()
+                .position(|(language, _)| language == mount.storage_language())
+            {
+                batches[index].push(definition);
+            }
+        }
+        let mut namespaces = Vec::new();
+        for ((_, classifier), batch) in self.namespace_classifiers.iter().zip(batches) {
+            if !batch.is_empty() {
+                namespaces.extend(classifier.definitions(self.selection, &batch, cancellation)?);
+            }
+        }
+        Ok(namespaces)
     }
 
     fn module_definitions(
@@ -2045,7 +2142,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypedFrontier>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2075,7 +2172,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_type_frontiers(slots.as_slice(), cancellation, visitor)
     }
 
     fn visit_type_identity_observation_pages_for_references(
@@ -2284,7 +2385,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         else {
             return cancelled();
         };
-        visit_combined_typed_rows(
+        let source = visit_combined_typed_rows(
             cancellation,
             visitor,
             |visitor| {
@@ -2315,7 +2416,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_type_components(containers.as_slice(), cancellation, visitor)
     }
 
     fn visit_declared_type_argument_pages_for_owners(
@@ -2605,7 +2710,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicSeed>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2625,7 +2730,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_type_seeds(slots.as_slice(), cancellation, visitor)
     }
 
     fn visit_intrinsic_seed_pages_for_type_identities(
@@ -2676,7 +2785,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredIntrinsicTypeDescriptor>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -2696,7 +2805,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_type_descriptors(type_identities.as_slice(), cancellation, visitor)
     }
 
     fn visit_binding_projection_pages_for_references(
@@ -3200,6 +3313,55 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         })
     }
 
+    fn visit_jvm_alias_pages_for_definitions(
+        &self,
+        definitions: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<JvmAliasProperty>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            definitions.as_slice(),
+            TypedFactRelation::DeclarationVisibilityDefinition,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        // These are existing blob-local alias rows. No staged or external
+        // alias definitions are manufactured for an authored source request.
+        self.visit_typed_rows(
+            &mounts,
+            typed_rows::JVM_ALIASES_BY_DEFINITION_SQL,
+            cancellation,
+            visitor,
+            |context, row| {
+                use brokk_bifrost_core::analyzer::resolution_facts::{
+                    ResolutionJvmAliasKind, ResolutionJvmAliasStatus,
+                };
+                let kind: String = row.get(3)?;
+                let status: String = row.get(4)?;
+                let owners: String = row.get(5)?;
+                Ok(SelectedTypedRow::new(
+                    context.fragment,
+                    JvmAliasProperty {
+                        definition: context.semantic(row.get(0)?),
+                        alias: row.get(1)?,
+                        member_name: row.get(2)?,
+                        kind: ResolutionJvmAliasKind::from_label(&kind).ok_or_else(|| {
+                            invalid_fact(format!("invalid JVM alias kind {kind:?}"))
+                        })?,
+                        status: ResolutionJvmAliasStatus::from_label(&status).ok_or_else(|| {
+                            invalid_fact(format!("invalid JVM alias status {status:?}"))
+                        })?,
+                        owner_segments: serde_json::from_str(&owners).map_err(|error| {
+                            invalid_fact(format!("invalid JVM alias owner segments: {error}"))
+                        })?,
+                    },
+                ))
+            },
+        )
+    }
+
     fn visit_companion_relation_pages_for_enclosing_types(
         &self,
         enclosing_types: TypedFactRequest<'_, SemanticId>,
@@ -3684,7 +3846,7 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredCallableSignatureProperty>>,
     ) -> StoreResult<TypedFactReadOutcome> {
-        self.visit_local_and_staged_typed_rows(
+        let source = self.visit_local_and_staged_typed_rows(
             cancellation,
             visitor,
             |source, cancellation| {
@@ -3710,7 +3872,11 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                     visitor,
                 )
             },
-        )
+        )?;
+        if !source.is_exhausted() {
+            return Ok(source);
+        }
+        self.visit_external_callable_signatures(definitions.as_slice(), cancellation, visitor)
     }
 
     fn visit_gap_reason_provenance_pages_for_reasons(
@@ -4453,26 +4619,6 @@ fn group_keys(coordinates: impl Iterator<Item = RequestCoordinate>) -> Vec<Mount
     grouped
 }
 
-/// One batch of integer keys as the JSON array a `json_each(?)` statement
-/// takes (milestone 6's rule, as `store/resolution_lexical.rs` states it).
-/// One batch of `(qualifier slot, lookup)` pairs as a JSON array of two-element
-/// arrays, which is the exact composite key the interior's index carries.
-fn json_pair_array(pairs: impl Iterator<Item = (i64, i64)>) -> String {
-    let mut out = String::from("[");
-    for (position, (first, second)) in pairs.enumerate() {
-        if position > 0 {
-            out.push(',');
-        }
-        out.push('[');
-        out.push_str(&first.to_string());
-        out.push(',');
-        out.push_str(&second.to_string());
-        out.push(']');
-    }
-    out.push(']');
-    out
-}
-
 // Both arms answer one caller request. Preserve their row order and multiplicity;
 // this buffer is dropped when that request finishes, before the next query.
 fn visit_combined_typed_rows<T: TypedRowEvidence + Clone>(
@@ -4553,6 +4699,7 @@ no_typed_row_evidence!(
     LoweredDeclarationVisibilityProperty,
     LoweredMemberScopeProperty,
     CompanionTypeRelation,
+    JvmAliasProperty,
     LoweredMemberOwnerProperty,
     LoweredDeferredMemberOwner,
     LoweredConstructionRequirementProperty,

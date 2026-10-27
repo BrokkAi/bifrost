@@ -2425,3 +2425,74 @@ export function caller(items: string[]): Wrapped<string> | string {
         assert_eq!(outcome.values(), Some([props].as_slice()));
     }
 }
+
+#[cfg(test)]
+mod pattern_binding_tests {
+    use super::{ts_object_pattern_binds, ts_pattern_binds_name};
+    use tree_sitter::Parser;
+
+    #[test]
+    fn pattern_binding_reads_binding_nodes_through_defaults_and_shadowed_scopes() {
+        let source = "function read({ direct: receiver = fallback, nested: { selected: nested = fallback }, list: [arrayReceiver = fallback, ...rest], ...outerRest }: Input) { { const receiver = shadow; receiver; } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut parameter_pattern = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "required_parameter" {
+                parameter_pattern = node.child_by_field_name("pattern");
+                break;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).unwrap());
+            }
+        }
+        let pattern = parameter_pattern.expect("parameter destructuring pattern");
+        let mut grammar_kinds = std::collections::BTreeSet::new();
+        let mut stack = vec![pattern];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "object_pattern" | "array_pattern" | "rest_pattern" | "assignment_pattern"
+            ) {
+                grammar_kinds.insert(node.kind());
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).unwrap());
+            }
+        }
+        assert_eq!(
+            grammar_kinds,
+            [
+                "array_pattern",
+                "assignment_pattern",
+                "object_pattern",
+                "rest_pattern"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(ts_object_pattern_binds(pattern, source, "receiver"));
+
+        let mut assignments = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "assignment_pattern"
+                && node
+                    .child_by_field_name("left")
+                    .is_some_and(|left| source[left.start_byte()..left.end_byte()] == *"receiver")
+            {
+                assignments.push(node);
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).unwrap());
+            }
+        }
+        assert_eq!(assignments.len(), 1);
+        assert!(ts_pattern_binds_name(assignments[0], source, "receiver"));
+        assert!(!ts_pattern_binds_name(assignments[0], source, "shadow"));
+    }
+}

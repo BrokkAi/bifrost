@@ -1678,6 +1678,8 @@ impl CSharpAssemblyPackProducer {
                 }
             }
             types.push(TypeFact {
+                implemented_traits_complete: false,
+                generic_trait_impls_complete: false,
                 jvm_inventory: None,
                 type_parameter_defaults: Vec::new(),
                 implemented_traits: Vec::new(),
@@ -1855,6 +1857,12 @@ impl CSharpAssemblyPackProducer {
             Completeness::Partial
         };
         let pack = AuthoredSemanticModelPack {
+            extraction: Some(
+                brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(
+                    request.artifact_kind,
+                    artifact,
+                ),
+            ),
             schema_version:
                 brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
             pack_id: request.pack_id.clone(),

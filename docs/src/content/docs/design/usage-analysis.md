@@ -123,6 +123,13 @@ available; the product records one incomplete reason per file. Missing caller
 authority cannot prove that any declaration has no inbound references. A missing
 selected context itself remains a whole-operation failure.
 
+A Go source that source admission refused does not make the Go inventory
+unavailable. The selected revision records it with its reason, the tool context
+gives each package that compiles it a `source_admission_refused` gap, and the
+graph reports one `source_admission_refused` incomplete reason per refused file.
+Like a missing caller, a refused file cannot prove the absence of inbound
+references, so dead-code evidence over a workspace with one stays inconclusive.
+
 Configured Go target settings are carried unchanged through session activation,
 discovery, the Go runner environment, and the selected profile digest. They take
 precedence over the host target. If discovery is disabled or fails, the graph

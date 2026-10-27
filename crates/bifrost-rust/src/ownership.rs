@@ -1056,8 +1056,25 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         let Some(target_referent) = reference_referent(target_type) else {
             return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::UnsupportedType);
         };
-        let source_mutable = reference_is_mutable(source_type);
-        let target_mutable = reference_is_mutable(target_type);
+        self.classify_reference_parts(
+            reference_is_mutable(source_type),
+            source_referent,
+            reference_is_mutable(target_type),
+            target_referent,
+        )
+    }
+
+    /// Prove the same reference coercions for declared and expression borrows.
+    pub fn classify_reference_parts(
+        &self,
+        source_mutable: bool,
+        source_referent: Node<'tree>,
+        target_mutable: bool,
+        target_referent: Node<'tree>,
+    ) -> RustReferenceCoercion {
+        if target_mutable && !source_mutable {
+            return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::UnsupportedType);
+        }
 
         if !target_mutable && source_mutable {
             match self.exact_type_equivalence(source_referent, target_referent) {
@@ -1081,9 +1098,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         }
 
         if source_referent.kind() == "array_type"
-            && target_referent.kind() == "array_type"
             && source_referent.child_by_field_name("length").is_some()
-            && target_referent.child_by_field_name("length").is_none()
+            && (target_referent.kind() == "slice_type"
+                || (target_referent.kind() == "array_type"
+                    && target_referent.child_by_field_name("length").is_none()))
         {
             let Some(source_element) = sequence_element(source_referent) else {
                 return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::MissingType);
@@ -2040,7 +2058,7 @@ where
         let Some(parent) = node.parent() else {
             return Ok(false);
         };
-        if matches!(parent.kind(), "unsafe_block" | "unsafe_item") {
+        if parent.kind() == "unsafe_block" {
             return Ok(true);
         }
         if parent.kind() == "function_modifiers" && has_unsafe_modifier_bounded(parent, charge)? {
@@ -2644,6 +2662,37 @@ mod tests {
             fields[1].0.map(|name| rust_node_text(name, source)),
             Some("second")
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: array unsizing strengthened a shared borrow"
+    )]
+    fn quicksilver_reference_unsizing_preserves_mutability() {
+        let source = "fn f(a: &[u8; 2], b: &mut [u8; 2], c: &[u8], d: &mut [u8]) {}";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        for (from, to, allowed) in [
+            ("&[u8; 2]", "&mut [u8]", false),
+            ("&[u8; 2]", "&[u8]", true),
+            ("&mut [u8; 2]", "&mut [u8]", true),
+            ("&mut [u8; 2]", "&[u8]", true),
+        ] {
+            let actual = index.classify_reference_coercion(
+                type_named(tree.root_node(), source, from),
+                type_named(tree.root_node(), source, to),
+            );
+            assert_eq!(
+                actual,
+                if allowed {
+                    RustReferenceCoercion::ArrayReferenceToSlice
+                } else {
+                    RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::UnsupportedType)
+                },
+                "{from} -> {to}"
+            );
+        }
     }
 
     #[test]
@@ -3296,5 +3345,230 @@ impl Owner {
         });
         assert!(result.is_err());
         assert!(charges > 0);
+    }
+}
+
+#[cfg(test)]
+mod reference_grammar_boundary {
+    use super::*;
+    use crate::test_helpers::{PATH_GRAMMAR_SOURCE, grammar_node, parse_rust};
+
+    #[test]
+    fn reference_grammar_fields_and_byte_spans() {
+        let tree = parse_rust(PATH_GRAMMAR_SOURCE);
+        assert!(!tree.root_node().has_error());
+        // kind, reference bytes/text, operand field, operand bytes/kind/text,
+        // mutable_specifier bytes. The inner &mut T is a separate grammar node.
+        for (kind, start, end, text, field, a, b, operand_kind, operand, mutable) in [
+            (
+                "reference_type",
+                145,
+                147,
+                "&T",
+                "type",
+                146,
+                147,
+                "type_identifier",
+                "T",
+                None,
+            ),
+            (
+                "reference_type",
+                152,
+                158,
+                "&mut T",
+                "type",
+                157,
+                158,
+                "type_identifier",
+                "T",
+                Some((153, 156)),
+            ),
+            (
+                "reference_type",
+                163,
+                170,
+                "&&mut T",
+                "type",
+                164,
+                170,
+                "reference_type",
+                "&mut T",
+                None,
+            ),
+            (
+                "reference_type",
+                164,
+                170,
+                "&mut T",
+                "type",
+                169,
+                170,
+                "type_identifier",
+                "T",
+                Some((165, 168)),
+            ),
+            (
+                "reference_type",
+                175,
+                185,
+                "&'a mut \u{0394}",
+                "type",
+                183,
+                185,
+                "type_identifier",
+                "\u{0394}",
+                Some((179, 182)),
+            ),
+            (
+                "reference_expression",
+                338,
+                344,
+                "&value",
+                "value",
+                339,
+                344,
+                "identifier",
+                "value",
+                None,
+            ),
+            (
+                "reference_expression",
+                354,
+                365,
+                "&mut *value",
+                "value",
+                359,
+                365,
+                "unary_expression",
+                "*value",
+                Some((355, 358)),
+            ),
+        ] {
+            let node = grammar_node(tree.root_node(), kind, start, end, text);
+            let operand = grammar_node(tree.root_node(), operand_kind, a, b, operand);
+            assert_eq!(node.child_by_field_name(field), Some(operand));
+            assert_eq!(rust_reference_is_mutable(node), mutable.is_some());
+            assert_eq!(has_mutable_reference_specifier(node), mutable.is_some());
+            if kind == "reference_type" {
+                assert_eq!(rust_reference_type_referent(node), Some(operand));
+                assert_eq!(rust_reference_expression_value(node), None);
+            } else {
+                assert_eq!(rust_reference_expression_value(node), Some(operand));
+                assert_eq!(rust_reference_type_referent(node), None);
+            }
+            let mut cursor = node.walk();
+            let specifier = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "mutable_specifier");
+            assert_eq!(specifier.map(|n| (n.start_byte(), n.end_byte())), mutable);
+            if let Some(specifier) = specifier {
+                assert_eq!(
+                    specifier.utf8_text(PATH_GRAMMAR_SOURCE.as_bytes()).unwrap(),
+                    "mut"
+                );
+                assert_ne!(specifier, operand);
+            }
+        }
+        let lifetime = grammar_node(tree.root_node(), "lifetime", 176, 178, "'a");
+        assert_eq!(lifetime.parent().unwrap().kind(), "reference_type");
+    }
+}
+
+#[cfg(test)]
+mod ownership_evidence_boundaries {
+    use super::*;
+
+    #[test]
+    fn ownership_payload_identity_and_reference_boundaries() {
+        // Contradictory Copy claims must still inspect named fields and nested
+        // references; a mutable reference never supplies a Copy payload proof.
+        // Negative non-Copy impls provide no positive destructor/clone evidence.
+        // The crate-qualified custom trait bypasses local-head rejection,
+        // keeping the standard-trait identity check observable.
+        let source = concat!(
+            "#[derive(core::marker::Copy, core::clone::Clone)] struct Shared { field: &'static u8 }\n",
+            "#[derive(core::marker::Copy, core::clone::Clone)] struct Mutable { field: &'static mut u8 }\n",
+            "#[derive(core::marker::Copy, core::clone::Clone)] struct Tuple(&'static mut u8);\n",
+            "struct NegativeDrop; impl !core::ops::Drop for NegativeDrop {}\n",
+            "struct NegativeClone; impl core::marker::Copy for NegativeClone {} impl !core::clone::Clone for NegativeClone {}\n",
+            "mod custom { pub trait Copy {} } struct Wrong; impl crate::custom::Copy for Wrong {} impl core::clone::Clone for Wrong {}\n",
+            "fn types(a: Shared, b: Mutable, c: Tuple, d: NegativeDrop, e: NegativeClone, f: Wrong, x: &u8, y: &mut u8) {}\n",
+            "unsafe trait UnsafeTrait { fn safe_method() { helper(); } }\n",
+            "unsafe impl UnsafeTrait for Shared { fn safe_method() { helper(); } }\n",
+            "unsafe fn unsafe_function() { helper(); }\n",
+        );
+        let tree = crate::test_helpers::parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let mut nodes = Vec::new();
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            nodes.push(node);
+            pending.extend(named_children(node));
+        }
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, |_| Ok::<_, ()>(())).unwrap();
+        let parameters = nodes
+            .iter()
+            .copied()
+            .filter(|node| node.kind() == "parameter")
+            .map(|node| node.child_by_field_name("type").unwrap())
+            .collect::<Vec<_>>();
+        for (name, expected) in [
+            ("Shared", RustOwnershipClass::AggregateCopy),
+            ("Mutable", RustOwnershipClass::Move),
+            ("Tuple", RustOwnershipClass::Move),
+            (
+                "NegativeDrop",
+                RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType),
+            ),
+            (
+                "NegativeClone",
+                RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity),
+            ),
+            (
+                "Wrong",
+                RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity),
+            ),
+        ] {
+            let ty = parameters
+                .iter()
+                .copied()
+                .find(|node| rust_node_text(*node, source) == name)
+                .unwrap();
+            assert_eq!(index.classify_type(ty), expected, "{name}");
+        }
+        // Reflexive coercions preserve alias identity for both mutabilities.
+        for (text, expected) in [
+            ("&u8", RustReferenceCoercion::SharedAlias),
+            ("&mut u8", RustReferenceCoercion::MutableAlias),
+        ] {
+            let ty = parameters
+                .iter()
+                .copied()
+                .find(|node| rust_node_text(*node, source) == text)
+                .unwrap();
+            assert_eq!(ty.kind(), "reference_type");
+            assert_eq!(
+                ty.child_by_field_name("type").unwrap().kind(),
+                "primitive_type"
+            );
+            assert_eq!(index.classify_reference_coercion(ty, ty), expected);
+        }
+        // Unsafe traits and impls do not make safe method bodies unsafe.
+        let mut unsafe_contexts = nodes
+            .iter()
+            .copied()
+            .filter(|node| node.kind() == "call_expression")
+            .map(|node| (node.start_byte(), rust_node_is_in_unsafe_context(node)))
+            .collect::<Vec<_>>();
+        unsafe_contexts.sort_unstable();
+        assert_eq!(
+            unsafe_contexts
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
     }
 }

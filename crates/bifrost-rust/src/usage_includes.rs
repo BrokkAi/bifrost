@@ -42,16 +42,14 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 
+use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::rust_facts::{RustIncludeBindingKind, RustIncludeEdgeFact};
-use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
-use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
-use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{RustCargoRouteError, RustFactSource};
 use crate::imports::rust_crate_root_package;
 use crate::lexical_scope::lexical_package_at;
-use crate::usage::{ModuleKey, RustSymbolIdentity, RustSymbolNamespace};
 use crate::usage_walks::RustUsageWalks;
 
 /// The lexical owner route for a physical file consumed by `include!(...)`.
@@ -370,151 +368,6 @@ impl<'a> RustIncludeRoutes<'a> {
             return Err(RustCargoRouteError::Cancelled);
         }
         Ok(verified)
-    }
-
-    /// Resolve one host's `include!` literal against that host's own directory.
-    fn module_routes_through(
-        &self,
-        route: &RustIncludeRoute,
-        source: &str,
-        scope_start: usize,
-        module_specifier: &str,
-    ) -> Result<Vec<crate::usage::RustResolvedModuleRoute>, RustCargoRouteError> {
-        let lexical_package = lexical_package_at(&route.module_package, source, scope_start);
-        let segments = parse_symbol_path(Language::Rust, module_specifier);
-        self.walks
-            .resolve_segments(&route.root_file, &lexical_package, &segments)
-    }
-
-    /// Resolve an import binder through an include route to canonical value
-    /// identities. The export walk keeps glob and re-export resolution in the
-    /// same module and Cargo graph as normal Rust usage analysis.
-    pub fn include_import_target_identities(
-        &self,
-        route: &RustIncludeRoute,
-        source: &str,
-        scope_start: usize,
-        binding: &ImportBinding,
-        target_identifier: &str,
-    ) -> Result<HashSet<RustSymbolIdentity>, RustCargoRouteError> {
-        if binding.kind == ImportKind::Namespace {
-            let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
-            let Some((target_name, module_segments)) = segments.split_last() else {
-                return Ok(HashSet::default());
-            };
-            let module_specifier = module_segments.join("::");
-            let mut targets = HashSet::default();
-            for resolved in
-                self.module_routes_through(route, source, scope_start, &module_specifier)?
-            {
-                if let Some(identity) = self.value_identity_in(
-                    &resolved.target_file,
-                    &resolved.target_module,
-                    target_name,
-                )? {
-                    targets.insert(identity);
-                }
-            }
-            return Ok(targets);
-        }
-        let Some(imported_name) = (match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref(),
-            ImportKind::Glob => Some(target_identifier),
-            _ => None,
-        }) else {
-            return Ok(HashSet::default());
-        };
-        let mut targets = HashSet::default();
-        for resolved in
-            self.module_routes_through(route, source, scope_start, &binding.module_specifier)?
-        {
-            let module_files = vec![resolved.target_file.clone()];
-            for (target_file, target_name) in
-                self.walks
-                    .export_targets_from_files(self.analyzer, &module_files, imported_name)?
-            {
-                targets.extend(self.value_identities_named_in(&target_file, &target_name)?);
-            }
-            if let Some(identity) = self.value_identity_in(
-                &resolved.target_file,
-                &resolved.target_module,
-                imported_name,
-            )? {
-                targets.insert(identity);
-            }
-        }
-        Ok(targets)
-    }
-
-    /// Resolve a qualified path whose first segment comes from a host import.
-    pub fn include_path_target_identities(
-        &self,
-        route: &RustIncludeRoute,
-        binding: &RustIncludeHostBinding,
-        suffix: &[&str],
-    ) -> Result<HashSet<RustSymbolIdentity>, RustCargoRouteError> {
-        let module_segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
-        if module_segments.is_empty() {
-            return Ok(HashSet::default());
-        }
-        let mut member_segments = Vec::new();
-        if let Some(imported_name) = &binding.imported_name {
-            if imported_name.is_empty() {
-                return Ok(HashSet::default());
-            }
-            member_segments.push(imported_name.clone());
-        }
-        for segment in suffix {
-            if segment.is_empty() {
-                return Ok(HashSet::default());
-            }
-            member_segments.push((*segment).to_string());
-        }
-        let Some((target_name, owner_segments)) = member_segments.split_last() else {
-            return Ok(HashSet::default());
-        };
-        let mut segments = module_segments;
-        segments.extend(owner_segments.iter().cloned());
-        let module_specifier = segments.join("::");
-        let mut targets = HashSet::default();
-        for resolved in self.module_routes_through(route, "", 0, &module_specifier)? {
-            if let Some(identity) =
-                self.value_identity_in(&resolved.target_file, &resolved.target_module, target_name)?
-            {
-                targets.insert(identity);
-            }
-        }
-        Ok(targets)
-    }
-
-    /// The value-namespace identity `file` declares as `name` in `module`.
-    fn value_identity_in(
-        &self,
-        file: &ProjectFile,
-        module: &ModuleKey,
-        name: &str,
-    ) -> Result<Option<RustSymbolIdentity>, RustCargoRouteError> {
-        Ok(self
-            .value_identities_named_in(file, name)?
-            .into_iter()
-            .find(|identity| identity.module == *module))
-    }
-
-    /// Every value-namespace identity `file` declares as `name`, in any module.
-    fn value_identities_named_in(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> Result<Vec<RustSymbolIdentity>, RustCargoRouteError> {
-        let identities = self
-            .walks
-            .queries()
-            .identities_in_file_named(file, name)?
-            .into_iter()
-            .map(|(identity, _)| identity)
-            .filter(|identity| identity.namespace == RustSymbolNamespace::Value)
-            .collect();
-        Ok(identities)
     }
 }
 

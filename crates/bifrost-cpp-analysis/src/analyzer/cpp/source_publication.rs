@@ -28,8 +28,19 @@ pub(crate) fn cost(facts: &CppSourceFacts) -> (usize, usize) {
     let mut rows = 1usize
         .saturating_add(facts.includes.len())
         .saturating_add(facts.declarations.len())
-        .saturating_add(facts.using_namespaces.len());
+        .saturating_add(facts.using_namespaces.len())
+        .saturating_add(facts.namespace_aliases.len());
     let mut bytes = 0usize;
+    for alias in &facts.namespace_aliases {
+        let components = alias.target.iter().flatten().chain(&alias.namespace);
+        rows = rows.saturating_add(components.clone().count());
+        bytes = bytes
+            .saturating_add(alias.name.len())
+            .saturating_add(components.map(String::len).sum::<usize>())
+            .saturating_add(alias.guards.as_ref().map_or(0, |guards| {
+                crate::analyzer::cpp::source_publication_context::guard_set_json(guards).len()
+            }));
+    }
     for include in &facts.includes {
         bytes = bytes.saturating_add(include.path.len());
     }
@@ -474,6 +485,54 @@ fn insert(
         ])?;
     }
     drop(namespaces);
+
+    let mut aliases = tx.prepare_cached(
+        "INSERT INTO source_cpp_namespace_aliases
+         (blob_id, ordinal, occurrence_id, name, target_present, target_global,
+          block_occurrence_id, guards)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    let mut alias_paths = tx.prepare_cached(
+        "INSERT INTO source_cpp_namespace_alias_paths
+         (blob_id, alias_ordinal, path_kind, ordinal, component)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (alias_ordinal, alias) in facts.namespace_aliases.iter().enumerate() {
+        check_cancelled(cancellation)?;
+        let alias_ordinal = usize_to_i64(alias_ordinal)?;
+        aliases.execute(params![
+            blob_id,
+            alias_ordinal,
+            alias.occurrence.get(),
+            alias.name,
+            alias.target.is_some(),
+            alias.target_global,
+            alias.block.map(|block| block.get()),
+            alias
+                .guards
+                .as_ref()
+                .map(crate::analyzer::cpp::source_publication_context::guard_set_json),
+        ])?;
+        for (path_kind, path) in [
+            alias.target.as_deref().unwrap_or_default(),
+            &alias.namespace,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (ordinal, component) in path.iter().enumerate() {
+                alias_paths.execute(params![
+                    blob_id,
+                    alias_ordinal,
+                    usize_to_i64(path_kind)?,
+                    usize_to_i64(ordinal)?,
+                    component
+                ])?;
+            }
+        }
+    }
+    drop(aliases);
+    drop(alias_paths);
 
     crate::analyzer::cpp::source_publication_context::insert(tx, blob_id, facts, cancellation)?;
     let (logical_rows, payload_bytes) = cost(facts);

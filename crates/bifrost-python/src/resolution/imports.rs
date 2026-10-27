@@ -79,10 +79,8 @@ pub(super) fn produce(
                     name,
                 });
         }
-        if relative_level != 0 {
-            p.facts
-                .add_route_gap(site, ResolutionRouteGap::UnknownPlacement);
-        }
+        // Selected environment summaries own relative placement. An unresolved
+        // route carries request-local python_relative_context_open evidence.
         p.facts.python_imports.push(PythonNativeImportFact {
             import_site: site,
             form,

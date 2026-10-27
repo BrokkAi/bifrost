@@ -8,6 +8,88 @@ use brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed;
 use std::ops::{ControlFlow, Range};
 use tree_sitter::{Node, Parser};
 
+/// A grammar context around embedded source with physical byte origins.
+/// Consumers of a sentinel tree count non-extra named children.
+/// Error nodes are preserved: recovery callers inspect them, while callers
+/// requiring a complete construct reject `tree.root_node().has_error()`.
+pub(crate) struct SentinelParse {
+    pub source: String,
+    pub tree: tree_sitter::Tree,
+    /// Byte origins relative to the embedded source, excluding the prefix.
+    /// Synthetic suffix bytes and the final boundary map to its original end.
+    pub original_offsets: Vec<Range<usize>>,
+    prefix_len: usize,
+}
+
+impl SentinelParse {
+    pub fn original_range(&self, node: Node<'_>) -> Option<Range<usize>> {
+        let start = node.start_byte().checked_sub(self.prefix_len)?;
+        let end = node.end_byte().checked_sub(self.prefix_len)?;
+        Some(
+            self.original_offsets.get(start)?.start
+                ..self.original_offsets.get(end.checked_sub(1)?)?.end,
+        )
+    }
+}
+
+/// Embedded bytes and their physical origins. Ordinary source regions retain
+/// their exact spelling; opaque preprocessing replacements need phase-2 splicing.
+pub(crate) struct SentinelInput {
+    pub source: String,
+    pub original_offsets: Vec<Range<usize>>,
+}
+
+impl SentinelInput {
+    pub fn replacement(source: &str) -> Self {
+        let (source, original_offsets) = normalize_macro_continuations(source);
+        Self {
+            source,
+            original_offsets,
+        }
+    }
+
+    pub fn region(source: &str) -> Self {
+        let mut original_offsets = (0..source.len()).map(|i| i..i + 1).collect::<Vec<_>>();
+        original_offsets.push(source.len()..source.len());
+        Self {
+            source: source.to_owned(),
+            original_offsets,
+        }
+    }
+}
+
+pub(crate) fn parse_sentinel(prefix: &str, embedded: SentinelInput, suffix: &str) -> SentinelParse {
+    let SentinelInput {
+        source: replacement,
+        mut original_offsets,
+    } = embedded;
+    let original_end = original_offsets
+        .last()
+        .expect("embedded source includes its final boundary")
+        .end;
+    debug_assert_eq!(original_offsets.len(), replacement.len() + 1);
+    // A preproc_arg can include a trailing line comment. End it before any
+    // synthetic punctuation, including an expression's terminating semicolon.
+    let source = format!("{prefix}{replacement}\n{suffix}");
+    original_offsets.extend(std::iter::repeat_n(
+        original_end..original_end,
+        1 + suffix.len(),
+    ));
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .expect("C++ grammar matches the parser ABI");
+    let tree = parser
+        .parse(&source, None)
+        .expect("sentinel parse has no cancellation or timeout");
+    SentinelParse {
+        source,
+        tree,
+        original_offsets,
+        prefix_len: prefix.len(),
+    }
+}
+
 /// Whether an expression denotes C++'s implicit object receiver.
 ///
 /// `this` is the implicit object only where C++ compiles the source; it is an
@@ -149,19 +231,11 @@ pub fn object_macro_replacement(replacement: &str) -> ObjectMacroReplacement {
     if replacement.trim().is_empty() {
         return ObjectMacroReplacement::default();
     }
-    let normalized_replacement = normalize_macro_continuations(replacement);
     const PREFIX: &str = "struct __bifrost_macro_fields { ";
-    let synthetic = format!("{PREFIX}{normalized_replacement} }};");
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .is_err()
-    {
-        return ObjectMacroReplacement::default();
-    }
-    let Some(tree) = parser.parse(&synthetic, None) else {
-        return ObjectMacroReplacement::default();
-    };
+    let parsed = parse_sentinel(PREFIX, SentinelInput::replacement(replacement), " };");
+    let synthetic = parsed.source.as_str();
+    let tree = &parsed.tree;
+    let original_offsets = &parsed.original_offsets;
     let mut stack = vec![tree.root_node()];
     let body = loop {
         let Some(current) = stack.pop() else {
@@ -184,27 +258,37 @@ pub fn object_macro_replacement(replacement: &str) -> ObjectMacroReplacement {
         if !matches!(declaration.kind(), "declaration" | "field_declaration") {
             continue;
         }
-        if let Some((name, terminator)) = nested_object_macro_invocation(declaration, &synthetic) {
+        if let Some((name, terminator)) = nested_object_macro_invocation(declaration, synthetic) {
             recovered.nested.push(name);
             composed_terminators.push(terminator.id());
             continue;
         }
-        let Some(declarator) = declaration
-            .child_by_field_name("declarator")
-            .or_else(|| declaration.named_child(1))
-        else {
+        let Some(declarator) = declaration.child_by_field_name("declarator").or_else(|| {
+            let mut cursor = declaration.walk();
+            declaration
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra())
+                .nth(1)
+        }) else {
             continue;
         };
-        let Some(name) = macro_replacement_declarator_name(declarator, &synthetic) else {
+        let Some(name) = macro_replacement_declarator_name(declarator, synthetic) else {
             continue;
         };
-        let Some(declaration_text) =
-            declaration_text_without_synthetic_prefix(declaration, replacement, PREFIX.len())
-        else {
+        let start = declaration
+            .start_byte()
+            .checked_sub(PREFIX.len())
+            .and_then(|start| original_offsets.get(start));
+        let end = declaration
+            .end_byte()
+            .checked_sub(PREFIX.len())
+            .and_then(|end| original_offsets.get(end.checked_sub(1)?));
+        let Some((start, end)) = start.zip(end) else {
             continue;
         };
+        let declaration_text = replacement[start.start..end.end].to_string();
         let (field_type, names_function_type) =
-            crate::source_facts::capture_field_type(declaration, &name, &synthetic);
+            crate::source_facts::capture_field_type(declaration, &name, synthetic);
         recovered.fields.push(MacroReplacementField {
             name,
             declaration: declaration_text,
@@ -292,17 +376,9 @@ pub fn recovered_aggregate_fields(
         return Vec::new();
     }
     const PREFIX: &str = "struct __bifrost_recovered_members { ";
-    let synthetic = format!("{PREFIX}{region} }};");
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(&synthetic, None) else {
-        return Vec::new();
-    };
+    let parsed = parse_sentinel(PREFIX, SentinelInput::region(region), " };");
+    let synthetic = parsed.source.as_str();
+    let tree = &parsed.tree;
     if tree.root_node().has_error() {
         return Vec::new();
     }
@@ -327,31 +403,29 @@ pub fn recovered_aggregate_fields(
         if !matches!(declaration.kind(), "declaration" | "field_declaration") {
             continue;
         }
-        let Some(declarator) = declaration
-            .child_by_field_name("declarator")
-            .or_else(|| declaration.named_child(1))
-        else {
-            continue;
-        };
-        let Some(name) = macro_replacement_declarator_name(declarator, &synthetic) else {
-            continue;
-        };
-        let Some(declaration_text) =
-            declaration_text_without_synthetic_prefix(declaration, region, PREFIX.len())
-        else {
-            continue;
-        };
-        let (field_type, names_function_type) =
-            crate::source_facts::capture_field_type(declaration, &name, &synthetic);
-        let start = span.start + declaration.start_byte() - PREFIX.len();
-        let end = span.start + declaration.end_byte() - PREFIX.len();
-        fields.push(RecoveredAggregateField {
-            name,
-            declaration: declaration_text,
-            range: start..end,
-            field_type,
-            names_function_type,
-        });
+        let mut declarator_cursor = declaration.walk();
+        for declarator in declaration.children_by_field_name("declarator", &mut declarator_cursor) {
+            let Some(name) = macro_replacement_declarator_name(declarator, synthetic) else {
+                continue;
+            };
+            let Some(range) = parsed.original_range(declaration) else {
+                continue;
+            };
+            let Some(declaration_text) = region.get(range.clone()).map(str::to_owned) else {
+                continue;
+            };
+            let (field_type, names_function_type) =
+                crate::source_facts::capture_field_type(declaration, &name, synthetic);
+            let start = span.start + range.start;
+            let end = span.start + range.end;
+            fields.push(RecoveredAggregateField {
+                name,
+                declaration: declaration_text,
+                range: start..end,
+                field_type,
+                names_function_type,
+            });
+        }
     }
     fields
 }
@@ -434,34 +508,31 @@ fn logical_line_end(start: usize, source: &str) -> usize {
     index
 }
 
-/// Keep preprocessor line continuations as byte-preserving whitespace before
-/// reparsing an opaque replacement. The parser's replacement node includes
-/// the backslash/newline pair, while C's preprocessing phase treats it as one
-/// logical line. Replacing both bytes (and CRLF's three bytes) keeps every
-/// tree-sitter byte range mapped directly to the original replacement.
-pub(crate) fn normalize_macro_continuations(replacement: &str) -> String {
+/// Apply translation phase 2 (C 5.1.1.2): delete a backslash-newline pair,
+/// allowing the surrounding bytes to form a single preprocessing token.
+/// Each normalized byte maps back to its physical source byte;
+/// consumers parse the joined text and report ranges in the physical source.
+fn normalize_macro_continuations(replacement: &str) -> (String, Vec<Range<usize>>) {
     let source = replacement.as_bytes();
-    let mut normalized = source.to_vec();
+    let mut normalized = Vec::with_capacity(source.len());
+    let mut original_offsets = Vec::with_capacity(source.len() + 1);
     let mut index = 0;
-    while index + 1 < source.len() {
-        if source[index] == b'\\' && source[index + 1] == b'\n' {
-            normalized[index] = b' ';
-            normalized[index + 1] = b' ';
+    while index < source.len() {
+        if source[index..].starts_with(b"\\\n") {
             index += 2;
-        } else if index + 2 < source.len()
-            && source[index] == b'\\'
-            && source[index + 1] == b'\r'
-            && source[index + 2] == b'\n'
-        {
-            normalized[index] = b' ';
-            normalized[index + 1] = b' ';
-            normalized[index + 2] = b' ';
+        } else if source[index..].starts_with(b"\\\r\n") {
             index += 3;
         } else {
+            original_offsets.push(index..index + 1);
+            normalized.push(source[index]);
             index += 1;
         }
     }
-    String::from_utf8(normalized).expect("source text must remain valid UTF-8")
+    original_offsets.push(source.len()..source.len());
+    (
+        String::from_utf8(normalized).expect("source text remains valid UTF-8"),
+        original_offsets,
+    )
 }
 
 fn macro_replacement_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -476,16 +547,6 @@ fn macro_replacement_declarator_name(node: Node<'_>, source: &str) -> Option<Str
             .or_else(|| node.child_by_field_name("name"))
             .and_then(|child| macro_replacement_declarator_name(child, source)),
     }
-}
-
-fn declaration_text_without_synthetic_prefix(
-    node: Node<'_>,
-    source: &str,
-    prefix_len: usize,
-) -> Option<String> {
-    let start = node.start_byte().checked_sub(prefix_len)?;
-    let end = node.end_byte().checked_sub(prefix_len)?;
-    (end <= source.len()).then(|| source[start..end].to_string())
 }
 
 /// Recover type-bearing syntax hidden inside an object-like macro replacement.
@@ -513,17 +574,9 @@ pub fn object_macro_replacement_type_references(
         return Vec::new();
     };
     const PREFIX: &str = "void __bifrost_macro_reference() { ";
-    let synthetic = format!("{PREFIX}{replacement}; }}");
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(&synthetic, None) else {
-        return Vec::new();
-    };
+    let parsed = parse_sentinel(PREFIX, SentinelInput::replacement(replacement), "; }");
+    let synthetic = parsed.source.as_str();
+    let tree = &parsed.tree;
     if tree.root_node().has_error() {
         return Vec::new();
     }
@@ -536,7 +589,7 @@ pub fn object_macro_replacement_type_references(
             "type_identifier" | "scoped_type_identifier" | "template_type"
         ) && !is_nested_type_node(current)
         {
-            cpp_type_name_components(current, &synthetic)
+            cpp_type_name_components(current, synthetic)
                 .zip(cpp_name_component_nodes(current))
                 .map(|(components, nodes)| {
                     (components, nodes, is_globally_qualified_cpp_name(current))
@@ -549,7 +602,7 @@ pub fn object_macro_replacement_type_references(
                 )
             })
         {
-            qualified_owner_components(current, &synthetic)
+            qualified_owner_components(current, synthetic)
                 .map(|owner| (owner.names, owner.nodes, owner.global))
         } else {
             None
@@ -558,10 +611,9 @@ pub fn object_macro_replacement_type_references(
             let component_ranges = component_nodes
                 .into_iter()
                 .map(|component| {
-                    let start = component.start_byte().checked_sub(PREFIX.len())?;
-                    let end = component.end_byte().checked_sub(PREFIX.len())?;
-                    (end <= replacement.len())
-                        .then_some(node.start_byte() + start..node.start_byte() + end)
+                    let range = parsed.original_range(component)?;
+                    (range.end <= replacement.len())
+                        .then_some(node.start_byte() + range.start..node.start_byte() + range.end)
                 })
                 .collect::<Option<Vec<_>>>();
             if let Some(component_ranges) = component_ranges
@@ -780,6 +832,55 @@ pub fn function_macro_included_ranges(
 #[cfg(test)]
 mod tests {
     use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: line splicing split macro field tokens"
+    )]
+    fn macro_splices_join_tokens() {
+        for newline in ["\n", "\r\n"] {
+            let source = format!("in\\{newline}t val\\{newline}ue;\\{newline}int after;");
+            let replacement = object_macro_replacement(&source);
+            assert_eq!(
+                replacement
+                    .fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["value", "after"]
+            );
+            assert_eq!(
+                replacement.fields[0].declaration,
+                source[..source.find(';').unwrap() + 1]
+            );
+            assert_eq!(replacement.fields[1].declaration, "int after;");
+            assert_eq!(
+                replacement.fields[0].field_type.as_ref().unwrap().type_text,
+                "int"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: recovered aggregate lost repeated declarators"
+    )]
+    fn quicksilver_recovered_aggregate_multi_declarators() {
+        let source = "int left, right;";
+        let fields = recovered_aggregate_fields(source, 0..source.len());
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["left", "right"]
+        );
+        for field in fields {
+            assert_eq!(field.declaration, source);
+            assert_eq!(&source[field.range], source);
+            assert_eq!(field.field_type.unwrap().type_text, "int");
+        }
+    }
+
     #[test]
     #[hardwon(
         "05fbd05c6bd7: C/C++ macro recovery previously lost or invented structured declarations"
@@ -1002,5 +1103,43 @@ mod tests {
             [("signal_cb", "uv_signal_cb signal_cb;")]
         );
         assert_eq!(&source[fields[0].range.clone()], "uv_signal_cb signal_cb;");
+    }
+
+    #[test]
+    fn function_macro_comment_boundary_grammar() {
+        // Comments touching either replacement boundary must be masked just
+        // like interior comments; replacement declarations cannot escape into
+        // the containing translation unit.
+        for replacement in [
+            "/*head*/ int phantom;",
+            "int phantom; /*tail*/",
+            "int /*middle*/ phantom;",
+        ] {
+            let source = format!("#define F(){replacement}\nvoid caller() {{ F(); }}\n");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let raw = parser.parse(&source, None).unwrap();
+            let ranges = super::function_macro_included_ranges(&source, &raw, || false)
+                .continue_value()
+                .unwrap()
+                .expect("comment masking is required");
+            parser.set_included_ranges(&ranges).unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let declarations: Vec<_> = tree
+                .root_node()
+                .named_children(&mut tree.root_node().walk())
+                .map(|n| n.kind())
+                .collect();
+            assert_eq!(
+                declarations,
+                ["preproc_function_def", "function_definition"],
+                "{source}: {}",
+                tree.root_node().to_sexp()
+            );
+            let caller = tree.root_node().named_child(1).unwrap();
+            assert_eq!(&source[caller.byte_range()], "void caller() { F(); }");
+        }
     }
 }

@@ -40,6 +40,7 @@ pub mod native_points;
 pub mod native_rename;
 #[doc(hidden)]
 pub mod native_usages;
+mod trait_applicability;
 mod value_type_barriers;
 
 pub use crate::analyzer::rust::native_usages::RustNativeUsageStrategy;
@@ -2003,6 +2004,8 @@ impl IAnalyzer for RustAnalyzer {
         }
     }
 
+    brokk_bifrost_analysis::forward_query_read_ledger!();
+
     fn begin_query(
         &self,
         context: &Arc<brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryContext>,
@@ -2656,7 +2659,8 @@ impl LanguageSupport for RustSupport {
                 cancellation,
             )
             .map_err(|error| error.to_string())?;
-        Ok(Some(map_bounded(answer, |outcome| match outcome {
+        Ok(Some(map_bounded(answer, |outcome| {
+            match outcome {
             SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
                 answer,
             )) => adapt_assignment_value_probe(site, language, answer),
@@ -2681,9 +2685,10 @@ impl LanguageSupport for RustSupport {
                 unavailable_assignment_value_probe(
                     site,
                     "native_cancelled",
-                    format!("{completion:?}"),
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_completion_details(&completion, |_| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_diagnostic_identity("semantic", None, None, None)),
                 )
             }
+        }
         })))
     }
 

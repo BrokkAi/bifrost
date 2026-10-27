@@ -1472,43 +1472,89 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         }
         let function = call.child_by_field_name("function")?;
         let arity = named_children(call.child_by_field_name("arguments")?).len();
-        let (owner, member, has_receiver) = match function.kind() {
-            "field_expression" => {
-                let receiver = function.child_by_field_name("value")?;
-                let owner = self.receiver_owner_bounded(source, receiver, depth - 1)?;
-                let member = source.node_text(function.child_by_field_name("field")?)?;
-                (owner.key(), member.to_owned(), true)
-            }
-            "scoped_identifier" | "generic_function" => {
-                let callee = if function.kind() == "generic_function" {
-                    function.child_by_field_name("function")?
-                } else {
-                    function
-                };
-                let name = callee.child_by_field_name("name")?;
-                let text = source.node_text(name)?.to_owned();
-                let site = ResolvedReferenceSite {
-                    path: text.clone(),
-                    text,
-                    range: node_range(name),
-                    focus_start_byte: name.start_byte(),
-                    focus_end_byte: name.end_byte(),
-                };
-                let identity = self.resolver.external_call_identity(
-                    &source.file,
-                    source.text(),
-                    source.tree(),
-                    &site,
-                    call.start_byte(),
-                )?;
-                (
-                    identity.owner_fqn().to_owned(),
-                    identity.member().to_owned(),
-                    false,
-                )
-            }
-            _ => return None,
-        };
+        let (owner, member, has_receiver) =
+            match function.kind() {
+                "field_expression" => {
+                    let receiver = function.child_by_field_name("value")?;
+                    let owner = self.receiver_owner_bounded(source, receiver, depth - 1)?;
+                    let name = function.child_by_field_name("field")?;
+                    let member = source.node_text(name)?;
+                    let overlay = self.analyzer.semantic_model_overlay()?;
+                    let active = self.analyzer.active_semantic_models()?;
+                    let mut applicability = super::trait_applicability::ModelApplicability::new(
+                        self.analyzer,
+                        self.rust,
+                        &overlay,
+                        &active,
+                    );
+                    let application = super::semantic::RustReceiverTypeFacts::from_tree(
+                        source.text(),
+                        source.tree(),
+                    )
+                    .declared_receiver_type(source.text(), source.tree(), receiver)
+                    .and_then(|ty| {
+                        applicability.receiver_type(self.analyzer, &source.file, source.text(), ty)
+                    })
+                    .or_else(|| self.modeled_receiver_type_bounded(source, receiver, depth - 1))
+                    .or_else(|| {
+                        overlay
+                            .symbols_named(&owner.key())
+                            .unique()
+                            .as_ref()
+                            .map(|owner| applicability.abstract_receiver(owner))
+                    })?;
+                    let site = ResolvedReferenceSite {
+                        path: member.to_owned(),
+                        text: member.to_owned(),
+                        range: node_range(name),
+                        focus_start_byte: name.start_byte(),
+                        focus_end_byte: name.end_byte(),
+                    };
+                    let owner = super::modeled_members::select(
+                        self.analyzer,
+                        &source.file,
+                        source.text(),
+                        &site,
+                        &owner.key(),
+                        true,
+                        u32::try_from(arity).ok()?,
+                        None,
+                        None,
+                        None,
+                        Some(&application),
+                    )?;
+                    (owner.owner, member.to_owned(), true)
+                }
+                "scoped_identifier" | "generic_function" => {
+                    let callee = if function.kind() == "generic_function" {
+                        function.child_by_field_name("function")?
+                    } else {
+                        function
+                    };
+                    let name = callee.child_by_field_name("name")?;
+                    let text = source.node_text(name)?.to_owned();
+                    let site = ResolvedReferenceSite {
+                        path: text.clone(),
+                        text,
+                        range: node_range(name),
+                        focus_start_byte: name.start_byte(),
+                        focus_end_byte: name.end_byte(),
+                    };
+                    let identity = self.resolver.external_call_identity(
+                        &source.file,
+                        source.text(),
+                        source.tree(),
+                        &site,
+                        call.start_byte(),
+                    )?;
+                    (
+                        identity.owner_fqn().to_owned(),
+                        identity.member().to_owned(),
+                        false,
+                    )
+                }
+                _ => return None,
+            };
         Some((owner, member, has_receiver, arity))
     }
 
@@ -1533,7 +1579,68 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 &SemanticModelCallApplication::positional(parameter_count),
             )
             .unique()?;
-        callable.structured_signature.as_ref()?.returns.clone()
+        let returned = callable.structured_signature.as_ref()?.returns.clone()?;
+        let owner_symbol = overlay.symbols_named(&owner).unique()?;
+        // The producer projects an impl's Self return onto its declared owner.
+        // Retain the call's explicit generic application, rather than treating
+        // Vec::<u8>::new() as an untyped Vec when probing its result (#6542).
+        if matches!(&returned, TypeRef::Declared { id, .. } if id == &owner_symbol.id)
+            || matches!(&returned, TypeRef::TypeParameter { name } if name == "Self")
+        {
+            let active = self.analyzer.active_semantic_models()?;
+            let mut applicability = super::trait_applicability::ModelApplicability::new(
+                self.analyzer,
+                self.rust,
+                &overlay,
+                &active,
+            );
+            let function = call.child_by_field_name("function")?;
+            let function = if function.kind() == "generic_function" {
+                function.child_by_field_name("function")?
+            } else {
+                function
+            };
+            let ty = if has_receiver {
+                function.child_by_field_name("value").and_then(|receiver| {
+                    super::semantic::RustReceiverTypeFacts::from_tree(source.text(), source.tree())
+                        .declared_receiver_type(source.text(), source.tree(), receiver)
+                })
+            } else {
+                function.child_by_field_name("path")
+            };
+            let mut actual = ty
+                .and_then(|ty| {
+                    applicability.receiver_type(self.analyzer, &source.file, source.text(), ty)
+                })
+                .unwrap_or_else(|| applicability.abstract_receiver(&owner_symbol));
+            while let TypeRef::ByRef { element, .. } = actual {
+                actual = *element;
+            }
+            let declaration =
+                brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                    &active,
+                    &owner_symbol,
+                )?;
+            let arguments = match &actual {
+                TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } => arguments,
+                _ => return None,
+            };
+            let mut bindings = declaration
+                .type_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            bindings.insert("Self".into(), actual);
+            let mut returned = super::trait_applicability::substitute(&returned, &bindings, 16)?;
+            if let TypeRef::Declared { arguments, .. } = &mut returned {
+                // An impl target can omit defaulted owner arguments too:
+                // Vec<T>'s Self is Vec<T, Global>, not a one-argument Vec.
+                super::trait_applicability::complete_type_arguments(&declaration, arguments)?;
+            }
+            return Some(returned);
+        }
+        Some(returned)
     }
 
     /// The owner a modeled external call's result is declared as, read from
@@ -1547,8 +1654,47 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
     ) -> Option<RustReceiverOwner> {
         match self.modeled_call_return_type(source, call, depth)? {
             TypeRef::Named { name, .. } => Some(RustReceiverOwner::Path(name)),
+            TypeRef::Declared { id, .. } => {
+                let overlay = self.analyzer.semantic_model_overlay()?;
+                let symbol = overlay.symbols_with_id(&id).unique()?;
+                Some(RustReceiverOwner::Path(symbol.qualified_name.clone()))
+            }
             _ => None,
         }
+    }
+
+    /// A modeled call result, including one carried by an unannotated local.
+    /// This supplies its structured application to the same query's Deref and
+    /// coherence checks; it is not general source result-type inference.
+    pub(crate) fn modeled_receiver_type(
+        &self,
+        file: &ProjectFile,
+        expression: Node<'_>,
+    ) -> Option<TypeRef> {
+        let source = self.source(file)?;
+        let expression = source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(expression.start_byte(), expression.end_byte())?;
+        self.modeled_receiver_type_bounded(&source, expression, PROOF_DEPTH)
+    }
+
+    fn modeled_receiver_type_bounded<'tree>(
+        &self,
+        source: &'tree RustSource,
+        mut expression: Node<'tree>,
+        depth: usize,
+    ) -> Option<TypeRef> {
+        for depth in (1..=depth).rev() {
+            match expression.kind() {
+                "call_expression" => {
+                    return self.modeled_call_return_type(source, expression, depth);
+                }
+                "identifier" => expression = self.binding_initializer(source, expression)?,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// The drop class of the model's structured return type. References,
@@ -1622,6 +1768,10 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         source: &'s RustSource,
         receiver: Node<'s>,
     ) -> Option<Node<'s>> {
+        if receiver.kind() == "self" {
+            return super::semantic::RustReceiverTypeFacts::from_tree(source.text(), source.tree())
+                .declared_receiver_type(source.text(), source.tree(), receiver);
+        }
         if receiver.kind() != "identifier" {
             return None;
         }
@@ -1755,8 +1905,30 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             return Some(owner);
         }
         let ty = self.declared_binding_type(source, receiver)?;
-        let (owner, _arguments) = self.nominal_type_owner(source, ty)?;
-        Some(RustReceiverOwner::Path(owner))
+        if let Some((owner, _arguments)) = self.nominal_type_owner(source, ty) {
+            return Some(RustReceiverOwner::Path(owner));
+        }
+        let overlay = self.analyzer.semantic_model_overlay()?;
+        let active = self.analyzer.active_semantic_models()?;
+        let model = super::trait_applicability::ModelApplicability::new(
+            self.analyzer,
+            self.rust,
+            &overlay,
+            &active,
+        );
+        let bounds = super::trait_applicability::lexical_receiver_traits(
+            self.analyzer,
+            &source.file,
+            source.text(),
+            source.tree(),
+            ty,
+            &model,
+        )?;
+        // This is an anchor for the bounded surface, not a nominal type claim.
+        // Selection independently reads every bound and retains rivals.
+        Some(RustReceiverOwner::Path(
+            bounds.first()?.qualified_name.clone(),
+        ))
     }
 
     /// A field's declared type, after the resolver has selected its actual
@@ -1842,7 +2014,10 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     };
                     break Some(format!("std.primitive.{primitive}"));
                 }
-                "type_identifier" | "scoped_type_identifier" => break None,
+                "identifier"
+                | "scoped_identifier"
+                | "type_identifier"
+                | "scoped_type_identifier" => break None,
                 _ => return None,
             }
         };
@@ -1869,7 +2044,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     {
                         (*subject).clone()
                     }
-                    [] if ty.kind() == "scoped_type_identifier" => {
+                    [] if matches!(ty.kind(), "scoped_type_identifier" | "scoped_identifier") => {
                         // A qualified type may have no terminal reference row. Prove
                         // its root through the selected resolver instead; the model
                         // below must still publish the complete nominal identity.
@@ -1914,18 +2089,21 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             return None;
         }
         let active = self.analyzer.active_semantic_models()?;
-        let declarations = active.types_with_id(&symbol.id);
-        if declarations.records.is_empty()
-            || declarations.records.iter().any(|declaration| {
-                let record = declaration.record;
-                let written = arguments.len();
-                written > record.type_parameters.len()
-                    || (written < record.type_parameters.len()
-                        && (record.type_parameter_defaults.len() != record.type_parameters.len()
-                            || record.type_parameter_defaults[written..]
-                                .iter()
-                                .any(Option::is_none)))
-            })
+        let Some(record) =
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                &active, &symbol,
+            )
+        else {
+            incomplete_proof("external_receiver_generic_arity_mismatch");
+            return None;
+        };
+        let written = arguments.len();
+        if written > record.type_parameters.len()
+            || (written < record.type_parameters.len()
+                && (record.type_parameter_defaults.len() != record.type_parameters.len()
+                    || record.type_parameter_defaults[written..]
+                        .iter()
+                        .any(Option::is_none)))
         {
             incomplete_proof("external_receiver_generic_arity_mismatch");
             return None;
@@ -2178,6 +2356,36 @@ pub(crate) fn rust_nominal_receiver_owner_with_operation<'analyzer>(
     >,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<String> {
+    rust_nominal_receiver_application_with_operation(
+        analyzer,
+        file,
+        source,
+        ty,
+        factory,
+        operation,
+        cancellation,
+    )
+    .map(|(owner, _arguments)| owner)
+}
+
+/// Preserve the explicit generic application for query-local impl obligations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_nominal_receiver_application_with_operation<'analyzer, 'tree>(
+    analyzer: &'analyzer dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    ty: Node<'tree>,
+    factory: Option<
+        &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
+    >,
+    operation: Option<
+        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
+            'analyzer,
+            '_,
+        >,
+    >,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> Option<(String, Vec<Node<'tree>>)> {
     completed_proof(cancellation, || {
         let prove = |proof: &RustTypeProof<'_, _>| {
             let rust_source = proof.source(file)?;
@@ -2185,9 +2393,7 @@ pub(crate) fn rust_nominal_receiver_owner_with_operation<'analyzer>(
                 incomplete_proof("source_mismatch");
                 return None;
             }
-            proof
-                .nominal_type_owner(&rust_source, ty)
-                .map(|(owner, _arguments)| owner)
+            proof.nominal_type_owner(&rust_source, ty)
         };
         match operation {
             Some(operation) => {
@@ -2211,9 +2417,7 @@ pub(crate) fn rust_nominal_receiver_owner_with_operation<'analyzer>(
                     incomplete_proof("source_mismatch");
                     return None;
                 }
-                proof
-                    .nominal_type_owner(&rust_source, ty)
-                    .map(|(owner, _arguments)| owner)
+                proof.nominal_type_owner(&rust_source, ty)
             }
         }
     })

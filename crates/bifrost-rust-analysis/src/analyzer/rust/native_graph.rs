@@ -399,6 +399,7 @@ fn project_rust_graph_in_operation(
         rust,
         &stage_files,
         maximum_batch_size,
+        rust.inner.analyzer_config().parallelism(),
         cancellation,
         &mut SelectedResolutionContextMetrics,
         &mut stage,

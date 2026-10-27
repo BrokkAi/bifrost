@@ -110,7 +110,9 @@ impl RustCargoManifestDocument {
     /// reach it, and table key order does not either. It leaves out only what
     /// no Rust reader consumes: `[profile]`, `[badges]`, `metadata` tables, and
     /// the publishing fields of `[package]` and `[workspace.package]`
-    /// (description, version, and the like). Everything else counts, so a
+    /// (description, license, and the like). `version` is not one of them:
+    /// `[patch]` selection reads it to decide which replacement a dependency
+    /// requirement accepts. Everything else counts, so a
     /// field a reader starts consuming later is covered without a change
     /// here.
     pub fn topology_digest(&self) -> [u8; 32] {
@@ -131,7 +133,6 @@ impl RustCargoManifestDocument {
             "readme",
             "repository",
             "rust-version",
-            "version",
         ];
         canonical_toml_digest(
             b"cargo manifest topology",
@@ -251,11 +252,11 @@ mod tests {
             ),
             TOPOLOGY_BASE.replace(
                 "[package]\n",
-                "[package]\nversion = \"9.9.9\"\ndescription = \"d\"\nauthors = [\"a\"]\n",
+                "[package]\ndescription = \"d\"\nauthors = [\"a\"]\n",
             ),
             TOPOLOGY_BASE.replace(
                 "[workspace.package]\n",
-                "[workspace.package]\nversion = \"1.0.0\"\nlicense = \"MIT\"\n",
+                "[workspace.package]\nlicense = \"MIT\"\n",
             ),
             format!(
                 "{TOPOLOGY_BASE}[profile.release]\nopt-level = 3\n[badges]\nmaintenance = {{ status = \"x\" }}\n"
@@ -286,6 +287,13 @@ mod tests {
             format!("{TOPOLOGY_BASE}[[bin]]\nname = \"tool\"\npath = \"src/tool.rs\"\n"),
             format!("{TOPOLOGY_BASE}[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"),
             format!("{TOPOLOGY_BASE}[patch.crates-io]\ndep = {{ path = \"../dep\" }}\n"),
+            // [patch] selection compares a replacement's version with the
+            // dependency requirement.
+            TOPOLOGY_BASE.replace("[package]\n", "[package]\nversion = \"9.9.9\"\n"),
+            TOPOLOGY_BASE.replace(
+                "[workspace.package]\n",
+                "[workspace.package]\nversion = \"1.0.0\"\n",
+            ),
         ] {
             assert_ne!(topology_digest(&edited), base, "{edited}");
         }

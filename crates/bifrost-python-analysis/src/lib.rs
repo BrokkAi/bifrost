@@ -8,7 +8,6 @@ pub mod analyzer {
             PythonArtifactPackProducer, PythonDependencyPackAdapter,
             resolve_python_semantic_pack_dependencies,
         },
-        parse_python_import_bindings, parse_python_import_infos,
         python_builtin_exception_is_subclass, python_builtin_exception_name,
     };
 

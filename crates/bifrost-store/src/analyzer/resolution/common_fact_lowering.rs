@@ -14,7 +14,8 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionJvmAliasFact, ResolutionJvmAliasId, ResolutionJvmAliasOwnerSegmentFact,
     ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberQualifierCompatibility,
     ResolutionNameId, ResolutionNamespace, ResolutionPackageObjectExportFact, ResolutionScopeFact,
-    ResolutionScopeId, ResolutionSingletonRelationFact, ResolutionSiteId, ResolutionTypeRelationId,
+    ResolutionScopeId, ResolutionSingletonRelationFact, ResolutionSiteFact, ResolutionSiteId,
+    ResolutionTypeRelationId,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::HoistingClass;
 
@@ -37,6 +38,38 @@ pub(super) fn anonymous_callable_declarations(
         row.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionDeclarationValueKind::Callable
             && !has_identifier(row.declaration)
     }).map(|row| row.declaration).collect()
+}
+
+fn authored_declaration_sites(
+    facts: &FileResolutionFacts,
+    sites: &BTreeMap<ResolutionSiteId, &ResolutionSiteFact>,
+) -> BTreeSet<ResolutionSiteId> {
+    let mut declarations = facts
+        .identifiers
+        .iter()
+        .filter(|identifier| identifier.role == ResolutionIdentifierRole::Declaration)
+        .map(|identifier| identifier.site)
+        .collect::<BTreeSet<_>>();
+    for declaration in anonymous_callable_declarations(facts, |site| {
+        facts
+            .identifiers
+            .iter()
+            .any(|identifier| identifier.site == site)
+    }) {
+        assert_eq!(
+            sites[&declaration].kind,
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CallableDeclaration
+        );
+        declarations.insert(declaration);
+    }
+    for &declaration in &facts.route_owned_module_declarations {
+        assert_eq!(
+            sites[&declaration].kind,
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ModuleDeclaration
+        );
+        declarations.insert(declaration);
+    }
+    declarations
 }
 
 pub(super) fn validate_scope_forest(
@@ -930,24 +963,7 @@ fn lower_shared_language_facts(
         facts.sites.len(),
         "resolution sites are unique"
     );
-    let mut declarations = facts
-        .identifiers
-        .iter()
-        .filter(|identifier| identifier.role == ResolutionIdentifierRole::Declaration)
-        .map(|identifier| identifier.site)
-        .collect::<BTreeSet<_>>();
-    for declaration in anonymous_callable_declarations(facts, |site| {
-        facts
-            .identifiers
-            .iter()
-            .any(|identifier| identifier.site == site)
-    }) {
-        assert_eq!(
-            sites[&declaration].kind,
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CallableDeclaration
-        );
-        declarations.insert(declaration);
-    }
+    let declarations = authored_declaration_sites(facts, &sites);
     let references = facts
         .identifiers
         .iter()
@@ -1422,6 +1438,7 @@ pub(crate) fn lower_common_resolution_facts(
         .map(|slot| slot.id)
         .collect::<BTreeSet<_>>();
 
+    let declarations = authored_declaration_sites(facts, &sites);
     let additional_definition_namespaces = facts
         .additional_definition_namespaces
         .iter()
@@ -1429,7 +1446,7 @@ pub(crate) fn lower_common_resolution_facts(
             assert_ne!(fact.namespace, ResolutionNamespace::TypeOrValue);
             LoweredAdditionalDefinitionNamespace {
                 definition: definition_semantic_for_site(
-                    &identifiers,
+                    &declarations,
                     identities,
                     fact.declaration,
                 ),
@@ -1453,7 +1470,7 @@ pub(crate) fn lower_common_resolution_facts(
             }
             Some(LoweredDefinitionUnitCrosswalk {
                 definition: definition_semantic_for_site(
-                    &identifiers,
+                    &declarations,
                     identities,
                     fact.declaration,
                 ),
@@ -1468,7 +1485,7 @@ pub(crate) fn lower_common_resolution_facts(
         .map(|fact| {
             assert!(type_slots.contains(&fact.owner_type));
             LoweredDeferredMemberOwner {
-                definition: definition_semantic_for_site(&identifiers, identities, fact.member),
+                definition: definition_semantic_for_site(&declarations, identities, fact.member),
                 owner_frontier: identities.semantic(type_slot_semantic_identity(fact.owner_type)),
                 hierarchy_frontier: hierarchy_by_member
                     .get(&fact.member)
@@ -1532,7 +1549,7 @@ pub(crate) fn lower_common_resolution_facts(
             LoweredRelationMember {
                 relation: identities.semantic(type_relation_semantic_identity(fact.relation)),
                 position: fact.ordinal,
-                definition: definition_semantic_for_site(&identifiers, identities, fact.member),
+                definition: definition_semantic_for_site(&declarations, identities, fact.member),
                 kind: fact.kind,
             }
         })
@@ -2087,14 +2104,14 @@ fn type_relation_semantic_identity(
 }
 
 fn definition_semantic_for_site(
-    identifiers: &BTreeMap<ResolutionSiteId, &PositionedIdentifierFact>,
+    declarations: &BTreeSet<ResolutionSiteId>,
     identities: &mut ResolutionIdentityCatalogBuilder,
     site: ResolutionSiteId,
 ) -> SemanticId {
-    let identifier = identifiers
-        .get(&site)
-        .unwrap_or_else(|| panic!("common resolution row names unknown site {site}"));
-    assert_declaration_identifier(identifier);
+    assert!(
+        declarations.contains(&site),
+        "common resolution row names unknown declaration {site}"
+    );
     identities.source_definition_semantic(site)
 }
 

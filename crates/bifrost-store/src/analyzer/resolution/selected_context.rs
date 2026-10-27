@@ -108,8 +108,8 @@ impl SelectedContextPathToken {
 #[doc(hidden)]
 pub trait SelectedContextPathSource {
     /// Preserve supplied base coverage, extending it with Cancelled only when
-    /// cancellation or the existing per-offered-row session budget stops work.
-    /// A budget stop drops a pending page, matching the context adapter contract.
+    /// cancellation stops work. Engine consumers own candidate budget charges;
+    /// readers preserve page boundaries without charging the supplied session.
     /// Path-specific completion remains in the hydrated path body. Pages are
     /// ordered by request ordinal and candidate identity and contain no repeats.
     #[allow(clippy::too_many_arguments)]
@@ -575,6 +575,7 @@ where
                 callback,
             )
         },
+        PartialPath::end,
         |half| {
             matches!(
                 half,
@@ -616,6 +617,7 @@ where
                 callback,
             )
         },
+        PartialPath::start,
         |half| matches!(half, SelectedRootPathHalf::Export { .. }),
     )
 }
@@ -645,6 +647,7 @@ fn visit_selected_root_path_half_pages<S, M, F>(
     cancellation: &CancellationToken,
     visitor: &mut FactPageVisitor<'_, SelectedRootPathHalf>,
     visit_matches: M,
+    offered_endpoint: fn(&PartialPath) -> &EndpointSignature,
     accepts: F,
 ) -> StoreResult<FactReadOutcome>
 where
@@ -658,6 +661,13 @@ where
     ) -> StoreResult<super::batch::BatchCandidateCompletionOutcome>,
     F: Fn(&SelectedRootPathHalf) -> bool,
 {
+    let session = visitor
+        .resolution_session()
+        .or_else(|| source.candidate_admission_session());
+    if !super::engine::charge_candidate_requests(session, 1) {
+        return Ok(FactReadOutcome::cancelled(super::cancelled_completion()));
+    }
+    let mut admission_work = 0;
     let mut stopped = false;
     let mut callback = |matches: &[BatchCandidateMatch]| {
         let identities = matches
@@ -679,6 +689,21 @@ where
         }
         let mut halves = Vec::with_capacity(hydrated.len());
         for (identity, path) in hydrated {
+            if super::poll_resolution_work(cancellation, &mut admission_work) {
+                return Ok(false);
+            }
+            match super::engine::admit_candidate_pair(
+                session,
+                request.endpoint(),
+                offered_endpoint(&path),
+            ) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    stopped = true;
+                    return Ok(false);
+                }
+            }
             let Some(half) =
                 classify_selected_root_path_half(anchors, identity, &path, cancellation)?
             else {
@@ -1804,6 +1829,7 @@ pub struct SelectedResolutionContextSet {
     /// Every carried mount's root bridges, in mount order, flattened once at
     /// construction.
     root_bridges: Box<[SelectedRootBridgeDescriptor]>,
+    callable_import_boundaries: BTreeSet<BindingNodeId>,
     package_bridges: Box<[SelectedPackageBridgeDescriptor]>,
     go_import_bindings: Box<[SelectedGoImportBindingDescriptor]>,
     /// Every carried mount's root reverse inventory evidence, combined once at
@@ -1823,6 +1849,7 @@ pub struct SelectedResolutionContextSet {
 #[doc(hidden)]
 pub struct SelectedResolutionContextInputs {
     root_bridges: Box<[SelectedRootBridgeDescriptor]>,
+    callable_import_boundaries: BTreeSet<BindingNodeId>,
     package_bridges: Box<[SelectedPackageBridgeDescriptor]>,
     go_import_bindings: Box<[SelectedGoImportBindingDescriptor]>,
     root_reverse_inventory_completion: ResolutionCompletion,
@@ -1839,6 +1866,7 @@ pub struct SelectedContextPathPublication {
     #[doc(hidden)]
     pub token: SelectedContextPathToken,
     pub(crate) context_digest: [u8; 32],
+    pub(crate) callable_static_import_boundaries: Box<[BindingNodeId]>,
     pub(crate) contextual_reverse_inventory_completion: ResolutionCompletion,
     pub(crate) go_package_inventory_complete: Option<bool>,
     pub(crate) go_package_inventory_fragments: HashMap<BindingFragmentId, bool>,
@@ -1863,6 +1891,8 @@ pub enum SelectedContextPathPublicationOutcome {
     },
 }
 
+// Validation moves the ready inputs directly into publication; keep them inline.
+#[allow(clippy::large_enum_variant)]
 #[doc(hidden)]
 pub enum SelectedResolutionContextValidationOutcome {
     Ready(SelectedResolutionContextInputs),
@@ -1880,6 +1910,7 @@ pub(crate) type SelectedResolutionContextParts = (
     SelectedContextIdentities,
     Box<[SelectedPackageBridgeDescriptor]>,
     Box<[SelectedGoImportBindingDescriptor]>,
+    BTreeSet<BindingNodeId>,
 );
 
 impl SelectedResolutionContextInputs {
@@ -1898,11 +1929,40 @@ impl SelectedResolutionContextInputs {
             self.identities,
             self.package_bridges,
             self.go_import_bindings,
+            self.callable_import_boundaries,
         )
     }
 }
 
 impl SelectedResolutionContextSet {
+    /// Publish all authored import binders before lazy member closure begins.
+    pub(crate) fn with_callable_imports<'a>(
+        mut self,
+        language: Language,
+        halves: impl IntoIterator<Item = &'a SelectedRootPathHalf>,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Self> {
+        assert!(is_jvm_language(language));
+        for half in halves {
+            if let SelectedRootPathHalf::Import {
+                identity, token, ..
+            } = half
+            {
+                self.callable_import_boundaries
+                    .insert(callable_import_boundary(
+                        identity.fragment(),
+                        language,
+                        *token,
+                        &self.identities,
+                        source,
+                        cancellation,
+                    )?);
+            }
+        }
+        Ok(self)
+    }
+
     /// Borrow the already prepared descriptor material without another read.
     pub(crate) fn root_bridges(&self) -> &[SelectedRootBridgeDescriptor] {
         &self.root_bridges
@@ -1971,6 +2031,7 @@ impl SelectedResolutionContextSet {
                 .collect(),
             selected_mount_count: self.selected_mount_count,
             root_bridges: Box::new([]),
+            callable_import_boundaries: self.callable_import_boundaries.clone(),
             package_bridges: Box::new([]),
             go_import_bindings: Box::new([]),
             root_reverse_inventory_completion: self.root_reverse_inventory_completion.clone(),
@@ -1999,6 +2060,7 @@ impl SelectedResolutionContextSet {
             selected_mount_count,
             declaration_access_source,
             context_owned_gap_identities,
+            callable_import_boundaries,
             identities,
             // Both are recomputed by `Self::new` below from the extended
             // mounts, so the extension cannot keep a stale flattening.
@@ -2073,6 +2135,7 @@ impl SelectedResolutionContextSet {
         .map(|mut context| {
             context.declaration_access_source = declaration_access_source;
             context.context_owned_gap_identities = context_owned_gap_identities;
+            context.callable_import_boundaries = callable_import_boundaries;
             Some(context)
         })
     }
@@ -2141,6 +2204,7 @@ impl SelectedResolutionContextSet {
             selected_mount_count,
             declaration_access_source,
             context_owned_gap_identities,
+            callable_import_boundaries,
             identities,
             ..
         } = self;
@@ -2199,6 +2263,7 @@ impl SelectedResolutionContextSet {
         Self::new(identities, mounts, selected_mount_count, selected_mount_of).map(|mut context| {
             context.declaration_access_source = declaration_access_source;
             context.context_owned_gap_identities = context_owned_gap_identities;
+            context.callable_import_boundaries = callable_import_boundaries;
             Some(context)
         })
     }
@@ -2215,6 +2280,7 @@ impl SelectedResolutionContextSet {
             selected_mount_count,
             declaration_access_source,
             context_owned_gap_identities,
+            callable_import_boundaries,
             identities,
             ..
         } = self;
@@ -2270,6 +2336,7 @@ impl SelectedResolutionContextSet {
         Self::new(identities, mounts, selected_mount_count, selected_mount_of).map(|mut context| {
             context.declaration_access_source = declaration_access_source;
             context.context_owned_gap_identities = context_owned_gap_identities;
+            context.callable_import_boundaries = callable_import_boundaries;
             Some(context)
         })
     }
@@ -2310,6 +2377,8 @@ impl SelectedResolutionContextSet {
         };
         let mut context_owned_gap_identities = self.context_owned_gap_identities;
         context_owned_gap_identities.extend(other.context_owned_gap_identities);
+        let mut callable_import_boundaries = self.callable_import_boundaries;
+        callable_import_boundaries.extend(other.callable_import_boundaries);
         let mut mounts = self.mounts.into_vec();
         for incoming in other.mounts.into_vec() {
             if cancellation.is_cancelled() {
@@ -2358,6 +2427,7 @@ impl SelectedResolutionContextSet {
         )?;
         merged.declaration_access_source = declaration_access_source;
         merged.context_owned_gap_identities = context_owned_gap_identities;
+        merged.callable_import_boundaries = callable_import_boundaries;
         Ok(Some(merged))
     }
 
@@ -2496,6 +2566,7 @@ impl SelectedResolutionContextSet {
             mounts,
             selected_mount_count,
             root_bridges: root_bridges.into_boxed_slice(),
+            callable_import_boundaries: BTreeSet::new(),
             package_bridges: package_bridges.into_boxed_slice(),
             go_import_bindings: go_import_bindings.into_boxed_slice(),
             root_reverse_inventory_completion,
@@ -2559,6 +2630,7 @@ impl SelectedResolutionContextSet {
             mounts: _mounts,
             selected_mount_count,
             root_bridges,
+            callable_import_boundaries,
             package_bridges,
             go_import_bindings,
             root_reverse_inventory_completion,
@@ -2594,6 +2666,7 @@ impl SelectedResolutionContextSet {
         Ok(SelectedResolutionContextValidationOutcome::Ready(
             SelectedResolutionContextInputs {
                 root_bridges,
+                callable_import_boundaries,
                 package_bridges,
                 go_import_bindings,
                 root_reverse_inventory_completion,
@@ -2712,6 +2785,7 @@ pub struct SelectedRootBridgeDescriptor {
     #[doc(hidden)]
     pub target_demand: ResolutionLookupSemanticRecipe,
     jvm_evidence: Option<SelectedJvmBridgeEvidence>,
+    callable_import: Option<SemanticId>,
     #[doc(hidden)]
     pub completion: ResolutionCompletion,
 }
@@ -2737,6 +2811,10 @@ impl std::hash::Hash for SelectedRootBridgeDescriptor {
         std::hash::Hash::hash(&self.target_demand, state);
         std::hash::Hash::hash(&self.jvm_evidence, state);
         std::hash::Hash::hash(&self.completion, state);
+        if let Some(import) = self.callable_import {
+            std::hash::Hash::hash(&"callable-import", state);
+            std::hash::Hash::hash(&import, state);
+        }
         if self.target_kind == SelectedBridgeTargetKind::Member {
             std::hash::Hash::hash(&"selected-member", state);
         }
@@ -3040,8 +3118,47 @@ impl SelectedRootBridgeDescriptor {
             source_demand,
             target_demand,
             jvm_evidence,
+            callable_import: None,
             completion,
         }
+    }
+
+    /// Only authored JVM import halves grant external callable authority.
+    /// Qualified references and lexical receiver paths carry no such premise.
+    pub(crate) fn with_callable_import_half(self, half: &SelectedRootPathHalf) -> Self {
+        self.with_callable_import_token(match half {
+            SelectedRootPathHalf::Import { token, .. } => Some(*token),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn with_callable_import_token(mut self, token: Option<SemanticId>) -> Self {
+        if let Some(token) = token {
+            assert!(is_jvm_language(self.source_language));
+            assert_eq!(token, self.source_import_token);
+        }
+        self.callable_import = token;
+        self
+    }
+
+    pub(crate) fn callable_import_boundary(
+        &self,
+        identities: &SelectedContextIdentities,
+        source: &dyn BatchResolutionFragmentSource,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<BindingNodeId>> {
+        self.callable_import
+            .map(|token| {
+                callable_import_boundary(
+                    self.source_fragment(),
+                    self.source_language(),
+                    token,
+                    identities,
+                    source,
+                    cancellation,
+                )
+            })
+            .transpose()
     }
 
     #[doc(hidden)]
@@ -3327,6 +3444,20 @@ pub(super) type SelectedContextOverlayParts = (
 
 impl SelectedContextOverlay {
     #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn add_callable_import_boundaries(&mut self, boundaries: BTreeSet<BindingNodeId>) {
+        let mut nodes = self.boundary_nodes.iter().copied().collect::<BTreeSet<_>>();
+        nodes.extend(boundaries.iter().copied());
+        self.boundary_nodes = nodes.into_iter().collect();
+        let mut callable = self
+            .callable_static_import_boundaries
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        callable.extend(boundaries);
+        self.callable_static_import_boundaries = callable.into_iter().collect();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn add_package_bridges(
         &mut self,
         identities: &SelectedContextIdentities,
@@ -3507,6 +3638,7 @@ fn compile_selected_context_overlay_with_session(
     let mut added = overlay.added_candidate_paths.into_vec();
     added.reserve(bridges.len());
     let mut compiled_bridges = HashMap::default();
+    let mut callable_boundaries = BTreeSet::new();
     let mut shared = BTreeSet::new();
     let mut fragment_local = BTreeSet::new();
     let mut work = 0_usize;
@@ -3548,6 +3680,9 @@ fn compile_selected_context_overlay_with_session(
             shared.insert(recipe.identity(names));
         }
         let candidate = compile_bridge(source, identities, bridge, names, cancellation)?;
+        if let Some(boundary) = bridge.callable_import_boundary(identities, source, cancellation)? {
+            callable_boundaries.insert(boundary);
+        }
         // Topology retains every import/profile justification. Compilation
         // projects those records onto executable relations: the same exact
         // source token, route and authorized endpoint need execute only once.
@@ -3617,6 +3752,8 @@ fn compile_selected_context_overlay_with_session(
         }
     }
     overlay.added_candidate_paths = added.into_boxed_slice();
+    overlay.boundary_nodes = callable_boundaries.iter().copied().collect();
+    overlay.callable_static_import_boundaries = callable_boundaries.into_iter().collect();
     overlay.shared_semantic_identities = shared.into_iter().collect();
     overlay.fragment_local_semantic_identities = fragment_local.into_iter().collect();
     if cancellation.is_cancelled() {
@@ -3716,6 +3853,8 @@ pub struct SelectedRootBridgeProjection {
     pub recipes: Vec<(SemanticId, ResolutionLookupSemanticRecipe)>,
     #[doc(hidden)]
     pub local_anchor: (BindingFragmentId, ResolutionSemanticIdentity),
+    #[doc(hidden)]
+    pub callable_import_boundary: Option<BindingNodeId>,
 }
 
 /// Validate and charge every derivation before its publication can deduplicate
@@ -3750,6 +3889,11 @@ pub fn compile_selected_root_bridge(
         return Ok(None);
     }
     Ok(Some(SelectedRootBridgeProjection {
+        callable_import_boundary: bridge.callable_import_boundary(
+            identities,
+            source,
+            cancellation,
+        )?,
         identity: bridge_digest(
             b"bifrost-selected-root-bridge-path:v1",
             bridge,
@@ -3808,7 +3952,7 @@ pub fn compile_bridge(
             bridge.source_demand().semantic(names),
         ])
         .collect::<Vec<_>>();
-    let (end_node, export, mut precedence, witness) =
+    let (end_node, export, mut precedence, mut witness) =
         match (bridge.target_definition, bridge.target_member_scope) {
             // The trait's member scope answers the lookup the route already
             // carries, so the bridge ends holding that one symbol and the
@@ -3841,6 +3985,9 @@ pub fn compile_bridge(
                 Vec::new(),
             ),
         };
+    if let Some(boundary) = bridge.callable_import_boundary(identities, source, cancellation)? {
+        witness.insert(0, WitnessStep::Node(boundary));
+    }
     if let Some(rank) = bridge.candidate_origin_rank {
         let semantic = precedence
             .first()
@@ -3885,6 +4032,36 @@ pub fn compile_bridge(
                 }),
         ),
     ))
+}
+
+fn callable_import_boundary(
+    fragment: BindingFragmentId,
+    language: Language,
+    token: SemanticId,
+    identities: &SelectedContextIdentities,
+    source: &dyn BatchResolutionFragmentSource,
+    cancellation: &CancellationToken,
+) -> StoreResult<BindingNodeId> {
+    let digest = |key| {
+        super::canonical_identity::selected_identity_content_digest(
+            identities,
+            source,
+            key,
+            cancellation,
+        )
+    };
+    let mut hasher =
+        CanonicalIdentityDescriptor::new(b"bifrost-selected-callable-import-boundary:v1", digest);
+    hasher.field("source_fragment", CanonicalIdentityPart::identity(fragment))?;
+    hasher.field(
+        "source_language",
+        CanonicalIdentityPart::Label(language.config_label()),
+    )?;
+    hasher.field(
+        "source_import_token",
+        CanonicalIdentityPart::identity(token),
+    )?;
+    Ok(identities.node(hasher.finish()))
 }
 
 fn bridge_digest(
@@ -3934,6 +4111,9 @@ fn bridge_digest(
         "target_export_token",
         CanonicalIdentityPart::identity(bridge.target_export_token()),
     )?;
+    if let Some(import) = bridge.callable_import {
+        hasher.field("callable_import", CanonicalIdentityPart::identity(import))?;
+    }
     if bridge.target_kind == SelectedBridgeTargetKind::Member {
         hasher.field(
             "target_authority",
@@ -4155,13 +4335,16 @@ mod tests {
             assert_eq!(inputs.root_reverse_inventory_completion, completion);
             // This test isolates metadata ownership; SQL path publication and
             // token liveness are covered by the actual operation adapter tests.
-            let (_, inventory, access, reasons, _, packages, imports) = inputs.into_parts();
+            let (_, inventory, access, reasons, _, packages, imports, boundaries) =
+                inputs.into_parts();
+            assert!(boundaries.is_empty());
             assert!(imports.is_empty());
             assert!(packages.is_empty());
             let blueprint =
                 SelectedFactOperationBlueprint::from_publication(SelectedContextPathPublication {
                     token: SelectedContextPathToken::new(1),
                     context_digest: [0; 32],
+                    callable_static_import_boundaries: Box::new([]),
                     contextual_reverse_inventory_completion: inventory,
                     go_package_inventory_complete: None,
                     go_package_inventory_fragments: HashMap::default(),
@@ -5146,5 +5329,155 @@ pub mod go_global_support_1 {
                 &self.lookup(),
             )
         }
+    }
+}
+
+impl SelectedRootBridgeDescriptor {
+    fn charge_retained(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        heap.slice(&self.route);
+        for recipe in &self.route {
+            heap.add(recipe.owned_bytes());
+        }
+        heap.add(self.source_demand.owned_bytes() + self.target_demand.owned_bytes());
+        self.completion.charge_retained(heap);
+    }
+}
+
+impl SelectedResolutionContextSet {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        // Only Go snapshots currently call this census. They have no retained
+        // declaration-access policy; a new consumer must weigh its policy.
+        assert!(self.declaration_access_source.is_none());
+        heap.slice(&self.mounts);
+        for mount in &self.mounts {
+            heap.slice(&mount.root_bridges);
+            for bridge in &mount.root_bridges {
+                bridge.charge_retained(heap);
+            }
+            heap.slice(&mount.package_bridges);
+            for bridge in &mount.package_bridges {
+                bridge.charge_retained(heap);
+            }
+            heap.slice(&mount.go_import_bindings);
+            for binding in &mount.go_import_bindings {
+                binding.charge_retained(heap);
+            }
+            mount
+                .root_reverse_inventory_completion
+                .charge_retained(heap);
+        }
+        heap.slice(&self.root_bridges);
+        for bridge in &self.root_bridges {
+            bridge.charge_retained(heap);
+        }
+        heap.slice(&self.package_bridges);
+        for bridge in &self.package_bridges {
+            bridge.charge_retained(heap);
+        }
+        heap.slice(&self.go_import_bindings);
+        for binding in &self.go_import_bindings {
+            binding.charge_retained(heap);
+        }
+        self.root_reverse_inventory_completion.charge_retained(heap);
+        heap.btree_set(&self.context_owned_gap_identities);
+        self.identities.charge_retained(heap);
+    }
+}
+
+impl SelectedContextIdentities {
+    fn charge_retained(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        heap.arc(&self.numbers, |numbers, heap| {
+            numbers
+                .lock()
+                .expect("identity numbers are not poisoned")
+                .charge_retained(heap)
+        });
+        heap.arc(&self.presumed_go_imports, |imports, heap| {
+            let imports = imports.lock().expect("presumed imports are not poisoned");
+            heap.map(&imports);
+            for provider in imports.values() {
+                provider.charge_retained(heap);
+            }
+        });
+        heap.arc(&self.named_reasons, |reasons, heap| {
+            let reasons = reasons.lock().expect("named reasons are not poisoned");
+            heap.map(&reasons);
+            for entry in reasons.values() {
+                heap.arc(&entry.reason.1, |_, _| {});
+            }
+        });
+        heap.arc(&self.rust_prelude_references, |references, heap| {
+            let references = references
+                .lock()
+                .expect("prelude references are not poisoned");
+            heap.map(&references);
+            for values in references.values() {
+                heap.vec(values);
+            }
+        });
+        heap.arc(&self.rust_external_type_import_paths, |paths, heap| {
+            let paths = paths.lock().expect("external paths are not poisoned");
+            heap.map(&paths);
+            for paths in paths.values() {
+                heap.vec(paths);
+                for path in paths {
+                    heap.vec(path);
+                    for part in path {
+                        heap.add(part.capacity());
+                    }
+                }
+            }
+        });
+        heap.arc(&self.java_import_route_gap_reasons, |reasons, heap| {
+            heap.btree_set(&reasons.lock().expect("Java reasons are not poisoned"));
+        });
+        let jvm = &self.jvm;
+        heap.add(std::mem::size_of_val(&**jvm));
+        heap.arc(&jvm.jvm_external_type_identities, |values, heap| {
+            heap.map(&values.lock().expect("external types are not poisoned"))
+        });
+        heap.arc(
+            &jvm.jvm_external_type_identities_by_reference,
+            |values, heap| {
+                heap.map(
+                    &values
+                        .lock()
+                        .expect("external type references are not poisoned"),
+                )
+            },
+        );
+        heap.arc(&jvm.jvm_external_type_boundaries, |values, heap| {
+            let values = values.lock().expect("external boundaries are not poisoned");
+            heap.map(&values);
+            for value in values.values() {
+                heap.vec(value);
+            }
+        });
+        heap.arc(&jvm.jvm_supertype_names, |values, heap| {
+            let values = values.lock().expect("supertype names are not poisoned");
+            heap.map(&values);
+            for value in values.values() {
+                heap.arc(value, |_, _| {});
+            }
+        });
+        heap.arc(&jvm.jvm_external_owners, |values, heap| {
+            let values = values.lock().expect("external owners are not poisoned");
+            heap.map(&values);
+            for value in values.values() {
+                heap.arc(&value.provider_id, |_, _| {});
+                heap.arc(&value.owner_fqn, |_, _| {});
+            }
+        });
+        heap.arc(&jvm.jvm_external_members, |values, heap| {
+            let values = values.lock().expect("external members are not poisoned");
+            heap.map(&values);
+            for (value, _) in values.values() {
+                heap.arc(&value.provider_id, |_, _| {});
+                heap.arc(&value.owner_fqn, |_, _| {});
+            }
+        });
     }
 }

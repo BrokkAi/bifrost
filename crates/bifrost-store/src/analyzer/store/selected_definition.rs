@@ -7,7 +7,7 @@ use crate::analyzer::resolution::lexical_definition::LexicalDefinition;
 use crate::analyzer::resolution::{ResolutionLocalKey, SelectedResolutionMountOrdinal};
 use crate::analyzer::{DeclarationKind, Range};
 
-use super::resolution::with_resolution_read_progress_handler;
+use super::resolution::{json_pair_array, with_resolution_read_progress_handler};
 use super::resolution_selection::{SELECTED_MOUNT_PAGE_ROWS, SelectedResolutionMountInventory};
 use super::{HydratedCandidateRow, Result, StoreError, hydrate_candidate_rows};
 
@@ -67,15 +67,15 @@ pub enum SelectedLexicalDefinitionReadOutcome {
 // declaration that carries neither is an item with no `CodeUnit`, which is a
 // projection this reader must answer rather than drop.
 pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str =
-    "SELECT request.mount_ordinal, request.key0,
+    "SELECT json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]'),
             declaration.lexical_kind, declaration.lexical_identifier,
             declaration.start_byte, declaration.end_byte,
             declaration.start_line, declaration.end_line,
             declaration.name_start_byte, declaration.name_end_byte,
             declaration.name_start_line, declaration.name_end_line
-     FROM temp.selected_resolution_typed_requests_1 AS request
+     FROM json_each(?1) AS request
      CROSS JOIN temp.selected_resolution_mounts AS mount
-       ON mount.mount_ordinal = request.mount_ordinal
+       ON mount.mount_ordinal = json_extract(request.value, '$[0]')
      CROSS JOIN main.resolution_fragment_interiors AS interior
        ON interior.blob_id = mount.blob_id
       AND interior.lang = mount.storage_language
@@ -87,7 +87,7 @@ pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str =
        ON source.blob_id = interior.blob_id AND source.publication_state = 'complete'
      CROSS JOIN main.resolution_semantic_sites AS semantic
        ON semantic.blob_id = interior.blob_id
-      AND semantic.semantic_role = 'definition' AND semantic.semantic_key = request.key0
+      AND semantic.semantic_role = 'definition' AND semantic.semantic_key = json_extract(request.value, '$[1]')
      CROSS JOIN main.source_native_declaration_bridges AS bridge
        ON bridge.blob_id = semantic.blob_id AND bridge.source_site = semantic.source_site
      CROSS JOIN main.source_declarations AS declaration
@@ -107,10 +107,9 @@ const SELECTED_UNIT_COLUMNS: &str = "keys.blob_oid, units.lang, units.unit_key, 
      units.normalized_fqn_tail";
 
 /// The mount and interior joins every request-driven selected reader opens.
-const SELECTED_REQUEST_INTERIOR_JOINS: &str =
-    "FROM temp.selected_resolution_typed_requests_1 AS request
+const SELECTED_REQUEST_INTERIOR_JOINS: &str = "FROM json_each(?1) AS request
      CROSS JOIN temp.selected_resolution_mounts AS mount
-       ON mount.mount_ordinal = request.mount_ordinal
+       ON mount.mount_ordinal = json_extract(request.value, '$[0]')
      CROSS JOIN main.resolution_fragment_interiors AS interior
        ON interior.blob_id = mount.blob_id
       AND interior.lang = mount.storage_language
@@ -121,15 +120,18 @@ const SELECTED_REQUEST_INTERIOR_JOINS: &str =
 
 /// Exact requested definition coordinates drive hydration independently of
 /// unrelated units in the same blob or mounts elsewhere in the selection.
+/// Both hydration readers order by the JSON array's rowid. The caller sorts
+/// coordinates before serialization, so SQLite can stream their order without
+/// sorting extracted JSON values again.
 #[doc(hidden)]
-pub static SELECTED_DEFINITION_UNITS_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
+pub static SELECTED_DEFINITION_UNITS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
         format!(
-            "SELECT {SELECTED_UNIT_COLUMNS}, request.mount_ordinal, request.key0
+            "SELECT {SELECTED_UNIT_COLUMNS}, json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]')
                      {SELECTED_REQUEST_INTERIOR_JOINS}
                      CROSS JOIN main.resolution_definition_unit_crosswalks AS crosswalk
                        ON crosswalk.blob_id = interior.blob_id
-                      AND crosswalk.definition_semantic_key = request.key0
+                      AND crosswalk.definition_semantic_key = json_extract(request.value, '$[1]')
                      CROSS JOIN main.code_units AS units
                        ON units.blob_id = crosswalk.blob_id
                       AND units.unit_key = crosswalk.unit_key
@@ -139,10 +141,11 @@ pub static SELECTED_DEFINITION_UNITS_SQL: std::sync::LazyLock<String> =
                        ON meta.blob_id = units.blob_id
                      WHERE units.in_declarations = 1
                        AND {}
-                     ORDER BY request.mount_ordinal, request.key0",
+                     ORDER BY request.rowid",
             super::PARSED_BLOB_COMPLETE_CONDITION
         )
-    });
+    },
+);
 
 /// The same projection reached through the source declaration a definition
 /// bridges to, rather than through the definition-to-unit crosswalk.
@@ -158,7 +161,7 @@ pub static SELECTED_DEFINITION_UNITS_SQL: std::sync::LazyLock<String> =
 pub(super) static SELECTED_DECLARATION_UNITS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         format!(
-            "SELECT {SELECTED_UNIT_COLUMNS}, request.mount_ordinal, request.key0
+            "SELECT {SELECTED_UNIT_COLUMNS}, json_extract(request.value, '$[0]'), json_extract(request.value, '$[1]')
                      {SELECTED_REQUEST_INTERIOR_JOINS}
                      CROSS JOIN main.source_fact_manifests AS source
                        ON source.blob_id = interior.blob_id
@@ -166,7 +169,7 @@ pub(super) static SELECTED_DECLARATION_UNITS_SQL: std::sync::LazyLock<String> =
                      CROSS JOIN main.resolution_semantic_sites AS semantic
                        ON semantic.blob_id = interior.blob_id
                       AND semantic.semantic_role = 'definition'
-                      AND semantic.semantic_key = request.key0
+                      AND semantic.semantic_key = json_extract(request.value, '$[1]')
                      CROSS JOIN main.source_native_declaration_bridges AS bridge
                        ON bridge.blob_id = semantic.blob_id
                       AND bridge.source_site = semantic.source_site
@@ -182,7 +185,7 @@ pub(super) static SELECTED_DECLARATION_UNITS_SQL: std::sync::LazyLock<String> =
                        ON meta.blob_id = units.blob_id
                      WHERE units.in_declarations = 1
                        AND {}
-                     ORDER BY request.mount_ordinal, request.key0",
+                     ORDER BY request.rowid",
             super::PARSED_BLOB_COMPLETE_CONDITION
         )
     });
@@ -293,17 +296,18 @@ impl SelectedResolutionMountInventory<'_> {
         }
         let mut all_rows = Vec::new();
         for page in definitions.chunks(SELECTED_MOUNT_PAGE_ROWS) {
-            if !self.replace_resolution_requests_1(
-                page.iter().map(|(mount, key)| (*mount, key.get())),
-                cancellation,
-            )? {
+            if cancellation.is_cancelled() {
                 return Ok(SelectedLexicalDefinitionReadOutcome::Cancelled);
             }
+            let requests = json_pair_array(
+                page.iter()
+                    .map(|(mount, key)| (i64::from(mount.get()), key.get())),
+            );
             let rows =
                 with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
                     let mut statement = conn.prepare(SELECTED_LEXICAL_DEFINITIONS_SQL)?;
                     statement
-                        .query_map([], |row| {
+                        .query_map([&requests], |row| {
                             let range = |offset| -> rusqlite::Result<Range> {
                                 Ok(Range {
                                     start_byte: row.get(offset)?,
@@ -541,6 +545,8 @@ impl SelectedResolutionMountInventory<'_> {
         if cancellation.is_cancelled() {
             return Ok(SelectedDefinitionUnitReadOutcome::Cancelled);
         }
+        // Ascending json_each rowid preserves this coordinate order in both
+        // hydration queries, including across pages.
         let requests = definitions.iter().copied().collect::<BTreeSet<_>>();
         if requests.len() != definitions.len() {
             return Err(StoreError::new(
@@ -550,17 +556,18 @@ impl SelectedResolutionMountInventory<'_> {
         let requests = requests.into_iter().collect::<Vec<_>>();
         let mut all_rows = Vec::new();
         for page in requests.chunks(SELECTED_MOUNT_PAGE_ROWS) {
-            if !self.replace_resolution_requests_1(
-                page.iter().map(|(mount, key)| (*mount, key.get())),
-                cancellation,
-            )? {
+            if cancellation.is_cancelled() {
                 return Ok(SelectedDefinitionUnitReadOutcome::Cancelled);
             }
+            let requests = json_pair_array(
+                page.iter()
+                    .map(|(mount, key)| (i64::from(mount.get()), key.get())),
+            );
             let result =
                 with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
                     let mut statement = conn.prepare(sql)?;
                     let rows = statement
-                        .query_map([], |row| {
+                        .query_map([&requests], |row| {
                             Ok((
                                 super::candidate_row_from_row(row)?,
                                 (

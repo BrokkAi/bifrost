@@ -4,6 +4,7 @@ pub mod java_functional;
 pub mod java_hierarchy;
 
 pub use crate::analyzer::semantic_model::overlay::java_hierarchy::JavaHierarchyAnswer;
+use std::sync::Arc;
 
 pub use crate::analyzer::semantic_model::overlay::java_hierarchy::JavaHierarchyIncomplete;
 
@@ -269,6 +270,8 @@ pub struct SemanticModelMatchedEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticModelProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<crate::analyzer::semantic_model::ArtifactExtraction>,
     pub active_model_set_hash: String,
     pub pack_digest: String,
     pub pack_id: String,
@@ -298,6 +301,15 @@ pub struct GeneratedFunctionScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticModelSymbol {
+    /// Order key frozen before composition. semantic_symbol_source_key is its
+    /// only reader; it must never serve as a lookup or presentation name.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub pre_composition_qualified_name: Option<String>,
+    /// #6542: curated declarations contributing semantics to this artifact
+    /// declaration. Structural identity always remains `id` / `provenance`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub semantic_contributors: Vec<SemanticModelProvenance>,
     /// Current activation authority, distinct from this positive declaration.
     #[serde(skip)]
     #[doc(hidden)]
@@ -512,15 +524,15 @@ pub enum SemanticModelCallableDisposition {
 }
 
 #[derive(Debug)]
-pub struct SemanticModelCallableMatch<'a> {
-    pub records: Vec<&'a SemanticModelSymbol>,
+pub struct SemanticModelCallableMatch {
+    pub records: Vec<Arc<SemanticModelSymbol>>,
     pub disposition: SemanticModelCallableDisposition,
 }
 
-impl<'a> SemanticModelCallableMatch<'a> {
-    pub fn unique(&self) -> Option<&'a SemanticModelSymbol> {
+impl SemanticModelCallableMatch {
+    pub fn unique(&self) -> Option<Arc<SemanticModelSymbol>> {
         (self.disposition == SemanticModelCallableDisposition::Unique)
-            .then(|| self.records.first().copied())
+            .then(|| self.records.first().cloned())
             .flatten()
     }
 
@@ -540,8 +552,10 @@ impl<'a> SemanticModelCallableMatch<'a> {
 /// complete family coverage, and share one structured owner/name/call shape
 /// plus one activation provenance. This is deliberately unavailable for
 /// partial, ambiguous, cross-pack, or merely same-named records.
-pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Option<String> {
-    let first = *records.first()?;
+pub fn semantic_model_callable_family_id<T: std::borrow::Borrow<SemanticModelSymbol>>(
+    records: &[T],
+) -> Option<String> {
+    let first = records.first()?.borrow();
     if !member_is_callable(first) {
         return None;
     }
@@ -578,6 +592,7 @@ pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Op
     }
     let first_provenance = &first.provenance;
     let same_family = records.iter().all(|record| {
+        let record = record.borrow();
         !record.provenance.ambiguous
             && (record.provenance.completeness == SemanticModelCompleteness::Complete
                 || record.callable_family_complete)
@@ -601,7 +616,7 @@ pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Op
     }
     let mut record_ids = records
         .iter()
-        .map(|record| record.id.as_str())
+        .map(|record| record.borrow().id.as_str())
         .collect::<Vec<_>>();
     record_ids.sort_unstable();
     record_ids.dedup();
@@ -617,6 +632,11 @@ pub fn semantic_model_callable_family_id(records: &[&SemanticModelSymbol]) -> Op
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticModelRelation {
+    /// Endpoints frozen before composition rewrites them. Only
+    /// semantic_relation_source_key reads them, solely for ordering.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub pre_composition_endpoints: Option<(String, String)>,
     pub id: String,
     pub kind: String,
     pub from: String,
@@ -624,6 +644,25 @@ pub struct SemanticModelRelation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration_ordinal: Option<u32>,
     pub provenance: SemanticModelProvenance,
+}
+
+/// The hierarchy and endpoint order before cross-group identity rewriting.
+#[doc(hidden)]
+pub fn semantic_relation_source_key(
+    relation: &SemanticModelRelation,
+) -> (&str, bool, Option<u32>, &str, &str) {
+    let (from, to) = relation
+        .pre_composition_endpoints
+        .as_ref()
+        .map(|(from, to)| (from.as_str(), to.as_str()))
+        .unwrap_or((&relation.from, &relation.to));
+    (
+        from,
+        relation.declaration_ordinal.is_some(),
+        relation.declaration_ordinal,
+        to,
+        &relation.id,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,16 +681,16 @@ pub enum SemanticModelOverlayBuildError {
 }
 
 #[derive(Debug)]
-pub struct SemanticModelOverlayMatch<'a, T> {
-    pub records: Vec<&'a T>,
+pub struct SemanticModelOverlayMatch<T> {
+    pub records: Vec<Arc<T>>,
     pub disposition: SemanticModelOverlayDisposition,
 }
 
-impl<'a, T> SemanticModelOverlayMatch<'a, T> {
+impl<T> SemanticModelOverlayMatch<T> {
     #[doc(hidden)]
-    pub fn unique(&self) -> Option<&'a T> {
+    pub fn unique(&self) -> Option<Arc<T>> {
         (self.disposition == SemanticModelOverlayDisposition::Unique)
-            .then(|| self.records.first().copied())
+            .then(|| self.records.first().cloned())
             .flatten()
     }
 }
@@ -671,8 +710,8 @@ pub enum SemanticModelMemberTargetDisposition {
 }
 
 #[derive(Debug)]
-pub struct SemanticModelMemberTargetMatch<'a> {
-    pub records: Vec<&'a SemanticModelSymbol>,
+pub struct SemanticModelMemberTargetMatch {
+    pub records: Vec<Arc<SemanticModelSymbol>>,
     pub disposition: SemanticModelMemberTargetDisposition,
 }
 
@@ -683,9 +722,9 @@ pub struct SemanticModelMemberTargetMatch<'a> {
 /// retained on every disposition so a caller can report exactly which
 /// declarations disagreed or were incomplete.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticModelExplicitOperationMatch<'a> {
+pub struct SemanticModelExplicitOperationMatch {
     pub operation: Option<ExplicitValueOperation>,
-    pub records: Vec<&'a SemanticModelSymbol>,
+    pub records: Vec<Arc<SemanticModelSymbol>>,
     pub disposition: SemanticModelMemberTargetDisposition,
 }
 
@@ -743,8 +782,8 @@ impl std::fmt::Display for SemanticModelUnresolvedEdge {
 /// declaration, which is exactly the difference between "this type has no base"
 /// and "nothing published this type's base".
 #[derive(Debug)]
-pub struct SemanticModelAncestry<'a> {
-    pub records: Vec<&'a SemanticModelSymbol>,
+pub struct SemanticModelAncestry {
+    pub records: Vec<Arc<SemanticModelSymbol>>,
     pub disposition: SemanticModelOverlayDisposition,
     pub defects: Vec<SemanticModelUnresolvedEdge>,
 }
@@ -752,9 +791,9 @@ pub struct SemanticModelAncestry<'a> {
 /// What one hierarchy edge target resolved to, and whether the resolution is
 /// clean. Produced only by `SemanticModelOverlay::resolve_edge_target`.
 #[doc(hidden)]
-pub struct ResolvedEdgeTarget<'a> {
+pub struct ResolvedEdgeTarget {
     #[doc(hidden)]
-    pub records: Vec<&'a SemanticModelSymbol>,
+    pub records: Vec<Arc<SemanticModelSymbol>>,
     #[doc(hidden)]
     pub defect: Option<SemanticModelEdgeDefect>,
 }
@@ -828,10 +867,10 @@ impl std::fmt::Display for SemanticModelSurfaceGap {
 /// root. A gap in any layer means a member missing from `closure` may still
 /// exist, so the caller must suppress rather than prove.
 #[derive(Debug)]
-pub struct SemanticModelOwnerSurface<'a> {
+pub struct SemanticModelOwnerSurface {
     /// The owner first, then every ancestor whose members belong to the
     /// owner's surface.
-    pub closure: Vec<&'a SemanticModelSymbol>,
+    pub closure: Vec<Arc<SemanticModelSymbol>>,
     /// Empty exactly when the closure is provably the whole surface. Otherwise
     /// the gaps in gate order: unresolved edges first, then the types whose own
     /// provenance does not support a proof.
@@ -842,12 +881,12 @@ pub struct SemanticModelOwnerSurface<'a> {
 /// This is a query result; no candidate or path survives the query.
 #[derive(Debug)]
 #[doc(hidden)]
-pub struct SemanticModelCallableOwner<'a> {
-    pub owner: &'a SemanticModelSymbol,
+pub struct SemanticModelCallableOwner {
+    pub owner: Arc<SemanticModelSymbol>,
     pub hierarchy: Vec<HierarchyFact>,
 }
 
-impl SemanticModelOwnerSurface<'_> {
+impl SemanticModelOwnerSurface {
     /// Whether a member absent from every type in `closure` is absent from the
     /// owner.
     pub fn proves_absence(&self) -> bool {
@@ -857,12 +896,12 @@ impl SemanticModelOwnerSurface<'_> {
 
 #[derive(Debug)]
 pub struct RuntimeValueContracts {
-    pub provenance: SemanticModelProvenance,
-    pub payload: RuntimeValuesPayload,
+    pub provenance: Arc<SemanticModelProvenance>,
+    pub payload: Arc<RuntimeValuesPayload>,
 }
 
 impl RuntimeValueContracts {
-    pub fn exposures(&self) -> &[RuntimeGlobalExposure] {
+    pub fn exposures(&self) -> &[Arc<RuntimeGlobalExposure>] {
         &self.payload.exposures
     }
 
@@ -932,7 +971,7 @@ impl CollectionFlowContract {
 }
 
 #[doc(hidden)]
-pub fn extraction_gap_index(gaps: &[ActivePackExtractionGap]) -> HashMap<String, usize> {
+pub fn extraction_gap_index(gaps: &[Arc<ActivePackExtractionGap>]) -> HashMap<String, usize> {
     let mut index = HashMap::default();
     for (ordinal, gap) in gaps.iter().enumerate() {
         index.entry(gap.declaration.clone()).or_insert(ordinal);
@@ -1048,6 +1087,19 @@ pub fn binding_layouts_match(left: &Signature, right: &Signature) -> bool {
                     && left.variadic == right.variadic
                     && left.passing_mode == right.passing_mode
             })
+}
+
+/// The shared ordering key, including the spelling before composition rewrites.
+#[doc(hidden)]
+pub fn semantic_symbol_source_key(symbol: &SemanticModelSymbol) -> (&str, &str, &str) {
+    (
+        symbol
+            .pre_composition_qualified_name
+            .as_deref()
+            .unwrap_or(&symbol.qualified_name),
+        &symbol.id,
+        &symbol.provenance.pack_digest,
+    )
 }
 
 impl SemanticModelSymbol {
@@ -1188,8 +1240,17 @@ impl SemanticModelProvenance {
     #[doc(hidden)]
     pub fn retained_string_bytes(&self) -> usize {
         let evidence = &self.activation.matched_evidence;
-        self.active_model_set_hash
-            .capacity()
+        self.extraction
+            .as_ref()
+            .map_or(0, |claim| match &claim.inputs {
+                crate::analyzer::semantic_model::ArtifactExtractionInputs::Single { sha256 } => {
+                    sha256.capacity()
+                }
+                crate::analyzer::semantic_model::ArtifactExtractionInputs::SourceSet { digest } => {
+                    digest.capacity()
+                }
+            })
+            .saturating_add(self.active_model_set_hash.capacity())
             .saturating_add(self.pack_digest.capacity())
             .saturating_add(self.pack_id.capacity())
             .saturating_add(self.pack_version.capacity())
@@ -1228,12 +1289,12 @@ fn coordinate_string_bytes(coordinate: Option<&SemanticModelMatchedCoordinate>) 
 
 #[doc(hidden)]
 pub fn disposition<T>(
-    records: &[&T],
+    records: &[Arc<T>],
     ambiguous: impl Fn(&T) -> bool,
 ) -> SemanticModelOverlayDisposition {
     if records.is_empty() {
         SemanticModelOverlayDisposition::Empty
-    } else if records.len() == 1 && !ambiguous(records[0]) {
+    } else if records.len() == 1 && !ambiguous(&records[0]) {
         SemanticModelOverlayDisposition::Unique
     } else {
         SemanticModelOverlayDisposition::Conflict
@@ -1536,6 +1597,7 @@ pub fn augment_go_overlay_surface(
             let mut provenance = candidate.provenance.clone();
             provenance.record_id = id.clone();
             relations.push(SemanticModelRelation {
+                pre_composition_endpoints: None,
                 id,
                 kind: "implements".to_owned(),
                 from: candidate.id.clone(),
@@ -2260,6 +2322,39 @@ pub fn hierarchy_kind_label(kind: HierarchyKind) -> &'static str {
         HierarchyKind::MixinInclude => "mixin_include",
         HierarchyKind::MixinPrepend => "mixin_prepend",
         HierarchyKind::MixinExtend => "mixin_extend",
+    }
+}
+
+/// The source-local hierarchy edge, before activation provenance is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HierarchyRelationProjection {
+    pub id: String,
+    pub kind: &'static str,
+    pub from: String,
+    pub to: String,
+    pub declaration_ordinal: Option<u32>,
+}
+
+/// Project the same structural edge for catalog publication and runtime reads.
+pub fn project_hierarchy_relation(
+    owner_id: &str,
+    hierarchy: &HierarchyFact,
+) -> HierarchyRelationProjection {
+    // Schema validation rejects unknown hierarchy targets, which must never
+    // be converted into a rendered edge identity.
+    debug_assert!(!hierarchy.target.contains_unknown());
+    let target = match &hierarchy.target {
+        TypeRef::Declared { id, .. } => id.clone(),
+        TypeRef::Named { name, .. } => name.clone(),
+        other => render_type_ref(other),
+    };
+    let kind = hierarchy_kind_label(hierarchy.hierarchy_kind);
+    HierarchyRelationProjection {
+        id: format!("hierarchy:{owner_id}:{kind}:{target}"),
+        kind,
+        from: owner_id.to_owned(),
+        to: target,
+        declaration_ordinal: hierarchy.declaration_ordinal,
     }
 }
 

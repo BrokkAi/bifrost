@@ -5,6 +5,12 @@
 //! causes with one selected context per caller file.
 
 use crate::analyzer::go::GoAnalyzer;
+use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+    SelectedInverseIndexOutcome, SelectedInverseReferenceIndex, SelectedInverseReferenceProvider,
+};
+use brokk_bifrost_analysis::analyzer::structural::selected_inverse::{
+    LazySelectedInverse, SelectedInverseAdapter, SelectedInverseFailure,
+};
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -107,6 +113,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum GoSelectedReverseOutcome<T> {
     Ready(T),
+    /// The target is outside selected coverage; other consumers retain its detail.
+    TargetUncovered(String),
     Unavailable(String),
     Stale(String),
     Cancelled,
@@ -197,10 +205,10 @@ fn go_selected_inverse_for_inner(
         ));
     };
     let path = brokk_bifrost_core::path_utils::rel_path_string(target.source());
-    // Normalize the declaration in its own context first. Today workspace
-    // source belongs to one domain; M4c adds source-bearing module providers.
+    // Normalize the declaration in its owner context before searching every
+    // context whose build list holds the source-bearing provider.
     let Some(own_profile) = go.context_profile_for_file(&path) else {
-        return Ok(GoSelectedReverseOutcome::Unavailable(format!(
+        return Ok(GoSelectedReverseOutcome::TargetUncovered(format!(
             "the target has no Go context: {path}"
         )));
     };
@@ -338,6 +346,10 @@ fn go_selected_inverse_in_context(
             return Ok(GoSelectedReverseOutcome::Cancelled);
         }
     };
+    operation.initialize_go_base_profile(
+        &go.native_context_base_profile()
+            .expect("reverse query captured an active base profile"),
+    );
     operation.bind_go_context_publication(context.clone());
     // Explicit candidates must be admitted even when the inverse index has no
     // sites for them. Enumerated candidates retain the inverse inventory contract.
@@ -392,6 +404,9 @@ fn go_selected_inverse_in_context(
         cancellation,
     )? {
         GoReverseCandidateOutcome::Ready(candidates) => candidates,
+        GoReverseCandidateOutcome::TargetUncovered(reason) => {
+            return Ok(GoSelectedReverseOutcome::TargetUncovered(reason));
+        }
         GoReverseCandidateOutcome::Unavailable(reason) => {
             return Ok(GoSelectedReverseOutcome::Unavailable(reason));
         }
@@ -1247,103 +1262,92 @@ fn go_selected_usage_kind(
     }
 }
 
-/// A generation-bound lazy facade. It retains the analyzer, not a workspace
-/// sized inverse map; each target's SQL candidates and source projections die
-/// with that target request.
+/// A generation-bound lazy facade retaining no workspace inverse map.
 pub struct GoNativeSelectedReferenceIndex {
-    generation: u64,
-    go: Box<GoAnalyzer>,
-    cancellation: CancellationToken,
+    index: LazySelectedInverse<GoInverseAdapter>,
 }
 
-impl brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseReferenceIndex
-    for GoNativeSelectedReferenceIndex
-{
+impl SelectedInverseReferenceIndex for GoNativeSelectedReferenceIndex {
     fn generation(&self) -> u64 {
-        self.generation
+        self.index.generation()
     }
-
     fn inverse_for(&self, target: &CodeUnit) -> EdgeDerivationResult {
-        if self.go.inner.project().analysis_generation() != self.generation {
-            return incomplete_inverse(
-                self.generation,
-                EdgeIncompleteReason::InverseIndexResolutionIncomplete,
-            );
-        }
-        match go_selected_inverse_for(&self.go, target, &self.cancellation) {
-            GoSelectedReverseOutcome::Ready(answer) => answer,
-            GoSelectedReverseOutcome::Unavailable(detail) => {
-                eprintln!("selected Go inverse query unavailable: {detail}");
-                incomplete_inverse(
-                    self.generation,
-                    EdgeIncompleteReason::InverseIndexTargetUncovered,
-                )
-            }
-            GoSelectedReverseOutcome::Stale(detail) => {
-                eprintln!("selected Go inverse query stale: {detail}");
-                incomplete_inverse(
-                    self.generation,
-                    EdgeIncompleteReason::InverseIndexResolutionIncomplete,
-                )
-            }
-            GoSelectedReverseOutcome::Cancelled => {
-                incomplete_inverse(self.generation, EdgeIncompleteReason::Cancelled)
-            }
-            GoSelectedReverseOutcome::StoreError(detail) => {
-                eprintln!("selected Go inverse query failed: {detail}");
-                incomplete_inverse(
-                    self.generation,
-                    EdgeIncompleteReason::InverseIndexResolutionIncomplete,
-                )
-            }
-        }
+        self.index.inverse_for(target)
     }
 }
 
-fn incomplete_inverse(generation: u64, reason: EdgeIncompleteReason) -> EdgeDerivationResult {
-    EdgeDerivationResult {
-        edges: Vec::new(),
-        completeness: EdgeCompleteness::Incomplete {
-            reasons: vec![reason],
-        },
-        provenance: EdgeProvenance::Inverse,
-        generation,
+struct GoInverseAdapter {
+    go: Box<GoAnalyzer>,
+}
+
+impl SelectedInverseAdapter for GoInverseAdapter {
+    fn admit(
+        analyzer: &dyn IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<(u64, Self), SelectedInverseFailure> {
+        let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+            return Err(SelectedInverseFailure::Unavailable(
+                "the workspace has no Go analyzer".into(),
+            ));
+        };
+        if cancellation.is_cancelled() {
+            return Err(SelectedInverseFailure::Cancelled);
+        }
+        if go.native_context_base_profile().is_none()
+            || !go.inner.selected_workspace_snapshots().contains_key("go")
+        {
+            return Err(SelectedInverseFailure::Unavailable(
+                "the selected Go package/import base profile is unavailable".into(),
+            ));
+        }
+        Ok((
+            go.inner.project().analysis_generation(),
+            Self {
+                go: Box::new(go.clone()),
+            },
+        ))
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.go.inner.project().analysis_generation()
+    }
+
+    fn query(
+        &self,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Option<EdgeDerivationResult>, SelectedInverseFailure> {
+        match go_selected_inverse_for(&self.go, target, cancellation) {
+            GoSelectedReverseOutcome::Ready(answer) => Ok(Some(answer)),
+            GoSelectedReverseOutcome::TargetUncovered(_) => Ok(None),
+            GoSelectedReverseOutcome::Unavailable(detail) => {
+                Err(SelectedInverseFailure::Unavailable(detail))
+            }
+            GoSelectedReverseOutcome::Stale(detail) => Err(SelectedInverseFailure::Stale(detail)),
+            GoSelectedReverseOutcome::Cancelled => Err(SelectedInverseFailure::Cancelled),
+            GoSelectedReverseOutcome::StoreError(detail) => {
+                Err(SelectedInverseFailure::StoreError(detail))
+            }
+        }
     }
 }
 
 pub struct GoNativeSelectedInverseProvider;
 
-impl brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseReferenceProvider
-    for GoNativeSelectedInverseProvider
-{
+impl SelectedInverseReferenceProvider for GoNativeSelectedInverseProvider {
     fn build_selected_inverse_index(
         &self,
         analyzer: &dyn IAnalyzer,
         cancellation: Option<&CancellationToken>,
-    ) -> brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseIndexOutcome
-    {
-        use brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedInverseIndexOutcome;
-        let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-            return SelectedInverseIndexOutcome::Unavailable(
-                "the workspace has no Go analyzer".into(),
-            );
-        };
+    ) -> SelectedInverseIndexOutcome {
         let token = cancellation.cloned().unwrap_or_default();
-        if token.is_cancelled() {
-            return SelectedInverseIndexOutcome::Cancelled;
-        }
-        if go.native_context_base_profile().is_some()
-            && go.inner.selected_workspace_snapshots().contains_key("go")
-        {
-            SelectedInverseIndexOutcome::Ready(Arc::new(GoNativeSelectedReferenceIndex {
-                generation: go.inner.project().analysis_generation(),
-                go: Box::new(go.clone()),
-                cancellation: token,
-            }))
-        } else {
-            SelectedInverseIndexOutcome::Unavailable(
-                "the selected Go package/import base profile is unavailable".into(),
-            )
+        match LazySelectedInverse::<GoInverseAdapter>::build(analyzer, &token) {
+            Ok(index) => {
+                SelectedInverseIndexOutcome::Ready(Arc::new(GoNativeSelectedReferenceIndex {
+                    index,
+                }))
+            }
+            Err(failure) => failure.into(),
         }
     }
 }
@@ -1368,6 +1372,10 @@ fn selected_go_context_id(go: &GoAnalyzer) -> Result<Option<i64>> {
 mod tests {
 
     use crate::analyzer::go::selected_reverse::*;
+    use crate::analyzer::go::{
+        activate_go_tool_context_for_test as activate_go_tool_context,
+        reconcile_go_summaries_for_test as reconcile_go_summaries,
+    };
 
     use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -1565,32 +1573,6 @@ func externalTest() {
             .expect("read selected Go package context")
             .expect("selected Go package context");
         reconcile_go_summaries(analyzer, context_id);
-    }
-
-    fn reconcile_go_summaries(analyzer: &GoAnalyzer, context_id: i64) {
-        let snapshot = analyzer
-            .selected_snapshot_for_test()
-            .expect("selected Go snapshot");
-        let profile = analyzer
-            .context_profile_for_test()
-            .expect("selected Go native context profile");
-        let report = analyzer
-            .inner
-            .analyzer_store()
-            .reconcile_unit_summaries(
-                &snapshot,
-                brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
-                    context_id,
-                    profile,
-                },
-                &brokk_bifrost_core::cancellation::CancellationToken::new(),
-            )
-            .expect("reconcile summaries for the selected Go native context");
-        assert!(
-            report.failed.is_empty(),
-            "selected Go native summary derivation must succeed: {:?}",
-            report.failed
-        );
     }
 
     fn target(analyzer: &GoAnalyzer, fixture: &BuiltInlineTestProject, name: &str) -> CodeUnit {
@@ -1900,6 +1882,55 @@ func (*Concrete) Required(struct { X int `json:"x"` }, string) {}
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6811: Go reverse search and outgoing calls read participation without a base profile"
+    )]
+    fn selected_go_usages_exclude_build_ignored_sibling_method() {
+        use brokk_bifrost_analysis::analyzer::usages::traits::UsageAnalyzer;
+        use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
+
+        let Some((fixture, analyzer)) =
+            crate::analyzer::go::build_constrained_sibling_fixture_for_test(
+                "package workerprofile\n\nfunc Invoke(values []*Service) { for _, s := range values { s.Run() } }\n",
+            )
+        else {
+            return;
+        };
+        let target = target_at(&analyzer, &fixture, "service_linux.go", "Run");
+        // A caller-scoped query must initialize participation itself, without
+        // incidental context lookups for out-of-build caller files.
+        let admitted = [fixture.file("service.go")].into_iter().collect();
+        let result = GoNativeUsageStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &admitted,
+            100,
+        );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } = result
+        else {
+            panic!("selected method usages must be complete: {result:?}");
+        };
+        assert!(
+            unproven_by_overload.values().all(BTreeSet::is_empty),
+            "{unproven_by_overload:?}"
+        );
+        let hits = hits_by_overload.values().flatten().collect::<Vec<_>>();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one caller of the participating method: {hits:?}"
+        );
+        assert_eq!(hits[0].file, fixture.file("service.go"));
+        assert_eq!(hits[0].line, 3);
+        assert_eq!(hits[0].enclosing.identifier(), "Invoke");
+        assert_eq!(hits[0].proof, UsageProof::Proven);
+    }
+
+    #[test]
     fn selected_go_inverse_composes_package_peers_aliases_dot_imports_and_external_tests() {
         let (fixture, analyzer) = fixture();
         for (name, expected_paths) in [
@@ -2087,56 +2118,6 @@ func Use(value api.Client, httpClient *Client) {}
             ],
             "only api.Client sites belong to the module's declaration: {answer:#?}"
         );
-    }
-
-    fn activate_go_tool_context(fixture: &BuiltInlineTestProject, analyzer: &GoAnalyzer) -> i64 {
-        use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
-
-        use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome;
-
-        use brokk_bifrost_analysis::analyzer::store::go_package_context::profile_digest;
-
-        let snapshot = analyzer.selected_snapshot_for_test().unwrap();
-        let store = analyzer.inner.analyzer_store();
-        let cancellation = CancellationToken::new();
-        let GoInputObservationOutcome::Ready(before) = store
-            .observe_go_context_inputs(&snapshot, analyzer.project(), &cancellation)
-            .unwrap()
-        else {
-            panic!("fixture Go inputs must be selected");
-        };
-        let discovery = crate::analyzer::go::dependency_discovery::discover_go_packages(
-            &brokk_bifrost_core::analyzer::config::GoAnalyzerConfig::default(),
-            analyzer.project(),
-            &brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default(),
-            Some(&cancellation),
-        )
-        .canonical
-        .expect("Go tool discovery must publish the package test variant");
-        let profile = profile_digest(&discovery);
-        let GoInputObservationOutcome::Ready(after) = store
-            .observe_go_context_inputs(&snapshot, analyzer.project(), &cancellation)
-            .unwrap()
-        else {
-            panic!("fixture Go inputs must remain selected");
-        };
-        let GoContextPublicationOutcome::Published(context) = store
-            .publish_go_package_context(
-                snapshot.clone(),
-                fixture.root().to_path_buf(),
-                None,
-                &before,
-                &after,
-                discovery,
-                &cancellation,
-            )
-            .unwrap()
-        else {
-            panic!("Go tool publication must succeed");
-        };
-        assert!(analyzer.activate_native_context_profile(&snapshot, profile));
-        reconcile_go_summaries(analyzer, context.context_id);
-        context.context_id
     }
 
     #[test]

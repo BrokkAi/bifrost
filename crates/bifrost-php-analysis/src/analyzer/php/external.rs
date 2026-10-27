@@ -263,6 +263,8 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
 
         DependencyPackProduction {
             pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
+                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_dependency_artifacts(
+                    ExternalArtifactKind::ComposerPackageSourceSet, artifacts)),
                 schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: "bifrost.external.php".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -472,7 +474,8 @@ impl ComposerPackagePackProducer {
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
-                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+                extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
+schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),
                 producer: Producer {
@@ -743,7 +746,8 @@ impl PhpDeclarationStubPackProducer {
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
-                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+                extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
+schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),
                 producer: Producer {

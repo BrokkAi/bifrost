@@ -274,6 +274,19 @@ pub fn compact_json_bytes<T: serde::Serialize + ?Sized>(
     serde_json::to_vec(value)
 }
 
+/// Schema of the compiled manifest, including producer-only extraction authority.
+pub fn compiled_manifest_json_schema() -> String {
+    // Key order must not depend on whether a crate in the same build enables
+    // serde_json's preserve_order feature, so sort like the authoring schema.
+    let mut schema = schemars::schema_for!(CompiledPackManifest);
+    let schema_object = schema.ensure_object();
+    schema_object.sort_keys();
+    for value in schema_object.values_mut() {
+        value.sort_all_objects();
+    }
+    serde_json::to_string_pretty(&schema).expect("manifest schema is JSON serializable")
+}
+
 /// Returns the current authoring schema as stable, pretty-printed JSON.
 pub fn authoring_json_schema() -> String {
     let mut schema = schemars::schema_for!(AuthoredSemanticModelPack);

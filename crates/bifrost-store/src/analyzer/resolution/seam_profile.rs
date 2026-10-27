@@ -165,7 +165,6 @@ use super::common_fact_lowering::LoweredDeferredMemberOwner;
 
 use super::engine::ResolutionQuery;
 
-use super::fact_source::CompanionTypeRelation;
 use super::fact_source::DeclarationAccessDecision;
 use super::fact_source::DeferredMemberOwnerLookupName;
 use super::fact_source::FactPageVisitor;
@@ -184,6 +183,7 @@ use super::fact_source::SelectedTypedRow;
 use super::fact_source::TypedFactPageVisitor;
 use super::fact_source::TypedFactReadOutcome;
 use super::fact_source::TypedFactRequest;
+use super::fact_source::{CompanionTypeRelation, JvmAliasProperty};
 
 use super::local_identity::SelectedResolutionMountOrdinal;
 
@@ -256,6 +256,7 @@ macro_rules! seam_methods {
 }
 
 seam_methods! {
+    CandidateAdmissionSession => "candidate_admission_session", "BatchResolutionFragmentSource";
     IdentityContentDigest => "identity_content_digest", "BatchResolutionFragmentSource";
     SelectionAuthority => "selection_authority", "BatchResolutionFragmentSource";
     AdmitsReverseReference => "admits_reverse_reference", "BatchResolutionFragmentSource";
@@ -266,6 +267,7 @@ seam_methods! {
     JvmIntrinsicOwnerIsUnshadowed => "jvm_intrinsic_owner_is_unshadowed", "SelectedTypedFactSource";
     GeneratedItemsCannotShadowBindings => "generated_items_cannot_shadow_bindings", "SelectedTypedFactSource";
     UniverseEntry => "universe_entry", "BatchResolutionFragmentSource";
+    NamespaceDefinitionLanguages => "namespace_definition_languages", "BatchResolutionFragmentSource";
     SemanticLanguageOf => "semantic_language_of", "BatchResolutionFragmentSource";
     InternSharedNameDigest => "intern_shared_name_digest", "BatchResolutionFragmentSource";
     SharedNameDigestForIdentity => "shared_name_digest_for_identity", "BatchResolutionFragmentSource";
@@ -315,6 +317,8 @@ seam_methods! {
     InvocationRolesForReferences => "invocation_roles_for_references", "SelectedTypedFactSource";
     LookupsOutsideImplicitRoot => "lookups_outside_implicit_root", "SelectedTypedFactSource";
     GenericParameterDeclarations => "generic_parameter_declarations", "SelectedTypedFactSource";
+    GoPackageMemberSources => "go_package_member_sources", "SelectedTypedFactSource";
+    GoSourcePlacementProofs => "go_source_placement_proofs", "SelectedTypedFactSource";
     DeferredMemberParticipation => "deferred_member_participation", "SelectedTypedFactSource";
     DeferredMemberOwnerProofs => "deferred_member_owner_proofs", "SelectedTypedFactSource";
     GoMemberDeclarations => "go_member_declarations", "SelectedTypedFactSource";
@@ -324,6 +328,7 @@ seam_methods! {
     RustExternalTypeImportPath => "rust_external_type_import_path", "SelectedTypedFactSource";
     NamedArgumentLabelForReference => "named_argument_label_for_reference", "SelectedTypedFactSource";
     CallableParameterForLabel => "callable_parameter_for_label", "SelectedTypedFactSource";
+    NamespaceDefinitions => "namespace_definitions", "SelectedTypedFactSource";
     ModuleDefinitions => "module_definitions", "SelectedTypedFactSource";
     RustModuleDefinitions => "rust_module_definitions", "SelectedTypedFactSource";
     VisitSelectedFragmentPages => "visit_selected_fragment_pages", "SelectedTypedFactSource";
@@ -361,6 +366,7 @@ seam_methods! {
     VisitMemberScopePagesForDefinitions => "visit_member_scope_pages_for_definitions", "SelectedTypedFactSource";
     VisitCompanionRelationPagesForEnclosingTypes => "visit_companion_relation_pages_for_enclosing_types", "SelectedTypedFactSource";
     VisitMemberScopePagesForHeads => "visit_member_scope_pages_for_heads", "SelectedTypedFactSource";
+    VisitJvmAliasPagesForDefinitions => "visit_jvm_alias_pages_for_definitions", "SelectedTypedFactSource";
     VisitMemberOwnerPagesForDefinitions => "visit_member_owner_pages_for_definitions", "SelectedTypedFactSource";
     VisitMemberOwnerPagesForOwners => "visit_member_owner_pages_for_owners", "SelectedTypedFactSource";
     VisitDeferredMemberOwnerPagesForDefinitions => "visit_deferred_member_owner_pages_for_definitions", "SelectedTypedFactSource";
@@ -549,7 +555,21 @@ impl GoReverseCounters {
     }
 }
 
+/// The reader arm selected by a candidate request's endpoint.
+#[derive(Clone, Copy)]
+pub(super) enum CandidateAdmissionArm {
+    Root,
+    Node,
+}
+
+#[derive(Default)]
+struct CandidateAdmissionCounters {
+    offered: AtomicU64,
+    admitted: AtomicU64,
+}
+
 struct Profile {
+    candidate_admission: [CandidateAdmissionCounters; 2],
     started: Instant,
     methods: [MethodCounters; METHOD_COUNT],
     go_reverse: GoReverseCounters,
@@ -569,6 +589,7 @@ impl Profile {
     fn open(path: &std::path::Path) -> Option<Self> {
         match std::fs::File::create(path) {
             Ok(output) => Some(Self {
+                candidate_admission: std::array::from_fn(|_| CandidateAdmissionCounters::default()),
                 root_source_bounded: AtomicU64::new(0),
                 root_source_universal: AtomicU64::new(0),
                 started: Instant::now(),
@@ -592,6 +613,16 @@ impl Profile {
 
     fn snapshot(&self) -> Vec<(u64, u64, u64)> {
         self.methods.iter().map(MethodCounters::snapshot).collect()
+    }
+
+    fn candidate_admission_snapshot(&self) -> [[u64; 2]; 2] {
+        std::array::from_fn(|arm| {
+            let counters = &self.candidate_admission[arm];
+            [
+                counters.offered.load(Ordering::Relaxed),
+                counters.admitted.load(Ordering::Relaxed),
+            ]
+        })
     }
 
     fn go_reverse_snapshot(&self) -> [u64; 18] {
@@ -649,6 +680,19 @@ pub(crate) fn record_jvm_operation_reads(reads: serde_json::Value) {
             })
             .to_string(),
         );
+    }
+}
+
+/// Offered and admitted frame pairs expose seek over-inclusion without
+/// retaining identities. Disabled with the rest of the seam profiler.
+pub(super) fn record_candidate_admission(arm: CandidateAdmissionArm, admitted: bool) {
+    if let Some(profile) = profile() {
+        let counters = &profile.candidate_admission[arm as usize];
+        counters.offered.fetch_add(1, Ordering::Relaxed);
+        counters
+            .admitted
+            .fetch_add(u64::from(admitted), Ordering::Relaxed);
+        profile.dirty.store(true, Ordering::Relaxed);
     }
 }
 
@@ -710,6 +754,7 @@ pub fn write_totals() {
     let counters = profile.snapshot();
     let line = serde_json::json!({
         "kind": "totals",
+        "candidate_admission": candidate_admission_object(profile.candidate_admission_snapshot()),
         "uptime_ms": profile.started.elapsed().as_millis(),
         "requests": profile.requests.load(Ordering::Relaxed),
         "methods": method_object(&counters, None),
@@ -891,6 +936,14 @@ fn method_object(now: &[(u64, u64, u64)], before: Option<&[(u64, u64, u64)]>) ->
     serde_json::Value::Object(object)
 }
 
+fn candidate_admission_object(counters: [[u64; 2]; 2]) -> serde_json::Value {
+    let [root, node] = counters;
+    serde_json::json!({
+        "root": {"offered": root[0], "admitted": root[1]},
+        "node": {"offered": node[0], "admitted": node[1]},
+    })
+}
+
 fn record_call(method: SeamMethod, keys: usize) {
     let Some(profile) = profile() else {
         return;
@@ -927,6 +980,7 @@ struct OpenRequest {
     before: Vec<(u64, u64, u64)>,
     sql_before: Option<(u64, u64, u128)>,
     root_source_before: [u64; 2],
+    candidate_before: [[u64; 2]; 2],
     go_reverse_before: [u64; 18],
     rename_phase_before: [[u64; 5]; 4],
     overlapped: bool,
@@ -949,6 +1003,7 @@ pub fn request_scope(tool: &str) -> RequestScope {
                 profile.root_source_bounded.load(Ordering::Relaxed),
                 profile.root_source_universal.load(Ordering::Relaxed),
             ],
+            candidate_before: profile.candidate_admission_snapshot(),
             go_reverse_before: profile.go_reverse_snapshot(),
             rename_phase_before: profile.rename_phase_snapshot(),
             overlapped,
@@ -974,6 +1029,12 @@ impl Drop for RequestScope {
             "overlapped": overlapped,
             "methods": method_object(&now, Some(&open.before)),
         });
+        let candidate_now = profile.candidate_admission_snapshot();
+        line["candidate_admission"] = candidate_admission_object(std::array::from_fn(|arm| {
+            std::array::from_fn(|counter| {
+                candidate_now[arm][counter] - open.candidate_before[arm][counter]
+            })
+        }));
         line["root_source_horizons"] = serde_json::json!({
             "bounded": profile.root_source_bounded.load(Ordering::Relaxed) - open.root_source_before[0],
             "universal": profile.root_source_universal.load(Ordering::Relaxed) - open.root_source_before[1],
@@ -1130,6 +1191,11 @@ impl<T: ?Sized> BatchResolutionFragmentSource for SeamProfiled<'_, T>
 where
     T: BatchResolutionFragmentSource,
 {
+    fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
+        record_call(SeamMethod::CandidateAdmissionSession, 0);
+        self.inner.candidate_admission_session()
+    }
+
     fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
@@ -1172,6 +1238,16 @@ where
         record_call(SeamMethod::ScopeReverseInventoryCompletion, 1);
         record_rows(SeamMethod::ScopeReverseInventoryCompletion, 1);
         self.inner.scope_reverse_inventory_completion(completion)
+    }
+
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        let languages = self.inner.namespace_definition_languages();
+        // Default-language lifecycle counters remain byte-identical.
+        if !languages.is_empty() {
+            record_call(SeamMethod::NamespaceDefinitionLanguages, 0);
+            record_rows(SeamMethod::NamespaceDefinitionLanguages, languages.len());
+        }
+        languages
     }
 
     fn semantic_language_of(
@@ -1723,6 +1799,19 @@ where
         rows = |decision| usize::from(decision.is_some())
     );
 
+    fn namespace_definitions(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        record_call(SeamMethod::NamespaceDefinitions, definitions.len());
+        let outcome = self.inner.namespace_definitions(definitions, cancellation);
+        if let Ok(modules) = &outcome {
+            record_rows(SeamMethod::NamespaceDefinitions, modules.len());
+        }
+        outcome
+    }
+
     fn module_definitions(
         &self,
         definitions: &[SemanticId],
@@ -1958,6 +2047,30 @@ where
             .deferred_member_participation(definitions, cancellation);
         if let Ok(Some(rows)) = &outcome {
             record_rows(SeamMethod::DeferredMemberParticipation, rows.len());
+        }
+        outcome
+    }
+
+    fn go_package_member_sources(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<Option<Vec<SemanticId>>>>> {
+        record_call(SeamMethod::GoPackageMemberSources, definitions.len());
+        self.inner
+            .go_package_member_sources(definitions, cancellation)
+    }
+
+    fn go_source_placement_proofs(
+        &self,
+        sources: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<bool>>> {
+        let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(sources.len());
+        record_call(SeamMethod::GoSourcePlacementProofs, sources.len());
+        let outcome = self.inner.go_source_placement_proofs(sources, cancellation);
+        if let Ok(Some(rows)) = &outcome {
+            record_rows(SeamMethod::GoSourcePlacementProofs, rows.len());
         }
         outcome
     }
@@ -2279,6 +2392,12 @@ where
         SelectedTypedRow<LoweredMemberScopeProperty>
     );
     counted_typed_pages!(
+        visit_jvm_alias_pages_for_definitions,
+        VisitJvmAliasPagesForDefinitions,
+        SemanticId,
+        SelectedTypedRow<JvmAliasProperty>
+    );
+    counted_typed_pages!(
         visit_companion_relation_pages_for_enclosing_types,
         VisitCompanionRelationPagesForEnclosingTypes,
         SemanticId,
@@ -2435,8 +2554,9 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 35, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 88, "SelectedTypedFactSource: {typed:?}");
+        // #5671: the root-inventory admission session is forwarded and counted too.
+        assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
+        assert_eq!(typed.len(), 92, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2464,7 +2584,8 @@ mod tests {
             declared, forwarded,
             "the reader seam and SeamProfiled disagree; declared {declared:?}, forwarded {forwarded:?}"
         );
-        assert_eq!(METHOD_COUNT, 121);
+        // #5671: profile the root-inventory session accessor with the other methods.
+        assert_eq!(METHOD_COUNT, 127);
     }
 
     #[cfg(test)]
@@ -2479,6 +2600,8 @@ mod tests {
         assert!(!enabled());
         record_call(SeamMethod::ReferenceSeed, 7);
         record_rows(SeamMethod::ReferenceSeed, 7);
+        record_candidate_admission(CandidateAdmissionArm::Root, false);
+        record_candidate_admission(CandidateAdmissionArm::Node, true);
         assert!(PROFILE.get().expect("read once above").is_none());
     }
 }

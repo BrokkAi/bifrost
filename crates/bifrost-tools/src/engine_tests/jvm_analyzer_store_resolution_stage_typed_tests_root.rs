@@ -517,6 +517,8 @@ mod jvm_extraction_tests {
         }
         Ok(SelectedResolutionTempTransaction::Commit(()))
     }).unwrap();
+        // Publish committed fixture rows through the same content epoch as admit.
+        selection.note_stage_content_commit();
         for requested in [vec![first], vec![second], vec![first, second]] {
             let payload = semantic_request_json(TypedFactRequest::new(&requested));
             let mut expected=selection.connection().prepare("SELECT fact.host_ordinal,fact.reference_key,fact.precedence_ordinal FROM temp.selected_resolution_stage_qualified_routes fact WHERE EXISTS(SELECT 1 FROM json_each(?1) request WHERE (fact.lookup_key IS request.value->>0 AND fact.lookup_shared IS request.value->>1) OR (fact.source_lookup_key IS request.value->>0 AND fact.source_lookup_shared IS request.value->>1))").unwrap().query_map([&payload],|row|Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?,row.get::<_,u32>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
@@ -1164,7 +1166,8 @@ mod jvm_extraction_tests {
     #[test]
     fn ordinary_property_provenance_requires_same_owner_without_rejecting_new_frontier() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
-        // The actual Java producer emits a hierarchy property gap for an interface.
+        // JLS 9.2 gives a parentless interface a lookup-only Object member root.
+        // Its unresolved provider retains property provenance at that reference.
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
             1,
             "package demo; public interface Model {}\n",
@@ -1211,25 +1214,45 @@ mod jvm_extraction_tests {
             let admitted=selection.with_owned_temp_transaction(|connection|{
             connection.execute("INSERT INTO temp.selected_resolution_stage_producers(producer_id,host_ordinal,bridge_identity,content_digest) VALUES(1,0,zeroblob(32),zeroblob(32))",[])?;
             assert!(insert_typed_fragment(connection,1,SelectedResolutionMountOrdinal::new(0),&fragment,&CancellationToken::new())?);
-            let mut found = Vec::new();
-            let outcome = visit_definition_property_gap_pages_for_reasons(
-                &selection, TypedFactRequest::new(&[SemanticId::local(0, reason)]),
-                &CancellationToken::new(),
-                &mut TypedFactPageVisitor::new(&mut |page| { found.extend_from_slice(page); Ok(true) }),
-            )?;
-            assert!(outcome.is_exhausted());
-            assert_eq!(found, vec![SelectedTypedRow::new(BindingFragmentId::at_ordinal(0), fragment.property_gaps()[0])]);
-            let cancelled = CancellationToken::cancel_after_checks_for_test(0);
-            let outcome = visit_definition_property_gap_pages_for_reasons(
-                &selection, TypedFactRequest::new(&[SemanticId::local(0, reason)]), &cancelled,
-                &mut TypedFactPageVisitor::new(&mut |_| panic!("cancelled owner lookup published rows")),
-            )?;
-            assert!(outcome.is_cancelled());
-            Ok(SelectedResolutionTempTransaction::Rollback(()))
+            Ok(SelectedResolutionTempTransaction::Commit(()))
         });
             if owner == SemanticId::local(0, definition) {
                 admitted.expect("same provenance owner can cover a new frontier");
+                // Publish committed fixture rows before reads, then clear via the stage boundary.
+                selection.note_stage_content_commit();
+                let mut found = Vec::new();
+                let outcome = visit_definition_property_gap_pages_for_reasons(
+                    &selection,
+                    TypedFactRequest::new(&[SemanticId::local(0, reason)]),
+                    &CancellationToken::new(),
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        found.extend_from_slice(page);
+                        Ok(true)
+                    }),
+                )
+                .unwrap();
+                assert!(outcome.is_exhausted());
+                assert_eq!(
+                    found,
+                    vec![SelectedTypedRow::new(
+                        BindingFragmentId::at_ordinal(0),
+                        fragment.property_gaps()[0]
+                    )]
+                );
+                let cancelled = CancellationToken::cancel_after_checks_for_test(0);
+                let outcome = visit_definition_property_gap_pages_for_reasons(
+                    &selection,
+                    TypedFactRequest::new(&[SemanticId::local(0, reason)]),
+                    &cancelled,
+                    &mut TypedFactPageVisitor::new(&mut |_| {
+                        panic!("cancelled owner lookup published rows")
+                    }),
+                )
+                .unwrap();
+                assert!(outcome.is_cancelled());
+                brokk_bifrost_analysis::analyzer::store::resolution_stage::SelectedResolutionStage::new(&selection).clear_facts().unwrap();
             } else {
+                // Invalid-owner admission rolls back before any content can be published.
                 let error = admitted.unwrap_err();
                 assert!(
                     error.to_string().contains("property provenance owner"),
@@ -1270,6 +1293,8 @@ mod jvm_extraction_tests {
         }
         Ok(SelectedResolutionTempTransaction::Commit(()))
     }).unwrap();
+        // Publish committed fixture rows through the same content epoch as admit.
+        selection.note_stage_content_commit();
         let mut rows = Vec::new();
         let mut receive = |page: &[SelectedGapReasonProvenance]| {
             rows.extend_from_slice(page);

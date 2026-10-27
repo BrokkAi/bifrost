@@ -31,8 +31,7 @@ use crate::imports::{
     rust_crate_root_package, rust_item_has_attribute,
 };
 use crate::lexical_scope::{
-    RustCfgCondition, lexical_package_at, local_type_item_name_shadowed_in_tree,
-    visible_import_binders_with_scopes_in_tree,
+    RustCfgCondition, lexical_package_at, visible_import_binders_with_scopes_in_tree,
 };
 use crate::usage_queries::RustUsageQueries;
 use crate::usage_walks::RustUsageWalks;
@@ -590,97 +589,14 @@ impl RustBindingSeeds {
             .filter(move |identity| &identity.file == file)
     }
 
-    pub fn has_import_edges(&self) -> bool {
-        !self.verified_importers.is_empty()
-    }
-
     pub fn unnamed_visibility(&self) -> impl Iterator<Item = &RustUnnamedImportVisibility> {
         self.unnamed_visibility.iter()
-    }
-
-    pub fn unnamed_target_visible_at(
-        &self,
-        target: &RustSymbolIdentity,
-        file: &ProjectFile,
-        module: &ModuleKey,
-        byte: usize,
-        call_cfg_conditions: &[RustCfgCondition],
-    ) -> bool {
-        self.unnamed_visibility.iter().any(|route| {
-            route.target == *target
-                && route.importer == *file
-                && route.importer_module == *module
-                && route.extent.contains(byte)
-                && route.domain.contains_module(module)
-                && combine_rust_cfg_conditions(&route.cfg_conditions, call_cfg_conditions)
-                    .is_some_and(|conditions| {
-                        conditions
-                            .iter()
-                            .all(|condition| !matches!(condition, RustCfgCondition::Unknown))
-                    })
-        })
     }
 
     /// Visibility domains carried by the prepared seed closure.
     pub fn candidate_domains(&self) -> impl Iterator<Item = &Domain> {
         self.identity_domains.values().flatten()
     }
-}
-
-/// Keep coarse candidate-provider files whose owned modules can see a
-/// prepared binding seed.
-///
-/// Structured importers and seed files are retained explicitly. Other files
-/// are admitted through the same Cargo-aware `Domain` containment used by
-/// reference resolution, including inline and file-backed descendant modules.
-pub fn usage_candidate_files_visible_to_binding_seeds_with_walks(
-    _analyzer: &dyn RustFactSource,
-    walks: &RustUsageWalks<'_>,
-    candidates: &HashSet<ProjectFile>,
-    target_source: &ProjectFile,
-    seeds: &RustBindingSeeds,
-) -> Result<Option<HashSet<ProjectFile>>, RustCargoRouteError> {
-    let verified_importers: HashSet<_> = seeds.verified_importer_files().cloned().collect();
-    let mut visible = HashSet::default();
-    for file in candidates {
-        if walks.cancelled() {
-            return Ok(None);
-        }
-        if !walks.is_analyzed(file) {
-            continue;
-        }
-        if file == target_source
-            || verified_importers.contains(file)
-            || seeds.identities_in_file(file).next().is_some()
-        {
-            visible.insert(file.clone());
-            continue;
-        }
-        let modules = walks
-            .physical_root_of(file)
-            .into_iter()
-            .chain(
-                walks
-                    .queries()
-                    .module_extents_of(file)?
-                    .into_iter()
-                    .map(|(module, _, _)| module),
-            )
-            .collect::<HashSet<_>>();
-        if seeds.candidate_domains().any(|domain| {
-            modules.iter().any(|module| {
-                domain_contains_module_for_file_with_routes(
-                    domain,
-                    walks.cargo_routes(),
-                    file,
-                    module,
-                )
-            })
-        }) {
-            visible.insert(file.clone());
-        }
-    }
-    Ok(Some(visible))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,88 +718,6 @@ impl RustUsageWalks<'_> {
                     .effective_module_domains_of(&identity.module)?
                     .is_some_and(|domains| domains.contains(&Domain::Public))),
         }
-    }
-
-    fn declaration_visible_at(
-        &self,
-        analyzer: &dyn RustFactSource,
-        declaration: &CodeUnit,
-        caller_file: &ProjectFile,
-        caller_byte: usize,
-    ) -> Result<bool, RustCargoRouteError> {
-        let Some(caller_module) = self.queries().module_at_byte(caller_file, caller_byte)? else {
-            return Ok(false);
-        };
-        let caller_module = &caller_module;
-        let immediate_parent = analyzer.structural_parent_of(declaration);
-        let visibility_declaration = match immediate_parent.as_ref() {
-            Some(parent) if crate::graph_support::is_trait_owner(analyzer, parent)? => parent,
-            _ => declaration,
-        };
-        let properties =
-            analyzer.declaration_source_properties(visibility_declaration.source(), &|| true)?;
-        let alternatives = properties
-            .get(visibility_declaration)
-            .ok_or(RustCargoRouteError::Unavailable)?;
-        let mut parent = immediate_parent;
-        let owner = loop {
-            match parent {
-                Some(ref candidate) if candidate.is_module() => {
-                    break ModuleKey::new(declaration.source(), &candidate.fq_name());
-                }
-                Some(candidate) => parent = analyzer.structural_parent_of(&candidate),
-                None => {
-                    break ModuleKey::new(
-                        declaration.source(),
-                        &rust_package_name(declaration.source()),
-                    );
-                }
-            }
-        };
-        let domains: Vec<_> = alternatives
-            .iter()
-            .filter_map(|property| {
-                direct_import_scope_for_module(
-                    declaration.source(),
-                    &owner.package(),
-                    property.visibility.clone(),
-                    self.is_actual_crate_root(declaration.source()),
-                )
-            })
-            .collect();
-        let files_share_visibility_domain = declaration.source() == caller_file
-            || self.owners_intersect(declaration.source(), caller_file)?
-            || self
-                .cargo_routes()
-                .files_share_target(declaration.source(), caller_file)
-                == Some(true);
-        if domains.contains(&Domain::Crate(rust_crate_root_package(
-            declaration.source(),
-        ))) && files_share_visibility_domain
-        {
-            return Ok(true);
-        }
-        let domain_reaches_caller = |effective: &Domain| {
-            *effective == Domain::Public
-                || (files_share_visibility_domain
-                    && domain_contains_module_for_file_with_routes(
-                        effective,
-                        self.cargo_routes(),
-                        caller_file,
-                        caller_module,
-                    ))
-        };
-        Ok(match self.effective_module_domains_of(&owner)? {
-            Some(owner_domains) => domains
-                .iter()
-                .flat_map(|domain| {
-                    owner_domains
-                        .iter()
-                        .filter_map(move |owner_domain| domain.intersect(owner_domain))
-                })
-                .any(|effective| domain_reaches_caller(&effective)),
-            None => domains.iter().any(domain_reaches_caller),
-        })
     }
 
     fn identity_visible_at(
@@ -1534,28 +1368,6 @@ pub fn rust_file_is_actual_crate_root(
             .contains(file))
 }
 
-/// Whether `domain` reaches `caller_module`, allowing for the caller sitting in
-/// a Cargo target whose shared modules carry a kind-root module key.
-///
-/// `benches/left.rs` is its own crate but `benches/common/mod.rs` is spelled
-/// under the shared `benches` root, so the plain key comparison misses a
-/// visibility that Cargo grants. Widening through the caller's target roots is
-/// what makes the two agree.
-pub fn domain_contains_module_for_file(
-    domain: &Domain,
-    analyzer: &dyn RustFactSource,
-    caller_file: &ProjectFile,
-    caller_module: &ModuleKey,
-) -> Result<bool, RustCargoRouteError> {
-    let routes = analyzer.cargo_routes()?;
-    Ok(domain_contains_module_for_file_with_routes(
-        domain,
-        &routes,
-        caller_file,
-        caller_module,
-    ))
-}
-
 fn domain_contains_module_for_file_with_routes(
     domain: &Domain,
     routes: &RustCargoRouteIndex,
@@ -1631,24 +1443,6 @@ fn usage_walks_while<'analyzer>(
         return Ok(None);
     }
     Ok(Some(walks))
-}
-
-pub fn usage_candidate_files_while(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    roots: &BTreeSet<CodeUnit>,
-    keep_going: &(impl Fn() -> bool + Sync),
-) -> Result<Option<HashSet<ProjectFile>>, RustCargoRouteError> {
-    let Some(walks) = usage_walks_while(analyzer, token, keep_going)? else {
-        return Ok(None);
-    };
-    let Some(seeds) = walks.binding_seeds_while(analyzer, roots, keep_going)? else {
-        return Ok(None);
-    };
-    if !keep_going() {
-        return Ok(None);
-    }
-    walks.importers_of_seeds_while(&seeds, keep_going)
 }
 
 /// Candidate files derived from binding seeds that a caller already prepared.
@@ -1743,95 +1537,6 @@ pub fn usage_binding_names(
     Ok((direct, qualified))
 }
 
-pub fn usage_has_exact_scoped_binding(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    seeds: &RustBindingSeeds,
-    name: &str,
-    byte: usize,
-    namespace: RustReferenceNamespace,
-) -> Result<bool, RustCargoRouteError> {
-    let _walks = RustUsageWalks::new(analyzer, token)?;
-    let Some(scoped) = scoped_explicit_import(analyzer, token, file, byte, name)
-        .map_err(RustCargoRouteError::from)?
-    else {
-        return Ok(false);
-    };
-    if unique_seed_identity_for_import_targets(
-        analyzer,
-        token,
-        file,
-        seeds,
-        &scoped.targets,
-        &scoped.dependency_roots,
-        namespace,
-        byte,
-    )?
-    .is_some()
-    {
-        return Ok(true);
-    }
-    if let Some(fqn) = scoped.fqn.as_deref()
-        && unique_seed_identity_for_fqn(
-            analyzer,
-            token,
-            file,
-            byte,
-            seeds,
-            fqn,
-            &scoped.dependency_roots,
-            namespace,
-        )?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn usage_import_path_matches_seed(
-    analyzer: &dyn RustFactSource,
-    _token: QueryToken<'_>,
-    file: &ProjectFile,
-    seeds: &RustBindingSeeds,
-    path: &[String],
-    local_name: &str,
-    byte: usize,
-    namespace: RustReferenceNamespace,
-    cfg_condition: &RustCfgCondition,
-) -> Result<bool, RustCargoRouteError> {
-    let Some(importer_module) = RustUsageQueries::new(analyzer).module_at_byte(file, byte)? else {
-        return Ok(false);
-    };
-    let edges = seeds
-        .edges_by_importer
-        .get(file)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    Ok(edges.iter().any(|edge| {
-        edge.importer_module == importer_module
-            && edge.extent.contains(byte)
-            && edge.source_path == path
-            && match &edge.kind {
-                RustImportEdgeKind::Named {
-                    local_name: edge_name,
-                    ..
-                }
-                | RustImportEdgeKind::Namespace {
-                    local_name: edge_name,
-                } => edge_name == local_name,
-                RustImportEdgeKind::Qualified(path) => path
-                    .first()
-                    .is_some_and(|edge_name| edge_name == local_name),
-                RustImportEdgeKind::Unnamed { .. } | RustImportEdgeKind::Glob => false,
-            }
-            && edge.cfg_condition == *cfg_condition
-            && edge.namespace.is_some_and(|bound| bound.accepts(namespace))
-    }))
-}
-
 /// All local names in `file` binding a seed (direct or namespace) — the
 /// owner-binding names the member scan keys on.
 pub fn usage_binding_local_names(
@@ -1851,198 +1556,12 @@ pub fn usage_binding_local_names(
         .collect())
 }
 
-pub fn usage_root_declaration_matches_at(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    seeds: &RustBindingSeeds,
-    name: &str,
-    byte: usize,
-) -> Result<bool, RustCargoRouteError> {
-    let walks = RustUsageWalks::new(analyzer, token)?;
-    let Some(module) = walks.queries().module_at_byte(file, byte)? else {
-        return Ok(false);
-    };
-    let module = &module;
-    for root in &seeds.roots {
-        if walks.identity_of(root)?.is_some_and(|identity| {
-            identity.file == *file && identity.module == *module && identity.name == name
-        }) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub fn usage_declaration_visible_at(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    declaration: &CodeUnit,
-    file: &ProjectFile,
-    byte: usize,
-) -> Result<bool, RustCargoRouteError> {
-    RustUsageWalks::new(analyzer, token)?.declaration_visible_at(analyzer, declaration, file, byte)
-}
-
-pub fn usage_identity_visible_at(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    declaration: &CodeUnit,
-    file: &ProjectFile,
-    byte: usize,
-) -> Result<bool, RustCargoRouteError> {
-    let walks = RustUsageWalks::new(analyzer, token)?;
-    let identity = match walks.identity_of(declaration)? {
-        Some(identity) => Some(identity),
-        None => walks.value_constructor_identity_of(declaration)?,
-    };
-    if let Some(identity) = identity {
-        return walks.identity_visible_at(analyzer, &identity, file, byte);
-    }
-    walks.declaration_visible_at(analyzer, declaration, file, byte)
-}
-
-pub fn usage_exact_root_for_resolution(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    resolution: &RustReferenceResolution,
-    seeds: &RustBindingSeeds,
-) -> Result<Option<CodeUnit>, RustCargoRouteError> {
-    let walks = RustUsageWalks::new(analyzer, token)?;
-    Ok(usage_exact_root_for_resolution_with_walks(
-        &walks, resolution, seeds,
-    ))
-}
-
 pub fn usage_exact_root_for_resolution_with_walks(
     walks: &RustUsageWalks<'_>,
     resolution: &RustReferenceResolution,
     seeds: &RustBindingSeeds,
 ) -> Option<CodeUnit> {
     walks.exact_root_for_resolution(resolution, seeds)
-}
-
-pub fn usage_local_module_prefix_visible_at(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    seeds: &RustBindingSeeds,
-    name: &str,
-    byte: usize,
-) -> Result<bool, RustCargoRouteError> {
-    let walks = RustUsageWalks::new(analyzer, token)?;
-    let queries = walks.queries();
-    let Some(module) = queries.module_at_byte(file, byte)? else {
-        return Ok(false);
-    };
-    let module = &module;
-
-    if let Some(syntax) = analyzer.prepared_syntax(token, file) {
-        if local_type_item_name_shadowed_in_tree(
-            syntax.tree().root_node(),
-            syntax.source(),
-            name,
-            byte,
-        ) {
-            return Ok(false);
-        }
-
-        // Resolve a function-local namespace before checking the physical child
-        // module identity. A local `use crate::extjson;` is not a declaration in
-        // the current module, but it still owns this path at the reference site.
-        if let Some(routes) = visible_namespace_module_routes(
-            analyzer,
-            token,
-            &walks,
-            queries,
-            file,
-            module,
-            byte,
-            &[name],
-            false,
-        )? {
-            for route in routes {
-                for identity in &seeds.identities {
-                    let target_module = module_route_for_identity(identity);
-                    let same_owner = route.target_file == identity.file
-                        || walks.owners_intersect(&route.target_file, &identity.file)?;
-                    if (same_owner
-                        || walks
-                            .cargo_routes()
-                            .files_share_target(&route.target_file, &identity.file)
-                            == Some(true))
-                        && route.target_module.contains(&target_module)
-                        && seeds.identity_domains.get(identity).is_some_and(|domains| {
-                            domains.iter().any(|domain| domain.contains_module(module))
-                        })
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-            return Ok(false);
-        }
-    }
-
-    if walks.matching_edges_for_importer(file, seeds).any(|edge| {
-        edge.importer_module == *module
-            && edge.extent.contains(byte)
-            && match &edge.kind {
-                RustImportEdgeKind::Named { local_name, .. }
-                | RustImportEdgeKind::Namespace { local_name } => {
-                    local_name == name && edge.namespace == Some(RustSymbolNamespace::Module)
-                }
-                RustImportEdgeKind::Qualified(path) => {
-                    path.first().is_some_and(|first| first == name)
-                }
-                RustImportEdgeKind::Unnamed { .. } | RustImportEdgeKind::Glob => false,
-            }
-    }) {
-        return Ok(true);
-    }
-    let module_identity = RustSymbolIdentity {
-        file: file.clone(),
-        module: module.clone(),
-        name: name.to_string(),
-        namespace: RustSymbolNamespace::Module,
-    };
-    if !walks
-        .declared_domains_of(&module_identity)?
-        .is_some_and(|domains| domains.iter().any(|domain| domain.contains_module(module)))
-    {
-        return Ok(false);
-    }
-
-    let prefix = [name.to_string()];
-    for route in walks.resolve_segments(file, &module.package(), &prefix)? {
-        for identity in &seeds.identities {
-            let target_module = module_route_for_identity(identity);
-            let same_owner = route.target_file == identity.file
-                || walks.owners_intersect(&route.target_file, &identity.file)?;
-            if (same_owner
-                || walks
-                    .cargo_routes()
-                    .files_share_target(&route.target_file, &identity.file)
-                    == Some(true))
-                && route.target_module.contains(&target_module)
-                && seeds.identity_domains.get(identity).is_some_and(|domains| {
-                    domains.iter().any(|domain| domain.contains_module(module))
-                })
-            {
-                return Ok(true);
-            }
-        }
-    }
-
-    let child_module = module.with_suffix(&[name.to_string()]);
-    Ok(seeds.identities.iter().any(|identity| {
-        let target_module = module_route_for_identity(identity);
-        child_module.contains(&target_module)
-            && seeds
-                .identity_domains
-                .get(identity)
-                .is_some_and(|domains| domains.iter().any(|domain| domain.contains_module(module)))
-    }))
 }
 
 /// Resolve a path prefix through the nearest visible namespace import.
@@ -2345,33 +1864,6 @@ fn rust_import_extent_key(extent: &RustImportExtent) -> (u8, usize, usize, usize
             end,
         } => (1, *module_start, *module_end, *start, *end),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn usage_reference_at(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    seeds: &RustBindingSeeds,
-    segments: &[&str],
-    byte: usize,
-    namespace: RustReferenceNamespace,
-    root_shadowed: bool,
-    leading_absolute: bool,
-) -> Result<RustReferenceResolution, RustCargoRouteError> {
-    let walks = RustUsageWalks::new(analyzer, token)?;
-    usage_reference_at_with_walks(
-        analyzer,
-        &walks,
-        file,
-        seeds,
-        segments,
-        byte,
-        namespace,
-        root_shadowed,
-        leading_absolute,
-    )
-    .map_err(RustCargoRouteError::from)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2880,59 +2372,6 @@ pub fn exported_targets_from_files_while(
     )
 }
 
-pub fn usage_crate_export_targets(
-    analyzer: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    export_name: &str,
-) -> Result<BTreeSet<(ProjectFile, String)>, RustCargoRouteError> {
-    let walks = RustUsageWalks::new(analyzer, token)?;
-    let mut crate_roots = walks
-        .owner_roots_of(file)?
-        .iter()
-        .filter(|root| walks.is_actual_crate_root(root))
-        .cloned()
-        .collect::<Vec<_>>();
-    if walks.is_actual_crate_root(file) {
-        crate_roots.push(file.clone());
-    }
-    crate_roots.sort();
-    crate_roots.dedup();
-    let mut targets = walks.export_targets_from_files(analyzer, &crate_roots, export_name)?;
-    // The v1 index scanned every import edge in the workspace for one
-    // whose importer is a crate root. Edges are produced per importer, so
-    // asking each crate root for its own forward edges is the same set.
-    for root in &crate_roots {
-        for edge in walks.forward_import_edges_of(root)?.iter() {
-            if let RustImportEdgeKind::Named {
-                imported_name,
-                local_name,
-            } = &edge.kind
-                && local_name == export_name
-            {
-                targets.insert((edge.target_file.clone(), imported_name.clone()));
-            }
-        }
-    }
-    Ok(targets)
-}
-
-pub fn edge_matches_single_seed(edge: &RustImportEdge, target: &RustSymbolIdentity) -> bool {
-    if edge.target_file != target.file
-        || (edge.target_module != target.module
-            && edge.target_module != module_route_for_identity(target))
-    {
-        return false;
-    }
-    match &edge.kind {
-        RustImportEdgeKind::Named { imported_name, .. }
-        | RustImportEdgeKind::Unnamed { imported_name } => imported_name == &target.name,
-        RustImportEdgeKind::Namespace { .. } => true,
-        RustImportEdgeKind::Glob => true,
-        RustImportEdgeKind::Qualified(_) => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn unique_seed_identity_for_fqn(
     analyzer: &dyn RustFactSource,
@@ -3254,11 +2693,10 @@ mod unnamed_guard_tests {
     use brokk_bifrost_test_macros::hardwon;
 
     use super::{
-        Domain, HashMap, HashSet, ModuleKey, ProjectFile, RustBindingSeeds, RustCfgCondition,
-        RustImportExtent, RustMacroInvocationCandidate, RustMacroInvocationResolution,
-        RustMacroInvocationRoute, RustMacroInvocationTarget, RustMacroScopeKey,
-        RustRouteProvenance, RustSymbolIdentity, RustSymbolNamespace, RustUnnamedImportVisibility,
-        combine_rust_cfg_conditions,
+        HashSet, ModuleKey, ProjectFile, RustBindingSeeds, RustCfgCondition, RustImportExtent,
+        RustMacroInvocationCandidate, RustMacroInvocationResolution, RustMacroInvocationRoute,
+        RustMacroInvocationTarget, RustMacroScopeKey, RustRouteProvenance, RustSymbolIdentity,
+        RustSymbolNamespace, combine_rust_cfg_conditions,
     };
     use std::collections::BTreeSet;
 
@@ -3276,55 +2714,6 @@ mod unnamed_guard_tests {
             combine_rust_cfg_conditions(&[yes.clone(), yes.clone()], std::slice::from_ref(&yes)),
             Some(vec![yes])
         );
-    }
-
-    #[test]
-    #[hardwon("#3080+75d44cf79d6d: unnamed imports require exact target, scope, and known guards")]
-    fn unnamed_visibility_requires_known_guards_exact_identity_and_scope() {
-        let root = tempfile::tempdir().expect("temporary root");
-        let file = ProjectFile::new(root.path().to_path_buf(), "lib.rs");
-        let module = ModuleKey::new(&file, "");
-        let target = RustSymbolIdentity {
-            file: file.clone(),
-            module: module.clone(),
-            name: "Trait".into(),
-            namespace: RustSymbolNamespace::Type,
-        };
-        let mut seeds = RustBindingSeeds {
-            roots: BTreeSet::new(),
-            root_origins: HashSet::default(),
-            root_identities: HashMap::default(),
-            canonical_identities: HashMap::default(),
-            identities: HashSet::default(),
-            identity_domains: HashMap::default(),
-            edges_by_importer: HashMap::default(),
-            verified_importers: HashSet::default(),
-            unnamed_visibility: vec![RustUnnamedImportVisibility {
-                target: target.clone(),
-                importer: file.clone(),
-                importer_module: module.clone(),
-                extent: RustImportExtent::Module { start: 0, end: 100 },
-                domain: Domain::Public,
-                provenance: RustRouteProvenance::Local,
-                cfg_conditions: vec![RustCfgCondition::Always],
-            }],
-        };
-        assert!(seeds.unnamed_target_visible_at(&target, &file, &module, 10, &[]));
-        assert!(!seeds.unnamed_target_visible_at(&target, &file, &module, 101, &[]));
-        let other = RustSymbolIdentity {
-            name: "Other".into(),
-            ..target.clone()
-        };
-        assert!(!seeds.unnamed_target_visible_at(&other, &file, &module, 10, &[]));
-        assert!(!seeds.unnamed_target_visible_at(
-            &target,
-            &file,
-            &module,
-            10,
-            &[RustCfgCondition::Unknown]
-        ));
-        seeds.unnamed_visibility[0].cfg_conditions = vec![RustCfgCondition::Unknown];
-        assert!(!seeds.unnamed_target_visible_at(&target, &file, &module, 10, &[]));
     }
 
     fn macro_candidate(
@@ -3442,5 +2831,169 @@ mod unnamed_guard_tests {
                 provenance: RustRouteProvenance::Local,
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod visibility_domain_properties {
+    use super::{Domain, ModuleKey};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn finite_module_universe_obeys_visibility_set_algebra_and_identity_round_trips() {
+        // Contract: Public includes both crates; Crate includes that crate's root
+        // and every module; Module(m) includes m and its descendants, never its
+        // ancestors, siblings, or a module in another crate. None is the empty
+        // intersection. These domains describe access regions, not whether an
+        // item's full path is reachable through its enclosing declarations.
+        // Exhaust every domain triple instead of randomly sampling this small
+        // universe. The hand-authored descendant sets below are the oracle;
+        // neither contains nor a component-prefix test builds the expected sets.
+        let roots = ["alpha", "alpha_tools"];
+        let paths: &[&[&str]] = &[
+            &[],
+            &["a"],
+            &["a", "inner"],
+            &["a", "inner", "deep"],
+            &["a", "side"],
+            &["ab"],
+            &["\u{6a21}\u{5757}"],
+            &["\u{6a21}\u{5757}", "inner"],
+        ];
+        let packages = [
+            "",
+            "a",
+            "a.inner",
+            "a.inner.deep",
+            "a.side",
+            "ab",
+            "\u{6a21}\u{5757}",
+            "\u{6a21}\u{5757}.inner",
+        ];
+        let parents = [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(6),
+        ];
+        let descendants: &[&[usize]] = &[
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[1, 2, 3, 4],
+            &[2, 3],
+            &[3],
+            &[4],
+            &[5],
+            &[6, 7],
+            &[7],
+        ];
+        let modules: Vec<_> = roots
+            .iter()
+            .flat_map(|root| {
+                paths.iter().map(move |path| ModuleKey {
+                    crate_root: (*root).to_owned(),
+                    components: path.iter().map(|name| (*name).to_owned()).collect(),
+                })
+            })
+            .collect();
+        let mut domains = vec![(Domain::Public, (0..modules.len()).collect::<BTreeSet<_>>())];
+        for (crate_index, root) in roots.iter().enumerate() {
+            let offset = crate_index * paths.len();
+            domains.push((
+                Domain::Crate((*root).to_owned()),
+                (offset..offset + paths.len()).collect(),
+            ));
+            for (local_index, module) in modules[offset..offset + paths.len()].iter().enumerate() {
+                let members: BTreeSet<_> = descendants[local_index]
+                    .iter()
+                    .map(|index| offset + index)
+                    .collect();
+                for (candidate_index, candidate) in modules.iter().enumerate() {
+                    assert_eq!(
+                        module.contains(candidate),
+                        members.contains(&candidate_index),
+                        "module={module:?}, candidate={candidate:?}"
+                    );
+                }
+                domains.push((Domain::Module(module.clone()), members));
+
+                let package = if local_index == 0 {
+                    (*root).to_owned()
+                } else {
+                    format!("{root}.{}", packages[local_index])
+                };
+                assert_eq!(module.package(), package);
+                assert_eq!(ModuleKey::with_crate_root(root, &package), *module);
+                assert_eq!(
+                    module.parent(),
+                    parents[local_index].map(|index| modules[offset + index].clone())
+                );
+                if let Some(parent_index) = parents[local_index] {
+                    let suffix = [paths[local_index].last().unwrap().to_string()];
+                    assert_eq!(modules[offset + parent_index].with_suffix(&suffix), *module);
+                }
+                // All split positions include empty suffix and multi-component
+                // suffixes, independently of parent()'s one-component removal.
+                for split in 0..=module.components.len() {
+                    let prefix = ModuleKey {
+                        crate_root: (*root).to_owned(),
+                        components: module.components[..split].to_vec(),
+                    };
+                    assert_eq!(prefix.with_suffix(&module.components[split..]), *module);
+                }
+            }
+        }
+        // Translate an actual result by identity lookup in the independently
+        // tabulated model, never by calling production membership logic.
+        let members_of = |domain: Option<&Domain>| -> BTreeSet<usize> {
+            match domain {
+                None => BTreeSet::new(),
+                Some(domain) => domains
+                    .iter()
+                    .find(|(key, _)| key == domain)
+                    .expect("intersection must return a domain in this closed universe")
+                    .1
+                    .clone(),
+            }
+        };
+        for (a, a_members) in &domains {
+            for (index, module) in modules.iter().enumerate() {
+                assert_eq!(
+                    a.contains_module(module),
+                    a_members.contains(&index),
+                    "domain={a:?}, module={module:?}"
+                );
+            }
+            assert_eq!(a.intersect(a), Some(a.clone()), "idempotence: {a:?}");
+            for (b, b_members) in &domains {
+                let ab = a.intersect(b);
+                assert_eq!(
+                    members_of(ab.as_ref()),
+                    a_members.intersection(b_members).copied().collect(),
+                    "intersection: {a:?}, {b:?}"
+                );
+                assert_eq!(ab, b.intersect(a), "commutativity: {a:?}, {b:?}");
+                for (c, c_members) in &domains {
+                    let left = ab.as_ref().and_then(|domain| domain.intersect(c));
+                    let right = b.intersect(c).and_then(|domain| a.intersect(&domain));
+                    assert_eq!(left, right, "associativity: {a:?}, {b:?}, {c:?}");
+                    let expected = a_members
+                        .intersection(b_members)
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .intersection(c_members)
+                        .copied()
+                        .collect();
+                    assert_eq!(
+                        members_of(left.as_ref()),
+                        expected,
+                        "triple intersection: {a:?}, {b:?}, {c:?}"
+                    );
+                }
+            }
+        }
     }
 }

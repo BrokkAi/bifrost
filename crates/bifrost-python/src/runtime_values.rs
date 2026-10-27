@@ -12,6 +12,7 @@
 
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as covers;
+use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -379,7 +380,17 @@ fn classify_container_occurrence<'tree>(
         writes.push(write(PythonRuntimeWriteTarget::ContainerEscape));
         return;
     };
-    let access = access_key(subscript, source);
+    // The grammar repeats the `subscript` field for comma-separated keys;
+    // even a trailing comma makes a tuple key rather than a scalar index.
+    let mut cursor = parent.walk();
+    let access = if parent
+        .children(&mut cursor)
+        .any(|child| child.kind() == ",")
+    {
+        PythonRuntimeAccessKey::Unsupported
+    } else {
+        access_key(subscript, source)
+    };
     let read_range = node_source_range(parent);
     let execution = match enclosing_execution_context(attribute) {
         Some(function) => {
@@ -412,8 +423,10 @@ fn access_key(subscript: Node<'_>, source: &str) -> PythonRuntimeAccessKey {
         return PythonRuntimeAccessKey::Property(literal.to_owned());
     }
     match subscript.kind() {
-        "integer" => node_text(subscript, source)
-            .parse::<u128>()
+        "integer" => crate::structural::PYTHON_STRUCTURAL_SPEC
+            .integer_literal_value(subscript, source)
+            .and_then(|value| value.decimal)
+            .and_then(|decimal| decimal.parse::<u128>().ok())
             .map_or(PythonRuntimeAccessKey::Unsupported, |index| {
                 PythonRuntimeAccessKey::Index(index)
             }),
@@ -777,8 +790,11 @@ pub fn python_module_member_mutation(
         visited_nodes: 0,
     };
     let bindings = python_import_bindings_from_tree(root, source);
-    let facts =
-        python_sys_modules_aliases(root, source, source_module, module, &bindings, &mut budget)?;
+    let Some(facts) =
+        python_sys_modules_aliases(root, source, source_module, module, &bindings, &mut budget)
+    else {
+        return Some(PythonModuleMemberMutation::Budget);
+    };
     let table_aliases = &facts.aliases;
     let locals: Vec<String> = bindings
         .iter()
@@ -1434,9 +1450,6 @@ fn python_sys_modules_guard_atom(
     module: &str,
     source: &str,
 ) -> PythonGuardTruth {
-    if node.kind() == "parenthesized_expression" {
-        return PythonGuardTruth::Unknown;
-    }
     if node.kind() == "comparison_operator" {
         return python_sys_modules_guard_comparison(node, key_name, module, source);
     }
@@ -2651,6 +2664,80 @@ mod tests {
             .expect("python grammar loads");
         let tree = parser.parse(source, None).expect("fixture parses");
         extract_python_runtime_reads(tree.root_node(), source, 64)
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: module alias exhaustion certified mutation-free"
+    )]
+    fn qs6_module_mutation_budget_is_not_absence() {
+        let source = "import os\nos.system = fake\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        for budget in [0, 1, 2] {
+            assert_eq!(
+                python_module_member_mutation(
+                    tree.root_node(),
+                    source,
+                    "test",
+                    "os",
+                    "system",
+                    budget
+                ),
+                Some(PythonModuleMemberMutation::Budget),
+                "budget={budget}"
+            );
+        }
+        assert!(
+            python_module_member_mutation(tree.root_node(), source, "test", "os", "system", 4096)
+                .is_some()
+        );
+    }
+
+    // Python's integer grammar admits radix prefixes and digit separators.
+    // The u128 representation deliberately refuses larger literal magnitudes.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: runtime indices lost radix and separator literals"
+    )]
+    fn qs6_runtime_key_shapes() {
+        use PythonRuntimeAccessKey::{Dynamic, Index, Property, Unsupported};
+        for (key, expected) in [
+            ("0", Index(0)),
+            ("0x1", Index(1)),
+            ("0b1", Index(1)),
+            ("0o7", Index(7)),
+            ("1_0", Index(10)),
+            ("340282366920938463463374607431768211455", Index(u128::MAX)),
+            ("340282366920938463463374607431768211456", Unsupported),
+            ("1:3", Unsupported),
+            ("1, 2", Unsupported),
+            ("1,", Unsupported),
+            ("(1, 2)", Unsupported),
+            ("name", Dynamic),
+            ("\"HOME\"", Property("HOME".into())),
+        ] {
+            let source = format!("import sys\nvalue = sys.argv[{key}]\n");
+            let facts = facts(&source);
+            assert!(facts.complete, "{facts:?}");
+            assert_eq!(facts.reads.len(), 1, "{facts:?}");
+            assert_eq!(facts.reads[0].access, expected, "{key}");
+        }
+    }
+
+    #[test]
+    fn qs6_runtime_extraction_bounds() {
+        let source = "pass\n".repeat(100);
+        let tree = crate::declarations::parse_python_tree(&source).unwrap();
+        let empty = extract_python_runtime_reads(tree.root_node(), &source, 1);
+        assert!(empty.complete, "{empty:?}");
+        assert!(empty.visited_nodes > 64, "{empty:?}");
+        let source = "import sys\nx = sys.argv[1]\ny = sys.argv[2]\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        for cap in [0, 1, 2, 3] {
+            let facts = extract_python_runtime_reads(tree.root_node(), source, cap);
+            assert_eq!(facts.reads.len(), cap.min(2), "{facts:?}");
+            assert_eq!(facts.complete, cap > 2, "{facts:?}");
+        }
     }
 
     /// The DataFlowBench template-1 positive shape.

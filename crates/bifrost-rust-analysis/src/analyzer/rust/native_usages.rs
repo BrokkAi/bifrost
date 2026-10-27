@@ -1,5 +1,13 @@
 //! Native usage-result preparation; production routing remains unchanged.
 
+use brokk_bifrost_analysis::analyzer::usages::native_result::{
+    NativeUsageAdmission, NativeUsageDiagnostics, NativeUsageFile, NativeUsageOrigin,
+    NativeUsagePending, NativeUsageProjection, NativeUsageSite, project_pending_files,
+    unique_targets,
+};
+
+use std::ops::ControlFlow;
+
 use crate::analyzer::rust::RustAnalyzer;
 
 use crate::analyzer::rust::selected_reverse::RustSelectedReverseOutcome;
@@ -22,15 +30,7 @@ use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
 
 use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
 
-use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic;
-
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHitSurface;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
@@ -52,19 +52,11 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
-use brokk_bifrost_core::analyzer::model::Range;
-
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
-
-use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::hash::HashSet;
 
-use brokk_bifrost_core::text_utils::compute_line_starts;
-
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
-use brokk_bifrost_core::text_utils::trimmed_snippet_around_line;
-use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct RustNativeUsageStrategy;
@@ -97,16 +89,6 @@ struct PreparedNativeUsageQuery {
     targets: Vec<CodeUnit>,
     candidate_sets: Vec<RustReverseCandidateSet>,
     files: HashSet<ProjectFile>,
-}
-
-struct PendingNativeUsageHit {
-    target_index: usize,
-    range: Range,
-    enclosing: CodeUnit,
-    proof: UsageProof,
-    kind: UsageHitKind,
-    reference_kind: Option<ReferenceKind>,
-    external_edge: bool,
 }
 
 impl GraphUsageAnalyzer for RustNativeUsageStrategy {
@@ -213,32 +195,19 @@ fn with_native_rust(
         return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
     };
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-        return GraphUsageOutcome::TerminalFailure(diagnostic(
+        return DIAGNOSTICS.failure(
             primary,
             "native_resolution_unavailable",
             "selected Rust analyzer is unavailable".into(),
-        ));
+        );
     };
     find(rust)
 }
 
-fn unique_targets(targets: &[CodeUnit]) -> Vec<CodeUnit> {
-    let mut seen = HashSet::default();
-    targets
-        .iter()
-        .filter(|target| seen.insert(*target))
-        .cloned()
-        .collect()
-}
-
-fn diagnostic(target: &CodeUnit, kind: &str, reason: String) -> UsageAnalysisDiagnostic {
-    UsageAnalysisDiagnostic {
-        fq_name: target.fq_name().to_string(),
-        strategy: "rust_native".into(),
-        reason_kind: kind.into(),
-        reason,
-    }
-}
+const DIAGNOSTICS: NativeUsageDiagnostics = NativeUsageDiagnostics {
+    strategy: "rust_native",
+    cancelled_reason: "native usage query was cancelled",
+};
 
 /// Preserve canonical target buckets, proofs and editor reference roles. Only
 /// the outer selected-operation outcome can release the provisional result.
@@ -318,9 +287,7 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                         candidate_sets.len(),
                         "every distinct target has one candidate set"
                     );
-                    let mut diagnostics = Vec::new();
-                    let mut pending_by_file =
-                        BTreeMap::<ProjectFile, Vec<PendingNativeUsageHit>>::new();
+                    let mut pending = NativeUsagePending::new(&targets);
                     let mut target_start = 0;
                     for target_batch in targets.chunks(MAX_REVERSE_TARGETS_PER_BATCH) {
                         let Some(answers) = queries.inverse_for_candidates(
@@ -336,7 +303,7 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                         {
                             let target_index = target_start + batch_offset;
                             if let EdgeCompleteness::Incomplete { reasons } = &answer.completeness {
-                                diagnostics.push(diagnostic(
+                                pending.diagnostics.push(DIAGNOSTICS.diagnostic(
                                     target,
                                     if reasons.contains(
                                         &brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason::TimeBudgetExceeded,
@@ -350,31 +317,15 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                                     ),
                                 ));
                             }
-                            for edge in answer.edges {
-                                if cancellation.is_cancelled() {
-                                    return Ok(None);
-                                }
-                                assert_eq!(&edge.target, target);
-                                assert!(scope.allows(&edge.site.file));
-                                // Imports and other module-level occurrences have no
-                                // enclosing callable. A file-scope display owner does
-                                // not invent a semantic target or a callable edge.
-                                let file = edge.site.file;
-                                let owner = edge
-                                    .site
-                                    .enclosing
-                                    .unwrap_or_else(|| CodeUnit::file_scope(file.clone()));
-                                pending_by_file.entry(file).or_default().push(
-                                    PendingNativeUsageHit {
-                                        target_index,
-                                        range: edge.site.range,
-                                        enclosing: owner,
-                                        proof: edge.proof,
-                                        kind: edge.usage_kind,
-                                        reference_kind: edge.reference_kind,
-                                        external_edge: true,
-                                    },
-                                );
+                            if let ControlFlow::Break(()) = pending
+                                .queue_target_edges::<RustUsageProjection<'_, '_>>(
+                                    target_index,
+                                    answer.edges,
+                                    scope,
+                                    cancellation,
+                                )
+                            {
+                                return Ok(None);
                             }
                             if (target.is_class() || target.is_field())
                                 && let Some(implementations) = rust
@@ -392,15 +343,11 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                                         continue;
                                     }
                                     for range in rust.ranges_of(&implementation) {
-                                        pending_by_file.entry(file.clone()).or_default().push(
-                                            PendingNativeUsageHit {
+                                        pending.push(file.clone(),
+                                            NativeUsageSite {
                                                 target_index,
-                                                range,
-                                                enclosing: implementation.clone(),
-                                                proof: UsageProof::Proven,
-                                                kind: UsageHitKind::OverrideDeclaration,
-                                                reference_kind: None,
-                                                external_edge: false,
+                                                hit: UsageHit::new(file.clone(), range.start_line, range.start_byte, range.end_byte, implementation.clone(), 1.0, "").into_override_declaration(),
+                                                origin: NativeUsageOrigin::SupplementalDeclaration,
                                             },
                                         );
                                     }
@@ -411,167 +358,15 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                     }
 
                     let syntax_scope = AnalyzerQueryScope::with_cancellation(rust, cancellation);
-                    let mut hits_by_target = (0..targets.len())
-                        .map(|_| BTreeSet::new())
-                        .collect::<Vec<BTreeSet<UsageHit>>>();
-                    let mut unproven_by_target = (0..targets.len())
-                        .map(|_| BTreeSet::new())
-                        .collect::<Vec<BTreeSet<UsageHit>>>();
-                    let mut external_by_target = (0..targets.len())
-                        .map(|_| BTreeSet::new())
-                        .collect::<Vec<BTreeSet<UsageHit>>>();
-                    for (file, pending) in pending_by_file {
-                        if cancellation.is_cancelled() {
-                            return Ok(None);
-                        }
-                        let source = rust.indexed_source(&file).ok_or_else(|| {
-                            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
-                                "selected usage source is unavailable for {file}"
-                            ))
-                        })?;
+                    let mut projection = RustUsageProjection {
+                        rust,
+                        queries: &mut *queries,
+                        syntax_scope: &syntax_scope,
+                        cancellation,
                         #[cfg(test)]
-                        if pending.iter().any(|hit| hit.external_edge) {
-                            work.snippet_sources.push(file.clone());
-                        }
-                        if !rust
-                            .inner
-                            .source_matches_selected_native_content(&file, &source)
-                        {
-                            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                                format!("selected usage source changed for {file}"),
-                            ));
-                        }
-                        let prepared = rust
-                            .prepared_syntax(syntax_scope.token(), &file)
-                            .ok_or_else(|| {
-                                brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
-                                    "selected usage syntax is unavailable for {file}"
-                                ))
-                            })?;
-                        if prepared.source() != source {
-                            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                                format!("selected usage syntax source changed for {file}"),
-                            ));
-                        }
-                        let line_starts = compute_line_starts(&source);
-                        for pending_hit in pending {
-                            let activation =
-                                crate::analyzer::rust::site_activation::rust_site_activation(
-                                    Some(prepared.tree()),
-                                    &source,
-                                    pending_hit.range.start_byte..pending_hit.range.end_byte,
-                                    |condition| {
-                                        queries.rust_cfg_activation_for_caller_under_site_cfg(
-                                            file.rel_path(),
-                                            condition,
-                                            cancellation,
-                                        )
-                                    },
-                                )?;
-                            let Some(activation) = activation else {
-                                return Ok(None);
-                            };
-                            let (proof, reason_kind) = match activation {
-                                crate::analyzer::rust::site_activation::RustSiteActivation::NoNode => {
-                                    return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
-                                        "Rust usage hit has no syntax node: {file}:{}..{}",
-                                        pending_hit.range.start_byte, pending_hit.range.end_byte
-                                    )));
-                                }
-                                crate::analyzer::rust::site_activation::RustSiteActivation::Inactive => continue,
-                                crate::analyzer::rust::site_activation::RustSiteActivation::Active => {
-                                    (pending_hit.proof, None)
-                                }
-                                crate::analyzer::rust::site_activation::RustSiteActivation::Unknown { .. } => {
-                                    (UsageProof::Unproven, Some("unknown_activation"))
-                                }
-                            };
-                            let snippet = trimmed_snippet_around_line(
-                                &source,
-                                &line_starts,
-                                pending_hit.range.start_line.saturating_sub(1),
-                                0,
-                            );
-                            let mut hit = UsageHit::new(
-                                file.clone(),
-                                pending_hit.range.start_line,
-                                pending_hit.range.start_byte,
-                                pending_hit.range.end_byte,
-                                pending_hit.enclosing,
-                                if proof == UsageProof::Proven {
-                                    1.0
-                                } else {
-                                    0.0
-                                },
-                                snippet,
-                            );
-                            hit.kind = pending_hit.kind;
-                            hit.proof = proof;
-                            hit.reference_kind = pending_hit.reference_kind;
-                            if let Some(reason_kind) = reason_kind {
-                                hit.reason_kind = Some(reason_kind.to_owned());
-                            }
-                            if proof == UsageProof::Proven {
-                                if pending_hit.external_edge
-                                    && hit.kind.included_in(UsageHitSurface::ExternalUsages)
-                                {
-                                    external_by_target[pending_hit.target_index]
-                                        .insert(hit.clone());
-                                }
-                                hits_by_target[pending_hit.target_index].insert(hit);
-                            } else {
-                                unproven_by_target[pending_hit.target_index].insert(hit);
-                            }
-                        }
-                    }
-
-                    let mut hits_by_overload = HashMap::default();
-                    let mut unproven_by_overload = HashMap::default();
-                    let mut unproven_total_by_overload = HashMap::default();
-                    let mut external_hits = BTreeSet::new();
-                    for (target_index, target) in targets.iter().enumerate() {
-                        external_hits.extend(external_by_target[target_index].iter().cloned());
-                        let last_in_batch = target_index + 1 == targets.len()
-                            || (target_index + 1) % MAX_REVERSE_TARGETS_PER_BATCH == 0;
-                        if last_in_batch && external_hits.len() > max_usages {
-                            return Ok(Some(FuzzyResult::TooManyCallsites {
-                                short_name: primary.short_name().to_owned(),
-                                total_callsites: external_hits.len(),
-                                limit: max_usages,
-                                sample_hits: external_hits.into_iter().take(max_usages).collect(),
-                            }));
-                        }
-                        let FuzzyResult::Success {
-                            hits_by_overload: proven,
-                            unproven_by_overload: uncertain,
-                            unproven_total_by_overload: totals,
-                        } = FuzzyResult::success_with_unproven_limit(
-                            target.clone(),
-                            std::mem::take(&mut hits_by_target[target_index]),
-                            std::mem::take(&mut unproven_by_target[target_index]),
-                            scope.max_unproven(),
-                        )
-                        else {
-                            unreachable!("success constructor produces Success");
-                        };
-                        hits_by_overload.extend(proven);
-                        unproven_by_overload.extend(uncertain);
-                        unproven_total_by_overload.extend(totals);
-                    }
-                    Ok(Some(if diagnostics.is_empty() {
-                        FuzzyResult::Success {
-                            hits_by_overload,
-                            unproven_by_overload,
-                            unproven_total_by_overload,
-                        }
-                    } else {
-                        FuzzyResult::Incomplete {
-                            hits_by_overload,
-                            unproven_by_overload,
-                            unproven_total_by_overload,
-                            diagnostics,
-                        }
-                    }))
+                        snippet_sources: &mut work.snippet_sources,
+                    };
+                    project_pending_files(&mut projection, pending, scope, max_usages, cancellation)
                 })();
                 #[cfg(test)]
                 {
@@ -589,18 +384,16 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                     cancellation.is_cancelled(),
                     "stopped native usage is not publishable"
                 );
-                ("cancelled", "native usage query was cancelled".into())
+                return DIAGNOSTICS.cancelled(primary);
             }
-            RustSelectedReverseOutcome::Cancelled => {
-                ("cancelled", "native usage query was cancelled".into())
-            }
+            RustSelectedReverseOutcome::Cancelled => return DIAGNOSTICS.cancelled(primary),
             RustSelectedReverseOutcome::Stale(reason) => ("stale_selected_source", reason),
             RustSelectedReverseOutcome::Unavailable(reason) => {
                 ("native_resolution_unavailable", reason)
             }
             RustSelectedReverseOutcome::StoreError(reason) => ("native_store_error", reason),
         };
-        GraphUsageOutcome::TerminalFailure(diagnostic(primary, kind, reason))
+        DIAGNOSTICS.failure(primary, kind, reason)
     })();
     NativeUsageExecution {
         outcome,
@@ -609,10 +402,125 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
     }
 }
 
+struct RustUsageProjection<'a, 'scope> {
+    rust: &'a RustAnalyzer,
+    queries: &'a mut dyn RustSelectedReverseQueries,
+    syntax_scope: &'a AnalyzerQueryScope<'scope>,
+    cancellation: &'a CancellationToken,
+    #[cfg(test)]
+    snippet_sources: &'a mut Vec<ProjectFile>,
+}
+
+impl NativeUsageProjection for RustUsageProjection<'_, '_> {
+    type Context =
+        std::sync::Arc<brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree>;
+    type Error = brokk_bifrost_analysis::analyzer::store::StoreError;
+
+    fn admit_edge(
+        target: &CodeUnit,
+        edge: &brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow,
+        scope: &UsageScanScope<'_>,
+    ) -> bool {
+        assert_eq!(&edge.target, target);
+        assert!(scope.allows(&edge.site.file));
+        true
+    }
+    fn load_file(
+        &mut self,
+        file: &ProjectFile,
+        _pending: &[NativeUsageSite],
+    ) -> Result<NativeUsageFile<Self::Context>, Self::Error> {
+        let source = self.rust.indexed_source(file).ok_or_else(|| {
+            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                "selected usage source is unavailable for {file}"
+            ))
+        })?;
+        #[cfg(test)]
+        if _pending
+            .iter()
+            .any(|hit| hit.origin == NativeUsageOrigin::ReferenceEdge)
+        {
+            self.snippet_sources.push(file.clone());
+        }
+        if !self
+            .rust
+            .inner
+            .source_matches_selected_native_content(file, &source)
+        {
+            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                format!("selected usage source changed for {file}"),
+            ));
+        }
+        let prepared = self
+            .rust
+            .prepared_syntax(self.syntax_scope.token(), file)
+            .ok_or_else(|| {
+                brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                    "selected usage syntax is unavailable for {file}"
+                ))
+            })?;
+        if prepared.source() != source {
+            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                format!("selected usage syntax source changed for {file}"),
+            ));
+        }
+
+        Ok(NativeUsageFile::new(source, prepared))
+    }
+
+    fn presentation(
+        &mut self,
+        file: &ProjectFile,
+        loaded: &NativeUsageFile<Self::Context>,
+        _target: &CodeUnit,
+        site: &mut NativeUsageSite,
+    ) -> Result<NativeUsageAdmission, Self::Error> {
+        let activation = crate::analyzer::rust::site_activation::rust_site_activation(
+            Some(loaded.context.tree()),
+            &loaded.source,
+            site.hit.start_offset..site.hit.end_offset,
+            |condition| {
+                self.queries.rust_cfg_activation_for_caller_under_site_cfg(
+                    file.rel_path(),
+                    condition,
+                    self.cancellation,
+                )
+            },
+        )?;
+        let Some(activation) = activation else {
+            return Ok(NativeUsageAdmission::Stopped);
+        };
+        let (proof, reason_kind) = match activation {
+            crate::analyzer::rust::site_activation::RustSiteActivation::NoNode => {
+                return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                    format!(
+                        "Rust usage hit has no syntax node: {file}:{}..{}",
+                        site.hit.start_offset, site.hit.end_offset
+                    ),
+                ));
+            }
+            crate::analyzer::rust::site_activation::RustSiteActivation::Inactive => {
+                return Ok(NativeUsageAdmission::Excluded);
+            }
+            crate::analyzer::rust::site_activation::RustSiteActivation::Active => {
+                (site.hit.proof, None)
+            }
+            crate::analyzer::rust::site_activation::RustSiteActivation::Unknown { .. } => {
+                (UsageProof::Unproven, Some("unknown_activation"))
+            }
+        };
+
+        site.hit.proof = proof;
+        site.hit.reason_kind = reason_kind.map(str::to_owned);
+        Ok(NativeUsageAdmission::Retain)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use crate::analyzer::rust::native_usages::*;
+    use std::collections::BTreeSet;
 
     use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 

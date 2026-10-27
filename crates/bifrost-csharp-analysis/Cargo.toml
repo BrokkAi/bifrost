@@ -19,10 +19,10 @@ name = "brokk_bifrost_csharp_analysis"
 workspace = true
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.1" }
-brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.1" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.1" }
-brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.14.1" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.2" }
+brokk-bifrost-semantic = { path = "../bifrost-semantic", version = "=0.14.2" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2" }
+brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.14.2" }
 goblin = "0.10.7"
 moka = { version = "0.12.11", features = ["sync"] }
 rayon = "1.10.0"
@@ -36,9 +36,9 @@ walkdir = "2.5.0"
 quick-xml = "0.40"
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.14.2", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.14.2", features = ["test-support"] }
 
 [features]
 default = []

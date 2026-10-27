@@ -87,10 +87,13 @@ fn classify_go_reverse_path_evidence_miss(
 
 // Admit source members before confirming candidates or their completeness.
 // A go member stays in scope even when mounted in an augmented test variant.
-pub(crate) const GO_REVERSE_CANDIDATE_SITES_SQL: &str = r#"
+pub(crate) static GO_REVERSE_CANDIDATE_SITES_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   SELECT package.package_id, package.tool_import_path, package.package_name
-  FROM temp.selected_go_context_source_files AS members
+  FROM ({}) AS members
   JOIN main.go_package_instances AS package
     ON package.package_id=members.package_id
   WHERE members.context_id=?1 AND package.context_id=?1 AND members.file_version_id=?2 AND members.source_role<>'ignored'
@@ -128,6 +131,9 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   JOIN temp.selected_resolution_mounts AS mounted
     ON mounted.file_version_id=members.file_version_id
   WHERE mounted.storage_language='go' AND members.source_role<>'ignored'
+    AND (package.provider_module_path IS NULL OR EXISTS(
+      SELECT 1 FROM main.go_context_domain_modules AS owner
+      WHERE owner.context_id=?1 AND owner.module_path=package.provider_module_path))
     AND (?5=1 OR members.source_role NOT IN ('test','xtest'))
   UNION
   SELECT placed.mount_ordinal, members.source_role, package.package_id, 1,
@@ -148,6 +154,9 @@ WITH RECURSIVE target_package(package_id, tool_import_path, package_name) AS (
   JOIN temp.selected_resolution_mounts AS mounted
     ON mounted.mount_ordinal=placed.mount_ordinal
   WHERE mounted.storage_language='go' AND members.source_role<>'ignored'
+    AND (package.provider_module_path IS NULL OR EXISTS(
+      SELECT 1 FROM main.go_context_domain_modules AS owner
+      WHERE owner.context_id=?1 AND owner.module_path=package.provider_module_path))
     AND (?5=1 OR members.source_role NOT IN ('test','xtest'))
 )
 SELECT mounted.mount_ordinal, mounted.persisted_relative_path,
@@ -194,7 +203,10 @@ WHERE mounted.storage_language='go'
         AND root.end_node=-1
     )
   )
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 const GO_REVERSE_DEFINITION_LEXICAL_LOCATION_SQL: &str = r#"
 SELECT mounted.persisted_relative_path,
@@ -653,11 +665,14 @@ LEFT JOIN main.resolution_unit_summaries AS alias_child
 "#;
 
 #[doc(hidden)]
-pub const GO_REVERSE_INVENTORY_COMPLETE_SQL: &str = r#"
+pub static GO_REVERSE_INVENTORY_COMPLETE_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 WITH target_packages(package_id,tool_import_path,package_name,for_test,source_role) AS (
   SELECT package.package_id,package.tool_import_path,package.package_name,
          package.for_test,members.source_role
-  FROM temp.selected_go_context_source_files AS members
+  FROM ({}) AS members
   JOIN main.go_package_instances AS package ON package.package_id=members.package_id
   WHERE members.context_id=?1 AND package.context_id=?1 AND members.file_version_id=?2 AND members.source_role<>'ignored'
     AND ((members.source_role='go' AND package.for_test='')
@@ -698,6 +713,16 @@ WITH target_packages(package_id,tool_import_path,package_name,for_test,source_ro
     ON versions.summary_id=dependency.summary_id
   WHERE versions.workspace_id=?6 AND versions.lang='go' AND versions.generation=?7
     AND versions.profile_digest=?10
+    AND EXISTS(
+      SELECT 1 FROM main.resolution_unit_summary_members AS member
+      JOIN ({}) AS source
+        ON source.context_id=?1 AND source.rel_path=member.rel_path
+       AND source.source_role<>'ignored'
+      JOIN main.go_package_instances AS package ON package.package_id=source.package_id
+      WHERE member.summary_id=versions.summary_id
+        AND (package.provider_module_path IS NULL OR EXISTS(
+          SELECT 1 FROM main.go_context_domain_modules AS owner
+          WHERE owner.context_id=?1 AND owner.module_path=package.provider_module_path)))
     AND versions.valid_from<=?8
     AND (versions.valid_until IS NULL OR ?8<versions.valid_until)
     AND (?4=1 OR NOT EXISTS(
@@ -785,7 +810,11 @@ SELECT NOT EXISTS(
               SELECT segment FROM main.source_import_segments
               WHERE blob_id=source_import.blob_id AND import_id=source_import.import_id
               ORDER BY ordinal)))
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 #[derive(Clone)]
 #[doc(hidden)]
@@ -959,7 +988,10 @@ fn read_go_live_reverse_summary(
         .optional()?)
 }
 
-pub(crate) const GO_RENAME_TARGET_UNITS_SQL: &str = r#"
+pub(crate) static GO_RENAME_TARGET_UNITS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 SELECT DISTINCT package.tool_import_path,package.for_test,members.source_role,
        CASE WHEN package.for_test<>'' AND members.source_role='go'
             THEN CASE WHEN package.package_name=(
@@ -969,12 +1001,15 @@ SELECT DISTINCT package.tool_import_path,package.for_test,members.source_role,
                  LIMIT 1) THEN 'test' ELSE 'xtest' END
             ELSE members.source_role END
 FROM temp.selected_resolution_mounts AS mounted
-JOIN temp.selected_go_context_source_files AS members
+JOIN ({}) AS members
   ON members.file_version_id=mounted.file_version_id
 JOIN main.go_package_instances AS package
   ON package.package_id=members.package_id AND package.context_id=?1
 WHERE mounted.storage_language='go' AND mounted.persisted_relative_path=?2 AND members.source_role<>'ignored'
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 pub(crate) const GO_RENAME_LOCAL_NAME_CONFLICT_SQL: &str = r#"
 WITH scopes(blob_id,site,scope_key) AS (
@@ -1107,7 +1142,10 @@ JOIN main.resolution_unit_summary_members AS member
  AND member.blob_id=export.declaration_blob_id
 "#;
 
-pub(crate) const GO_RENAME_REBOUND_ROOT_REFERENCES_SQL: &str = r#"
+pub(crate) static GO_RENAME_REBOUND_ROOT_REFERENCES_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 WITH summaries(summary_id) AS (
   SELECT CAST(value AS INTEGER) FROM json_each(?1)
 ), names(identity_id) AS (
@@ -1179,7 +1217,15 @@ SELECT DISTINCT candidate.rel_path,candidate.start_byte,candidate.end_byte,candi
 FROM candidates AS candidate
 JOIN main.resolution_sites AS site
   ON site.blob_id=candidate.blob_id AND site.site=candidate.site
-WHERE NOT EXISTS(
+WHERE EXISTS(
+  SELECT 1 FROM ({}) AS source
+  JOIN main.go_package_instances AS package ON package.package_id=source.package_id
+  WHERE source.context_id=?6 AND source.rel_path=candidate.rel_path
+    AND source.source_role<>'ignored'
+    AND (package.provider_module_path IS NULL OR EXISTS(
+      SELECT 1 FROM main.go_context_domain_modules AS owner
+      WHERE owner.context_id=?6 AND owner.module_path=package.provider_module_path)))
+AND NOT EXISTS(
   SELECT 1 FROM renamed_sites AS renamed
   WHERE renamed.blob_id=candidate.blob_id AND renamed.site=candidate.site
 )
@@ -1204,7 +1250,10 @@ AND EXISTS(
            ) AS enclosing_scope
            WHERE CAST(enclosing_scope.value AS INTEGER)=target.scope_key))
 )
-"#;
+"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
 #[allow(clippy::too_many_arguments)]
 fn read_go_reverse_summary_exports(
@@ -1711,6 +1760,7 @@ fn follow_go_reverse_aliases(
 #[doc(hidden)]
 pub enum GoReverseCandidateOutcome {
     Ready(GoReverseCandidateSet),
+    TargetUncovered(String),
     Unavailable(String),
     Cancelled,
 }
@@ -1811,7 +1861,7 @@ impl SelectedResolutionOperation<'_, '_> {
 
         let target_path = crate::path_utils::rel_path_string(target.source());
         let connection = self.ready.inventory.connection();
-        let mut target_units_statement = connection.prepare_cached(GO_RENAME_TARGET_UNITS_SQL)?;
+        let mut target_units_statement = connection.prepare_cached(&GO_RENAME_TARGET_UNITS_SQL)?;
         let target_units = target_units_statement
             .query_map(params![context_id, target_path], |row| {
                 Ok((
@@ -1947,7 +1997,7 @@ impl SelectedResolutionOperation<'_, '_> {
             ""
         };
         let rebound = connection
-            .prepare_cached(GO_RENAME_REBOUND_ROOT_REFERENCES_SQL)?
+            .prepare_cached(&GO_RENAME_REBOUND_ROOT_REFERENCES_SQL)?
             .query_map(
                 params![
                     summary_ids_json,
@@ -1955,6 +2005,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     reference_rows_json,
                     go_reverse_target_declarations_json(&rename_context.target_declarations),
                     universe_scope_name,
+                    summary_context.context_id,
                 ],
                 |row| {
                     Ok((
@@ -1992,7 +2043,7 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         let relative_path = crate::path_utils::rel_path_string(target.source());
         let Some(mount) = self.mount_table().mount_for_path("go", &relative_path)? else {
-            return Ok(GoReverseCandidateOutcome::Unavailable(format!(
+            return Ok(GoReverseCandidateOutcome::TargetUncovered(format!(
                 "Go target is outside the selected source mounts: {relative_path}"
             )));
         };
@@ -2003,7 +2054,35 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let Some(file_version) = super::go_context::go_placement_file_version(connection, &record)?
         else {
-            return Ok(GoReverseCandidateOutcome::Unavailable(format!(
+            // Placement can be absent for the whole publication, not just this target.
+            // Read its published evidence before treating the target as uncovered.
+            let placement_inventory = connection
+                .query_row(
+                    "SELECT json(c.gaps),
+                            EXISTS(SELECT 1 FROM main.go_package_instances p
+                                   WHERE p.context_id=c.context_id)
+                            AND NOT EXISTS(SELECT 1 FROM json_each(c.gaps) gap
+                                           WHERE json_extract(gap.value, '$.code') IN
+                                                 ('domain_discovery_failed', 'build_selection_unavailable'))
+                     FROM main.go_context_publications c WHERE c.context_id=?1",
+                    [context_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .optional()?;
+            match placement_inventory {
+                None => {
+                    return Ok(GoReverseCandidateOutcome::Unavailable(
+                        "Go package placement publication is absent".into(),
+                    ));
+                }
+                Some((evidence, false)) => {
+                    return Ok(GoReverseCandidateOutcome::Unavailable(format!(
+                        "Go package placement inventory is absent or failed: {evidence}"
+                    )));
+                }
+                Some((_, true)) => {}
+            }
+            return Ok(GoReverseCandidateOutcome::TargetUncovered(format!(
                 "Go target has no proven selected package placement: {relative_path}"
             )));
         };
@@ -2090,7 +2169,7 @@ impl SelectedResolutionOperation<'_, '_> {
         target_surfaces.sort_unstable();
         target_surfaces.dedup();
         let Some(target_semantic) = target_semantics.first().copied() else {
-            return Ok(GoReverseCandidateOutcome::Unavailable(format!(
+            return Ok(GoReverseCandidateOutcome::TargetUncovered(format!(
                 "Go target has no selected definition identity: {target:?}"
             )));
         };
@@ -2098,7 +2177,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let family_packages =
             serde_json::to_string(&family.packages()).expect("Go family package ids serialize");
         if target_surfaces.is_empty() {
-            return Ok(GoReverseCandidateOutcome::Unavailable(format!(
+            return Ok(GoReverseCandidateOutcome::TargetUncovered(format!(
                 "Go target has no shared summary identity: {target:?}"
             )));
         }
@@ -2146,7 +2225,7 @@ impl SelectedResolutionOperation<'_, '_> {
         )
         .expect("Go summary surfaces serialize");
         let inventory_complete: bool = connection
-            .prepare_cached(GO_REVERSE_INVENTORY_COMPLETE_SQL)?
+            .prepare_cached(&GO_REVERSE_INVENTORY_COMPLETE_SQL)?
             .query_row(
                 params![
                     context_id,
@@ -2200,7 +2279,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     .expect("explain populated Go reverse candidate query");
                 });
             }
-            let mut statement = connection.prepare_cached(GO_REVERSE_CANDIDATE_SITES_SQL)?;
+            let mut statement = connection.prepare_cached(&GO_REVERSE_CANDIDATE_SITES_SQL)?;
             for row in statement.query_map(
                 params![
                     context_id,
@@ -3045,7 +3124,8 @@ pub(crate) fn explain_go_reverse_candidate_plan(
     include_tests: bool,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(&format!(
-        "EXPLAIN QUERY PLAN {GO_REVERSE_CANDIDATE_SITES_SQL}"
+        "EXPLAIN QUERY PLAN {}",
+        GO_REVERSE_CANDIDATE_SITES_SQL.as_str()
     ))?;
     statement
         .query_map(

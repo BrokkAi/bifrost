@@ -1,4 +1,5 @@
 //! Query-lived point contexts compiled from persisted crate rows.
+use super::root_bridges::{RootBridgePair, RootBridgeRules, assemble_root_bridges};
 use super::rust_crate_rows::{RustCrateDeclaration, RustCrateExport};
 use super::*;
 use crate::analyzer::resolution::SharedNameInterner;
@@ -441,10 +442,11 @@ pub(super) fn inactive_cfg_route_boundary(
 }
 
 pub(super) fn generated_item_surface_boundary(
-    conn: &rusqlite::Connection,
-    identities: &SelectedContextIdentities,
+    ready: &ReadySelectedResolution<'_, '_>,
     targets: &[SemanticId],
 ) -> Result<ResolutionCompletion> {
+    let conn = ready.inventory.connection();
+    let identities = &ready.context_identities;
     let origin = crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
         crate::analyzer::resolution::LoweringGapOrigin::Extracted(
             brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface,
@@ -463,15 +465,21 @@ pub(super) fn generated_item_surface_boundary(
         {
             continue;
         }
-        details.push(
+        // Preserve the internal reason key and multiplicity. Only the
+        // evidence registered for public presentation uses the projection.
+        let internal_key = serde_json::json!({"evidence": [{
+            "reason": "GeneratedItemSurface", "semantic": semantic.to_string(),
+        }]})
+        .to_string();
+        details.push((internal_key,
             serde_json::json!({
                 "evidence": [{
                     "reason": "GeneratedItemSurface",
-                    "semantic": semantic.to_string(),
+                    "semantic": super::native_units::public_diagnostic_identity("GeneratedItemSurface", None, None, super::native_units::selected_public_diagnostic_site(ready, *semantic)?.as_ref()),
                 }]
             })
             .to_string(),
-        );
+        ));
     }
     details.sort_unstable();
     details.dedup();
@@ -479,9 +487,9 @@ pub(super) fn generated_item_surface_boundary(
         return Ok(ResolutionCompletion::Complete);
     }
     Ok(ResolutionCompletion::incomplete(details.iter().map(
-        |detail| {
+        |(internal_key, detail)| {
             let mut digest = CanonicalHasher::new(b"bifrost-rust-generated-item-surface:v1");
-            digest.field("evidence", detail.as_bytes());
+            digest.field("evidence", internal_key.as_bytes());
             ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
                 digest.finish(),
                 GENERATED_ITEM_SURFACE_REASON,
@@ -1377,10 +1385,7 @@ impl SelectedResolutionOperation<'_, '_> {
         mount: SelectedResolutionMountOrdinal,
         blob: i64,
         declaration: i64,
-        source: BindingFragmentId,
-        token: SemanticId,
-        anchor: ResolutionRootImportAnchor,
-        anchor_semantic: SemanticId,
+        import_half: &SelectedRootPathHalf,
         prefix: Option<SemanticId>,
         route: &[ResolutionLookupSemanticRecipe],
         demand: &ResolutionLookupSemanticRecipe,
@@ -1483,20 +1488,31 @@ impl SelectedResolutionOperation<'_, '_> {
         if !self.fill_root_lookup_recipes(reader, requests, &mut recipes, cancellation)? {
             return Ok(None);
         }
-        append_half_bridges(
-            out,
-            &self.ready.shared_names(),
-            halves.iter(),
-            &recipes,
-            source,
-            token,
-            anchor,
-            anchor_semantic,
-            prefix,
-            route,
-            demand,
-            continuation,
-        );
+        let names = self.ready.shared_names();
+        let assembly = assemble_root_bridges(
+            &self.ready,
+            halves.iter().map(|export_half| RootBridgePair {
+                import_half,
+                export_half,
+                extra: (),
+            }),
+            &RustRootBridgeRules {
+                names: &names,
+                recipes: &recipes,
+                prefix,
+                route,
+                demand,
+                continuation,
+            },
+            cancellation,
+        )?;
+        if assembly
+            .completion
+            .contains_reason(ResolutionIncompleteReason::Cancelled)
+        {
+            return Ok(None);
+        }
+        out.extend(assembly.descriptors);
         Ok(Some(ResolutionCompletion::Complete))
     }
 
@@ -1516,16 +1532,12 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             true
         });
-        for page in requests.chunks(MAX_SOURCE_ROWS_PER_BATCH) {
-            let SelectedLookupRecipeReadOutcome::Ready(rows) =
-                source.lookup_semantic_recipes(page, cancellation, None)?
-            else {
-                return Ok(false);
-            };
-            for (request, recipe) in page.iter().zip(rows) {
-                if let Some(recipe) = recipe {
-                    recipes.insert((request.fragment, request.semantic), recipe);
-                }
+        let Some(rows) = self.read_context_recipes(source, &requests, cancellation, |_| {})? else {
+            return Ok(false);
+        };
+        for (request, recipe) in requests.iter().zip(rows) {
+            if let Some(recipe) = recipe {
+                recipes.insert((request.fragment, request.semantic), recipe);
             }
         }
         Ok(true)
@@ -1931,10 +1943,10 @@ impl SelectedResolutionOperation<'_, '_> {
             else {
                 return Ok(SelectedRustContextOutcome::Cancelled);
             };
-            let (additional, evidence, access, _owned, _identities, packages, imports) =
+            let (additional, evidence, access, _owned, _identities, packages, imports, boundaries) =
                 context.into_parts();
             assert!(
-                packages.is_empty() && imports.is_empty(),
+                packages.is_empty() && imports.is_empty() && boundaries.is_empty(),
                 "Rust crate context does not produce package bridges"
             );
             drop(access);
@@ -2495,10 +2507,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     mount,
                                     blob,
                                     declaration,
-                                    identity.fragment(),
-                                    token,
-                                    anchor,
-                                    anchor_semantic,
+                                    half,
                                     None,
                                     &route,
                                     &demand,
@@ -2512,17 +2521,14 @@ impl SelectedResolutionOperation<'_, '_> {
                                 continue;
                             }
                         };
-                        if !append_export_bridges(
+                        let Some(lowered) = append_export_bridges(
                             &mut descriptors,
-                            &self.ready.shared_names(),
+                            &self.ready,
+                            half,
                             &modules,
                             &halves,
                             &exports_by_site,
                             &recipes,
-                            identity.fragment(),
-                            token,
-                            anchor,
-                            anchor_semantic,
                             None,
                             &route,
                             &demand,
@@ -2531,7 +2537,12 @@ impl SelectedResolutionOperation<'_, '_> {
                             export_topology,
                             &export_module_path,
                             &binding_completion,
-                        ) {
+                            cancellation,
+                        )?
+                        else {
+                            return Ok(SelectedRustContextOutcome::Cancelled);
+                        };
+                        if !lowered {
                             route_completion =
                                 route_completion.combine(&unlowered_export_declaration(
                                     &self.ready.context_identities,
@@ -2905,10 +2916,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                         mount,
                                         blob,
                                         declaration,
-                                        identity.fragment(),
-                                        *token,
-                                        *anchor,
-                                        *anchor_semantic,
+                                        half,
                                         Some(*prefix),
                                         &route,
                                         &demand,
@@ -2922,17 +2930,14 @@ impl SelectedResolutionOperation<'_, '_> {
                                     continue;
                                 }
                             };
-                            if !append_export_bridges(
+                            let Some(lowered) = append_export_bridges(
                                 &mut additions,
-                                &self.ready.shared_names(),
+                                &self.ready,
+                                half,
                                 &modules,
                                 &halves,
                                 &exports_by_site,
                                 &recipes,
-                                identity.fragment(),
-                                *token,
-                                *anchor,
-                                *anchor_semantic,
                                 Some(*prefix),
                                 &route,
                                 &demand,
@@ -2941,7 +2946,12 @@ impl SelectedResolutionOperation<'_, '_> {
                                 export_topology,
                                 &export_module_path,
                                 &continuation,
-                            ) {
+                                cancellation,
+                            )?
+                            else {
+                                return Ok(SelectedRustContextOutcome::Cancelled);
+                            };
+                            if !lowered {
                                 unstaged_items =
                                     unstaged_items.combine(&unlowered_export_declaration(
                                         &self.ready.context_identities,
@@ -3057,10 +3067,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                                         mount,
                                                         blob,
                                                         declaration,
-                                                        identity.fragment(),
-                                                        *token,
-                                                        *anchor,
-                                                        *anchor_semantic,
+                                                        half,
                                                         Some(*prefix),
                                                         &route,
                                                         &demand,
@@ -3076,17 +3083,14 @@ impl SelectedResolutionOperation<'_, '_> {
                                                 continue;
                                             }
                                         };
-                                        if !append_export_bridges(
+                                        let Some(lowered) = append_export_bridges(
                                             &mut additions,
-                                            &self.ready.shared_names(),
+                                            &self.ready,
+                                            half,
                                             &modules,
                                             &halves,
                                             &exports_by_site,
                                             &recipes,
-                                            identity.fragment(),
-                                            *token,
-                                            *anchor,
-                                            *anchor_semantic,
                                             Some(*prefix),
                                             &route,
                                             &demand,
@@ -3095,7 +3099,12 @@ impl SelectedResolutionOperation<'_, '_> {
                                             export_topology,
                                             &export_module_path,
                                             &continuation,
-                                        ) {
+                                            cancellation,
+                                        )?
+                                        else {
+                                            return Ok(SelectedRustContextOutcome::Cancelled);
+                                        };
+                                        if !lowered {
                                             unstaged_items = unstaged_items.combine(
                                                 &unlowered_export_declaration(
                                                     &self.ready.context_identities,
@@ -4275,15 +4284,12 @@ pub(super) fn namespace(namespace: ResolutionNamespace) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn append_export_bridges(
     out: &mut Vec<SelectedRootBridgeDescriptor>,
-    names: &dyn crate::analyzer::resolution::SharedNameInterner,
+    operation: &ReadySelectedResolution<'_, '_>,
+    import_half: &SelectedRootPathHalf,
     modules: &[Module],
     halves: &[SelectedRootPathHalf],
     exports_by_site: &BTreeMap<(BindingFragmentId, ResolutionSiteId), Vec<usize>>,
     recipes: &HashMap<(BindingFragmentId, SemanticId), ResolutionLookupSemanticRecipe>,
-    source: BindingFragmentId,
-    token: SemanticId,
-    anchor: ResolutionRootImportAnchor,
-    anchor_semantic: SemanticId,
     prefix: Option<SemanticId>,
     route: &[ResolutionLookupSemanticRecipe],
     demand: &ResolutionLookupSemanticRecipe,
@@ -4292,7 +4298,8 @@ fn append_export_bridges(
     topology: i64,
     export_module_path: &str,
     continuation: &ResolutionCompletion,
-) -> bool {
+    cancellation: &CancellationToken,
+) -> Result<Option<bool>> {
     // Blobs are content addressed, so two byte-identical files at different
     // module paths share one blob id. The export row's own container path is
     // what names the mount that declares it.
@@ -4307,99 +4314,158 @@ fn append_export_bridges(
     let lowered = declaring.clone().any(|module| {
         exports_by_site.contains_key(&(module.fragment, ResolutionSiteId::new(site)))
     });
-    append_half_bridges(
-        out,
-        names,
+    let names = operation.shared_names();
+    let assembly = assemble_root_bridges(
+        operation,
         declaring
             .flat_map(|module| exports_by_site.get(&(module.fragment, ResolutionSiteId::new(site))))
             .flatten()
-            .map(|index| &halves[*index]),
-        recipes,
-        source,
-        token,
-        anchor,
-        anchor_semantic,
-        prefix,
-        route,
-        demand,
-        continuation,
-    );
-    lowered
+            .map(|index| RootBridgePair {
+                import_half,
+                export_half: &halves[*index],
+                extra: (),
+            }),
+        &RustRootBridgeRules {
+            names: &names,
+            recipes,
+            prefix,
+            route,
+            demand,
+            continuation,
+        },
+        cancellation,
+    )?;
+    if assembly
+        .completion
+        .contains_reason(ResolutionIncompleteReason::Cancelled)
+    {
+        return Ok(None);
+    }
+    out.extend(assembly.descriptors);
+    Ok(Some(lowered))
 }
 
-/// One bridge per export half whose demand spells the route's demand in its
-/// namespace, from the source token to the half's export token.
-#[allow(clippy::too_many_arguments)]
-fn append_half_bridges<'a>(
-    out: &mut Vec<SelectedRootBridgeDescriptor>,
-    names: &dyn crate::analyzer::resolution::SharedNameInterner,
-    halves: impl Iterator<Item = &'a SelectedRootPathHalf>,
-    recipes: &HashMap<(BindingFragmentId, SemanticId), ResolutionLookupSemanticRecipe>,
-    source: BindingFragmentId,
-    token: SemanticId,
-    anchor: ResolutionRootImportAnchor,
-    anchor_semantic: SemanticId,
+/// Topology/name selection above admits the canonical declaration. This rule
+/// checks its namespace and keeps binding evidence on that individual bridge.
+struct RustRootBridgeRules<'a> {
+    names: &'a dyn SharedNameInterner,
+    recipes: &'a HashMap<(BindingFragmentId, SemanticId), ResolutionLookupSemanticRecipe>,
     prefix: Option<SemanticId>,
-    route: &[ResolutionLookupSemanticRecipe],
-    demand: &ResolutionLookupSemanticRecipe,
-    continuation: &ResolutionCompletion,
-) {
-    for half in halves {
+    route: &'a [ResolutionLookupSemanticRecipe],
+    demand: &'a ResolutionLookupSemanticRecipe,
+    continuation: &'a ResolutionCompletion,
+}
+
+impl RootBridgeRules for RustRootBridgeRules<'_> {
+    type Extra = ();
+    type Admission = (ResolutionLookupSemanticRecipe, ResolutionCompletion);
+
+    fn admit(
+        &self,
+        _operation: &ReadySelectedResolution<'_, '_>,
+        pair: &RootBridgePair<'_, Self::Extra>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<Self::Admission>> {
+        let () = pair.extra;
         let SelectedRootPathHalf::Export {
             identity,
-            token: export,
-            demand: target_demand,
+            demand,
             incomplete_reasons,
             ..
-        } = half
+        } = pair.export_half
         else {
-            continue;
+            return Ok(None);
         };
-        let Some(target_demand) = recipes.get(&(identity.fragment(), *target_demand)) else {
-            continue;
+        let Some(target_demand) = self.recipes.get(&(identity.fragment(), *demand)) else {
+            return Ok(None);
         };
-        if target_demand.namespace() != demand.namespace() {
-            continue;
+        if target_demand.namespace() != self.demand.namespace() {
+            return Ok(None);
         }
         let completion = if incomplete_reasons.is_empty() {
             ResolutionCompletion::Complete
         } else {
             ResolutionCompletion::incomplete(incomplete_reasons.iter().copied())
         };
-        let completion = completion.combine(continuation);
-        let bridge = if let Some(prefix) = prefix {
+        Ok(Some((
+            target_demand.clone(),
+            completion.combine(self.continuation),
+        )))
+    }
+
+    fn descriptor(
+        &self,
+        pair: &RootBridgePair<'_, Self::Extra>,
+        (target_demand, completion): Self::Admission,
+    ) -> SelectedRootBridgeDescriptor {
+        let (identity, token, anchor, anchor_semantic) = match pair.import_half {
+            SelectedRootPathHalf::Import {
+                identity,
+                token,
+                anchor,
+                anchor_semantic,
+                ..
+            }
+            | SelectedRootPathHalf::Reference {
+                identity,
+                token,
+                anchor,
+                anchor_semantic,
+                ..
+            } => (*identity, *token, *anchor, *anchor_semantic),
+            SelectedRootPathHalf::Export { .. } => {
+                unreachable!("a source route is an import or reference half")
+            }
+        };
+        let SelectedRootPathHalf::Export {
+            identity: target,
+            token: export,
+            ..
+        } = pair.export_half
+        else {
+            unreachable!("admission requires an export half")
+        };
+        let bridge = if let Some(prefix) = self.prefix {
             SelectedRootBridgeDescriptor::from_selected_path_tokens_with_prefix(
-                source,
+                identity.fragment(),
                 Language::Rust,
                 token,
                 anchor,
                 anchor_semantic,
-                identity.fragment(),
+                target.fragment(),
                 Language::Rust,
                 *export,
                 prefix,
-                route.to_vec(),
-                demand.clone(),
-                target_demand.clone(),
+                self.route.to_vec(),
+                self.demand.clone(),
+                target_demand,
                 completion,
             )
         } else {
             SelectedRootBridgeDescriptor::from_selected_path_tokens(
-                source,
+                identity.fragment(),
                 Language::Rust,
                 token,
                 anchor,
                 anchor_semantic,
-                identity.fragment(),
+                target.fragment(),
                 Language::Rust,
                 *export,
-                route.to_vec(),
-                demand.clone(),
-                target_demand.clone(),
+                self.route.to_vec(),
+                self.demand.clone(),
+                target_demand,
                 completion,
             )
         };
-        out.push(bridge.with_selected_export(names, half));
+        bridge.with_selected_export(self.names, pair.export_half)
+    }
+
+    fn fold_completion(
+        &self,
+        _completion: &mut ResolutionCompletion,
+        _descriptor: &SelectedRootBridgeDescriptor,
+    ) {
+        // Rust's binding-local evidence must not taint unrelated routes.
     }
 }
 

@@ -124,9 +124,9 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::graph::resolver::{
     CSharpCallArgumentOwners, call_argument_node, call_argument_parameter_index,
-    callable_parameter_type_fq_name_for_forward, callable_parameter_type_fq_name_in_session,
+    canonical_builtin_type_identity as csharp_canonical_builtin_type_identity,
     csharp_invocation_member, filter_call_argument_method_candidates_with_metadata,
-    resolve_call_argument_owners,
+    resolve_call_argument_owners, with_callable_parameter_type_nodes,
 };
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::csharp_source_identifier;
@@ -2862,6 +2862,123 @@ fn csharp_type_candidates_at(
     candidates
 }
 
+/// What the written type of one callable parameter names.
+enum CSharpParameterType {
+    /// A predefined type such as `int`, by its canonical identity.
+    Predefined(&'static str),
+    /// The workspace classes the name resolves to where the callee wrote it.
+    Classes(Vec<CodeUnit>),
+}
+
+/// The type a callable's parameter spells at `type_node`, in the file `method`
+/// is declared in.
+///
+/// The callee wrote the name in its own scope, so it is resolved there and not
+/// in the scope of the call: through the ladder a receiver typed by that
+/// parameter takes, in which a global type outranks a compilation-unit `using`
+/// and a type of unproven compilation membership leaves the answer unproven
+/// (#6472). A lexical type parameter names no workspace type.
+fn csharp_parameter_type(
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    method: &CodeUnit,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<CSharpParameterType> {
+    let reference = csharp_reference_type_text(type_node, source);
+    if csharp_type_parameter_shadows_reference(type_node, source, &reference) {
+        return None;
+    }
+    if let Some(canonical) = csharp_canonical_builtin_type_identity(&reference) {
+        return Some(CSharpParameterType::Predefined(canonical));
+    }
+    Some(CSharpParameterType::Classes(csharp_type_candidates_at(
+        csharp,
+        token,
+        definitions,
+        method.source(),
+        source,
+        type_node,
+    )))
+}
+
+/// The classes that parameter `parameter_index` of `method` constructs when an
+/// argument is a target-typed `new()`.
+fn csharp_callable_parameter_type_owners(
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    method: &CodeUnit,
+    parameter_index: usize,
+) -> Vec<CodeUnit> {
+    // Reading and parsing the declaring file is one step of the request's
+    // scope budget; the lookups inside charge their own.
+    if !definitions.scope_step() {
+        return Vec::new();
+    }
+    let parameter_type =
+        with_callable_parameter_type_nodes(csharp, method, |source, type_nodes| {
+            let type_node = type_nodes.get(parameter_index).copied().flatten()?;
+            csharp_parameter_type(csharp, token, definitions, method, source, type_node)
+        })
+        .flatten();
+    match parameter_type {
+        Some(CSharpParameterType::Classes(owners)) => owners,
+        Some(CSharpParameterType::Predefined(_)) | None => Vec::new(),
+    }
+}
+
+/// Whether each argument type in `argument_types` names the type of the
+/// parameter it is passed to, `parameter_indices[i]` for argument `i`. A
+/// parameter whose type does not resolve to exactly one type matches nothing.
+fn csharp_callable_parameter_types_match(
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    method: &CodeUnit,
+    parameter_indices: &[usize],
+    argument_types: &[String],
+) -> bool {
+    if parameter_indices.is_empty() {
+        return true;
+    }
+    if !definitions.scope_step() {
+        return false;
+    }
+    with_callable_parameter_type_nodes(csharp, method, |source, type_nodes| {
+        parameter_indices
+            .iter()
+            .zip(argument_types)
+            .all(|(&parameter_index, actual_type)| {
+                let Some(type_node) = type_nodes.get(parameter_index).copied().flatten() else {
+                    return false;
+                };
+                let parameter_type = match csharp_parameter_type(
+                    csharp,
+                    token,
+                    definitions,
+                    method,
+                    source,
+                    type_node,
+                ) {
+                    Some(CSharpParameterType::Predefined(canonical)) => canonical.to_owned(),
+                    Some(CSharpParameterType::Classes(classes))
+                        if graph_support::logical_type_count(&classes) == 1 =>
+                    {
+                        match graph_support::first_logical_type_fqn(&classes) {
+                            Some(fqn) => fqn,
+                            None => return false,
+                        }
+                    }
+                    Some(CSharpParameterType::Classes(_)) | None => return false,
+                };
+                csharp_comparable_type_name(&parameter_type) == *actual_type
+            })
+    })
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 fn parse_csharp_tree(source: &str) -> Option<Tree> {
     brokk_bifrost_csharp::preprocessor::parse_csharp(source)
@@ -3219,38 +3336,19 @@ fn refine_csharp_invocation_overload(
         let Some(metadata) = metadata else {
             continue;
         };
-        let mut matches = true;
-        for (index, actual_type) in argument_types.iter().enumerate() {
-            let Some(parameter_index) =
-                call_argument_parameter_index(invocation, index, &metadata, source)
-            else {
-                matches = false;
-                break;
-            };
-            let parameter_type = match definitions.session() {
-                Some(session) => callable_parameter_type_fq_name_in_session(
-                    csharp,
-                    token,
-                    candidate,
-                    parameter_index,
-                    session,
-                ),
-                None => callable_parameter_type_fq_name_for_forward(
-                    csharp,
-                    token,
-                    candidate,
-                    parameter_index,
-                ),
-            };
-            let Some(parameter_type) = parameter_type else {
-                matches = false;
-                break;
-            };
-            if csharp_comparable_type_name(&parameter_type) != *actual_type {
-                matches = false;
-                break;
-            }
-        }
+        let parameter_indices = (0..argument_types.len())
+            .map(|index| call_argument_parameter_index(invocation, index, &metadata, source))
+            .collect::<Option<Vec<_>>>();
+        let matches = parameter_indices.is_some_and(|parameter_indices| {
+            csharp_callable_parameter_types_match(
+                csharp,
+                token,
+                definitions,
+                candidate,
+                &parameter_indices,
+                &argument_types,
+            )
+        });
         if matches {
             selected.push(candidate.clone());
         }
@@ -4599,28 +4697,13 @@ impl CSharpInitializerOwnerLookups for CSharpForwardInitializerOwnerLookups<'_, 
             candidates,
             |method| self.definitions.signature_metadata(method),
             |method, parameter_index| {
-                let parameter_type = match self.definitions.session() {
-                    Some(session) => callable_parameter_type_fq_name_in_session(
-                        self.csharp,
-                        self.token,
-                        method,
-                        parameter_index,
-                        session,
-                    ),
-                    None => callable_parameter_type_fq_name_for_forward(
-                        self.csharp,
-                        self.token,
-                        method,
-                        parameter_index,
-                    ),
-                };
-                let mut owners: Vec<_> = parameter_type
-                    .into_iter()
-                    .flat_map(|fqn| self.definitions.fqn(&fqn))
-                    .filter(CodeUnit::is_class)
-                    .collect();
-                graph_support::sort_dedup_type_candidates(&mut owners);
-                owners
+                csharp_callable_parameter_type_owners(
+                    self.csharp,
+                    self.token,
+                    self.definitions,
+                    method,
+                    parameter_index,
+                )
             },
         )
     }
@@ -9471,6 +9554,407 @@ namespace Demo
                 ..
             }
         ));
+    }
+
+    /// The definition answers for the reference `name` inside the first
+    /// `needle` of `source`, the text of `use_path`: the unbounded and the
+    /// bounded API, on the first requests and again once the analyzer's
+    /// hierarchy memos are warm, followed by the proven and unproven inverse
+    /// hits of each field in `targets`.
+    fn definition_answers(
+        files: &[(&str, &str)],
+        use_path: &str,
+        source: &str,
+        needle: &str,
+        name: &str,
+        targets: &[&str],
+    ) -> (Vec<DefinitionLookupOutcome>, Vec<(usize, usize)>) {
+        use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, files);
+        let analyzer = fixture.analyzer.analyzer();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
+        let file = ProjectFile::new(fixture.project_root(), use_path);
+        let tree = parse_csharp_tree(source).expect("C# reference tree");
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let start_byte = source.find(needle).expect("reference fixture")
+            + needle.find(name).expect("name in fragment");
+        let line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: name.to_owned(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + name.len(),
+                start_line: line,
+                end_line: line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + name.len(),
+        };
+        let answers = || {
+            let definitions = CSharpDefinitionProvider::new(csharp, &file);
+            let unbounded = resolve_csharp(
+                analyzer,
+                token,
+                &definitions,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                false,
+            )
+            .outcome;
+            let bounded = resolve_csharp_bounded(
+                analyzer,
+                token,
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value: bounded, .. } = bounded else {
+                panic!("reference lookup must complete: {bounded:#?}");
+            };
+            [unbounded, bounded]
+        };
+        let mut outcomes = Vec::from(answers());
+        for unit in analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(CodeUnit::is_class)
+        {
+            csharp.get_ancestors(&unit);
+        }
+        outcomes.extend(answers());
+        outcomes.extend(answers());
+
+        let roots = HashSet::from_iter([file.clone()]);
+        let batch = crate::analyzer::usages::csharp_graph::CSharpAuthoritativeUsageBatch::new(
+            analyzer, token, &roots,
+        )
+        .expect("C# authoritative usage batch");
+        let count = |hits: &HashMap<CodeUnit, std::collections::BTreeSet<_>>| {
+            hits.values().map(|hits| hits.len()).sum::<usize>()
+        };
+        let inverse = targets
+            .iter()
+            .map(|target_fqn| {
+                let target = analyzer
+                    .get_definitions(target_fqn)
+                    .into_iter()
+                    .find(CodeUnit::is_field)
+                    .unwrap_or_else(|| panic!("field {target_fqn}"));
+                let result = batch
+                    .find_usages(std::slice::from_ref(&target), &roots, 100)
+                    .into_fuzzy_result();
+                let FuzzyResult::Success {
+                    hits_by_overload,
+                    unproven_by_overload,
+                    ..
+                } = &result
+                else {
+                    panic!("usages of {target_fqn} complete: {result:#?}");
+                };
+                (count(hits_by_overload), count(unproven_by_overload))
+            })
+            .collect();
+        (outcomes, inverse)
+    }
+
+    fn fq_names(outcome: &DefinitionLookupOutcome) -> Vec<String> {
+        outcome.definitions.iter().map(CodeUnit::fq_name).collect()
+    }
+
+    #[test]
+    #[hardwon(
+        "#6472: a call-argument initializer took its owner from an imported type that a visible global parameter type outranks"
+    )]
+    fn call_argument_initializer_owner_follows_parameter_type_precedence() {
+        const MODEL: &str = "namespace Ns { public class Foo { public int Flag; } }";
+        const USE: &str = "using Ns; class Use { void Take(Foo arg) {} void Run() { Take(new() { Flag = 1 }); } }";
+        const NESTED_USE: &str = "namespace Outer { using Ns; class Use { void Take(Foo arg) {} void Run() { Take(new() { Flag = 1 }); } } }";
+        const SDK: &str = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        // The callee's file imports `Ns`; the caller's imports `Other`. The
+        // parameter type is written in the callee's file, so only its scope
+        // decides what `Foo` names.
+        const API: &str = "using Ns; public class Api { public void Take(Foo arg) {} }";
+        const CALLER: &str =
+            "using Other; class Use { void Run(Api api) { api.Take(new() { Flag = 1 }); } }";
+        const OTHER: &str = "namespace Other { public class Foo { public int Flag; } }";
+        // Attributes, a doc comment and a generic method put the parameter
+        // after the callee's own type parameter.
+        const GENERIC_API: &str = "using Ns;\npublic class Api {\n    /// <summary>Takes it.</summary>\n    [System.Obsolete] public static void Take<T>(T tag, Foo arg) {}\n}";
+        const GENERIC_CALLER: &str =
+            "class Use { void Run() { Api.Take(1, new() { Flag = 1 }); } }";
+
+        // A global `Foo` precedes every compilation-unit `using`, so the
+        // imported `Ns.Foo` is never the owner.
+        // Case name, fixture files, the file with the call, its source, and the
+        // fully qualified names a proven answer resolves to.
+        type InitializerCase<'a> = (
+            &'a str,
+            Vec<(&'a str, &'a str)>,
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+        );
+        let cases: [InitializerCase<'_>; 10] = [
+            (
+                "a visible global type without the member",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Foo.cs", "public class Foo {}"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Use.cs", USE),
+                ],
+                "App/Use.cs",
+                USE,
+                &[],
+            ),
+            (
+                "a visible global type with the member",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Foo.cs", "public class Foo { public int Flag; }"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Use.cs", USE),
+                ],
+                "App/Use.cs",
+                USE,
+                &["Foo.Flag"],
+            ),
+            (
+                "an imported type no global type outranks",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Model.cs", MODEL),
+                    ("App/Use.cs", USE),
+                ],
+                "App/Use.cs",
+                USE,
+                &["Ns.Foo.Flag"],
+            ),
+            (
+                "an import inside the enclosing namespace precedes the global namespace",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Foo.cs", "public class Foo {}"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Use.cs", NESTED_USE),
+                ],
+                "App/Use.cs",
+                NESTED_USE,
+                &["Ns.Foo.Flag"],
+            ),
+            (
+                "a callee in another file resolves its parameter in its own scope",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Model.cs", MODEL),
+                    ("App/Other.cs", OTHER),
+                    ("App/Api.cs", API),
+                    ("App/Use.cs", CALLER),
+                ],
+                "App/Use.cs",
+                CALLER,
+                &["Ns.Foo.Flag"],
+            ),
+            (
+                "a visible global type in the callee's file scope",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Foo.cs", "public class Foo {}"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Other.cs", OTHER),
+                    ("App/Api.cs", API),
+                    ("App/Use.cs", CALLER),
+                ],
+                "App/Use.cs",
+                CALLER,
+                &[],
+            ),
+            (
+                "an attributed generic callee, imported type",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Model.cs", MODEL),
+                    ("App/Api.cs", GENERIC_API),
+                    ("App/Use.cs", GENERIC_CALLER),
+                ],
+                "App/Use.cs",
+                GENERIC_CALLER,
+                &["Ns.Foo.Flag"],
+            ),
+            (
+                "an attributed generic callee, visible global type",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("App/Foo.cs", "public class Foo {}"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Api.cs", GENERIC_API),
+                    ("App/Use.cs", GENERIC_CALLER),
+                ],
+                "App/Use.cs",
+                GENERIC_CALLER,
+                &[],
+            ),
+            (
+                "a global type of unproven membership",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("Loose/Foo.cs", "public class Foo {}"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Use.cs", USE),
+                ],
+                "App/Use.cs",
+                USE,
+                &[],
+            ),
+            (
+                "a global type of unproven membership with the member",
+                vec![
+                    ("App/App.csproj", SDK),
+                    ("Loose/Foo.cs", "public class Foo { public int Flag; }"),
+                    ("App/Model.cs", MODEL),
+                    ("App/Use.cs", USE),
+                ],
+                "App/Use.cs",
+                USE,
+                &["Foo.Flag"],
+            ),
+        ];
+        for (name, files, use_path, source, expected) in cases {
+            let unproven_global = name.contains("unproven");
+            let global_target =
+                expected == ["Foo.Flag"] || (unproven_global && name.contains("with the member"));
+            let mut targets = vec!["Ns.Foo.Flag"];
+            if global_target {
+                targets.push("Foo.Flag");
+            }
+            let (outcomes, inverse) =
+                definition_answers(&files, use_path, source, "Flag = 1", "Flag", &targets);
+            for outcome in &outcomes {
+                if unproven_global {
+                    // Either type could be the owner; no resolution is proven.
+                    assert_eq!(
+                        outcome.status,
+                        DefinitionLookupStatus::Incomplete,
+                        "{name}: {outcome:#?}"
+                    );
+                    assert!(
+                        outcome.diagnostics.iter().any(|diagnostic| diagnostic.kind
+                            == "csharp_compilation_membership_unproven"),
+                        "{name}: {outcome:#?}"
+                    );
+                    assert!(
+                        !fq_names(outcome).contains(&"Ns.Foo.Flag".to_owned()),
+                        "{name}: {outcome:#?}"
+                    );
+                } else if expected.is_empty() {
+                    assert_ne!(
+                        outcome.status,
+                        DefinitionLookupStatus::Resolved,
+                        "{name}: {outcome:#?}"
+                    );
+                    assert!(fq_names(outcome).is_empty(), "{name}: {outcome:#?}");
+                } else {
+                    assert_eq!(
+                        outcome.status,
+                        DefinitionLookupStatus::Resolved,
+                        "{name}: {outcome:#?}"
+                    );
+                    assert_eq!(fq_names(outcome), expected, "{name}: {outcome:#?}");
+                }
+            }
+            // The inverse scan agrees: the imported field is a proven use only
+            // when the forward answer names it. An owner that lacks the member
+            // leaves the use unproven rather than absent, as it always has.
+            let (imported_proven, imported_unproven) = inverse[0];
+            assert_eq!(
+                imported_proven,
+                usize::from(expected == ["Ns.Foo.Flag"]),
+                "{name}: inverse proven hits of Ns.Foo.Flag"
+            );
+            if unproven_global {
+                assert!(
+                    imported_unproven > 0,
+                    "{name}: an unproven global type leaves the imported field unproven, not absent"
+                );
+            }
+            if !unproven_global && expected == ["Foo.Flag"] {
+                assert_eq!(
+                    imported_unproven, 0,
+                    "{name}: the visible global field is a different member"
+                );
+                assert_eq!(inverse[1], (1, 0), "{name}: inverse hits of Foo.Flag");
+            }
+            if unproven_global && global_target {
+                assert_eq!(inverse[1].0, 0, "{name}: inverse proven hits of Foo.Flag");
+                assert!(
+                    inverse[1].1 > 0,
+                    "{name}: inverse unproven hits of Foo.Flag"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#6472: overload refinement compared an argument with an imported parameter type that a visible global type outranks"
+    )]
+    fn overload_refinement_follows_parameter_type_precedence() {
+        const SDK: &str = r#"<Project Sdk="Microsoft.NET.Sdk" />"#;
+        const USE: &str = "using Ns; class Use { void Take(Foo arg) {} void Take(int count) {} void Run(Foo foo) { Take(foo); } }";
+        const IMPORTED_ARGUMENT: &str = "using Ns; class Use { void Take(Foo arg) {} void Take(int count) {} void Run(Ns.Foo foo) { Take(foo); } }";
+        let files = |use_source| {
+            vec![
+                ("App/App.csproj", SDK),
+                ("App/Foo.cs", "public class Foo {}"),
+                ("App/Model.cs", "namespace Ns { public class Foo {} }"),
+                ("App/Use.cs", use_source),
+            ]
+        };
+        // `Foo` names the global type at the declaration, so a global `Foo`
+        // argument selects `Take(Foo)` and an `Ns.Foo` argument does not: the
+        // overload set stays as the call found it.
+        for (name, source, narrowed) in [
+            ("a global argument", USE, true),
+            ("an imported argument", IMPORTED_ARGUMENT, false),
+        ] {
+            let (outcomes, _) = definition_answers(
+                &files(source),
+                "App/Use.cs",
+                source,
+                "Take(foo)",
+                "Take",
+                &[],
+            );
+            for outcome in &outcomes {
+                let signatures = outcome
+                    .definitions
+                    .iter()
+                    .map(|definition| definition.signature().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>();
+                let foo_overload_only =
+                    matches!(signatures.as_slice(), [signature] if signature.contains("Foo"));
+                assert_eq!(foo_overload_only, narrowed, "{name}: {outcome:#?}");
+                if narrowed {
+                    assert_eq!(
+                        outcome.status,
+                        DefinitionLookupStatus::Resolved,
+                        "{name}: {outcome:#?}"
+                    );
+                } else {
+                    assert_eq!(signatures.len(), 2, "{name}: {signatures:?}");
+                }
+            }
+        }
     }
 
     #[test]

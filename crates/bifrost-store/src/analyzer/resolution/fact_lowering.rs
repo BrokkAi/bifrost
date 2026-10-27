@@ -40,6 +40,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
 
 use crate::analyzer::structural::PrecedenceTier;
 use crate::hash::{HashMap, HashSet};
+use std::collections::BTreeSet;
 
 use super::batch::FactReferenceSiteMetadata;
 use super::engine::PreloadedFragment;
@@ -1600,9 +1601,29 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         .collect::<HashSet<_>>();
     index.validate_scope_forest();
 
+    let applicability_selects_callee =
+        crate::analyzer::semantic::languages::language_knowledge(language)
+            .expect("resolution facts require registered language knowledge")
+            .call_applicability_may_select_callee();
     let mut gap_sources = facts
         .gaps
         .iter()
+        .filter(|gap| {
+            // Typed lowering reads the original facts and retains the call
+            // obligation's reason. Indirect callees without reference identifiers
+            // have no such obligation and must keep their type coverage.
+            applicability_selects_callee
+                || gap.kind != ResolutionGapKind::UnsupportedCallApplicability
+                || !call_callees.contains(&gap.site)
+                || !index
+                    .identifiers_by_site
+                    .get(&gap.site)
+                    .is_some_and(|identifiers| {
+                        identifiers.iter().any(|identifier| {
+                            identifier.role == ResolutionIdentifierRole::Reference
+                        })
+                    })
+        })
         .map(|gap| GapSource {
             site: gap.site,
             origin: LoweringGapOrigin::Extracted(gap.kind),
@@ -1780,12 +1801,10 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         .copied()
         .collect::<HashSet<_>>();
     for &module in &route_owned_modules {
-        let identifier = index.declaration_identifier(module);
         assert!(
             index.site(module).kind == ResolutionSiteKind::ModuleDeclaration
-                && identifier.namespace == ResolutionNamespace::Type
                 && !declarations_with_binders.contains(&module),
-            "a route-owned module is a Type module declaration with no binder: {identifier:?}"
+            "a route-owned module is a module declaration with no binder: {module:?}"
         );
     }
     let slot_authored_declarations = facts
@@ -1815,8 +1834,8 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         }
         if identifier.role == ResolutionIdentifierRole::Reference
             && identifier.qualifier.is_some()
-            && !(root_prefix_rule(language).is_some_and(|rule| rule.terminal_type_or_value)
-                && identifier.namespace == ResolutionNamespace::TypeOrValue
+            && !(root_prefix_rule(language)
+                .is_some_and(|rule| rule.terminal_namespace == Some(identifier.namespace))
                 && index.root_reference(identifier.site).is_some())
         {
             gap_sources.push(GapSource {
@@ -1989,19 +2008,25 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         nodes.push((node, kind));
     }
 
-    // Anonymous values own source bodies, but never introduce a named binder
-    // or lookup route. Preloaded ownership still needs their definition node.
+    // Nameless declarations own source bodies without inventing a lexical
+    // name. Languages declare their namespace through structured authority.
     let mut anonymous = index
         .anonymous_callables
         .iter()
-        .copied()
+        .map(|&site| (site, ResolutionNamespace::Callable))
+        .chain(
+            route_owned_modules
+                .iter()
+                .filter(|site| !index.identifiers_by_site.contains_key(*site))
+                .map(|&site| {
+                    let namespaces = &index.additional_definition_namespaces_by_declaration[&site];
+                    assert_eq!(namespaces.len(), 1, "one nameless module namespace");
+                    (site, namespaces[0].namespace)
+                }),
+        )
         .collect::<Vec<_>>();
     anonymous.sort_unstable();
-    for site in anonymous {
-        assert_eq!(
-            index.site(site).kind,
-            ResolutionSiteKind::CallableDeclaration
-        );
+    for (site, namespace) in anonymous {
         let semantic = identities.source_definition_semantic(site);
         let node = identities.source_definition_node(site);
         assert!(
@@ -2016,7 +2041,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         );
         semantics.push(LoweredSemanticSite::new(
             site,
-            ResolutionNamespace::Callable,
+            namespace,
             LoweredSemanticRole::Definition,
             semantic,
             node,
@@ -2439,6 +2464,8 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         if supported_declarations.contains(&semantic.site)
             || deferred_member_declarations.contains(&semantic.site)
             || index.anonymous_callables.contains(&semantic.site)
+            || (route_owned_modules.contains(&semantic.site)
+                && !index.identifiers_by_site.contains_key(&semantic.site))
         {
             continue;
         }
@@ -2582,23 +2609,35 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             // supertype obligation without erasing its siblings.
             let sink = identities.node(hierarchy_terminal_node_identity(source.site));
             #[cfg(any(test, feature = "test-support"))]
-            hierarchy_terminals.push((
-                identities.semantic(gap_reason_semantic_identity(source.site, source.origin)),
-                sink,
-            ));
+            hierarchy_terminals.push((identities.gap_reason(source.site, source.origin), sink));
             nodes.push((sink, BindingNodeKind::Scope));
             let reason = ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(
-                    identities.semantic(gap_reason_semantic_identity(source.site, source.origin)),
+                    identities.gap_reason(source.site, source.origin),
                 ),
             ]);
-            if index.is_implicit_superclass_reference(source.site) {
+            let interface_members = index
+                .implicit_interface_member_references
+                .contains(&source.site);
+            if index.is_implicit_superclass_reference(source.site) || interface_members {
                 // The implicit superclass is java.lang.Object, whose members
                 // JLS 4.3.2 fixes: methods only. Only a callable lookup of one
                 // of its method names can reach this unindexed edge, so the
                 // branch is closed on exactly those lookups; member-type,
                 // field and constructor lookups never meet it.
-                for &name in language_implicit_root_member_names(Language::Java) {
+                let member_names = if interface_members {
+                    brokk_bifrost_jvm::intrinsics::implicit_interface_members(language)
+                        .expect("a producer member-root edge requires a language rule")
+                        .methods
+                        .iter()
+                        .map(|method| method.name)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    language_implicit_root_member_names(Language::Java).to_vec()
+                };
+                for name in member_names {
                     let lookup =
                         identities.lookup_semantic(language, ResolutionNamespace::Callable, name);
                     let id = identities.path(implicit_object_hierarchy_path_identity(
@@ -2848,10 +2887,10 @@ fn lower_root_import_paths(
                             .digest(),
                     )],
                 )));
-                let reason = identities.semantic(gap_reason_semantic_identity(
+                let reason = identities.gap_reason(
                     import.fact.site,
                     LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
-                ));
+                );
                 paths.push((
                     gap_id,
                     PartialPath::new(
@@ -3074,12 +3113,15 @@ fn lower_root_reference_paths(
         let rule = root_prefix_rule(language);
         assert!(
             identifier.namespace != ResolutionNamespace::TypeOrValue
-                || (rule.is_some_and(|rule| rule.terminal_type_or_value)
-                    && (reference.fact.prefix_reference.is_some()
-                        || (language == Language::Scala
-                            && reference.fact.anchor == ResolutionRootImportAnchor::Absolute)
-                        || (language == Language::Scala
-                            && reference.fact.anchor == ResolutionRootImportAnchor::Lexical))),
+                || (rule.is_some_and(
+                    |rule| rule.terminal_namespace == Some(ResolutionNamespace::TypeOrValue)
+                ) && (reference.fact.prefix_reference.is_some()
+                    || (rule.is_some_and(|rule| rule.unprefixed_type_or_value)
+                        && matches!(
+                            reference.fact.anchor,
+                            ResolutionRootImportAnchor::Absolute
+                                | ResolutionRootImportAnchor::Lexical
+                        )))),
             "only prefixed JVM or absolute/lexical Scala root references may retain type-or-value ambiguity: {reference:?}, {identifier:?}"
         );
         let (route_namespace, lookup_scope, prefix_reference) =
@@ -3102,11 +3144,11 @@ fn lower_root_reference_paths(
                     );
                 }
                 (
-                    ResolutionNamespace::Type,
+                    rule.route_namespace,
                     index.site(prefix_reference).scope,
                     Some(identities.source_reference_semantic(prefix_reference)),
                 )
-            } else if (language == Language::Scala
+            } else if (rule.is_some_and(|rule| rule.unprefixed_type_or_value)
                 && reference.fact.anchor == ResolutionRootImportAnchor::Absolute)
                 || call_target_routes.is_some()
             {
@@ -3121,7 +3163,7 @@ fn lower_root_reference_paths(
             .segments
             .iter()
             .skip(usize::from(
-                prefix_reference.is_some() && matches!(language, Language::Rust | Language::Go),
+                prefix_reference.is_some() && rule.is_some_and(|rule| rule.consume_prefix_segment),
             ))
             .map(|&name| identities.lookup_semantic(language, route_namespace, index.name(name)))
             .collect::<Vec<_>>();
@@ -3236,7 +3278,7 @@ fn root_scope_gap_reasons(
                 .entry(index.site(source.site).scope)
                 .or_default()
                 .push(ResolutionIncompleteReason::UnsupportedSemantic(
-                    identities.semantic(gap_reason_semantic_identity(source.site, source.origin)),
+                    identities.gap_reason(source.site, source.origin),
                 ));
         }
     }
@@ -3301,11 +3343,9 @@ fn route_publication_completion(
                 && binder_gap_namespaces(language, binding_namespace)
                     .any(|effective| effective == namespace))
             .then(|| {
-                ResolutionIncompleteReason::UnsupportedSemantic(identities.semantic(
-                    gap_reason_semantic_identity(
-                        gap.site,
-                        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
-                    ),
+                ResolutionIncompleteReason::UnsupportedSemantic(identities.gap_reason(
+                    gap.site,
+                    LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
                 ))
             })
         })
@@ -3317,11 +3357,9 @@ fn route_publication_completion(
             .into_iter()
             .flat_map(|export| export.gaps.iter())
             .map(|gap| {
-                ResolutionIncompleteReason::UnsupportedSemantic(identities.semantic(
-                    gap_reason_semantic_identity(
-                        gap.site,
-                        LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
-                    ),
+                ResolutionIncompleteReason::UnsupportedSemantic(identities.gap_reason(
+                    gap.site,
+                    LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
                 ))
             }),
     );
@@ -3421,6 +3459,7 @@ pub struct FactIndex<'facts> {
     /// Supertype references the producer supplied as a class's implicit
     /// `java.lang.Object` superclass.
     implicit_superclass_references: HashSet<ResolutionSiteId>,
+    implicit_interface_member_references: HashSet<ResolutionSiteId>,
     type_body_scope_by_owner: HashMap<ResolutionSiteId, ResolutionScopeFact>,
     structured_import_by_site: HashMap<ResolutionSiteId, StructuredImportFact>,
     root_imports: Vec<IndexedRootImport>,
@@ -3744,6 +3783,7 @@ impl<'facts> FactIndex<'facts> {
     }
 
     fn index_root_references(
+        prefix_rule: Option<RootPrefixRule>,
         facts: &'facts FileResolutionFacts,
         names: &HashMap<ResolutionNameId, &'facts str>,
         scopes: &HashMap<ResolutionScopeId, ResolutionScopeFact>,
@@ -3797,10 +3837,10 @@ impl<'facts> FactIndex<'facts> {
                     "root reference lexical prefix must be a reference: {reference:?}"
                 );
                 assert!(
-                    matches!(
-                        prefix_identifier.namespace,
-                        ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
-                    ),
+                    prefix_rule.is_some_and(|rule| {
+                        rule.prefix_namespaces
+                            .contains(&prefix_identifier.namespace)
+                    }),
                     "root reference lexical prefix needs a type or qualified-name lookup: {reference:?}"
                 );
                 assert_eq!(
@@ -4196,36 +4236,43 @@ impl<'facts> FactIndex<'facts> {
         let mut additional_definition_namespaces_by_declaration: HashMap<_, Vec<_>> =
             HashMap::default();
         for &additional in &facts.additional_definition_namespaces {
-            let identifier = identifiers_by_site
-                .get(&additional.declaration)
-                .and_then(|identifiers| identifiers.first())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "additional definition namespace names declaration without an identifier: {additional:?}"
-                    )
-                });
-            assert_eq!(
-                identifier.role,
-                ResolutionIdentifierRole::Declaration,
-                "additional definition namespace must name a declaration: {additional:?}"
-            );
             assert_ne!(
                 additional.namespace,
                 ResolutionNamespace::TypeOrValue,
                 "additional definition namespace must be effective: {additional:?}"
             );
-            let binder = facts
-                .binders
-                .iter()
-                .find(|binder| binder.declaration == additional.declaration)
-                .unwrap_or_else(|| {
-                    panic!(
+            let identifier = identifiers_by_site
+                .get(&additional.declaration)
+                .and_then(|identifiers| identifiers.first());
+            if let Some(identifier) = identifier {
+                assert_eq!(identifier.role, ResolutionIdentifierRole::Declaration);
+            }
+            let hoisting = if facts
+                .route_owned_module_declarations
+                .contains(&additional.declaration)
+            {
+                assert_eq!(
+                    sites[&additional.declaration].kind,
+                    ResolutionSiteKind::ModuleDeclaration
+                );
+                if let Some(identifier) = identifier {
+                    assert_eq!(identifier.namespace, additional.namespace);
+                }
+                HoistingClass::ScopeWide
+            } else {
+                assert!(
+                    identifier.is_some(),
+                    "a named binder needs an identifier: {additional:?}"
+                );
+                facts.binders.iter()
+                    .find(|binder| binder.declaration == additional.declaration)
+                    .unwrap_or_else(|| panic!(
                         "additional definition namespace names declaration without a binder: {additional:?}"
-                    )
-                });
+                    )).hoisting
+            };
             assert_eq!(
-                additional.hoisting, binder.hoisting,
-                "definition namespace authority must declare the binder's hoisting: {additional:?}, {binder:?}"
+                additional.hoisting, hoisting,
+                "definition namespace authority must declare its activation: {additional:?}"
             );
             additional_definition_namespaces_by_declaration
                 .entry(additional.declaration)
@@ -4324,6 +4371,10 @@ impl<'facts> FactIndex<'facts> {
             })
             .map(|supertype| supertype.supertype_reference)
             .collect::<HashSet<_>>();
+        let implicit_interface_member_references = facts.supertypes.iter()
+            .filter(|edge| edge.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSupertypeKind::ImplicitInterfaceMembers)
+            .map(|edge| edge.supertype_reference)
+            .collect::<HashSet<_>>();
         for supertype in &facts.supertypes {
             let subtype = sites.get(&supertype.subtype).unwrap_or_else(|| {
                 panic!(
@@ -4395,8 +4446,14 @@ impl<'facts> FactIndex<'facts> {
             );
         }
 
-        let root_references =
-            Self::index_root_references(facts, &names, &scopes, &sites, &identifiers_by_site);
+        let root_references = Self::index_root_references(
+            root_prefix_rule(language),
+            facts,
+            &names,
+            &scopes,
+            &sites,
+            &identifiers_by_site,
+        );
         let root_imports = Self::index_root_imports(facts, &names, &scopes, &sites);
         Self::validate_root_import_demand_targets(facts, &root_imports, &root_references);
         let mut binders_by_declaration: HashMap<_, Vec<_>> = HashMap::default();
@@ -4532,6 +4589,7 @@ impl<'facts> FactIndex<'facts> {
             type_slots_by_site,
             supertype_owner_by_reference,
             implicit_superclass_references,
+            implicit_interface_member_references,
             type_body_scope_by_owner,
             structured_import_by_site,
             root_imports,
@@ -4752,7 +4810,13 @@ struct RootPrefixRule {
     /// Whether the terminal of a prefixed root reference may keep the
     /// grammar-ambiguous type-or-value namespace, which lowers one route in
     /// each namespace.
-    terminal_type_or_value: bool,
+    terminal_namespace: Option<ResolutionNamespace>,
+    /// The selected prefix already consumed the first authored route segment.
+    consume_prefix_segment: bool,
+    /// Namespace of the remaining container route.
+    route_namespace: ResolutionNamespace,
+    /// Absolute and lexical roots may retain ambiguity without a prefix.
+    unprefixed_type_or_value: bool,
     /// Whether a prefixed route is exactly one positioned qualifier.
     single_prefix_segment: bool,
 }
@@ -4767,19 +4831,44 @@ const fn root_prefix_rule(language: Language) -> Option<RootPrefixRule> {
     const BOTH: &[ResolutionNamespace] =
         &[ResolutionNamespace::Type, ResolutionNamespace::TypeOrValue];
     match language {
-        Language::Rust | Language::Java => Some(RootPrefixRule {
+        Language::Rust => Some(RootPrefixRule {
             prefix_namespaces: TYPE,
-            terminal_type_or_value: false,
+            terminal_namespace: None,
+            consume_prefix_segment: true,
+            route_namespace: ResolutionNamespace::Type,
+            unprefixed_type_or_value: false,
+            single_prefix_segment: false,
+        }),
+        Language::Java => Some(RootPrefixRule {
+            prefix_namespaces: TYPE,
+            terminal_namespace: None,
+            consume_prefix_segment: false,
+            route_namespace: ResolutionNamespace::Type,
+            unprefixed_type_or_value: false,
             single_prefix_segment: false,
         }),
         Language::Go => Some(RootPrefixRule {
             prefix_namespaces: TYPE_OR_VALUE,
-            terminal_type_or_value: true,
+            terminal_namespace: Some(ResolutionNamespace::TypeOrValue),
+            consume_prefix_segment: true,
+            route_namespace: ResolutionNamespace::Type,
+            unprefixed_type_or_value: false,
+            single_prefix_segment: true,
+        }),
+        Language::Python => Some(RootPrefixRule {
+            prefix_namespaces: &[ResolutionNamespace::Value],
+            terminal_namespace: Some(ResolutionNamespace::Value),
+            consume_prefix_segment: true,
+            route_namespace: ResolutionNamespace::Value,
+            unprefixed_type_or_value: false,
             single_prefix_segment: true,
         }),
         Language::Kotlin | Language::Scala => Some(RootPrefixRule {
             prefix_namespaces: BOTH,
-            terminal_type_or_value: true,
+            terminal_namespace: Some(ResolutionNamespace::TypeOrValue),
+            consume_prefix_segment: false,
+            route_namespace: ResolutionNamespace::Type,
+            unprefixed_type_or_value: matches!(language, Language::Scala),
             single_prefix_segment: false,
         }),
         _ => None,
@@ -5343,7 +5432,7 @@ fn gap_reasons_by_site(
     for source in sources {
         reasons.entry(source.site).or_default().push((
             source.origin,
-            identities.semantic(gap_reason_semantic_identity(source.site, source.origin)),
+            identities.gap_reason(source.site, source.origin),
         ));
     }
     for site_reasons in reasons.values_mut() {
@@ -5433,10 +5522,8 @@ fn lower_external_prelude_boundary_gaps(
         if !prelude.contains(&head) {
             continue;
         }
-        let reason_semantic = identities.semantic(gap_reason_semantic_identity(
-            import.fact.site,
-            LoweringGapOrigin::ExternalPreludeBoundary,
-        ));
+        let reason_semantic =
+            identities.gap_reason(import.fact.site, LoweringGapOrigin::ExternalPreludeBoundary);
         for demand in &import.demands {
             let lookup = identities.lookup_semantic(language, demand.namespace, head);
             let frontier = LoweringCoverageFrontier::Candidate {
@@ -5751,8 +5838,7 @@ fn lower_coverage_gaps(
         }
     }
     for &source in sources.all {
-        let reason_semantic =
-            identities.semantic(gap_reason_semantic_identity(source.site, source.origin));
+        let reason_semantic = identities.gap_reason(source.site, source.origin);
         if !sources.point.contains(&source) {
             assert!(
                 sources.enumeration.contains(&source),
@@ -6954,7 +7040,7 @@ fn lower_unexpanded_item_macro_branches(
         .expect("a scope with an unexpanded item macro has its invocation");
     let reason = ResolutionCompletion::incomplete(sources.iter().map(|source| {
         ResolutionIncompleteReason::UnsupportedSemantic(
-            identities.semantic(gap_reason_semantic_identity(source.site, source.origin)),
+            identities.gap_reason(source.site, source.origin),
         )
     }));
     let sink = identities.node(gap_sink_node_identity(first, b"unexpanded-item-macro"));
@@ -6999,7 +7085,7 @@ fn lower_unexpanded_item_macro_branches(
     };
     let reason = ResolutionCompletion::incomplete(open_sources.iter().map(|source| {
         ResolutionIncompleteReason::UnsupportedSemantic(
-            identities.semantic(gap_reason_semantic_identity(source.site, source.origin)),
+            identities.gap_reason(source.site, source.origin),
         )
     }));
     let mut owners = index
@@ -7053,10 +7139,10 @@ pub(super) fn placement_gap_lexical_row_with_identities(
     let id = identities.path(placement_gap_path_identity(site, scope));
     let variable = passthrough_variable(identities, id);
     let scope_head = identities.source_scope_node(scope);
-    let reason = identities.semantic(gap_reason_semantic_identity(
+    let reason = identities.gap_reason(
         site,
         LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedPlacementBoundary),
-    ));
+    );
     (
         sink,
         (
@@ -7111,10 +7197,10 @@ pub(super) fn structured_import_gap_lexical_row_with_identities(
     let path = identities.path(structured_import_gap_path_identity(site, namespace));
     let root = identities.source_scope_node(root_scope);
     let choice = identities.semantic(scope_choice_identity(root_scope, namespace));
-    let reason = identities.semantic(gap_reason_semantic_identity(
+    let reason = identities.gap_reason(
         site,
         LoweringGapOrigin::Extracted(ResolutionGapKind::UnsupportedRoute),
-    ));
+    );
     (
         sink,
         (
@@ -7211,7 +7297,7 @@ pub fn gap_reason_semantic(
     site: ResolutionSiteId,
     origin: LoweringGapOrigin,
 ) -> SemanticId {
-    identities.semantic(gap_reason_semantic_identity(site, origin))
+    identities.gap_reason(site, origin)
 }
 
 pub(crate) fn gap_reason_semantic_identity(
@@ -7531,10 +7617,10 @@ mod tests {
             let variable = passthrough_variable(&mut identities, path);
             let semantic = identities.source_reference_semantic(ResolutionSiteId::new(13));
             let node = identities.source_reference_node(ResolutionSiteId::new(13));
-            let reason = identities.semantic(gap_reason_semantic_identity(
+            let reason = identities.gap_reason(
                 ResolutionSiteId::new(13),
                 LoweringGapOrigin::QualifiedReference,
-            ));
+            );
             let gap = coverage_gap_digest(
                 &identities,
                 reason,

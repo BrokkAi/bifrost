@@ -1,9 +1,9 @@
 use brokk_bifrost_core::analyzer::model::StructuredImportPathKind;
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    BindingProjectionKind, ResolutionGapFact, ResolutionGapKind, ResolutionIdentifierRole,
-    ResolutionImportRouteKind, ResolutionNamespace, ResolutionScopeKind, ResolutionSiteKind,
-    ResolutionTypeTransferKind,
+    BindingProjectionKind, ResolutionBinderKind, ResolutionGapFact, ResolutionGapKind,
+    ResolutionIdentifierRole, ResolutionImportRouteKind, ResolutionNamespace, ResolutionScopeKind,
+    ResolutionSiteKind, ResolutionTypeTransferKind,
 };
 use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccurrenceProvenance};
 use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
@@ -198,7 +198,17 @@ enum Mode { FAST, SLOW { void custom() {} } }
         ("method_declaration", "custom", 0),
     ] {
         let node = named_node(root, source, kind, name, ordinal);
-        display_ids.push((kind, name, assert_primary_declaration_span(&parsed, node)));
+        let record_header_formal = kind == "formal_parameter"
+            && node
+                .parent()
+                .and_then(|list| list.parent())
+                .is_some_and(|owner| owner.kind() == "record_declaration");
+        display_ids.push((
+            kind,
+            name,
+            assert_primary_declaration_span(&parsed, node),
+            record_header_formal,
+        ));
     }
 
     let facts = source_facts(&parsed);
@@ -207,8 +217,9 @@ enum Mode { FAST, SLOW { void custom() {} } }
         .iter()
         .map(|(_, declaration)| *declaration)
         .collect::<std::collections::HashSet<_>>();
-    for (kind, name, declaration) in &display_ids {
-        let native_expected = *kind != "formal_parameter";
+    // #6291: record headers now supply source-linked canonical formals.
+    for (kind, name, declaration, record_header_formal) in &display_ids {
+        let native_expected = *kind != "formal_parameter" || *record_header_formal;
         assert_eq!(
             native_ids.contains(declaration),
             native_expected,
@@ -224,9 +235,10 @@ fn nested_class_callables_have_captured_parameter_shapes() {
     let source = "class Sample { Object f(int x) { if (x == 1) { record R(int component) {} class Local { int local(int value) { return value; } } return new Object() { int anonymous(int value) { return value; } }; } else { enum E { A { int enumBody(int value) { return value; } } } class Local { int local(int value) { return value; } } return E.A; } } }";
     let (parsed, _) = parse(source);
 
-    // The record component is not a callable parameter; the other five
-    // parameters belong to methods the native walk enters, including local,
-    // anonymous, and enum-constant class bodies in if/else arms.
+    // The record component belongs only to R's implicit canonical constructor.
+    // The other five parameters belong to methods the native walk enters,
+    // including local, anonymous, and enum-constant class bodies. In particular,
+    // f keeps exactly its written parameter x, never the local record component.
     // The classes that write no constructor supply default constructors, which
     // have signatures of their own and no parameters.
     let facts = &parsed.resolution_facts;
@@ -237,9 +249,61 @@ fn nested_class_callables_have_captured_parameter_shapes() {
             .filter(|signature| facts.sites[signature.callable.index()].kind
                 == ResolutionSiteKind::CallableDeclaration)
             .count(),
-        5
+        6 // Five written methods and R's implicit component accessor (JLS 8.10.3).
     );
-    assert_eq!(facts.callable_parameters.len(), 5);
+    assert_eq!(facts.callable_parameters.len(), 6);
+    let declaration = |spelling: &str, namespace| {
+        facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && identifier.namespace == namespace
+                    && facts.names[identifier.name.index()].spelling == spelling
+            })
+            .expect("named declaration")
+            .site
+    };
+    let record = declaration("R", ResolutionNamespace::Type);
+    let constructor = facts
+        .member_owners
+        .iter()
+        .find(|member| {
+            member.owner == record
+                && facts.sites[member.member.index()].kind
+                    == ResolutionSiteKind::ConstructorDeclaration
+        })
+        .expect("R has its implicit canonical constructor")
+        .member;
+    let parameters = |callable| {
+        facts
+            .callable_parameters
+            .iter()
+            .filter(move |parameter| parameter.callable == callable)
+            .map(|parameter| parameter.parameter)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        parameters(constructor),
+        vec![
+            facts
+                .binders
+                .iter()
+                .find(|binder| {
+                    binder.kind == ResolutionBinderKind::Parameter
+                        && facts.identifiers.iter().any(|identifier| {
+                            identifier.site == binder.declaration
+                                && facts.names[identifier.name.index()].spelling == "component"
+                        })
+                })
+                .expect("the canonical formal has its own parameter binder")
+                .declaration
+        ]
+    );
+    assert_eq!(
+        parameters(declaration("f", ResolutionNamespace::Callable)),
+        vec![declaration("x", ResolutionNamespace::Value)]
+    );
 }
 
 #[test]

@@ -40,7 +40,7 @@ exclude = [".claude/worktrees/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.14.1"
+version = "0.14.2"
 edition = "2024"
 # The floor is what CI actually pins and tests (rust-toolchain.toml); raise
 # both together.
@@ -54,7 +54,7 @@ keywords = ["analyzer", "tree-sitter", "code-analysis"]
 categories = ["development-tools", "parser-implementations"]
 
 [workspace.dependencies]
-brokk-bifrost-store = { path = "crates/bifrost-store", version = "=0.14.1" }
+brokk-bifrost-store = { path = "crates/bifrost-store", version = "=0.14.2" }
 
 [package]
 name = "brokk-bifrost"
@@ -119,28 +119,33 @@ exclude = [
 name = "brokk_bifrost"
 crate-type = ["rlib", "cdylib"]
 
+[[bin]]
+name = "most_relevant_files"
+test = false
+required-features = ["devtools"]
+
 [build-dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 
 [dependencies]
-brokk-bifrost-jvm-analysis = { path = "crates/bifrost-jvm-analysis", version = "=0.14.1" }
-brokk-bifrost-rust-analysis = { path = "crates/bifrost-rust-analysis", version = "=0.14.1" }
-brokk-bifrost-go-analysis = { path = "crates/bifrost-go-analysis", version = "=0.14.1" }
-brokk-bifrost-php-analysis = { path = "crates/bifrost-php-analysis", version = "=0.14.1" }
-brokk-bifrost-cpp-analysis = { path = "crates/bifrost-cpp-analysis", version = "=0.14.1" }
-brokk-bifrost-python-analysis = { path = "crates/bifrost-python-analysis", version = "=0.14.1" }
-brokk-bifrost-ruby-analysis = { path = "crates/bifrost-ruby-analysis", version = "=0.14.1" }
-brokk-bifrost-csharp-analysis = { path = "crates/bifrost-csharp-analysis", version = "=0.14.1" }
-brokk-bifrost-js-ts-analysis = { path = "crates/bifrost-js-ts-analysis", version = "=0.14.1" }
-brokk-bifrost-tools = { path = "crates/bifrost-tools", version = "=0.14.1" }
-brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.14.1" }
-brokk-bifrost-flow = { path = "crates/bifrost-flow", version = "=0.14.1" }
-brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.14.1" }
-brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.14.1" }
-brokk-bifrost-rql = { path = "crates/bifrost-rql", version = "=0.14.1" }
-brokk-bifrost-runtime = { path = "crates/bifrost-runtime", version = "=0.14.1" }
-brokk-bifrost-semantic-packs = { path = "crates/bifrost-semantic-packs", version = "=0.14.1", features = ["download"] }
+brokk-bifrost-jvm-analysis = { path = "crates/bifrost-jvm-analysis", version = "=0.14.2" }
+brokk-bifrost-rust-analysis = { path = "crates/bifrost-rust-analysis", version = "=0.14.2" }
+brokk-bifrost-go-analysis = { path = "crates/bifrost-go-analysis", version = "=0.14.2" }
+brokk-bifrost-php-analysis = { path = "crates/bifrost-php-analysis", version = "=0.14.2" }
+brokk-bifrost-cpp-analysis = { path = "crates/bifrost-cpp-analysis", version = "=0.14.2" }
+brokk-bifrost-python-analysis = { path = "crates/bifrost-python-analysis", version = "=0.14.2" }
+brokk-bifrost-ruby-analysis = { path = "crates/bifrost-ruby-analysis", version = "=0.14.2" }
+brokk-bifrost-csharp-analysis = { path = "crates/bifrost-csharp-analysis", version = "=0.14.2" }
+brokk-bifrost-js-ts-analysis = { path = "crates/bifrost-js-ts-analysis", version = "=0.14.2" }
+brokk-bifrost-tools = { path = "crates/bifrost-tools", version = "=0.14.2" }
+brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.14.2" }
+brokk-bifrost-flow = { path = "crates/bifrost-flow", version = "=0.14.2" }
+brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.14.2" }
+brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.14.2" }
+brokk-bifrost-rql = { path = "crates/bifrost-rql", version = "=0.14.2" }
+brokk-bifrost-runtime = { path = "crates/bifrost-runtime", version = "=0.14.2" }
+brokk-bifrost-semantic-packs = { path = "crates/bifrost-semantic-packs", version = "=0.14.2", features = ["download"] }
 bincode = "1.3.3"
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 csv = "1.3.1"
@@ -176,12 +181,21 @@ tree-sitter = "0.25.10"
 tree-sitter-python = "0.25.0"
 
 # Grammars that still need older published releases for this port.
-tree-sitter-cpp = { package = "brokk-tree-sitter-cpp", version = "=0.24.4" }
+tree-sitter-cpp = { package = "brokk-tree-sitter-cpp", version = "=0.24.6" }
 walkdir = "2.5.0"
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }
 
 [features]
 default = []
+# Developer-tool binaries (benchmark, differentials, fuzzer, most_relevant_files)
+# and their tests. Off by default so integration and release test builds skip
+# them; CI and scripts that run these tools enable this feature.
+# It gates targets and test code only; no library or binary code reads it.
+# Quick performance times the `bifrost` binary of a historical anchor built
+# without this feature against the candidate built with it, so a
+# `cfg(feature = "devtools")` in library or binary code would make the two
+# sides differ.
+devtools = []
 # CI-only mode that changes internal hash tables to randomly seeded tables.
 randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
 # Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
@@ -214,34 +228,34 @@ test-support = ["brokk-bifrost-jvm-analysis/test-support",
 ]
 
 [dev-dependencies]
-brokk-bifrost-jvm-analysis = { path = "crates/bifrost-jvm-analysis", version = "=0.14.1" , features = ["test-support"] }
-brokk-bifrost-rust-analysis = { path = "crates/bifrost-rust-analysis", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-go-analysis = { path = "crates/bifrost-go-analysis", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-csharp-analysis = { path = "crates/bifrost-csharp-analysis", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-cpp-analysis = { path = "crates/bifrost-cpp-analysis", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-python-analysis = { path = "crates/bifrost-python-analysis", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-js-ts-analysis = { path = "crates/bifrost-js-ts-analysis", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-tools = { path = "crates/bifrost-tools", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-jvm-analysis = { path = "crates/bifrost-jvm-analysis", version = "=0.14.2" , features = ["test-support"] }
+brokk-bifrost-rust-analysis = { path = "crates/bifrost-rust-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-go-analysis = { path = "crates/bifrost-go-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-csharp-analysis = { path = "crates/bifrost-csharp-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-cpp-analysis = { path = "crates/bifrost-cpp-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-python-analysis = { path = "crates/bifrost-python-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-js-ts-analysis = { path = "crates/bifrost-js-ts-analysis", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-tools = { path = "crates/bifrost-tools", version = "=0.14.2", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "crates/bifrost-test-macros" }
 # Private grammar differentials exercise the public parser boundary directly.
-brokk-bifrost-core = { path = "crates/bifrost-core", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-js-ts = { path = "crates/bifrost-js-ts", version = "=0.14.1" }
+brokk-bifrost-core = { path = "crates/bifrost-core", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-js-ts = { path = "crates/bifrost-js-ts", version = "=0.14.2" }
 # Cargo unifies this with the plain `[dependencies]` entry above for test targets, turning
 # on bifrost-analysis's test-only hooks (e.g. analyzer instrumentation,
 # usages::get_definition::scala_active_path_node_visits_for_test) for the integration tests
 # under `tests/` without affecting non-test builds of this package. See #1337.
-brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.14.2", features = ["test-support"] }
 # The Kotlin value-class producer (#2851) is language knowledge, not analyzer
 # state, so the integration suite rebuilds its exact adaptation witnesses from
 # the fixture source instead of restating a content-addressed digest by hand.
-brokk-bifrost-jvm = { path = "crates/bifrost-jvm", version = "=0.14.1" }
+brokk-bifrost-jvm = { path = "crates/bifrost-jvm", version = "=0.14.2" }
 # Same unification, for `SearchToolsService::new_manual_ephemeral`: the suites
 # under `tests/` build ephemeral manual services over inline fixtures, and that
 # constructor has no production caller, so it lives behind bifrost-mcp's
 # `test-support` gate rather than in the shipped API.
-brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.14.1", features = ["test-support"] }
-brokk-bifrost-rql = { path = "crates/bifrost-rql", version = "=0.14.1", features = ["test-support"] }
+brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.14.2", features = ["test-support"] }
+brokk-bifrost-rql = { path = "crates/bifrost-rql", version = "=0.14.2", features = ["test-support"] }
 filetime = "0.2"
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 jsonschema = { version = "0.48.0", default-features = false }

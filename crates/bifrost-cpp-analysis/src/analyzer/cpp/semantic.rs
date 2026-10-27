@@ -187,7 +187,20 @@ use std::sync::Arc;
 // #3093: parsed namespace Modules carry their source facts again, so bounded
 // visibility reaches their dependency names and resolved calls change for
 // unchanged bytes.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v47";
+// Quicksilver round 4: the lowerer reaches declaration helpers whose output
+// changed (class_like_name through cpp_callable_declaration_return_type_identity,
+// and procedure inventory and resolved-call lookup through the declaration
+// products), so unchanged bytes lower differently.
+// #6898: declarator_name_node and macro_fracture_boundary changed.
+// Grammar 0.24.6 changes unnamed enum-base trees (#6902).
+// #6902 item 8: resolved-call lookup reaches foreign declaration visibility,
+// which now requires guard implication, so unchanged bytes lower differently.
+// #6902 item 12: definition lookup now rebinds namespace-alias qualifiers, so
+// resolved type references change for unchanged bytes.
+// #7033 (#6902 item 7): declarations.rs functions this lowerer imports
+// changed; bumped without a trace because no checked-in golden prints C/C++
+// semantic ids, so the rotation costs nothing and a stale lowering would.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v52";
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their

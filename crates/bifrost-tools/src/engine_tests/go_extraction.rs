@@ -3041,7 +3041,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
             for (file_version_id, role, rel_path) in &files {
                 let package = connection
             .query_row(
-                brokk_bifrost_analysis::analyzer::store::resolution_operation::go_same_package::CALLER_PACKAGE,
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::go_same_package::CALLER_PACKAGE.as_str(),
                 rusqlite::params![context_id, file_version_id, role],
                 |row| row.get::<_, i64>(0),
             )
@@ -3350,7 +3350,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     if file_role != role
                 || connection
                     .query_row(
-                        brokk_bifrost_analysis::analyzer::store::resolution_operation::go_same_package::CALLER_PACKAGE,
+                        brokk_bifrost_analysis::analyzer::store::resolution_operation::go_same_package::CALLER_PACKAGE.as_str(),
                         rusqlite::params![context_id, file_version_id, file_role],
                         |row| row.get::<_, i64>(0),
                     )
@@ -6329,15 +6329,18 @@ type Item struct{ Decoy bool }
             second_warm.search.statement_count(),
             second_warm.search.decoded_rows,
         );
+        eprintln!("production Go point {kind:?} work: cold={:?}, warm={:?}, repeat={:?}", cold.work, first_warm.work, second_warm.work);
         (kind, cold, first_warm, second_warm)
     });
             // Measure both kinds before checking either pin so a changed reader can
             // report every independent cold/warm tuple in one test run.
             for (kind, cold, first_warm, second_warm) in measurements {
                 // Includes the #5243 type-production read and migration 0181 schema statements.
+                // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
+                // #5671 root-prefix seeks stop returning the two context rows admission rejected: scope steps (Definition 459 -> 457, Type 462 -> 460) and decoded search rows (Definition cold 156 -> 154/warm 96 -> 94, Type cold 152 -> 150/warm 93 -> 91) fall together; search statement counts are unchanged.
                 let expected_scope_nodes = match kind {
-                    ProductionGoPointKind::Definition => 438,
-                    ProductionGoPointKind::Type => 441,
+                    ProductionGoPointKind::Definition => 411,
+                    ProductionGoPointKind::Type => 414,
                 };
                 // These generic-free fixtures no longer open the optional formal-row
                 // table and its indexes during cold point setup. The cold open is
@@ -6395,14 +6398,28 @@ type Item struct{ Decoy bool }
                 // selection setup, plus three decoded SQLite schema rows.
                 // Retaining the typed interior certificate removes one COUNT
                 // statement and aggregate row from warm Definition searches.
-                // #6527 issues module-definition classification only for languages
-                // with a provider; Go has none, so both query kinds lose two cold
-                // and two warm search statements that returned no rows.
+                // #5671 context partial indexes add two cold schema statements/rows.
+                // Master #5664 adds the selected Go source view: cold open
+                // 276/242 -> 277/243 on this branch (+1 statement/schema row).
+                // Master #6527 skips Go module-definition probes; #5664 also
+                // replaces root-profile reads with per-file membership selection.
+                // Their merged search pins are two statements below this branch:
+                // Definition 185/144 -> 183/142, Type 204/164 -> 202/162.
+                // Decoded search rows retain this branch's root-seek reduction;
+                // scope steps retain 411/414: charge site moved to engine admission;
+                // delta = rows the seek over-includes. Master adds no scope delta.
+                // #6594 binds typed request keys as a json_each array: removing the
+                // request tables' setup takes cold open from 277/243 to 273/241,
+                // and removing their per-batch writes takes eight statements from
+                // cold and warm searches. Search rows and engine work are unchanged.
+                // #6594 skips empty staged families: measured Definition cold/warm
+                // searches lose 20/14 statements, Type loses 22/16; rows and work stay
+                // fixed. Only the ordinary empty type-production read remains.
                 let (cold_open, cold_search, warm_open, warm_search) = match kind {
                     ProductionGoPointKind::Definition => {
-                        ((275, 241), (183, 156), (5, 4), (142, 96))
+                        ((273, 241), (155, 154), (5, 4), (120, 94))
                     }
-                    ProductionGoPointKind::Type => ((275, 241), (202, 152), (5, 4), (162, 93)),
+                    ProductionGoPointKind::Type => ((273, 241), (172, 150), (5, 4), (138, 91)),
                 };
                 let production_schema = cold
                     .open
@@ -6422,7 +6439,7 @@ type Item struct{ Decoy bool }
                         .zip(&measurement.search.rows_by_statement)
                         .filter(|(sql, _)| sql.contains("type_productions"))
                         .collect::<Vec<_>>();
-                    assert_eq!(production_reads.len(), 2, "{production_reads:?}");
+                    assert_eq!(production_reads.len(), 1, "{production_reads:?}");
                     assert!(
                         production_reads.iter().all(|(_, rows)| **rows == 0),
                         "{production_reads:?}"
@@ -6537,6 +6554,77 @@ type Item struct{ Decoy bool }
                 );
             }
         }
+        #[test]
+        #[hardwon(
+            "#6803: a Go placement gap reason had no provenance row, so workers could not authenticate it"
+        )]
+        fn go_memberless_placement_reason_authenticates_after_persistence() {
+            use brokk_bifrost_analysis::analyzer::resolution::{
+                LoweringGapOrigin, ResolutionIdentityDigestKey,
+            };
+            use brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code;
+
+            let fixture = GoResolutionOperationFixture::with_source("package empty\n");
+            assert!(
+                fixture.facts.package_members.is_empty(),
+                "{:?}",
+                fixture.facts.package_members
+            );
+            let placement = fixture
+                .facts
+                .gaps
+                .iter()
+                .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedPlacementBoundary)
+                .collect::<Vec<_>>();
+            assert_eq!(placement.len(), 1, "{placement:?}");
+            let site = placement[0].site;
+            let origin = gap_origin_code(LoweringGapOrigin::Extracted(
+                ResolutionGapKind::UnsupportedPlacementBoundary,
+            ));
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let connection = operation.ready.inventory.connection();
+            let members: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM resolution_package_members",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                members, 0,
+                "the persisted fixture has no source-owned package members"
+            );
+            let (ordinal, reason): (u32, u32) = connection.query_row(
+                "SELECT mount.mount_ordinal, reason.reason FROM temp.selected_resolution_mounts mount \
+                 JOIN resolution_gap_reasons reason ON reason.blob_id=mount.blob_id \
+                 WHERE reason.site=?1 AND reason.origin=?2",
+                rusqlite::params![site.get(), origin], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).expect("a memberless placement reason has persisted provenance");
+            let (paths, gaps): (i64, i64) = connection
+                .query_row(
+                    "SELECT (SELECT count(*) FROM resolution_paths p, json_each(p.body, '$[10]') c \
+                 WHERE c.value ->> 0 = 3 AND c.value ->> 1 = ?1), \
+                 (SELECT count(*) FROM resolution_gaps WHERE reason=?1)",
+                    [reason],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(
+                paths > 0,
+                "the reason is referenced by a persisted path completion"
+            );
+            assert_eq!(gaps, 0, "provenance must not invent candidate coverage");
+            let digest = operation
+                .ready
+                .identity_content_digest(
+                    ResolutionIdentityDigestKey::Semantic(SemanticId::local(ordinal, reason)),
+                    &cancellation,
+                )
+                .expect("the real selected read authenticates the persisted completion reason");
+            assert_ne!(digest, [0; 32]);
+        }
+
         #[test]
         fn real_go_bundle_reopens_without_java_placement_and_matches_preload() {
             let fixture = GoResolutionOperationFixture::new();
@@ -7100,6 +7188,7 @@ type Item struct{ Decoy bool }
                         manifest.as_slice().into(),
                     )],
                     &[],
+                    &[],
                 )
                 .unwrap();
             fixture.snapshots.insert("go".into(), selected);
@@ -7608,7 +7697,7 @@ type Item struct{ Decoy bool }
             connection.execute("INSERT INTO temp.selected_workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'go',?2,?3)",rusqlite::params![workspace_id,generation,revision]).unwrap();
             connection
                 .query_row(
-                    brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL,
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GO_REVERSE_INVENTORY_COMPLETE_SQL.as_str(),
                     rusqlite::params![
                         context_id,
                         file_version,
@@ -8271,7 +8360,7 @@ func use() { provider.Rewrites.ReadFile() }
                 }
                 let caller: i64 = connection
                     .query_row(
-                        go_same_package::CALLER_PACKAGE,
+                        go_same_package::CALLER_PACKAGE.as_str(),
                         rusqlite::params![context, version, "go"],
                         |row| row.get(0),
                     )
@@ -8279,7 +8368,7 @@ func use() { provider.Rewrites.ReadFile() }
                 let requested = format!("[[{},{version},\"go\"]]", source.ordinal().get());
                 let (provider_name, target): (String, i64) = connection
                     .query_row(
-                        go_named::GO_FILE_IMPORT_ROWS,
+                        go_named::GO_FILE_IMPORT_ROWS.as_str(),
                         rusqlite::params![context, requested],
                         |row| Ok((row.get(4)?, row.get(5)?)),
                     )
@@ -8309,12 +8398,12 @@ func use() { provider.Rewrites.ReadFile() }
                     (
                         "go_caller_source_role",
                         vec![Integer(context), Integer(version)],
-                        "path_members",
+                        "source",
                     ),
                     (
                         "go_caller_package",
                         vec![Integer(context), Integer(version), Text("go".into())],
-                        "path_members",
+                        "source",
                     ),
                     (
                         "go_package_peer_mounts",
@@ -8974,6 +9063,7 @@ func use() { provider.Rewrites.ReadFile() }
 
         use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
 
+        use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputChange;
         use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome;
 
         use brokk_bifrost_core::analyzer::model::Language;
@@ -9009,6 +9099,263 @@ func use() { provider.Rewrites.ReadFile() }
                     .file("provider/item.go", "package provider\ntype Item struct{}\n")
                     .build(),
             )
+        }
+        #[test]
+        #[brokk_bifrost_test_macros::hardwon(
+            "#6650: a source that admission refused left every Go input observation changed"
+        )]
+        fn refused_source_is_a_recorded_input_and_a_named_package_gap() {
+            // Shaped like ollama's embedded WAV test data: one line over the
+            // default 16,000-byte structural line limit.
+            let refused = format!("package provider\n\nvar data = `{}`\n", "A".repeat(20_000));
+            let fixture = Fixture::from_project(
+                InlineTestProject::with_language(Language::Go)
+                    .file("go.mod", "module example.test/root\n\ngo 1.22\n")
+                    .file(
+                        "consumer/use.go",
+                        "package consumer\nimport . \"example.test/root/provider\"\nvar Use *Item\n",
+                    )
+                    .file("provider/item.go", "package provider\ntype Item struct{}\n")
+                    .file("provider/data_test.go", refused.as_str())
+                    .build(),
+            );
+            let conn = fixture.store().read_conn().unwrap();
+            let recorded = conn
+                .prepare(
+                    "SELECT rel_path, blob_oid, json(reason) FROM workspace_source_refusals
+                     WHERE workspace_id=?1 AND lang='go' AND generation=?2
+                       AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)",
+                )
+                .unwrap()
+                .query_map(
+                    rusqlite::params![
+                        fixture.snapshot.workspace_id.as_str(),
+                        fixture.snapshot.generation.get(),
+                        fixture.snapshot.revision
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let longest = refused.lines().map(str::len).max().unwrap();
+            assert_eq!(
+                recorded
+                    .iter()
+                    .map(|(path, oid, reason)| (
+                        path.as_str(),
+                        oid.clone(),
+                        serde_json::from_str::<serde_json::Value>(reason).unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                [(
+                    "provider/data_test.go",
+                    Oid::hash_object(ObjectType::Blob, refused.as_bytes())
+                        .unwrap()
+                        .to_string(),
+                    json!({"code": "structural_line", "limit": 16000, "observed": longest})
+                )],
+                "the revision records the refusal with its evidence"
+            );
+            let selected: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM workspace_file_versions
+                     WHERE lang='go' AND rel_path='provider/data_test.go'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                selected, 0,
+                "a refused source is never a selected source row"
+            );
+            drop(conn);
+
+            // `fixture.publish` observes twice and requires both to be Ready.
+            let root = fixture.project.root();
+            let mut discovery = fixture.discovery();
+            discovery.packages[1]
+                .test_go_files
+                .push("data_test.go".into());
+            discovery.packages.push(
+                serde_json::from_value(json!({
+                    "ImportPath": "example.test/root/provider [example.test/root/provider.test]",
+                    "Name": "provider", "Dir": root.join("provider"),
+                    "ForTest": "example.test/root/provider",
+                    "Module": {"Path":"example.test/root","Dir":root,"Main":true,"GoMod":root.join("go.mod")},
+                    "GoFiles": ["item.go", "data_test.go"]
+                }))
+                .unwrap(),
+            );
+            let identity = fixture.publish(discovery, None);
+            let conn = fixture.store().read_conn().unwrap();
+            let packages = conn
+                .prepare(
+                    "SELECT tool_import_path, provider_provenance, complete, json(gaps)
+                     FROM go_package_instances WHERE context_id=?1 ORDER BY tool_import_path",
+                )
+                .unwrap()
+                .query_map([identity.context_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(3)?)
+                            .unwrap(),
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                packages,
+                [
+                    (
+                        "example.test/root/consumer".to_owned(),
+                        "go_tool".to_owned(),
+                        true,
+                        json!([])
+                    ),
+                    (
+                        "example.test/root/provider".to_owned(),
+                        "go_tool".to_owned(),
+                        true,
+                        json!([])
+                    ),
+                    (
+                        "example.test/root/provider [example.test/root/provider.test]".to_owned(),
+                        "go_tool".to_owned(),
+                        false,
+                        json!([{"code": "source_admission_refused", "evidence": {
+                            "path": root.join("provider").join("data_test.go"),
+                            "reason": {"code": "structural_line", "limit": 16000, "observed": longest}
+                        }}])
+                    ),
+                ],
+                "only the variant that compiles the refused file is partial, and it names why"
+            );
+            drop(conn);
+
+            let observe = || {
+                fixture
+                    .store()
+                    .observe_go_context_inputs(
+                        &fixture.snapshot,
+                        fixture.workspace.analyzer().project(),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap()
+            };
+            let item = fixture.project.file("provider/item.go");
+            item.write("package provider\ntype Item struct{ Changed int }\n")
+                .unwrap();
+            assert!(matches!(
+                observe(),
+                GoInputObservationOutcome::InputsChanged(GoInputChange::ContentChanged { kind, path })
+                    if kind == "source" && path == "provider/item.go"
+            ));
+            item.write("package provider\ntype Item struct{}\n")
+                .unwrap();
+            fixture
+                .project
+                .file("provider/data_test.go")
+                .write(format!(
+                    "package provider\n\nvar data = `{}`\n",
+                    "B".repeat(20_000)
+                ))
+                .unwrap();
+            assert!(
+                matches!(
+                    observe(),
+                    GoInputObservationOutcome::InputsChanged(GoInputChange::ContentChanged { kind, path })
+                        if kind == "refused" && path == "provider/data_test.go"
+                ),
+                "a refused input keeps byte validation"
+            );
+        }
+        #[test]
+        #[brokk_bifrost_test_macros::hardwon(
+            "#6650: an incremental update selected a refused source that a full build omits"
+        )]
+        fn incremental_update_records_a_refused_source_instead_of_selecting_it() {
+            use rusqlite::OptionalExtension;
+            let fixture = Fixture::new();
+            let selection = |workspace: &WorkspaceAnalyzer| {
+                let store = workspace.store().unwrap();
+                let conn = store.read_conn().unwrap();
+                let mut snapshot = fixture.snapshot.clone();
+                snapshot.revision = conn
+                    .query_row(
+                        "SELECT revision FROM workspace_heads WHERE workspace_id=?1 AND lang='go'",
+                        [snapshot.workspace_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let at_revision = rusqlite::params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ];
+                let selected: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workspace_file_versions
+                         WHERE workspace_id=?1 AND lang='go' AND generation=?2
+                           AND rel_path='provider/item.go' AND input_kind='source'
+                           AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until))",
+                        at_revision,
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let refusal: Option<String> = conn
+                    .query_row(
+                        "SELECT json_extract(reason,'$.code') FROM workspace_source_refusals
+                         WHERE workspace_id=?1 AND lang='go' AND generation=?2
+                           AND rel_path='provider/item.go'
+                           AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)",
+                        at_revision,
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .unwrap();
+                let observation = store
+                    .observe_go_context_inputs(
+                        &snapshot,
+                        workspace.analyzer().project(),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap();
+                (
+                    selected,
+                    refusal,
+                    matches!(observation, GoInputObservationOutcome::Ready(_)),
+                )
+            };
+            let item = fixture.project.file("provider/item.go");
+            item.write(format!(
+                "package provider\ntype Item struct{{}}\nvar data = `{}`\n",
+                "A".repeat(20_000)
+            ))
+            .unwrap();
+            let refused = fixture.workspace.update(&BTreeSet::from([item.clone()]));
+            assert_eq!(
+                selection(&refused),
+                (false, Some("structural_line".to_owned()), true),
+                "the update classifies the refusal exactly as a full build does"
+            );
+            item.write("package provider\ntype Item struct{}\n")
+                .unwrap();
+            let restored = refused.update(&BTreeSet::from([item]));
+            assert_eq!(
+                selection(&restored),
+                (true, None, true),
+                "an admitted source replaces its refusal"
+            );
         }
         #[test]
         #[brokk_bifrost_test_macros::hardwon(
@@ -9323,7 +9670,8 @@ func use() { provider.Rewrites.ReadFile() }
                         &CancellationToken::new()
                     )
                     .unwrap(),
-                GoInputObservationOutcome::InputsChanged
+                GoInputObservationOutcome::InputsChanged(GoInputChange::ContentChanged { kind, path })
+                    if kind == "source" && path == "provider/item.go"
             ));
         }
         #[test]
@@ -9669,7 +10017,10 @@ func use() { provider.Rewrites.ReadFile() }
             let first_profile = profile_digest(&first_discovery);
             let first = fixture.publish(first_discovery, None);
             let mut second_discovery = fixture.discovery();
-            second_discovery.build_tags.push("another-profile".into());
+            second_discovery
+                .build_configuration
+                .tags
+                .push("another-profile".into());
             let second_profile = profile_digest(&second_discovery);
             fixture.publish(second_discovery, None);
             let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
@@ -9794,7 +10145,10 @@ func use() { provider.Rewrites.ReadFile() }
             let mut identities = Vec::new();
             for index in 0..48 {
                 let mut discovery = fixture.discovery();
-                discovery.build_tags.push(format!("profile{index}"));
+                discovery
+                    .build_configuration
+                    .tags
+                    .push(format!("profile{index}"));
                 let profile = profile_digest(&discovery);
                 identities.push((profile, fixture.publish(discovery, None)));
             }
@@ -9817,6 +10171,8 @@ func use() { provider.Rewrites.ReadFile() }
             ];
             let mut inputs = pinned("go_native_observed_inputs");
             inputs.params = selection.params[..3].to_vec();
+            let mut refused = pinned("go_native_refused_inputs");
+            refused.params = inputs.params.clone();
             let mut source_inventory = pinned("go_native_source_inventory");
             source_inventory.params = inputs.params.clone();
             let mut canonical_source = pinned("go_native_canonical_source");
@@ -9835,6 +10191,7 @@ func use() { provider.Rewrites.ReadFile() }
                     &selection,
                     &head,
                     &inputs,
+                    &refused,
                     &prior,
                     &source_inventory,
                     &canonical_source,
@@ -9857,6 +10214,13 @@ func use() { provider.Rewrites.ReadFile() }
                         );
                         assert!(
                             plan.iter().any(|line| line.contains("SEARCH f")),
+                            "{state:?}: {plan:?}"
+                        );
+                    }
+                    if query.name == "go_native_refused_inputs" {
+                        assert!(
+                            plan.iter()
+                                .any(|line| line.contains("SEARCH workspace_source_refusals")),
                             "{state:?}: {plan:?}"
                         );
                     }
@@ -10678,6 +11042,7 @@ func use() { provider.Rewrites.ReadFile() }
         }
     }
     mod go_move_20 {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogPackSourceKind;
 
         use brokk_bifrost_go_analysis::GoDependencyPackAdapter;
 
@@ -10856,8 +11221,6 @@ func use() { provider.Rewrites.ReadFile() }
             assert_ne!(compiled.key.input_digest(), GO_SOURCE_SHA256);
             assert_ne!(compiled.key.production_digest(), GO_SOURCE_SHA256);
             let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-            let reader = catalog.runtime_source_reader();
-
             for status in [
                 DependencyPackPreparationStatus::Generated,
                 DependencyPackPreparationStatus::Reused,
@@ -10901,7 +11264,7 @@ func use() { provider.Rewrites.ReadFile() }
                 assert_eq!(candidates.len(), 1);
                 let loaded = catalog.load(&candidates[0]).unwrap();
                 assert_eq!(
-                    loaded.shard.activation()[0].artifact_sha256.as_deref(),
+                    loaded.selectors.as_slice()[0].artifact_sha256.as_deref(),
                     Some(GO_SOURCE_SHA256)
                 );
                 assert!(
@@ -10921,6 +11284,13 @@ func use() { provider.Rewrites.ReadFile() }
                     package_import_path: "example.test/source/api",
                     file: "api.go",
                 };
+                let reader = catalog
+                    .runtime_source_reader(std::iter::once((
+                        request.manifest_digest,
+                        request.shard_id,
+                        CatalogPackSourceKind::Generated,
+                    )))
+                    .unwrap();
                 let selected = reader
                     .read_go_source(
                         &request,
@@ -10994,6 +11364,13 @@ func use() { provider.Rewrites.ReadFile() }
                 changed.evidence[0].artifact_sha256.as_deref(),
                 Some(changed_artifact.sha256())
             );
+            let reader = catalog
+                .runtime_source_reader(std::iter::once((
+                    changed.packs[0].production.manifest_digest.as_str(),
+                    compiled.compiled.manifest.shards[0].shard_id.as_str(),
+                    CatalogPackSourceKind::Generated,
+                )))
+                .unwrap();
             let selected = reader
                 .read_go_source(
                     &CatalogGoSourceRequest {
@@ -11146,18 +11523,19 @@ func use() { provider.Rewrites.ReadFile() }
                 .file("probe.go", "package probe\n")
                 .build();
             let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let active = std::sync::Arc::new(active);
             let overlay =
                 SemanticModelOverlay::build(workspace.analyzer(), &active, &cancellation, 1 << 26)
                     .unwrap();
             let factory = overlay
                 .symbols()
-                .iter()
+                .into_iter()
                 .find(|symbol| symbol.provenance.record_id == "member.widget.create")
                 .expect("activated factory symbol");
             let query = activated_returned_callable_targets(
                 &catalog,
                 &active,
-                factory,
+                &factory,
                 0,
                 limits(64),
                 &cancellation,
@@ -11183,6 +11561,7 @@ func use() { provider.Rewrites.ReadFile() }
         }
     }
     mod go_move_22 {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogPackSourceKind;
 
         use brokk_bifrost_go_analysis::analyze_go_package_source_identities;
 
@@ -11432,7 +11811,13 @@ func use() { provider.Rewrites.ReadFile() }
                     std::slice::from_ref(&package),
                 )
                 .unwrap();
-            let reader = catalog.runtime_source_reader();
+            let reader = catalog
+                .runtime_source_reader(std::iter::once((
+                    pack.manifest.content_sha256.as_str(),
+                    pack.manifest.shards[0].shard_id.as_str(),
+                    CatalogPackSourceKind::Installed,
+                )))
+                .unwrap();
             let request = CatalogGoSourceRequest {
                 manifest_digest: &pack.manifest.content_sha256,
                 shard_id: &pack.manifest.shards[0].shard_id,
@@ -11557,21 +11942,28 @@ func use() { provider.Rewrites.ReadFile() }
                     )
                     .unwrap();
                 assert!(matches!(
-                    catalog.runtime_source_reader().read_go_source(
-                        &CatalogGoSourceRequest {
-                            manifest_digest: &pack.manifest.content_sha256,
-                            shard_id: &pack.manifest.shards[0].shard_id,
-                            artifact_sha256: artifact.sha256(),
-                            package_import_path: &package.import_path,
-                            file: &package.files[0],
-                        },
-                        CatalogGoSourceReadLimits {
-                            max_files: 8,
-                            max_source_bytes: 2048,
-                            ..CatalogGoSourceReadLimits::default()
-                        },
-                        &CancellationToken::new(),
-                    ),
+                    catalog
+                        .runtime_source_reader(std::iter::once((
+                            pack.manifest.content_sha256.as_str(),
+                            pack.manifest.shards[0].shard_id.as_str(),
+                            CatalogPackSourceKind::Installed,
+                        )))
+                        .unwrap()
+                        .read_go_source(
+                            &CatalogGoSourceRequest {
+                                manifest_digest: &pack.manifest.content_sha256,
+                                shard_id: &pack.manifest.shards[0].shard_id,
+                                artifact_sha256: artifact.sha256(),
+                                package_import_path: &package.import_path,
+                                file: &package.files[0],
+                            },
+                            CatalogGoSourceReadLimits {
+                                max_files: 8,
+                                max_source_bytes: 2048,
+                                ..CatalogGoSourceReadLimits::default()
+                            },
+                            &CancellationToken::new(),
+                        ),
                     Err(CatalogError::SourceBudgetExhausted {
                         max_source_bytes: 2048,
                         ..
@@ -11595,7 +11987,13 @@ func use() { provider.Rewrites.ReadFile() }
                     std::slice::from_ref(&package),
                 )
                 .unwrap();
-            let reader = catalog.runtime_source_reader();
+            let reader = catalog
+                .runtime_source_reader(std::iter::once((
+                    pack.manifest.content_sha256.as_str(),
+                    pack.manifest.shards[0].shard_id.as_str(),
+                    CatalogPackSourceKind::EphemeralWorkspace,
+                )))
+                .unwrap();
             let selected = reader
                 .read_go_source(
                     &CatalogGoSourceRequest {
@@ -11809,12 +12207,21 @@ func use() { provider.Rewrites.ReadFile() }
                         connection.execute_batch("ANALYZE;").unwrap();
                     }
 
+                    let reader = catalog
+                        .runtime_source_reader(std::iter::once((
+                            manifest.as_str(),
+                            shard.as_str(),
+                            CatalogPackSourceKind::Installed,
+                        )))
+                        .unwrap();
+                    let connection = reader.connection.lock().unwrap();
+                    // ANALYZE may scan the one-row shard marker. Fact rows
+                    // must still search the named index in each view branch.
                     let source_files_plan = connection
                         .prepare(
                             "EXPLAIN QUERY PLAN
                          SELECT relative_path, source_text
-                         FROM catalog_exact_go_source_files
-                              INDEXED BY catalog_exact_go_source_files_read
+                         FROM active_catalog_exact_go_source_files
                          WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
                          ORDER BY relative_path",
                         )
@@ -11826,15 +12233,14 @@ func use() { provider.Rewrites.ReadFile() }
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
                     assert!(
-                        source_files_plan
-                            .iter()
-                            .any(|line| line.contains("catalog_exact_go_source_files_read")),
+                        source_files_plan.iter().any(|line| line
+                            .contains("SEARCH r USING INDEX catalog_exact_go_source_files_read")),
                         "{state}: {source_files_plan:?}"
                     );
                     assert!(
                         !source_files_plan
                             .iter()
-                            .any(|line| { line.contains("SCAN ") || line.contains("AUTOMATIC") }),
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {source_files_plan:?}"
                     );
 
@@ -11880,8 +12286,7 @@ func use() { provider.Rewrites.ReadFile() }
                         .prepare(
                             "EXPLAIN QUERY PLAN
                          SELECT package_ordinal, import_path, package_name
-                         FROM catalog_exact_go_packages
-                              INDEXED BY catalog_exact_go_packages_read
+                         FROM active_catalog_exact_go_packages
                          WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
                          ORDER BY package_ordinal",
                         )
@@ -11893,15 +12298,15 @@ func use() { provider.Rewrites.ReadFile() }
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
                     assert!(
-                        package_plan
-                            .iter()
-                            .any(|line| line.contains("catalog_exact_go_packages_read")),
+                        package_plan.iter().any(|line| line.contains(
+                            "SEARCH r USING COVERING INDEX catalog_exact_go_packages_read"
+                        )),
                         "{state}: {package_plan:?}"
                     );
                     assert!(
                         !package_plan
                             .iter()
-                            .any(|line| { line.contains("SCAN ") || line.contains("AUTOMATIC") }),
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {package_plan:?}"
                     );
 
@@ -11909,8 +12314,7 @@ func use() { provider.Rewrites.ReadFile() }
                         .prepare(
                             "EXPLAIN QUERY PLAN
                          SELECT package_ordinal, file_ordinal, relative_path
-                         FROM catalog_exact_go_package_files
-                              INDEXED BY catalog_exact_go_package_files_ordered_read
+                         FROM active_catalog_exact_go_package_files
                          WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
                          ORDER BY package_ordinal, file_ordinal",
                         )
@@ -11923,14 +12327,16 @@ func use() { provider.Rewrites.ReadFile() }
                         .unwrap();
                     assert!(
                         package_files_plan.iter().any(|line| {
-                            line.contains("catalog_exact_go_package_files_ordered_read")
+                            line.contains(
+                                "SEARCH r USING INDEX catalog_exact_go_package_files_ordered_read",
+                            )
                         }),
                         "{state}: {package_files_plan:?}"
                     );
                     assert!(
                         !package_files_plan
                             .iter()
-                            .any(|line| { line.contains("SCAN ") || line.contains("AUTOMATIC") }),
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {package_files_plan:?}"
                     );
 
@@ -11948,14 +12354,14 @@ func use() { provider.Rewrites.ReadFile() }
                         .unwrap();
                     assert!(
                         returned.iter().any(|line| line.contains(
-                            "SEARCH fact USING INDEX catalog_callable_value_returned_lookup"
+                            "SEARCH r USING INDEX catalog_callable_value_returned_lookup"
                         )),
                         "{state}: {returned:?}"
                     );
                     assert!(
-                        !returned.iter().any(|line| {
-                            line.contains("SCAN fact") || line.contains("AUTOMATIC")
-                        }),
+                        !returned
+                            .iter()
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {returned:?}"
                     );
 
@@ -11981,14 +12387,14 @@ func use() { provider.Rewrites.ReadFile() }
                         .unwrap();
                     assert!(
                         callbacks.iter().any(|line| line.contains(
-                            "SEARCH fact USING INDEX catalog_callable_value_callback_lookup"
+                            "SEARCH r USING INDEX catalog_callable_value_callback_lookup"
                         )),
                         "{state}: {callbacks:?}"
                     );
                     assert!(
-                        !callbacks.iter().any(|line| {
-                            line.contains("SCAN fact") || line.contains("AUTOMATIC")
-                        }),
+                        !callbacks
+                            .iter()
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {callbacks:?}"
                     );
 
@@ -12012,14 +12418,14 @@ func use() { provider.Rewrites.ReadFile() }
                         .unwrap();
                     assert!(
                         coverage.iter().any(|line| line.contains(
-                            "SEARCH coverage USING INDEX catalog_callable_value_coverage_lookup"
+                            "SEARCH r USING INDEX catalog_callable_value_coverage_lookup"
                         )),
                         "{state}: {coverage:?}"
                     );
                     assert!(
-                        !coverage.iter().any(|line| {
-                            line.contains("SCAN coverage") || line.contains("AUTOMATIC")
-                        }),
+                        !coverage
+                            .iter()
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {coverage:?}"
                     );
 
@@ -12035,19 +12441,20 @@ func use() { provider.Rewrites.ReadFile() }
                         .unwrap()
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap();
+                    let identity_index = concat!(
+                        "SEARCH r USING INDEX ",
+                        "sqlite_autoindex_catalog_anonymous_callable_identities_1"
+                    );
                     assert!(
-                    anonymous_base.iter().any(|line| line.contains(
-                        "SEARCH identity USING INDEX sqlite_autoindex_catalog_anonymous_callable_identities_1"
-                    )),
-                    "{state}: {anonymous_base:?}"
-                );
+                        anonymous_base
+                            .iter()
+                            .any(|line| line.contains(identity_index)),
+                        "{state}: {anonymous_base:?}"
+                    );
                     assert!(
-                        !anonymous_base.iter().any(|line| {
-                            line.contains("SCAN ")
-                                || line.contains("AUTOMATIC")
-                                || line.contains("TEMP B-TREE")
-                                || line.contains("CO-ROUTINE")
-                        }),
+                        !anonymous_base
+                            .iter()
+                            .any(|line| { line.contains("SCAN r") || line.contains("AUTOMATIC") }),
                         "{state}: {anonymous_base:?}"
                     );
 
@@ -12071,19 +12478,15 @@ func use() { provider.Rewrites.ReadFile() }
                             .unwrap()
                             .collect::<Result<Vec<_>, _>>()
                             .unwrap();
-                        let expected_index = format!(
-                            "SEARCH {table_name} USING INDEX sqlite_autoindex_{table_name}_1"
-                        );
+                        let expected_index =
+                            format!("SEARCH r USING INDEX sqlite_autoindex_{table_name}_1");
                         assert!(
                             children.iter().any(|line| line.contains(&expected_index)),
                             "{state}: {children:?}"
                         );
                         assert!(
                             !children.iter().any(|line| {
-                                line.contains("SCAN ")
-                                    || line.contains("AUTOMATIC")
-                                    || line.contains("TEMP B-TREE")
-                                    || line.contains("CO-ROUTINE")
+                                line.contains("SCAN r") || line.contains("AUTOMATIC")
                             }),
                             "{state}: {children:?}"
                         );

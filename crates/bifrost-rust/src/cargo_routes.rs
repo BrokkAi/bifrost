@@ -992,26 +992,6 @@ impl RustCargoRouteIndex {
         Some(sorted)
     }
 
-    pub fn candidates_in_library_route(
-        &self,
-        source_file: &ProjectFile,
-        route: &str,
-        candidates: Vec<CodeUnit>,
-    ) -> Option<Vec<CodeUnit>> {
-        let root = self.resolve_crate_root_file(source_file, route)?;
-        let routed: Vec<_> = candidates
-            .into_iter()
-            .filter(|candidate| {
-                candidate.source() == &root
-                    || self
-                        .target_roots_by_file
-                        .get(candidate.source())
-                        .is_some_and(|roots| roots.contains(&root))
-            })
-            .collect();
-        Some(routed)
-    }
-
     /// [`Self::target_relation`] as the tri-state boolean the usage paths ask
     /// for: `None` when either side's target is unknown.
     pub fn files_share_target(&self, left: &ProjectFile, right: &ProjectFile) -> Option<bool> {
@@ -2798,6 +2778,18 @@ fn cargo_patch_path_directories(
         .collect()
 }
 
+/// Cargo workspace exclusions are literal directories, including descendants.
+/// Leading `.` components have the same meaning as when Cargo joins the path
+/// to the workspace root. Member discovery and retained inventories share it.
+pub(crate) fn cargo_workspace_exclude_covers(excluded: &Path, relative: &Path) -> bool {
+    relative.starts_with(
+        excluded
+            .components()
+            .filter(|part| *part != std::path::Component::CurDir)
+            .collect::<PathBuf>(),
+    )
+}
+
 fn cargo_workspace_member_directories(
     root: &Path,
     workspace_directory: &Path,
@@ -2812,7 +2804,7 @@ fn cargo_workspace_member_directories(
         .into_iter()
         .flatten()
         .filter_map(toml::Value::as_str)
-        .filter_map(|pattern| glob::Pattern::new(pattern).ok())
+        .map(PathBuf::from)
         .collect();
     let mut directories = Vec::new();
     for member in workspace
@@ -2844,7 +2836,7 @@ fn cargo_workspace_member_directories(
                 .unwrap_or(&relative);
             if excludes
                 .iter()
-                .any(|pattern| pattern.matches_path(member_relative))
+                .any(|excluded| cargo_workspace_exclude_covers(excluded, member_relative))
             {
                 continue;
             }

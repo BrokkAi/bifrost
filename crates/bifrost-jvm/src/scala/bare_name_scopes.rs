@@ -404,9 +404,15 @@ mod tests {
             "}\n",
         );
         let scopes = build(source);
-        for (name, site) in [("ws", "ws()"), ("shared", "shared()"), ("table", "table()")] {
+        for (name, site, enclosing) in [
+            ("ws", "ws()", "trait Rules"),
+            ("shared", "shared()", "trait Child"),
+            ("table", "table()", "object User"),
+        ] {
+            let byte = source.rfind(site).expect("invocation site");
+            assert!(byte > source.find(enclosing).expect("enclosing declaration"));
             assert!(
-                scopes.is_bound_at(name, byte_of(source, site)),
+                scopes.is_bound_at(name, byte),
                 "`{name}` must stay reachable at `{site}`"
             );
         }
@@ -425,8 +431,10 @@ mod tests {
             "  }\n",
             "}\n",
         );
+        let site = source.rfind("helper()").expect("nested invocation site");
+        assert!(site > source.find("class Inner").expect("nested template"));
         assert!(
-            build(source).is_bound_at("helper", byte_of(source, "helper()")),
+            build(source).is_bound_at("helper", site),
             "an enclosing template's member is reachable from a nested template"
         );
     }

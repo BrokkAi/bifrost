@@ -514,9 +514,14 @@ struct SourceSetLinks {
     reexports: Vec<CrossDocumentReexport>,
     private_modules: RandomHashSet<String>,
     generic_trait_impls: Vec<(String, GenericTraitImplFact)>,
+    concrete_trait_impls: Vec<(String, ImplementedTraitFact)>,
     callable_impl_members: RandomHashSet<String>,
     incomplete_callable_owners: RandomHashSet<String>,
+    pending_primitive_members: Vec<(String, ProducerDiagnostic)>,
     declarations_interrupted: bool,
+    incomplete_implementation_owners: RandomHashSet<String>,
+    incomplete_generic_traits: RandomHashSet<String>,
+    auto_traits: RandomHashSet<String>,
 }
 
 // Like the JVM producer's selective certification, decoding failures block an
@@ -1020,6 +1025,10 @@ fn implemented_trait_fact(
         .collect::<Vec<_>>();
     associated_types.sort_by(|a, b| a.name.cmp(&b.name));
     ImplementedTraitFact {
+        is_negative: false,
+        type_parameters: Vec::new(),
+        self_pattern: None,
+        bounds: Vec::new(),
         trait_type,
         associated_types,
     }
@@ -1072,6 +1081,10 @@ fn generic_trait_bounds(
                 bounds.push(GenericTraitBound {
                     subject: contract_type_ref(subject, document, type_ids, limits, diagnostics, 0),
                     bound: ImplementedTraitFact {
+                        is_negative: false,
+                        type_parameters: Vec::new(),
+                        self_pattern: None,
+                        bounds: Vec::new(),
                         trait_type: contract_type_ref(
                             &Type::ResolvedPath(trait_.clone()),
                             document,
@@ -1097,18 +1110,93 @@ fn generic_trait_bounds(
             add(type_, bounds);
         }
     }
+    // Rust's implicit Sized bound is a condition too. Without it a negative
+    // blanket over T would incorrectly apply to an unsized receiver. A written
+    // ?Sized (inline or where-clause) relaxes the default.
+    for parameter in &generics.params {
+        if !matches!(
+            parameter.kind,
+            rustdoc_types::GenericParamDefKind::Type { .. }
+        ) {
+            continue;
+        }
+        let subject = TypeRef::TypeParameter {
+            name: parameter.name.clone(),
+        };
+        let has_sized_bound = |bounds: &[GenericBound]| {
+            bounds.iter().any(|bound| {
+                matches!(bound, GenericBound::TraitBound { trait_, .. }
+                if normalized_path(trait_, document) == "core.marker.Sized")
+            })
+        };
+        let inline_sized = matches!(&parameter.kind,
+            rustdoc_types::GenericParamDefKind::Type { bounds, .. } if has_sized_bound(bounds));
+        let where_sized = generics.where_predicates.iter().any(|predicate|
+            matches!(predicate, WherePredicate::BoundPredicate { type_: Type::Generic(name), bounds, .. }
+                if name == &parameter.name && has_sized_bound(bounds)));
+        if inline_sized || where_sized {
+            continue;
+        }
+        bounds.push(GenericTraitBound {
+            subject,
+            bound: ImplementedTraitFact {
+                is_negative: false,
+                type_parameters: Vec::new(),
+                self_pattern: None,
+                bounds: Vec::new(),
+                associated_types: Vec::new(),
+                trait_type: TypeRef::named("core.marker.Sized"),
+            },
+            maybe: false,
+        });
+    }
     bounds
 }
 
-fn is_forwarding_self(ty: &Type, document: &RustdocCrate) -> bool {
-    match ty {
-        Type::BorrowedRef { type_, .. } => matches!(type_.as_ref(), Type::Generic(_)),
-        Type::ResolvedPath(path) => matches!(
-            normalized_path(path, document).as_str(),
-            "alloc.boxed.Box" | "alloc.rc.Rc" | "alloc.sync.Arc" | "core.pin.Pin"
-        ),
-        _ => false,
-    }
+fn implementation_conditions_supported(generics: &Generics) -> bool {
+    let supported_bounds = |bounds: &[GenericBound]| {
+        bounds.iter().all(|bound| match bound {
+            GenericBound::TraitBound {
+                trait_,
+                generic_params,
+                modifier,
+            } => {
+                generic_params.is_empty()
+                    && *modifier != rustdoc_types::TraitBoundModifier::MaybeConst
+                    && match trait_.args.as_deref() {
+                        Some(GenericArgs::AngleBracketed { constraints, .. }) => {
+                            constraints.iter().all(|constraint| {
+                                matches!(
+                                    constraint.binding,
+                                    rustdoc_types::AssocItemConstraintKind::Equality(Term::Type(_))
+                                )
+                            })
+                        }
+                        Some(
+                            GenericArgs::ReturnTypeNotation | GenericArgs::Parenthesized { .. },
+                        ) => false,
+                        _ => true,
+                    }
+            }
+            _ => false,
+        })
+    };
+    generics.params.iter().all(|param| match &param.kind {
+        rustdoc_types::GenericParamDefKind::Type { bounds, .. } => supported_bounds(bounds),
+        rustdoc_types::GenericParamDefKind::Lifetime { outlives } => outlives.is_empty(),
+        _ => true,
+    }) && generics
+        .where_predicates
+        .iter()
+        .all(|predicate| match predicate {
+            WherePredicate::BoundPredicate {
+                bounds,
+                generic_params,
+                ..
+            } => generic_params.is_empty() && supported_bounds(bounds),
+            WherePredicate::LifetimePredicate { .. } => false,
+            WherePredicate::EqPredicate { .. } => false,
+        })
 }
 
 fn self_pattern(
@@ -1164,6 +1252,14 @@ fn self_pattern(
                 };
             Some(RustSelfPattern::Constructor { owner, arguments })
         }
+        Type::Slice(_)
+        | Type::Array { .. }
+        | Type::Tuple(_)
+        | Type::Primitive(_)
+        | Type::RawPointer { .. } => Some(RustSelfPattern::Constructor {
+            owner: contract_type_ref(ty, document, type_ids, limits, diagnostics, depth),
+            arguments: Vec::new(),
+        }),
         _ => None,
     }
 }
@@ -1261,6 +1357,28 @@ fn merge_source_set_productions(
             merged_types.push(fact);
         }
     }
+    // A primitive extension can precede its defining document. Missing
+    // definitions still produce diagnostics and never leave dangling facts.
+    let mut missing_primitive_members: RandomHashSet<&String> = RandomHashSet::default();
+    for (member_id, diagnostic) in &links.pending_primitive_members {
+        if !type_positions.contains_key(diagnostic.declaration.as_ref().expect("primitive owner")) {
+            missing_primitive_members.insert(member_id);
+            if diagnostics.len() < limits.max_diagnostics
+                || admit_into_full_diagnostics(
+                    &mut diagnostics,
+                    &mut suppressed_diagnostics,
+                    true,
+                    |retained: &ProducerDiagnostic| {
+                        retained.severity == ProducerDiagnosticSeverity::Warning
+                    },
+                )
+            {
+                diagnostics.push(diagnostic.clone());
+            }
+        }
+    }
+    members.retain(|member| !missing_primitive_members.contains(&member.id));
+    relations.retain(|relation| !missing_primitive_members.contains(&relation.from));
     let mut types = merged_types;
     let resolved_reexports = apply_cross_document_reexports(
         &links.reexports,
@@ -1286,6 +1404,11 @@ fn merge_source_set_productions(
             union_facts(&mut trait_.generic_trait_impls, vec![fact.clone()]);
         }
     }
+    for (owner, fact) in &links.concrete_trait_impls {
+        if let Some(ty) = types.iter_mut().find(|ty| &ty.name == owner) {
+            union_facts(&mut ty.implemented_traits, vec![fact.clone()]);
+        }
+    }
     let mut merged_members: Vec<MemberFact> = Vec::new();
     let mut member_positions = RandomHashMap::new();
     for fact in members {
@@ -1300,6 +1423,18 @@ fn merge_source_set_productions(
     let mut members = merged_members;
     if all_documents_decoded {
         certify_callable_families(&types, &mut members, links);
+        if !links.declarations_interrupted {
+            for ty in &mut types {
+                ty.implemented_traits_complete =
+                    !matches!(
+                        ty.type_kind,
+                        TypeKind::Module | TypeKind::Trait | TypeKind::TypeAlias
+                    ) && !links.incomplete_implementation_owners.contains(&ty.name);
+                ty.generic_trait_impls_complete = ty.type_kind == TypeKind::Trait
+                    && !links.incomplete_generic_traits.contains(&ty.name)
+                    && !links.auto_traits.contains(&ty.name);
+            }
+        }
     } else {
         for member in &mut members {
             member.callable_family_complete = false;
@@ -1334,6 +1469,12 @@ fn merge_source_set_productions(
     // toolchain. Applicability remains the caller's authored selectors.
     let activation = request.activation.clone();
     let pack = (!types.is_empty()).then(|| AuthoredSemanticModelPack {
+        extraction: Some(
+            brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::source_set(
+                request.artifact_kind,
+                artifact_sha256,
+            ),
+        ),
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: request.pack_id.clone(),
         version: request.pack_version.clone(),
@@ -1351,7 +1492,13 @@ fn merge_source_set_productions(
         carried_sources: Vec::new(),
         cpp_portability: None,
         python_correspondence: None,
-        shards: source_set_declaration_shards(types, members, relations, activation),
+        shards: source_set_declaration_shards(
+            types,
+            members,
+            relations,
+            activation,
+            &links.private_modules,
+        ),
     });
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
@@ -1363,7 +1510,8 @@ fn merge_source_set_productions(
 }
 
 // Join and certify the whole source set first, then partition by canonical
-// owner crate. Identical activation selects every shard together; pack-wide
+// owner module and pack modules in canonical order. Identical activation
+// selects every shard together; pack-wide
 // reference validation permits the cross-crate links. Keep the compiler and
 // decoder's per-shard allocation/decompression caps and pack-wide caps intact.
 fn source_set_declaration_shards(
@@ -1371,15 +1519,38 @@ fn source_set_declaration_shards(
     members: Vec<MemberFact>,
     relations: Vec<RelationFact>,
     activation: Vec<crate::analyzer::semantic_model::ActivationSelector>,
+    private_modules: &RandomHashSet<String>,
 ) -> Vec<AuthoredShard> {
-    let crate_name = |name: &str| name.split('.').next().unwrap().to_owned();
-    let mut crates = types
+    // Both public and private modules can own exported declarations. The
+    // primitive namespace is canonical across core/alloc/std documents.
+    let mut modules = private_modules.clone();
+    modules.extend(
+        types
+            .iter()
+            .filter(|ty| ty.type_kind == TypeKind::Module)
+            .map(|ty| ty.name.clone()),
+    );
+    modules.insert("core.primitive".to_owned());
+    let owner_module = |name: &str| {
+        let mut segments = name.split('.');
+        let crate_name = segments.next().expect("canonical owner crate");
+        let Some(module) = segments.next() else {
+            return crate_name.to_owned();
+        };
+        let module = format!("{crate_name}.{module}");
+        if modules.contains(&module) {
+            module
+        } else {
+            crate_name.to_owned()
+        }
+    };
+    let mut partitions = types
         .iter()
-        .map(|fact| crate_name(&fact.name))
+        .map(|fact| owner_module(&fact.name))
         .collect::<Vec<_>>();
-    crates.sort_unstable();
-    crates.dedup();
-    let mut shards = crates
+    partitions.sort_unstable();
+    partitions.dedup();
+    let mut shards = partitions
         .iter()
         .map(|name| AuthoredShard {
             id: format!("declarations.rust.external.{name}"),
@@ -1401,7 +1572,7 @@ fn source_set_declaration_shards(
     // guaranteed to be declarations produced in this source set.
     let mut declaration_shards = RandomHashMap::new();
     for fact in types {
-        let position = crates.binary_search(&crate_name(&fact.name)).unwrap();
+        let position = partitions.binary_search(&owner_module(&fact.name)).unwrap();
         declaration_shards.insert(fact.id.clone(), position);
         let AuthoredPayload::DeclarationFacts { types, .. } = &mut shards[position].payload else {
             unreachable!("source-set shards contain declaration facts")
@@ -1425,7 +1596,48 @@ fn source_set_declaration_shards(
         };
         relations.push(fact);
     }
-    shards
+    // First-fit in canonical module order avoids a shard per module while
+    // preserving each module as one unit. Reserve 10% of the hard raw cap for
+    // the compiled envelope and growth in future nightly inputs. Authored
+    // declaration facts use the same wire shapes as compiled facts; counting
+    // each module's full shard also conservatively repeats its array/envelope
+    // overhead. The compiler still enforces the unchanged hard limit (including
+    // when one indivisible module alone outgrows this packing target).
+    let target_bytes =
+        crate::analyzer::semantic_model::DecodeLimits::default().max_raw_shard_bytes * 9 / 10;
+    let mut packed: Vec<AuthoredShard> = Vec::new();
+    let mut sizes = Vec::new();
+    for shard in shards {
+        let bytes = serde_json::to_vec(&shard)
+            .expect("typed declaration shard is JSON serializable")
+            .len();
+        let Some(position) = sizes.iter().position(|size| size + bytes <= target_bytes) else {
+            sizes.push(bytes);
+            packed.push(shard);
+            continue;
+        };
+        sizes[position] += bytes;
+        let AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } = &mut packed[position].payload
+        else {
+            unreachable!("source-set shards contain declaration facts")
+        };
+        let AuthoredPayload::DeclarationFacts {
+            types: module_types,
+            members: module_members,
+            relations: module_relations,
+        } = shard.payload
+        else {
+            unreachable!("source-set shards contain declaration facts")
+        };
+        types.extend(module_types);
+        members.extend(module_members);
+        relations.extend(module_relations);
+    }
+    packed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1695,8 +1907,33 @@ fn produce_document(
         };
         let (type_kind, generics, hierarchy) =
             type_shape(item, document, &type_ids, limits, &mut diagnostics);
+        let impl_ids: &[Id] = match &item.inner {
+            ItemEnum::Struct(ty) => &ty.impls,
+            ItemEnum::Union(ty) => &ty.impls,
+            ItemEnum::Enum(ty) => &ty.impls,
+            ItemEnum::Trait(ty) => &ty.implementations,
+            ItemEnum::Primitive(ty) => &ty.impls,
+            _ => &[],
+        };
+        if impl_ids.iter().any(|id| {
+            !matches!(
+                document.index.get(id).map(|item| &item.inner),
+                Some(ItemEnum::Impl(_))
+            )
+        }) {
+            if type_kind == TypeKind::Trait {
+                links.incomplete_generic_traits.insert(name.clone());
+            } else {
+                links.incomplete_implementation_owners.insert(name.clone());
+            }
+        }
+        if matches!(&item.inner, ItemEnum::Trait(ty) if ty.is_auto) || name == "core.marker.Sized" {
+            links.auto_traits.insert(name.clone());
+        }
         type_position.insert(item.id, types.len());
         types.push(TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: generic_parameters(generics)
                 .map(|param| match &param.kind {
@@ -1841,9 +2078,22 @@ fn produce_document(
         {
             member_kind = MemberKind::Method;
         }
-        let Some(owner_item_id) = type_id_by_name.get(&owner_name).cloned() else {
-            // The defining type may arrive in another source-set document.
-            // Its inventory still failed if this contributing member was lost.
+        let primitive_extension = source_relative_path.is_some()
+            && parents
+                .get(&item.id)
+                .and_then(|parent| document.index.get(parent))
+                .is_some_and(|parent| {
+                    matches!(&parent.inner, ItemEnum::Impl(implementation)
+                        if matches!(&implementation.for_, Type::Primitive(_) | Type::Slice(_) | Type::Array { .. }))
+                });
+        let owner_item_id = if let Some(id) = type_id_by_name.get(&owner_name) {
+            id.clone()
+        } else if primitive_extension {
+            // Primitive identities are shared across documents. Validate this
+            // owner after the source-set join, rather than dropping alloc/std
+            // extensions of a primitive emitted by core.
+            owner_name.clone()
+        } else {
             links.incomplete_callable_owners.insert(owner_name.clone());
             diagnostics.warning(
                 "rust.rustdoc.missing_member_owner",
@@ -1865,14 +2115,31 @@ fn produce_document(
             .and_then(|owner| type_position.get(owner))
             .map(|position| types[*position].type_parameters.as_slice())
             .unwrap_or_default();
-        let mut signature = member_signature(
-            item,
+        let implementation = parents
+            .get(&item.id)
+            .and_then(|parent| document.index.get(parent))
+            .and_then(|parent| match &parent.inner {
+                ItemEnum::Impl(implementation) => Some(implementation),
+                _ => None,
+            });
+        let self_type = implementation.map(|implementation| {
+            RustdocTypeProjection {
+                document,
+                type_ids: &type_ids,
+                owner_type_parameters,
+                self_type: None,
+                limits,
+            }
+            .project(&implementation.for_, &mut diagnostics, 0)
+        });
+        let projection = RustdocTypeProjection {
             document,
-            &type_ids,
+            type_ids: &type_ids,
             owner_type_parameters,
+            self_type: self_type.as_ref(),
             limits,
-            &mut diagnostics,
-        );
+        };
+        let mut signature = member_signature(item, &projection, &mut diagnostics);
         if has_receiver
             && let ItemEnum::Function(function) = &item.inner
             && let Some(signature) = signature.as_mut()
@@ -1883,17 +2150,6 @@ fn produce_document(
                     .next()
                     .is_some_and(|(name, _)| !(name == "self" || name.ends_with(" self")))
             });
-            for parameter in &mut signature.parameters {
-                replace_self_type(
-                    &mut parameter.r#type,
-                    &owner_item_id,
-                    0,
-                    limits.max_signature_depth,
-                );
-            }
-            if let Some(returns) = &mut signature.returns {
-                replace_self_type(returns, &owner_item_id, 0, limits.max_signature_depth);
-            }
         }
         let is_static = !has_receiver;
         let parameter_types = signature
@@ -1965,10 +2221,27 @@ fn produce_document(
         {
             links.callable_impl_members.insert(member_id.clone());
         }
+        if primitive_extension && !type_id_by_name.contains_key(&owner_name) {
+            links.pending_primitive_members.push((
+                member_id.clone(),
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    source_entry: source_relative_path.map(Into::into),
+                    code: "rust.rustdoc.missing_member_owner".into(),
+                    location: Some(format!("item.{}", item.id.0)),
+                    declaration: Some(owner_name.clone()),
+                    message: format!("member owner {owner_name} is not an emitted declaration"),
+                },
+            ));
+        }
         member_position.insert(item.id, members.len());
         members.push(MemberFact {
             implemented_trait: trait_implementation.map(|implementation| {
                 let mut fact = ImplementedTraitFact {
+                    is_negative: false,
+                    type_parameters: Vec::new(),
+                    self_pattern: None,
+                    bounds: Vec::new(),
                     trait_type: contract_type_ref(
                         &Type::ResolvedPath(
                             implementation.trait_.as_ref().expect("trait impl").clone(),
@@ -2403,10 +2676,7 @@ fn member_kind(inner: &ItemEnum) -> Option<MemberKind> {
 
 fn member_signature(
     item: &Item,
-    document: &RustdocCrate,
-    type_ids: &HashMap<Id, String>,
-    owner_type_parameters: &[String],
-    limits: &ArtifactProducerLimits,
+    projection: &RustdocTypeProjection<'_>,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<Signature> {
     let (parameters, returns, type_parameters) = match &item.inner {
@@ -2417,56 +2687,30 @@ fn member_signature(
                 .iter()
                 .map(|(name, ty)| Parameter {
                     name: rust_parameter_name(name),
-                    r#type: member_type_ref(
-                        ty,
-                        document,
-                        type_ids,
-                        owner_type_parameters,
-                        limits,
-                        diagnostics,
-                    ),
+                    r#type: projection.project(ty, diagnostics, 0),
                     optional: false,
                     variadic: false,
                     role: None,
                     passing_mode: Default::default(),
                 })
                 .collect(),
-            function.sig.output.as_ref().map(|ty| {
-                member_type_ref(
-                    ty,
-                    document,
-                    type_ids,
-                    owner_type_parameters,
-                    limits,
-                    diagnostics,
-                )
-            }),
+            function
+                .sig
+                .output
+                .as_ref()
+                .map(|ty| projection.project(ty, diagnostics, 0)),
             generic_names(&function.generics),
         ),
         ItemEnum::StructField(ty)
         | ItemEnum::Constant { type_: ty, .. }
         | ItemEnum::AssocConst { type_: ty, .. } => (
             Vec::new(),
-            Some(rust_type_ref(
-                ty,
-                document,
-                type_ids,
-                limits,
-                diagnostics,
-                0,
-            )),
+            Some(projection.project(ty, diagnostics, 0)),
             Vec::new(),
         ),
         ItemEnum::Static(static_) => (
             Vec::new(),
-            Some(rust_type_ref(
-                &static_.type_,
-                document,
-                type_ids,
-                limits,
-                diagnostics,
-                0,
-            )),
+            Some(projection.project(&static_.type_, diagnostics, 0)),
             Vec::new(),
         ),
         ItemEnum::Variant(variant) => {
@@ -2478,11 +2722,17 @@ fn member_signature(
             let parameters = fields
                 .iter()
                 .enumerate()
-                .filter_map(|(index, id)| document.index.get(id).map(|field| (index, field)))
+                .filter_map(|(index, id)| {
+                    projection
+                        .document
+                        .index
+                        .get(id)
+                        .map(|field| (index, field))
+                })
                 .filter_map(|(index, field)| match &field.inner {
                     ItemEnum::StructField(ty) => Some(Parameter {
                         name: field.name.clone().or_else(|| Some(index.to_string())),
-                        r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
+                        r#type: projection.project(ty, diagnostics, 0),
                         optional: false,
                         variadic: false,
                         role: None,
@@ -2503,91 +2753,6 @@ fn member_signature(
     })
 }
 
-fn member_type_ref(
-    ty: &Type,
-    document: &RustdocCrate,
-    type_ids: &HashMap<Id, String>,
-    owner_type_parameters: &[String],
-    limits: &ArtifactProducerLimits,
-    diagnostics: &mut BoundedProducerDiagnostics,
-) -> TypeRef {
-    if let Type::Generic(name) = ty
-        && owner_type_parameters
-            .iter()
-            .any(|parameter| parameter == name)
-    {
-        return TypeRef::TypeParameter { name: name.clone() };
-    }
-    rust_type_ref(ty, document, type_ids, limits, diagnostics, 0)
-}
-
-fn replace_self_type(ty: &mut TypeRef, owner: &str, depth: usize, max_depth: usize) {
-    if depth >= max_depth {
-        return;
-    }
-    if matches!(ty, TypeRef::TypeParameter { name } if name == "Self") {
-        *ty = TypeRef::Declared {
-            id: owner.to_owned(),
-            arguments: Vec::new(),
-            nullable: false,
-        };
-        return;
-    }
-    let next = depth + 1;
-    match ty {
-        TypeRef::Projection {
-            owner: projection_owner,
-            trait_type,
-            arguments,
-            ..
-        } => {
-            replace_self_type(projection_owner, owner, next, max_depth);
-            for ty in trait_type
-                .iter_mut()
-                .map(Box::as_mut)
-                .chain(arguments.iter_mut())
-            {
-                replace_self_type(ty, owner, next, max_depth);
-            }
-        }
-        TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } => {
-            for argument in arguments {
-                replace_self_type(argument, owner, next, max_depth);
-            }
-        }
-        TypeRef::Array { element }
-        | TypeRef::ByRef { element, .. }
-        | TypeRef::Pointer { element }
-        | TypeRef::Slice { element }
-        | TypeRef::FixedArray { element, .. }
-        | TypeRef::Channel { element, .. }
-        | TypeRef::Wildcard {
-            bound: Some(element),
-            ..
-        } => replace_self_type(element, owner, next, max_depth),
-        TypeRef::Map { key, value } => {
-            replace_self_type(key, owner, next, max_depth);
-            replace_self_type(value, owner, next, max_depth);
-        }
-        TypeRef::Tuple { elements } => {
-            for element in elements {
-                replace_self_type(element, owner, next, max_depth);
-            }
-        }
-        TypeRef::Function { parameters, result } => {
-            for parameter in parameters {
-                replace_self_type(&mut parameter.r#type, owner, next, max_depth);
-            }
-            if let Some(result) = result {
-                replace_self_type(result, owner, next, max_depth);
-            }
-        }
-        TypeRef::Unknown
-        | TypeRef::TypeParameter { .. }
-        | TypeRef::Wildcard { bound: None, .. } => {}
-    }
-}
-
 fn rust_type_ref(
     ty: &Type,
     document: &RustdocCrate,
@@ -2596,101 +2761,163 @@ fn rust_type_ref(
     diagnostics: &mut BoundedProducerDiagnostics,
     depth: usize,
 ) -> TypeRef {
-    if depth >= limits.max_signature_depth {
-        diagnostics.warning(
-            "limit.signature_depth",
-            None,
-            format!(
-                "Rust signature exceeded depth {}",
-                limits.max_signature_depth
-            ),
-        );
-        return TypeRef::named("_");
+    RustdocTypeProjection {
+        document,
+        type_ids,
+        owner_type_parameters: &[],
+        self_type: None,
+        limits,
     }
-    let next = depth + 1;
-    match ty {
-        Type::ResolvedPath(path) => {
-            path_type_ref(path, document, type_ids, limits, diagnostics, next)
+    .project(ty, diagnostics, depth)
+}
+
+struct RustdocTypeProjection<'a> {
+    document: &'a RustdocCrate,
+    type_ids: &'a HashMap<Id, String>,
+    owner_type_parameters: &'a [String],
+    self_type: Option<&'a TypeRef>,
+    limits: &'a ArtifactProducerLimits,
+}
+
+impl RustdocTypeProjection<'_> {
+    fn project(
+        &self,
+        ty: &Type,
+        diagnostics: &mut BoundedProducerDiagnostics,
+        depth: usize,
+    ) -> TypeRef {
+        if depth >= self.limits.max_signature_depth {
+            diagnostics.warning(
+                "limit.signature_depth",
+                None,
+                format!(
+                    "Rust signature exceeded depth {}",
+                    self.limits.max_signature_depth
+                ),
+            );
+            return TypeRef::named("_");
         }
-        // rustdoc can emit generic binders from an enclosing trait or impl
-        // that are not present in the projected declaration's signature.
-        // Preserve the uncertainty without producing an invalid pack whose
-        // type parameter references cannot be resolved by the compiler.
-        Type::Generic(_) => TypeRef::Wildcard {
-            variance: WildcardVariance::Any,
-            bound: None,
-        },
-        Type::Primitive(name) => TypeRef::named(name),
-        Type::Tuple(elements) if elements.is_empty() => TypeRef::Wildcard {
-            variance: WildcardVariance::Any,
-            bound: None,
-        },
-        Type::Tuple(elements) => TypeRef::Tuple {
-            elements: elements
+        let next = depth + 1;
+        match ty {
+            Type::ResolvedPath(path) => self.path(path, diagnostics, next),
+            // rustdoc can emit generic binders from an enclosing trait or impl
+            // that are not present in the projected declaration's signature.
+            // Preserve the uncertainty without producing an invalid pack whose
+            // type parameter references cannot be resolved by the compiler.
+            Type::Generic(name) if name == "Self" && self.self_type.is_some() => {
+                self.self_type.expect("impl self type").clone()
+            }
+            Type::Generic(name) if self.owner_type_parameters.contains(name) => {
+                TypeRef::TypeParameter { name: name.clone() }
+            }
+            Type::Generic(_) => TypeRef::Wildcard {
+                variance: WildcardVariance::Any,
+                bound: None,
+            },
+            Type::Primitive(name) => TypeRef::named(name),
+            Type::Tuple(elements) if elements.is_empty() => TypeRef::Wildcard {
+                variance: WildcardVariance::Any,
+                bound: None,
+            },
+            Type::Tuple(elements) => TypeRef::Tuple {
+                elements: elements
+                    .iter()
+                    .map(|element| self.project(element, diagnostics, next))
+                    .collect(),
+            },
+            Type::Slice(element) | Type::Array { type_: element, .. } => TypeRef::Array {
+                element: Box::new(self.project(element, diagnostics, next)),
+            },
+            Type::RawPointer { type_, .. } | Type::BorrowedRef { type_, .. } => TypeRef::ByRef {
+                element: Box::new(self.project(type_, diagnostics, next)),
+                reference_kind: TypeRefReferenceKind::Lvalue,
+            },
+            Type::FunctionPointer(pointer) => TypeRef::Function {
+                parameters: pointer
+                    .sig
+                    .inputs
+                    .iter()
+                    .map(|(name, ty)| Parameter {
+                        name: rust_parameter_name(name),
+                        r#type: self.project(ty, diagnostics, next),
+                        optional: false,
+                        variadic: false,
+                        role: None,
+                        passing_mode: Default::default(),
+                    })
+                    .collect(),
+                result: pointer
+                    .sig
+                    .output
+                    .as_ref()
+                    .map(|ty| Box::new(self.project(ty, diagnostics, next))),
+            },
+            Type::Pat { type_, .. } => self.project(type_, diagnostics, next),
+            // DeclarationFacts cannot encode Rust existential/trait-object bounds
+            // or associated projections without inventing one qualified-name
+            // string. Preserve that uncertainty explicitly instead of emitting
+            // Rust syntax (which is not a declaration identifier) as a name.
+            Type::DynTrait(_) | Type::ImplTrait(_) | Type::QualifiedPath { .. } => {
+                TypeRef::Wildcard {
+                    variance: WildcardVariance::Any,
+                    bound: None,
+                }
+            }
+            Type::Infer => TypeRef::named("_"),
+        }
+    }
+    fn path(
+        &self,
+        path: &RustdocPath,
+        diagnostics: &mut BoundedProducerDiagnostics,
+        depth: usize,
+    ) -> TypeRef {
+        let arguments = path
+            .args
+            .as_deref()
+            .map(|args| self.arguments(args, diagnostics, depth))
+            .unwrap_or_default();
+        if let Some(id) = self.type_ids.get(&path.id) {
+            TypeRef::Declared {
+                id: id.clone(),
+                arguments,
+                nullable: false,
+            }
+        } else {
+            TypeRef::Named {
+                name: normalized_path(path, self.document),
+                arguments,
+                nullable: false,
+            }
+        }
+    }
+
+    fn arguments(
+        &self,
+        args: &GenericArgs,
+        diagnostics: &mut BoundedProducerDiagnostics,
+        depth: usize,
+    ) -> Vec<TypeRef> {
+        match args {
+            GenericArgs::AngleBracketed { args, .. } => args
                 .iter()
-                .map(|element| {
-                    rust_type_ref(element, document, type_ids, limits, diagnostics, next)
+                .filter_map(|argument| match argument {
+                    GenericArg::Type(ty) => Some(self.project(ty, diagnostics, depth)),
+                    _ => None,
                 })
                 .collect(),
-        },
-        Type::Slice(element) | Type::Array { type_: element, .. } => TypeRef::Array {
-            element: Box::new(rust_type_ref(
-                element,
-                document,
-                type_ids,
-                limits,
-                diagnostics,
-                next,
-            )),
-        },
-        Type::RawPointer { type_, .. } | Type::BorrowedRef { type_, .. } => TypeRef::ByRef {
-            element: Box::new(rust_type_ref(
-                type_,
-                document,
-                type_ids,
-                limits,
-                diagnostics,
-                next,
-            )),
-            reference_kind: TypeRefReferenceKind::Lvalue,
-        },
-        Type::FunctionPointer(pointer) => TypeRef::Function {
-            parameters: pointer
-                .sig
-                .inputs
-                .iter()
-                .map(|(name, ty)| Parameter {
-                    name: rust_parameter_name(name),
-                    r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, next),
-                    optional: false,
-                    variadic: false,
-                    role: None,
-                    passing_mode: Default::default(),
-                })
-                .collect(),
-            result: pointer.sig.output.as_ref().map(|ty| {
-                Box::new(rust_type_ref(
-                    ty,
-                    document,
-                    type_ids,
-                    limits,
-                    diagnostics,
-                    next,
-                ))
-            }),
-        },
-        Type::Pat { type_, .. } => {
-            rust_type_ref(type_, document, type_ids, limits, diagnostics, next)
+            GenericArgs::Parenthesized { inputs, output } => {
+                let mut types = inputs
+                    .iter()
+                    .map(|ty| self.project(ty, diagnostics, depth))
+                    .collect::<Vec<_>>();
+                if let Some(output) = output {
+                    types.push(self.project(output, diagnostics, depth));
+                }
+                types
+            }
+            GenericArgs::ReturnTypeNotation => Vec::new(),
         }
-        // DeclarationFacts cannot encode Rust existential/trait-object bounds
-        // or associated projections without inventing one qualified-name
-        // string. Preserve that uncertainty explicitly instead of emitting
-        // Rust syntax (which is not a declaration identifier) as a name.
-        Type::DynTrait(_) | Type::ImplTrait(_) | Type::QualifiedPath { .. } => TypeRef::Wildcard {
-            variance: WildcardVariance::Any,
-            bound: None,
-        },
-        Type::Infer => TypeRef::named("_"),
     }
 }
 
@@ -2702,68 +2929,14 @@ fn path_type_ref(
     diagnostics: &mut BoundedProducerDiagnostics,
     depth: usize,
 ) -> TypeRef {
-    let arguments = path
-        .args
-        .as_deref()
-        .map(|args| generic_argument_types(args, document, type_ids, limits, diagnostics, depth))
-        .unwrap_or_default();
-    if let Some(id) = type_ids.get(&path.id) {
-        TypeRef::Declared {
-            id: id.clone(),
-            arguments,
-            nullable: false,
-        }
-    } else {
-        TypeRef::Named {
-            name: normalized_path(path, document),
-            arguments,
-            nullable: false,
-        }
+    RustdocTypeProjection {
+        document,
+        type_ids,
+        owner_type_parameters: &[],
+        self_type: None,
+        limits,
     }
-}
-
-fn generic_argument_types(
-    args: &GenericArgs,
-    document: &RustdocCrate,
-    type_ids: &HashMap<Id, String>,
-    limits: &ArtifactProducerLimits,
-    diagnostics: &mut BoundedProducerDiagnostics,
-    depth: usize,
-) -> Vec<TypeRef> {
-    match args {
-        GenericArgs::AngleBracketed { args, .. } => args
-            .iter()
-            .filter_map(|argument| match argument {
-                GenericArg::Type(ty) => Some(rust_type_ref(
-                    ty,
-                    document,
-                    type_ids,
-                    limits,
-                    diagnostics,
-                    depth,
-                )),
-                _ => None,
-            })
-            .collect(),
-        GenericArgs::Parenthesized { inputs, output } => {
-            let mut types = inputs
-                .iter()
-                .map(|ty| rust_type_ref(ty, document, type_ids, limits, diagnostics, depth))
-                .collect::<Vec<_>>();
-            if let Some(output) = output {
-                types.push(rust_type_ref(
-                    output,
-                    document,
-                    type_ids,
-                    limits,
-                    diagnostics,
-                    depth,
-                ));
-            }
-            types
-        }
-        GenericArgs::ReturnTypeNotation => Vec::new(),
-    }
+    .path(path, diagnostics, depth)
 }
 
 fn normalized_path(path: &RustdocPath, document: &RustdocCrate) -> String {
@@ -2883,7 +3056,7 @@ fn apply_impl_hierarchy(
         let ItemEnum::Impl(implementation) = &item.inner else {
             continue;
         };
-        if !projection.visible.contains(&item.id) || implementation.is_negative {
+        if !projection.visible.contains(&item.id) {
             continue;
         }
         let diagnostics_before = diagnostics.total();
@@ -2895,7 +3068,6 @@ fn apply_impl_hierarchy(
             limits,
             diagnostics,
             hierarchy_seen,
-            links,
         );
         if diagnostics.total() != diagnostics_before
             && implementation.blanket_impl.is_none()
@@ -2907,7 +3079,34 @@ fn apply_impl_hierarchy(
         {
             links.incomplete_callable_owners.insert(owner);
         }
+        project_impl_contract(
+            item,
+            implementation,
+            projection,
+            types,
+            limits,
+            diagnostics,
+            links,
+        );
     }
+}
+
+fn compiler_derived_trait_impl(
+    implementation: &rustdoc_types::Impl,
+    document: &RustdocCrate,
+) -> bool {
+    implementation.is_synthetic
+        || implementation.trait_.as_ref().is_some_and(|trait_| {
+            matches!(document.index.get(&trait_.id).map(|item| &item.inner),
+            Some(ItemEnum::Trait(ty)) if ty.is_auto)
+                || matches!(
+                    normalized_path(trait_, document).as_str(),
+                    "core.marker.Send"
+                        | "core.marker.Sync"
+                        | "core.marker.Unpin"
+                        | "core.marker.Sized"
+                )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2919,7 +3118,6 @@ fn project_impl_hierarchy(
     limits: &ArtifactProducerLimits,
     diagnostics: &mut BoundedProducerDiagnostics,
     hierarchy_seen: &mut [RandomHashSet<HierarchyFact>],
-    links: &mut SourceSetLinks,
 ) {
     // Rustdoc repeats blanket impls on each displayed receiver. Their `for_`
     // is instantiated for that receiver, but their binders still belong to
@@ -2930,6 +3128,9 @@ fn project_impl_hierarchy(
             Some(format!("item.{}", item.id.0)),
             "blanket implementation presentation copy was not projected",
         );
+        return;
+    }
+    if compiler_derived_trait_impl(implementation, projection.document) {
         return;
     }
     for id in &implementation.items {
@@ -2944,63 +3145,8 @@ fn project_impl_hierarchy(
             );
         }
     }
-    if let Some(trait_) = &implementation.trait_ {
-        let implementation_fact = implemented_trait_fact(
-            implementation,
-            projection.document,
-            projection.type_ids,
-            limits,
-            diagnostics,
-        );
-        if let Some(name) = projection
-            .names
-            .get(&item.id)
-            .cloned()
-            .or_else(|| resolved_type_name(&implementation.for_, projection.document))
-            && let Some(owner_item) = projection.type_item_by_name.get(&name)
-        {
-            let position = projection.type_position[owner_item];
-            let mut concrete_fact = implementation_fact.clone();
-            bind_concrete_implementation(
-                &mut concrete_fact,
-                &implementation.for_,
-                &types[position].type_parameters,
-            );
-            union_facts(&mut types[position].implemented_traits, vec![concrete_fact]);
-        }
-        if !implementation.generics.params.is_empty()
-            && let Some(pattern) = self_pattern(
-                &implementation.for_,
-                projection.document,
-                projection.type_ids,
-                limits,
-                diagnostics,
-                0,
-            )
-            && is_forwarding_self(&implementation.for_, projection.document)
-        {
-            let fact = GenericTraitImplFact {
-                type_parameters: generic_names(&implementation.generics),
-                self_pattern: pattern,
-                bounds: generic_trait_bounds(
-                    &implementation.generics,
-                    projection.document,
-                    projection.type_ids,
-                    limits,
-                    diagnostics,
-                ),
-                implementation: implementation_fact,
-            };
-            if !fact.bounds.is_empty() {
-                if let Some(position) = projection.type_position.get(&trait_.id) {
-                    union_facts(&mut types[*position].generic_trait_impls, vec![fact]);
-                } else {
-                    links
-                        .generic_trait_impls
-                        .push((normalized_path(trait_, projection.document), fact));
-                }
-            }
-        }
+    if implementation.is_negative {
+        return;
     }
     let Some(owner_name) = projection
         .names
@@ -3037,6 +3183,201 @@ fn project_impl_hierarchy(
     };
     if hierarchy_seen[position].insert(hierarchy.clone()) {
         types[position].hierarchy.push(hierarchy);
+    }
+}
+
+fn project_impl_contract(
+    item: &Item,
+    implementation: &rustdoc_types::Impl,
+    projection: &RustdocProjectionIndex<'_>,
+    types: &mut [TypeFact],
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    links: &mut SourceSetLinks,
+) {
+    if implementation.blanket_impl.is_some() {
+        return;
+    }
+    if let Some(trait_) = &implementation.trait_ {
+        let trait_name = normalized_path(trait_, projection.document);
+        if compiler_derived_trait_impl(implementation, projection.document) {
+            links.auto_traits.insert(trait_name);
+            return;
+        }
+        let owner_name = projection
+            .names
+            .get(&item.id)
+            .cloned()
+            .or_else(|| resolved_type_name(&implementation.for_, projection.document));
+        let mut implementation_fact = implemented_trait_fact(
+            implementation,
+            projection.document,
+            projection.type_ids,
+            limits,
+            diagnostics,
+        );
+        implementation_fact.is_negative = implementation.is_negative;
+        let parameters = generic_names(&implementation.generics);
+        let mut bounds = generic_trait_bounds(
+            &implementation.generics,
+            projection.document,
+            projection.type_ids,
+            limits,
+            diagnostics,
+        );
+        let self_type = contract_type_ref(
+            &implementation.for_,
+            projection.document,
+            projection.type_ids,
+            limits,
+            diagnostics,
+            0,
+        );
+        // Unsupported predicates and erased types cannot justify negative
+        // evidence or a closed inventory. Keep other owners independently usable.
+        let mut reviewed = implementation_conditions_supported(&implementation.generics);
+        let roots = std::iter::once(&self_type)
+            .chain(std::iter::once(&implementation_fact.trait_type))
+            .chain(
+                implementation_fact
+                    .associated_types
+                    .iter()
+                    .map(|binding| &binding.r#type),
+            )
+            .chain(bounds.iter().flat_map(|bound| {
+                std::iter::once(&bound.subject)
+                    .chain(std::iter::once(&bound.bound.trait_type))
+                    .chain(
+                        bound
+                            .bound
+                            .associated_types
+                            .iter()
+                            .map(|binding| &binding.r#type),
+                    )
+            }));
+        brokk_bifrost_semantic::analyzer::semantic::common::visit_type_refs(roots, |ty| {
+            reviewed &= match ty {
+                TypeRef::Unknown => false,
+                TypeRef::TypeParameter { name } => parameters.contains(name) || name == "Self",
+                _ => true,
+            };
+        });
+        let mut conditions_reviewed = true;
+        brokk_bifrost_semantic::analyzer::semantic::common::visit_type_refs(
+            bounds
+                .iter()
+                .flat_map(|bound| [&bound.subject, &bound.bound.trait_type]),
+            |ty| {
+                conditions_reviewed &=
+                    !matches!(ty, TypeRef::ByRef { .. } | TypeRef::Pointer { .. })
+            },
+        );
+        reviewed &= conditions_reviewed;
+        let mut pattern = self_pattern(
+            &implementation.for_,
+            projection.document,
+            projection.type_ids,
+            limits,
+            diagnostics,
+            0,
+        );
+        let mut pattern_reviewed = pattern.is_some();
+        if let Some(pattern) = &pattern {
+            let mut pending = vec![pattern];
+            while let Some(pattern) = pending.pop() {
+                match pattern {
+                    RustSelfPattern::Reference { inner, .. } => pending.push(inner),
+                    RustSelfPattern::Constructor { owner, arguments } => {
+                        brokk_bifrost_semantic::analyzer::semantic::common::visit_type_refs(
+                            [owner],
+                            |ty| {
+                                pattern_reviewed &= match ty {
+                                    TypeRef::Unknown
+                                    | TypeRef::ByRef { .. }
+                                    | TypeRef::Pointer { .. } => false,
+                                    TypeRef::TypeParameter { name } => {
+                                        parameters.contains(name) || name == "Self"
+                                    }
+                                    _ => true,
+                                }
+                            },
+                        );
+                        pending.extend(arguments);
+                    }
+                    RustSelfPattern::Parameter { name } => {
+                        pattern_reviewed &= parameters.contains(name) || name == "Self"
+                    }
+                }
+            }
+        }
+        if !reviewed || !pattern_reviewed {
+            // The list remains exhaustive; applicability is explicitly open.
+            // Unknown is not an impossible condition, including for negatives.
+            if !pattern_reviewed {
+                pattern = Some(RustSelfPattern::Constructor {
+                    owner: TypeRef::Unknown,
+                    arguments: Vec::new(),
+                });
+            }
+            bounds = vec![GenericTraitBound {
+                subject: TypeRef::Unknown,
+                bound: ImplementedTraitFact {
+                    is_negative: false,
+                    type_parameters: Vec::new(),
+                    self_pattern: None,
+                    bounds: Vec::new(),
+                    trait_type: TypeRef::Unknown,
+                    associated_types: Vec::new(),
+                },
+                maybe: false,
+            }];
+            for binding in &mut implementation_fact.associated_types {
+                binding.r#type = TypeRef::Unknown;
+            }
+            // A Path always retains the trait's identity even if its arguments
+            // cannot be represented. Erase arguments rather than its owner.
+            if let TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } =
+                &mut implementation_fact.trait_type
+            {
+                arguments
+                    .iter_mut()
+                    .for_each(|argument| *argument = TypeRef::Unknown);
+            }
+            diagnostics.warning("rust.rustdoc.impl_conditions_unreviewed",
+                Some(format!("item.{}", item.id.0)),
+                "implementation retained with unknown applicability: unsupported types or predicates");
+        }
+        // Lifetime-only and non-nominal targets still need a trait-owned
+        // rule when no concrete declaration can carry their applicability.
+        let needs_rule = !implementation.generics.params.is_empty() || owner_name.is_none();
+        let mut concrete = implementation_fact.clone();
+        concrete.type_parameters = parameters.clone();
+        concrete.self_pattern = pattern.clone();
+        concrete.bounds = bounds.clone();
+        if let Some(owner_item) = owner_name
+            .as_ref()
+            .and_then(|name| projection.type_item_by_name.get(name))
+        {
+            let position = projection.type_position[owner_item];
+            union_facts(&mut types[position].implemented_traits, vec![concrete]);
+        } else if let Some(owner) = owner_name {
+            // A source-set trait can implement a type defined by another
+            // document. Its defining type need not be repeated locally.
+            links.concrete_trait_impls.push((owner, concrete));
+        }
+        if needs_rule {
+            let fact = GenericTraitImplFact {
+                type_parameters: parameters,
+                self_pattern: pattern.expect("reviewed generic self pattern"),
+                bounds,
+                implementation: implementation_fact,
+            };
+            if let Some(position) = projection.type_position.get(&trait_.id) {
+                union_facts(&mut types[*position].generic_trait_impls, vec![fact]);
+            } else {
+                links.generic_trait_impls.push((trait_name, fact));
+            }
+        }
     }
 }
 
@@ -3905,9 +4246,9 @@ mod tests {
         let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
         assert_eq!(
             lowest_schema_version(&pack, &CompilerOptions::default()).unwrap(),
-            18
+            19
         );
-        assert_eq!(compiled.shards.len(), 3);
+        assert_eq!(compiled.shards.len(), 1, "small modules share one shard");
         assert!(
             pack.shards
                 .iter()
@@ -3980,21 +4321,88 @@ mod tests {
             .unwrap();
         // Required acceptance: no overridden method is needed to retain this
         // implementation and its associated binding.
+        let direct = widget.implemented_traits.iter().find(|fact|
+            matches!(&fact.trait_type, TypeRef::Declared { id, .. } if id == &traverse.id)).unwrap();
+        assert_eq!(direct.type_parameters, ["T"]);
         assert_eq!(
-            widget.implemented_traits,
-            [ImplementedTraitFact {
-                trait_type: TypeRef::Declared {
-                    id: traverse.id.clone(),
-                    arguments: vec![],
-                    nullable: false
+            direct.bounds.len(),
+            2,
+            "explicit conditions and implicit Sized survive"
+        );
+        assert!(direct.self_pattern.is_some());
+        assert_eq!(
+            direct.associated_types,
+            [AssociatedTypeBinding {
+                name: "Item".into(),
+                r#type: TypeRef::Slice {
+                    element: Box::new(TypeRef::TypeParameter { name: "T".into() })
                 },
-                associated_types: vec![AssociatedTypeBinding {
-                    name: "Item".into(),
-                    r#type: TypeRef::Slice {
-                        element: Box::new(TypeRef::TypeParameter { name: "T".into() })
-                    }
-                }],
             }]
+        );
+        assert!(
+            widget
+                .implemented_traits
+                .iter()
+                .any(|fact| fact.type_parameters.is_empty()
+                    && matches!(&fact.trait_type,
+                TypeRef::Named { name, .. } if name == "core.Traverse")),
+            "a concrete impl in alloc joins its owner from core"
+        );
+        assert!(widget.implemented_traits_complete);
+        assert!(traverse.generic_trait_impls_complete);
+        let forbidden = types.iter().find(|ty| ty.name == "core.Forbidden").unwrap();
+        let blanket = types.iter().find(|ty| ty.name == "core.Blanket").unwrap();
+        let auto = types
+            .iter()
+            .find(|ty| ty.name == "core.marker.Send")
+            .unwrap();
+        assert!(!auto.generic_trait_impls_complete);
+        assert!(auto.generic_trait_impls.is_empty());
+        let blanket_rule = &blanket.generic_trait_impls[0];
+        assert!(
+            matches!(&blanket_rule.self_pattern, RustSelfPattern::Parameter { name } if name == "T")
+        );
+        assert_eq!(blanket_rule.bounds.len(), 2);
+        use brokk_bifrost_semantic::analyzer::semantic_model::provably_does_not_implement;
+        // Explicit negative evidence rules out the rival, independently of coverage.
+        let mut open_widget = widget.clone();
+        std::sync::Arc::make_mut(&mut open_widget).implemented_traits_complete = false;
+        assert!(provably_does_not_implement(
+            &open_widget,
+            forbidden,
+            |_| Some(true),
+            |_| None
+        ));
+        // Both exhaustive inventories are needed to dismiss an absent rival.
+        assert!(provably_does_not_implement(
+            widget,
+            blanket,
+            |_| Some(false),
+            |_| Some(false)
+        ));
+        assert!(!provably_does_not_implement(
+            &open_widget,
+            blanket,
+            |_| Some(false),
+            |_| Some(false)
+        ));
+        let mut open_blanket = blanket.clone();
+        std::sync::Arc::make_mut(&mut open_blanket).generic_trait_impls_complete = false;
+        assert!(!provably_does_not_implement(
+            widget,
+            &open_blanket,
+            |_| Some(false),
+            |_| Some(false)
+        ));
+        assert!(!provably_does_not_implement(
+            widget,
+            blanket,
+            |_| Some(false),
+            |_| None
+        ));
+        assert!(
+            !provably_does_not_implement(widget, auto, |_| Some(false), |_| Some(false)),
+            "a compiler-derived auto-trait rival stays unknown"
         );
         assert!(
             !members
@@ -4083,31 +4491,79 @@ mod tests {
             .find(|fact| fact.name == "alloc.boxed.Box")
             .unwrap();
         assert!(boxed.implemented_traits.is_empty());
-        let forwarding = &traverse.generic_trait_impls;
-        assert_eq!(
-            forwarding.len(),
-            1,
-            "external core trait impl from alloc must join its defining owner"
+        let constructed = TypeRef::Declared {
+            id: boxed.id.clone(),
+            arguments: vec![
+                TypeRef::TypeParameter { name: "I".into() },
+                TypeRef::named("u8"),
+            ],
+            nullable: false,
+        };
+        for (name, expected) in [
+            ("new", constructed.clone()),
+            (
+                "as_self",
+                TypeRef::ByRef {
+                    element: Box::new(constructed),
+                    reference_kind: TypeRefReferenceKind::Lvalue,
+                },
+            ),
+        ] {
+            let member = members
+                .iter()
+                .find(|member| member.owner == boxed.id && member.name == name)
+                .unwrap();
+            assert_eq!(member.signature.as_ref().unwrap().returns, Some(expected));
+        }
+        let slice = members
+            .iter()
+            .find(|member| member.owner == "core.primitive.slice" && member.name == "iter")
+            .expect("alloc extension of core's primitive survives the join");
+        assert!(slice.callable_family_complete);
+        assert!(!members.iter().any(|member| member.name == "missing_owner"));
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.code == "rust.rustdoc.missing_member_owner"
+                        && diagnostic.declaration.as_deref() == Some("core.primitive.i128")
+                )
         );
+        assert!(
+            !production
+                .diagnostics
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.code == "rust.rustdoc.missing_member_owner"
+                        && diagnostic.declaration.as_deref() == Some("core.primitive.slice")
+                )
+        );
+
+        let forwarding = traverse
+            .generic_trait_impls
+            .iter()
+            .find(|fact| matches!(fact.self_pattern, RustSelfPattern::Reference { .. }))
+            .unwrap();
         assert_eq!(
-            forwarding[0].self_pattern,
+            forwarding.self_pattern,
             RustSelfPattern::Reference {
                 mutable: true,
-                inner: Box::new(RustSelfPattern::Parameter { name: "I".into() })
+                inner: Box::new(RustSelfPattern::Parameter { name: "I".into() }),
             }
         );
-        assert_eq!(forwarding[0].bounds.len(), 2);
-        assert!(forwarding[0].bounds[1].maybe);
+        assert_eq!(forwarding.bounds.len(), 2);
+        assert!(forwarding.bounds[1].maybe);
         assert_eq!(
-            forwarding[0].implementation.associated_types,
+            forwarding.implementation.associated_types,
             [AssociatedTypeBinding {
                 name: "Item".into(),
                 r#type: TypeRef::Projection {
                     owner: Box::new(TypeRef::TypeParameter { name: "I".into() }),
                     trait_type: Some(Box::new(TypeRef::named("core.Traverse"))),
                     name: "Item".into(),
-                    arguments: vec![]
-                }
+                    arguments: vec![],
+                },
             }]
         );
         assert_eq!(pack.completeness, Completeness::Partial);
@@ -4202,6 +4658,13 @@ mod tests {
             && !fact.callable_family_complete));
 
         let mut old = pack.clone();
+        old.schema_version = 18;
+        assert!(
+            compile_pack(&old, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "declaration.impl_self_schema_version")
+        );
         old.schema_version = 17;
         assert!(
             compile_pack(&old, &CompilerOptions::default())
@@ -4617,7 +5080,7 @@ mod tests {
                 format!("{}.json", fact.name.split('.').next().unwrap())
             );
         }
-        assert_eq!(pack.shards.len(), 3);
+        assert_eq!(pack.shards.len(), 1, "small source sets fit one shard");
         assert!(
             pack.shards
                 .iter()

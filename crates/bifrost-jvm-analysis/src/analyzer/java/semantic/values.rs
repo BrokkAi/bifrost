@@ -318,6 +318,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         value,
                     });
             }
+            // A pattern variable has no lowered binding. Its name is kept so
+            // that a reference to it can say so.
+            if let Some(binder) =
+                brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)
+                && let Some(text) = node_text(self.prepared.source(), binder)
+            {
+                self.pattern_variable_names.insert(text.into());
+            }
             Ok(WalkControl::Continue)
         })
     }
@@ -479,6 +487,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
         self.constant_index_values.insert(text.into(), value);
+        Ok(value)
+    }
+
+    /// The canonical value of array position `ordinal`, the one every
+    /// `array[ordinal]` access that spells that decimal literal shares (see
+    /// [`Self::index_value`]). An array initializer stores its elements at
+    /// these values so a later constant-index read finds the same location.
+    pub(in crate::analyzer::java::semantic) fn ordinal_index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        ordinal: usize,
+    ) -> Result<ValueId, JavaLoweringError> {
+        let spelling = ordinal.to_string();
+        if let Some(value) = self.constant_index_values.get(spelling.as_str()) {
+            return Ok(*value);
+        }
+        let value = self.value(builder, point, SemanticValueKind::Constant)?;
+        self.constant_index_values.insert(spelling.into(), value);
         Ok(value)
     }
 

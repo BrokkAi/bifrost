@@ -80,7 +80,7 @@ type CrateKey = [u8; 32];
 /// rotating the epoch for a consumer-side change would make every Rust blob
 /// dirty and force a full reparse of a warm store.
 #[doc(hidden)]
-pub const RUST_CRATE_DERIVATION_VERSION: &str = "4460-2026-10-07-module-self-imports-target-has-atomic-cfg-attr-derived-surface-generated-attribute-boundary-fact-enum-variant-export-set-2026-10-08-cycle-only-forced-wave-2026-10-09-primitive-shadowing-5235-2026-10-14-item-macro-guess-scope-5375-2026-10-15-reverse-inventory-5375-2026-10-16-v2-composite-primitive-shadowing-5243-2026-10-15-reverse-inventory-5375-2026-10-16-v3-enumerated-inputs-5517-cfg-if-ordered-items-and-conditional-imports-5172-2026-10-17-conditional-macro-frontiers-constructor-visibility-5133-2026-10-15-forwarded-public-surface-5133-2026-10-17-rust-route-precedence-5780-v6-admitted-binding-provenance-5658-p2-own-binding-authority-native-namespaces-owner-gap-certificates-owner-wide-propagation-6046-own-member-source-paths-prelude-root-witnesses-6102-gap-subject-levels-6136-settled-terminal-lookups-6114-glob-own-root-lookup-6389-associated-macro-contexts-inherent-impl-subjects-6394";
+pub const RUST_CRATE_DERIVATION_VERSION: &str = "4460-2026-10-07-module-self-imports-target-has-atomic-cfg-attr-derived-surface-generated-attribute-boundary-fact-enum-variant-export-set-2026-10-08-cycle-only-forced-wave-2026-10-09-primitive-shadowing-5235-2026-10-14-item-macro-guess-scope-5375-2026-10-15-reverse-inventory-5375-2026-10-16-v2-composite-primitive-shadowing-5243-2026-10-15-reverse-inventory-5375-2026-10-16-v3-enumerated-inputs-5517-cfg-if-ordered-items-and-conditional-imports-5172-2026-10-17-conditional-macro-frontiers-constructor-visibility-5133-2026-10-15-forwarded-public-surface-5133-2026-10-17-rust-route-precedence-5780-v6-admitted-binding-provenance-5658-p2-own-binding-authority-native-namespaces-owner-gap-certificates-owner-wide-propagation-6046-own-member-source-paths-prelude-root-witnesses-6102-gap-subject-levels-6136-settled-terminal-lookups-6114-glob-own-root-lookup-6389-associated-macro-contexts-inherent-impl-subjects-6394-duplicate-module-macro-scope-v1-absent-feature-cfg-inactive-v1-workspace-exclude-curdir-patch-version-topology-v1-macro-replay-path-module-walk-6861-v1-6846-cargo-literal-exclude-selected-build-features-v1";
 
 /// Set by `crate_topology_digests_follow_the_derivation_version` and
 /// `warm_derivation_version_rotation_replaces_same_revision_versions` so that a
@@ -342,6 +342,35 @@ struct WalkRow {
     mount_start: Option<i64>,
     activation: i64,
     parent_path: Option<String>,
+}
+
+impl WalkRow {
+    fn placement_gap(&self, counts: &HashMap<&str, usize>) -> Option<&'static str> {
+        if self.activation == 0 {
+            Some("inactive_placement")
+        } else if self.activation < 0 {
+            Some("unknown_activation")
+        } else if self.blob.is_none() {
+            Some("unplaced_module")
+        } else if counts.get(self.module_path.as_str()).copied().unwrap_or(0) > 1 {
+            Some("duplicate_placement")
+        } else {
+            None
+        }
+    }
+}
+
+// A file placed under different module paths supplies distinct modules. Only
+// active non-include placements of the same module path conflict; includes
+// contribute to their host module rather than declaring another placement.
+fn active_placement_counts(rows: &[WalkRow]) -> HashMap<&str, usize> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        if row.placement != "include" && row.activation == 1 {
+            *counts.entry(row.module_path.as_str()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// One item-position macro decision used while walking a crate's module tree.
@@ -1229,7 +1258,10 @@ impl AnalyzerStore {
             // left inactive, duplicated or undecided is not a member, so its
             // file neither inherits the mounting file's `macro_rules!` nor
             // offers its own invocations for decision.
-            let mounted = rows.iter().filter(|row| row.activation == 1);
+            let counts = active_placement_counts(&rows);
+            let mounted = rows
+                .iter()
+                .filter(|row| row.placement_gap(&counts).is_none());
             let mounts = serde_json::Value::Array(
                 mounted
                     .clone()
@@ -1332,21 +1364,7 @@ impl AnalyzerStore {
             });
             self.walk_crate_modules(&conn, stable_path(&item.target.root_path), &cfg)?
         };
-        // A duplicate placement is keyed on the module path, not on the file.
-        // rustc compiles a file reached from two `mod` declarations once per
-        // declaration, and the two results are distinct modules that hold
-        // distinct items, so two placements of one file under two module paths
-        // are two rows here. What the crate rows cannot hold is one module path
-        // placed from two files, which is what `mod foo;` means when `foo.rs`
-        // and `foo/mod.rs` both exist; that stays a gap. Only an active
-        // placement can conflict, because an inactive or undecided one is not a
-        // member and already carries its own gap kind.
-        let mut counts = HashMap::new();
-        for row in &rows {
-            if row.placement != "include" && row.activation == 1 {
-                *counts.entry(&row.module_path).or_insert(0) += 1;
-            }
-        }
+        let counts = active_placement_counts(&rows);
         let mut modules = Vec::new();
         let mut gaps = Vec::new();
         if let Some(error) = &item.inventory_error {
@@ -1356,29 +1374,18 @@ impl AnalyzerStore {
                 detail: serde_json::json!({"reason": error}).to_string(),
             });
         }
-        for WalkRow {
-            module_path,
-            blob,
-            scope,
-            path,
-            placement,
-            activation,
-            parent_path,
-            ..
-        } in &rows
-        {
-            let kind = if *activation == 0 {
-                Some("inactive_placement")
-            } else if *activation < 0 {
-                Some("unknown_activation")
-            } else if blob.is_none() {
-                Some("unplaced_module")
-            } else if counts.get(module_path).copied().unwrap_or(0) > 1 {
-                Some("duplicate_placement")
-            } else {
-                None
-            };
-            if let Some(kind) = kind {
+        for row in &rows {
+            let WalkRow {
+                module_path,
+                blob,
+                scope,
+                path,
+                placement,
+                activation,
+                parent_path,
+                ..
+            } = row;
+            if let Some(kind) = row.placement_gap(&counts) {
                 gaps.push(Gap {
                     kind,
                     subject: module_path.clone(),
@@ -1825,8 +1832,13 @@ pub(super) fn register_functions(conn: &Connection) -> Result<()> {
         Ok(path.map(|path| stable_path(Path::new(&path).parent().unwrap_or(Path::new("")))))
     })?;
     conn.create_scalar_function("cr_join", 2, flags, |context| {
-        let base: String = context.get(0)?;
-        let path: String = context.get(1)?;
+        let base: Option<String> = context.get(0)?;
+        let path: Option<String> = context.get(1)?;
+        // An escaping inline #[path] has no directory. Descendants retain
+        // that missing placement instead of passing NULL to a String reader.
+        let (Some(base), Some(path)) = (base, path) else {
+            return Ok(None);
+        };
         let mut result = PathBuf::from(base);
         for part in Path::new(&path).components() {
             match part {
@@ -2212,4 +2224,138 @@ pub fn prepare_pin_context(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_PENDING_CRATES_SQL)?;
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS rust_schedule_live(crate_key BLOB PRIMARY KEY, topology_id INTEGER NOT NULL, surface BLOB NOT NULL) WITHOUT ROWID, STRICT")?;
     derivation::prepare_tables(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn sql_cfg_preserves_incomplete_features() {
+        use brokk_bifrost_core::analyzer::rust_facts::{
+            RustCfgCondition, encode_rust_cfg_condition,
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        let condition =
+            encode_rust_cfg_condition(&RustCfgCondition::Atom("feature = \"x\"".into()));
+        let activation: (i32, i32) = conn
+            .query_row(
+                r#"SELECT cr_cfg(?1, '[]'),
+                          cr_cfg(?1, '["bifrost_incomplete_features"]')"#,
+                params![condition],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            activation,
+            (0, -1),
+            "complete: Inactive; incomplete: Unknown"
+        );
+    }
+
+    #[test]
+    #[hardwon("#6861: descendants of an escaping inline path must retain missing placement")]
+    fn module_path_joins_propagate_missing_directory() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        let joined: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cr_join('src', 'alt'),
+                    cr_join('src', '../../outside'),
+                    cr_join(cr_join('src', '../../outside'), 'child.rs')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(joined, (Some("src/alt".to_owned()), None, None));
+    }
+
+    #[test]
+    #[hardwon(
+        "4fb16a86137c: duplicate module placements leaked macro_use scope into item decisions"
+    )]
+    fn duplicate_module_placements_do_not_supply_macro_scope() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        // Minimal query-input projection of this two-file crate:
+        // lib.rs: #[path = "macros.rs"] mod duplicate;
+        //         #[macro_use] #[path = "macros.rs"] mod duplicate;
+        //         pass! { pub struct Leaked; }
+        // macros.rs: macro_rules! pass { ($item:item) => { $item }; }
+        // Keep the fixture at the store boundary: both production SQL queries
+        // and the production fixed-point loop run against these source rows.
+        conn.execute_batch(
+            "CREATE TABLE blobs(id, blob_oid, lang, generation);
+             INSERT INTO blobs VALUES(1,'root','rust',0),(2,'macros','rust',0);
+             CREATE TABLE workspace_file_versions(file_version_id, rel_path, blob_oid, lang, generation);
+             INSERT INTO workspace_file_versions VALUES
+               (1,'src/lib.rs','root','rust',0),(2,'src/macros.rs','macros','rust',0);
+             CREATE VIEW selected_workspace_file_versions AS SELECT * FROM workspace_file_versions;
+             CREATE TABLE source_declarations(blob_id, declaration_id, start_byte, end_byte);
+             INSERT INTO source_declarations VALUES(1,0,0,10),(1,1,20,30);
+             CREATE TABLE source_rust_module_declarations(
+               blob_id, declaration_id, module_name, body_occurrence_id,
+               path_attribute, body_start_byte, body_end_byte, macro_use);
+             INSERT INTO source_rust_module_declarations VALUES
+               (1,0,'duplicate',NULL,'macros.rs',NULL,NULL,0),
+               (1,1,'duplicate',NULL,'macros.rs',NULL,NULL,1);
+             CREATE TABLE source_rust_module_scopes(blob_id, ordinal, parent_ordinal, declaration_id);
+             CREATE TABLE source_rust_declaration_properties(blob_id, declaration_id, cfg_condition, macro_exported);
+             INSERT INTO source_rust_declaration_properties VALUES(1,0,'always',0),(1,1,'always',0);
+             CREATE TABLE source_rust_module_routes(blob_id, ordinal, scope_ordinal, declaration_id);
+             INSERT INTO source_rust_module_routes VALUES(1,0,0,0),(1,1,0,1);
+             CREATE TABLE source_rust_module_route_gates(blob_id, route_ordinal, invocation_occurrence_id);
+             CREATE TABLE rust_include_edges(blob_id, relative_path, include_start);
+             CREATE TABLE source_rust_item_macro_expansions(
+               blob_id, invocation_occurrence_id, invocation_start_byte, invocation_end_byte,
+               source_position, expansion_kind);
+             INSERT INTO source_rust_item_macro_expansions VALUES(1,7,40,70,0,0);
+             CREATE TABLE source_rust_macro_invocations(blob_id, occurrence_id, macro_name);
+             INSERT INTO source_rust_macro_invocations VALUES(1,7,'pass');
+             CREATE TABLE rust_item_macros(
+               blob_id, declaration_id, macro_name, passthrough, decoration_cfg,
+               scope_start, scope_end, visible_after);
+             INSERT INTO rust_item_macros VALUES(2,0,'pass',1,'always',0,100,60);
+             CREATE TABLE source_rust_item_contexts(
+               blob_id, context_kind, parent_occurrence_id, start_byte, end_byte);
+             INSERT INTO source_rust_item_contexts VALUES(2,0,NULL,0,100);
+             CREATE TABLE source_rust_macro_inputs(blob_id, invocation_occurrence_id, native_gap_site);
+             INSERT INTO source_rust_macro_inputs VALUES(1,7,7);
+             CREATE TABLE source_rust_import_targets(blob_id, bound_name, is_glob, is_macro_use);",
+        )
+        .unwrap();
+
+        let (rows, decisions) = store
+            .walk_crate_modules(&conn, "src/lib.rs".to_string(), "[]")
+            .unwrap();
+        let duplicate_mounts: Vec<_> = rows
+            .iter()
+            .filter(|row| row.module_path == "crate::duplicate" && row.activation == 1)
+            .map(|row| (row.blob, row.mount_start))
+            .collect();
+        assert_eq!(
+            duplicate_mounts,
+            vec![(Some(2), Some(0)), (Some(2), Some(20))]
+        );
+        let admitted: Vec<_> = decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision.blob_id,
+                    decision.invocation_occurrence_id,
+                    decision.decoration_cfg.as_str(),
+                    decision.no_route,
+                )
+            })
+            .collect();
+        assert_eq!(
+            admitted,
+            vec![],
+            "rejected duplicate mounts cannot export pass!"
+        );
+    }
 }

@@ -48,7 +48,6 @@ use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFil
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::text_utils::compute_line_starts;
-use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
@@ -60,20 +59,6 @@ pub struct ParsedFile {
 
 pub struct PythonProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
-}
-
-impl PythonProjectGraph {
-    pub fn scan_files(
-        &self,
-        candidate_files: &HashSet<ProjectFile>,
-        target_file: &ProjectFile,
-    ) -> HashSet<ProjectFile> {
-        candidate_files
-            .iter()
-            .cloned()
-            .chain(std::iter::once(target_file.clone()))
-            .collect()
-    }
 }
 
 pub fn build_python_graph(
@@ -159,76 +144,6 @@ impl<'a> PythonScanTarget<'a> {
             member_unique_in_target_file,
         }
     }
-}
-
-/// Scan a set of files, retaining the historical whole-set API for callers
-/// that do not need per-file frontier replay.
-pub fn scan_files_for_seeds(
-    graph: &PythonGraphSource<'_>,
-    python: &dyn PythonUsageSource,
-    project_graph: &PythonProjectGraph,
-    files: &HashSet<ProjectFile>,
-    target: &CodeUnit,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-    cancellation: Option<&CancellationToken>,
-) -> Result<ScanResult, HashSet<ProjectFile>> {
-    let scan_target = PythonScanTarget::new(graph.index, target);
-    let results = files
-        .par_iter()
-        .map(|file| {
-            scan_file_for_seeds(
-                graph,
-                python,
-                project_graph,
-                file,
-                &scan_target,
-                seeds,
-                cancellation,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut collected = ScanResult::default();
-    let mut missing = HashSet::default();
-    for result in results {
-        match result {
-            Ok(result) => {
-                collected.hits.extend(result.hits);
-                collected.unproven_hits.extend(result.unproven_hits);
-            }
-            Err(file) => {
-                missing.insert(file);
-            }
-        }
-    }
-    if missing.is_empty() {
-        Ok(collected)
-    } else {
-        Err(missing)
-    }
-}
-
-/// Scan one file against one target. The owned result is suitable for replay
-/// by a relational item frontier: no provisional result is published through
-/// shared state.
-pub fn scan_file_for_seeds(
-    graph: &PythonGraphSource<'_>,
-    python: &dyn PythonUsageSource,
-    project_graph: &PythonProjectGraph,
-    file: &ProjectFile,
-    scan_target: &PythonScanTarget<'_>,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-    cancellation: Option<&CancellationToken>,
-) -> Result<ScanResult, ProjectFile> {
-    scan_file_for_seed_batch(
-        graph,
-        python,
-        project_graph,
-        file,
-        &[(graph, scan_target, seeds)],
-        cancellation,
-    )
-    .pop()
-    .expect("one scan target has one result")
 }
 
 /// One target's resolver snapshot, immutable facts and import/re-export seeds.

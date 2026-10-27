@@ -493,8 +493,10 @@ fn export_semantic_document<'a>(
     let mut symbols = Vec::new();
     let mut declarations = Vec::new();
     let mut seen_symbols = HashSet::new();
-    let go_types_by_id: HashMap<String, &TypeFact> =
-        types.iter().map(|fact| (fact.id.clone(), *fact)).collect();
+    let go_types_by_id: HashMap<String, &TypeFact> = types
+        .iter()
+        .map(|fact| (fact.id.clone(), fact.as_ref()))
+        .collect();
     #[allow(clippy::too_many_arguments)]
     fn ensure_type(
         name: &str,

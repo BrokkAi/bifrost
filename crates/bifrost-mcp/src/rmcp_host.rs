@@ -71,7 +71,7 @@ use tokio_util::sync::CancellationToken as McpCancellationToken;
 /// Bifrost used to publish this as `serverInfo.buildIdentity`, but
 /// `rmcp::model::Implementation` is a closed struct with no extension point.
 /// `_meta` is the protocol's sanctioned place for vendor fields, so the facade
-/// identity moves here. Consumers: `tests/mcp_build_identity_facade.rs` and
+/// identity moves here. Consumers: `tests/suite_mcp_cli/mcp_build_identity_facade.rs` and
 /// `src/benchmark/mcp_session.rs`.
 pub const BUILD_IDENTITY_META_KEY: &str = "io.bifrost/build-identity";
 

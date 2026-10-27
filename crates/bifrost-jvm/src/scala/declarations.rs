@@ -172,7 +172,9 @@ pub fn parse_scala_file(
             visitor.capture(node, name);
         }
         if node.kind() == "instance_expression" && scala_anonymous_template_body(node).is_some() {
-            visitor.visit_anonymous_class(node);
+            let mut scheduled = Vec::new();
+            visitor.visit_anonymous_class(node, &mut scheduled);
+            schedule_scala_work(scheduled, &mut pending);
         }
         let mut parent = enclosing;
         if node.is_named()
@@ -549,7 +551,11 @@ impl ScalaVisitor<'_, '_> {
             .add_signature_with_source_declaration_metadata(declaration, unit, metadata);
     }
 
-    fn visit_anonymous_class(&mut self, instance: Node<'_>) {
+    fn visit_anonymous_class<'tree>(
+        &mut self,
+        instance: Node<'tree>,
+        stack: &mut Vec<ScalaWork<'tree>>,
+    ) {
         let parent = self
             .parsed
             .declarations()
@@ -600,11 +606,14 @@ impl ScalaVisitor<'_, '_> {
         self.parsed
             .add_code_unit(anonymous.clone(), instance, self.source, parent, None);
 
-        let package_prefixes = self.package_contexts.prefixes_at(instance.start_byte());
+        let package_prefixes = self
+            .package_contexts
+            .prefixes_at(instance.start_byte())
+            .to_vec();
         let lexical_scopes = scala_lexical_scope_path(instance);
         let mut supertypes = extract_scala_instance_supertypes(instance, self.source);
         for fact in &mut supertypes {
-            fact.lookup_path.set_package_prefixes(package_prefixes);
+            fact.lookup_path.set_package_prefixes(&package_prefixes);
             fact.lookup_path.set_lexical_scopes(&lexical_scopes);
         }
         if !supertypes.is_empty() {
@@ -642,33 +651,13 @@ impl ScalaVisitor<'_, '_> {
             return;
         };
         let mut cursor = body.walk();
-        self.process_anonymous_template_body(
-            body.named_children(&mut cursor).collect(),
-            &package_name,
-            &anonymous,
-        );
-    }
-
-    fn process_anonymous_template_body(
-        &mut self,
-        children: Vec<Node<'_>>,
-        package_name: &str,
-        parent: &CodeUnit,
-    ) {
-        for child in children {
-            match child.kind() {
-                "function_definition" | "function_declaration" | "given_definition" => {
-                    self.visit_function(child, package_name, Some(parent.clone()))
-                }
-                "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
-                    self.visit_field_declaration(child, package_name, Some(parent.clone()))
-                }
-                "type_definition" => {
-                    self.visit_type_alias(child, package_name, Some(parent.clone()))
-                }
-                _ => {}
-            }
-        }
+        stack.push(ScalaWork::TemplateBody {
+            children: body.named_children(&mut cursor).collect(),
+            index: 0,
+            package_name,
+            package_prefixes,
+            parent: anonymous,
+        });
     }
 
     fn process_compilation_unit<'tree>(
@@ -885,23 +874,21 @@ impl ScalaVisitor<'_, '_> {
                             recovery_owners.push(ScalaRecoveryOwner {
                                 declaration,
                                 name,
-                                indentation: child.start_position().column,
+                                indentation: type_node.start_position().column,
                             });
                         }
-                    } else if let Some((kind, name_node, colon)) = scala_error_type_header(child)
+                    } else if let Some(header) = scala_error_type_header(child)
                         && let Some(declaration) = self.visit_recovered_type_header(
                             child,
-                            colon,
-                            kind,
-                            name_node,
+                            &header,
                             &current_package,
                             recovery_parent,
                         )
                     {
                         recovery_owners.push(ScalaRecoveryOwner {
                             declaration,
-                            name: scala_node_text(name_node, self.source).trim().to_string(),
-                            indentation: child.start_position().column,
+                            name: scala_node_text(header.name, self.source).trim().to_string(),
+                            indentation: header.keyword.start_position().column,
                         });
                     }
                 }
@@ -921,13 +908,12 @@ impl ScalaVisitor<'_, '_> {
     fn visit_recovered_type_header(
         &mut self,
         node: Node<'_>,
-        colon: Node<'_>,
-        kind: &str,
-        name_node: Node<'_>,
+        header: &ScalaRecoveredTypeHeader<'_>,
         package_name: &str,
         parent: Option<CodeUnit>,
     ) -> Option<CodeUnit> {
-        let raw_name = scala_node_text(name_node, self.source).trim();
+        let kind = header.keyword.kind();
+        let raw_name = scala_node_text(header.name, self.source).trim();
         if raw_name.is_empty() {
             return None;
         }
@@ -941,11 +927,11 @@ impl ScalaVisitor<'_, '_> {
             return Some(code_unit);
         }
         let occurrence = self.collector.intern_subspan_bytes(
-            node.start_byte(),
-            colon.end_byte(),
+            header.keyword.start_byte(),
+            header.colon.end_byte(),
             SourceOccurrenceProvenance::ExplicitSubspan,
         );
-        let name = self.collector.intern_node(name_node);
+        let name = self.collector.intern_node(header.name);
         let declaration = self.collector.declare(occurrence, Some(name));
         self.parsed
             .source_declaration_units
@@ -958,16 +944,11 @@ impl ScalaVisitor<'_, '_> {
         self.capture_declaration_context(node, &mut fact);
         self.scala_facts.declarations.push(fact);
         self.captured_declarations.insert(declaration);
-        // The recovered header runs from the node the recovery claimed to the
-        // colon that closes it, so each end comes from `node_range`: it is
-        // the one reader of a tree-sitter position in this walk, and it is
-        // what makes a recorded line 1-based (#2428). Reading
-        // `start_position().row` here instead recorded a 0-based span, which
-        // reported the header one line early and, once #3291 grew that span
-        // with the members the recovery adopts, mixed the two bases in one
-        // range (#3303).
-        let opening = node_range(node);
-        let closing = node_range(colon);
+        // ERROR can also contain a preceding expression's incomplete tokens.
+        // The declaration itself starts at its keyword, not that wrapper.
+        // Keep both endpoints on the shared one-based range convention (#3303).
+        let opening = node_range(header.keyword);
+        let closing = node_range(header.colon);
         self.parsed.add_code_unit_with_range(
             code_unit.clone(),
             Range {
@@ -1648,18 +1629,33 @@ fn scala_error_type_declaration(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn scala_error_type_header(node: Node<'_>) -> Option<(&'static str, Node<'_>, Node<'_>)> {
-    let mut kind = None;
+struct ScalaRecoveredTypeHeader<'tree> {
+    keyword: Node<'tree>,
+    name: Node<'tree>,
+    colon: Node<'tree>,
+}
+
+fn scala_error_type_header(node: Node<'_>) -> Option<ScalaRecoveredTypeHeader<'_>> {
+    let mut keyword = None;
     let mut name = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "class" => kind = Some("class"),
-            "object" => kind = Some("object"),
-            "trait" => kind = Some("trait"),
-            "enum" => kind = Some("enum"),
-            "identifier" if kind.is_some() && name.is_none() => name = Some(child),
-            ":" if kind.is_some() && name.is_some() => return Some((kind?, name?, child)),
+            "class" | "object" | "trait" | "enum" => {
+                keyword = Some(child);
+                name = None;
+            }
+            "identifier" if keyword.is_some() && name.is_none() => name = Some(child),
+            ":" if keyword.is_some() && name.is_some() => {
+                let header = ScalaRecoveredTypeHeader {
+                    keyword: keyword?,
+                    name: name?,
+                    colon: child,
+                };
+                debug_assert!(header.keyword.end_byte() <= header.name.start_byte());
+                debug_assert!(header.name.end_byte() <= header.colon.start_byte());
+                return Some(header);
+            }
             _ => {}
         }
     }
@@ -2410,6 +2406,29 @@ mod same_package_and_extension_tests {
 
     #[test]
     #[hardwon(
+        "d5886539d3ef: quicksilver round 5 on brokk-bifrost-jvm: anonymous templates lost nested definitions"
+    )]
+    fn anonymous_templates_declare_nested_types_and_extensions() {
+        let parsed = parse(
+            "package demo\ntrait T\nobject Factory { val t = new T { class Inner { def member = 1 }; object O; trait R; enum E { case A }; extension (x: Int) def f = x } }\n",
+        );
+        let names = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.short_name())
+            .collect::<Vec<_>>();
+        for name in ["Inner", "member", "O$", "R", "E", "f"] {
+            assert!(
+                names
+                    .iter()
+                    .any(|actual| actual.rsplit('.').next() == Some(name)),
+                "missing {name}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
         "#3499: same-file Scala trait inheritance was reported as an unindexed import boundary"
     )]
     fn abstract_and_initialized_fields_keep_all_declared_names() {
@@ -2572,5 +2591,259 @@ mod same_package_and_extension_tests {
                 .iter()
                 .any(|(_, linked)| linked == unit)
         }));
+    }
+    /// Grammar-boundary contract: the final named child of a postfix application
+    /// is its operator; symbolic import paths and generic annotation names are
+    /// nodes, too. Extension groups are transparent members inside templates.
+    #[test]
+    fn scala_structural_grammar_fields() {
+        use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind as K, Role};
+        let source = "import +.Item\nimport holder.+\n@Ann[Int] class Tagged\ntrait Host { extension (s: String) { def member = s } }\nextension (s: String) { def top = s }\ndef run(rows: List[Int]) = { rows toList; (rows) toList; rows.size }\n";
+        let tree = crate::scala::language::parse_tree(source).unwrap().unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let text = |id| {
+            let range = facts.occurrences.occurrence(id).range;
+            &source[range.start_byte..range.end_byte]
+        };
+        let mut stack = vec![tree.root_node()];
+        let mut checked = Vec::new();
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+            let expected = match node.kind() {
+                "postfix_expression" => {
+                    let operator = node.named_child(node.named_child_count() - 1).unwrap();
+                    assert_eq!(operator.kind(), "identifier");
+                    assert_eq!(scala_node_text(operator, source), "toList");
+                    Some((K::Call, Some(operator)))
+                }
+                "annotation" => {
+                    let name = node.child_by_field_name("name").unwrap();
+                    assert_eq!(name.kind(), "generic_type");
+                    Some((K::Decorator, Some(name)))
+                }
+                "function_definition" => {
+                    let name = node.child_by_field_name("name").unwrap();
+                    match scala_node_text(name, source) {
+                        "member" => Some((K::Method, Some(name))),
+                        "top" => Some((K::Function, Some(name))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((kind, name)) = expected {
+                let fact = facts
+                    .structural
+                    .nodes()
+                    .iter()
+                    .find(|fact| {
+                        facts.occurrences.occurrence(fact.occurrence).range == node_range(node)
+                            && fact.kind == kind
+                    })
+                    .unwrap_or_else(|| panic!("missing {kind:?}: {}", node.to_sexp()));
+                assert_eq!(
+                    fact.name.map(text),
+                    name.map(|name| scala_node_text(name, source))
+                );
+                checked.push(kind);
+            }
+        }
+        assert_eq!(checked.len(), 5, "{checked:?}");
+        let imports = facts
+            .structural
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.kind == K::Import)
+            .map(|(id, _)| {
+                facts
+                    .structural
+                    .roles(u32::try_from(id).unwrap())
+                    .iter()
+                    .filter(|role| role.role == Role::Module)
+                    .map(|role| text(role.name.expect("module path name")))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(imports, [vec!["Item", "+.Item"], vec!["+", "holder.+"]]);
+    }
+
+    /// Preserve slots when the released grammar accepts an unfinished
+    /// constructor parameter without a type field. No inferred type is claimed.
+    #[test]
+    fn scala_constructor_type_fields_match_grammar_slots() {
+        for (source, expected) in [
+            (
+                "class Incomplete(first, second: String)",
+                vec!["", "String"],
+            ),
+            (
+                "class Typed(first: Any, second: String)",
+                vec!["Any", "String"],
+            ),
+            (
+                "class Curried(first: Int)(second: String)",
+                vec!["Int", "String"],
+            ),
+        ] {
+            let tree = crate::scala::language::parse_tree(source).unwrap().unwrap();
+            let class = tree.root_node().named_child(0).unwrap();
+            assert_eq!(class.kind(), "class_definition");
+            let mut cursor = class.walk();
+            let lists = class
+                .children_by_field_name("class_parameters", &mut cursor)
+                .collect::<Vec<_>>();
+            let grammar_types = lists
+                .iter()
+                .flat_map(|list| {
+                    let mut cursor = list.walk();
+                    list.named_children(&mut cursor)
+                        .filter(|node| node.kind() == "class_parameter")
+                        .map(|node| {
+                            node.child_by_field_name("type")
+                                .map(|node| scala_node_text(node, source))
+                                .unwrap_or("")
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(grammar_types, expected);
+            let parsed = parse(source);
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .filter(|(_, metadata)| {
+                    metadata
+                        .iter()
+                        .any(|metadata| metadata.callable_is_constructor())
+                })
+                .flat_map(|(_, metadata)| metadata)
+                .find_map(|metadata| metadata.callable_parameter_types())
+                .unwrap();
+            assert_eq!(metadata, grammar_types, "{source}");
+        }
+    }
+
+    /// Imports in distinct extension groups have distinct source regions even
+    /// when their tokens are identical. Compare stored facts with AST ancestry.
+    #[test]
+    fn scala_extension_import_scopes_match_grammar_ancestors() {
+        let source = "import root.One\ntrait Host {\n  extension (s: String) { def first = { import local.One; s } }\n  extension (i: Int) { def second = { import local.One; i } }\n}\n";
+        let tree = crate::scala::language::parse_tree(source).unwrap().unwrap();
+        assert!(!tree.root_node().has_error());
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut checked = 0;
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+            if node.kind() != "import_declaration" {
+                continue;
+            }
+            let import = facts
+                .imports
+                .iter()
+                .find(|import| {
+                    facts.occurrences.occurrence(import.declaration).range == node_range(node)
+                })
+                .unwrap();
+            let actual = import
+                .path
+                .as_ref()
+                .unwrap()
+                .lexical_scopes
+                .iter()
+                .map(|id| facts.occurrences.occurrence(*id).range)
+                .collect::<Vec<_>>();
+            let mut parent = node.parent();
+            let mut expected = Vec::new();
+            let mut extensions = 0;
+            while let Some(node) = parent {
+                if matches!(
+                    node.kind(),
+                    "template_body"
+                        | "trait_definition"
+                        | "extension_definition"
+                        | "function_definition"
+                        | "block"
+                ) {
+                    expected.push(node_range(node));
+                }
+                extensions += usize::from(node.kind() == "extension_definition");
+                parent = node.parent();
+            }
+            expected.reverse();
+            assert_eq!(actual, expected, "{}", node.to_sexp());
+            checked += extensions;
+        }
+        assert_eq!(checked, 2);
+    }
+    /// On unfinished input the grammar can expose a raw keyword/name/colon
+    /// header in ERROR. Preserve that keyword rather than guessing class.
+    #[test]
+    #[hardwon("d5886539d3ef: recovered type header ranges included the preceding assignment")]
+    fn scala_recovered_header_kind_matches_grammar_keyword() {
+        // The released grammar retains the name in these raw ERROR headers.
+        // Its corresponding object recovery drops the name, so that shape is
+        // correctly declined rather than reconstructed from source text.
+        for keyword in ["class", "trait", "enum"] {
+            let source =
+                format!("package demo\ndef helper =\n{keyword} Broken:\n  val value: Int =\n");
+            let tree = crate::scala::language::parse_tree(&source)
+                .unwrap()
+                .unwrap();
+            let mut cursor = tree.root_node().walk();
+            let error = tree
+                .root_node()
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "ERROR")
+                .unwrap();
+            let mut cursor = error.walk();
+            let token = error
+                .children(&mut cursor)
+                .find(|node| node.kind() == keyword)
+                .unwrap();
+            assert!(!token.is_named());
+            let header = scala_error_type_header(error).unwrap();
+            assert_eq!(header.keyword, token);
+            assert_eq!(header.name.kind(), "identifier");
+            assert_eq!(scala_node_text(header.name, &source), "Broken");
+            assert_eq!(header.colon.kind(), ":");
+
+            let parsed = parse(&source);
+            let facts = parsed.source_facts.as_ref().unwrap();
+            let (declaration, unit) = parsed
+                .source_declaration_units
+                .iter()
+                .find(|(id, _)| {
+                    facts.occurrences.declaration(*id).name.is_some_and(|name| {
+                        facts.occurrences.occurrence(name).range == node_range(header.name)
+                    })
+                })
+                .unwrap();
+            let occurrence = facts
+                .occurrences
+                .occurrence(facts.occurrences.declaration(*declaration).occurrence);
+            let expected = Range {
+                start_byte: header.keyword.start_byte(),
+                end_byte: header.colon.end_byte(),
+                start_line: 3,
+                end_line: 3,
+            };
+            assert_eq!(
+                occurrence.provenance,
+                SourceOccurrenceProvenance::ExplicitSubspan
+            );
+            assert_eq!(occurrence.range, expected, "{keyword}");
+            assert_eq!(parsed.declaration_ranges(unit), [expected], "{keyword}");
+        }
     }
 }

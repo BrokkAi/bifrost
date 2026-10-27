@@ -149,9 +149,6 @@ pub const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
 pub enum DispatchReadUnattributedReason {
     /// The semantic call site has no exact retained source range.
     SourceRangeUnavailable,
-    /// More than one lowered call row has the same exact source range inside
-    /// the owning procedure.
-    SourceRangeAmbiguous,
     /// Contextual dispatch has no context-aware persisted replay question yet.
     CallContextUnavailable,
 }

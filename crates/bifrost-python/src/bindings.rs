@@ -408,11 +408,6 @@ impl PythonLexicalScopeBindings {
         self.global_binding_events.iter().map(|name| name.as_ref())
     }
 
-    pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
-        self.resolves_to_local_function_bounded(name, reference, || true)
-            .expect("unbounded local function lookup completes")
-    }
-
     pub fn resolves_to_local_function_bounded(
         &self,
         name: &str,
@@ -451,12 +446,6 @@ impl PythonLexicalScopeBindings {
                 || self.comprehension_binds_name_at_bounded(name, reference, &mut scope_step)?,
         )
     }
-}
-
-#[derive(Clone, Copy)]
-struct ScanFrame<'tree> {
-    node: Node<'tree>,
-    in_comprehension: bool,
 }
 
 /// Binding events in an executing class namespace at one reference. Only a
@@ -591,16 +580,12 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         } else {
             return Some(inventory);
         };
-        let mut stack = vec![ScanFrame {
-            node: body,
-            in_comprehension: false,
-        }];
+        let mut stack = vec![body];
 
-        while let Some(frame) = stack.pop() {
+        while let Some(node) = stack.pop() {
             if !scope_step() {
                 return None;
             }
-            let node = frame.node;
             let nested_scope = node != body
                 && matches!(
                     node.kind(),
@@ -617,12 +602,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                 // execute in an enclosing scope. Keep scanning those headers
                 // for walrus/comprehension bindings while pruning the nested
                 // callable or class body itself.
-                push_nested_scope_header_children(
-                    &mut stack,
-                    node,
-                    frame.in_comprehension,
-                    &mut scope_step,
-                )?;
+                push_nested_scope_header_children(&mut stack, node, &mut scope_step)?;
                 continue;
             }
 
@@ -724,13 +704,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                                 inventory.record_binding_write(name, declaration);
                             },
                         )?;
-                        push_named_children_except(
-                            &mut stack,
-                            node,
-                            alias,
-                            frame.in_comprehension,
-                            &mut scope_step,
-                        )?;
+                        push_named_children_except(&mut stack, node, alias, &mut scope_step)?;
                         continue;
                     }
                 }
@@ -765,10 +739,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                     }
                     for child in children.into_iter().rev() {
                         if child.kind() != "case_pattern" {
-                            stack.push(ScanFrame {
-                                node: child,
-                                in_comprehension: frame.in_comprehension,
-                            });
+                            stack.push(child);
                         }
                     }
                     continue;
@@ -808,17 +779,14 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                         }
                     }
                     for child in children.into_iter().rev() {
-                        stack.push(ScanFrame {
-                            node: child,
-                            in_comprehension: true,
-                        });
+                        stack.push(child);
                     }
                     continue;
                 }
                 _ => {}
             }
 
-            push_named_children(&mut stack, node, frame.in_comprehension, &mut scope_step)?;
+            push_named_children(&mut stack, node, &mut scope_step)?;
         }
 
         // Preserve all real global binding events before pruning semantic
@@ -869,10 +837,6 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
     ) -> Option<PythonLexicalNameResolution> {
         self.bindings
             .name_resolution_at_bounded(name, reference, scope_step)
-    }
-
-    pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
-        self.bindings.resolves_to_local_function(name, reference)
     }
 
     pub fn has_runtime_callable_binding_at(&self, name: &str, reference: Node<'_>) -> bool {
@@ -1692,21 +1656,19 @@ fn collect_match_pattern_bindings<'tree>(
 }
 
 fn push_named_children<'tree>(
-    stack: &mut Vec<ScanFrame<'tree>>,
+    stack: &mut Vec<Node<'tree>>,
     node: Node<'tree>,
-    in_comprehension: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<()> {
     let children = named_children_bounded(node, scope_step)?;
-    push_bounded_children(stack, children.into_iter(), in_comprehension);
+    push_bounded_children(stack, children.into_iter());
     Some(())
 }
 
 fn push_named_children_except<'tree>(
-    stack: &mut Vec<ScanFrame<'tree>>,
+    stack: &mut Vec<Node<'tree>>,
     node: Node<'tree>,
     excluded: Node<'tree>,
-    in_comprehension: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<()> {
     let children = named_children_bounded(node, scope_step)?;
@@ -1715,15 +1677,13 @@ fn push_named_children_except<'tree>(
         children
             .into_iter()
             .filter(|child| child.id() != excluded.id()),
-        in_comprehension,
     );
     Some(())
 }
 
 fn push_nested_scope_header_children<'tree>(
-    stack: &mut Vec<ScanFrame<'tree>>,
+    stack: &mut Vec<Node<'tree>>,
     node: Node<'tree>,
-    in_comprehension: bool,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<()> {
     let body = node.child_by_field_name("body").map(|child| child.id());
@@ -1739,21 +1699,16 @@ fn push_nested_scope_header_children<'tree>(
     push_bounded_children(
         stack,
         headers.into_iter().filter(|child| Some(child.id()) != name),
-        in_comprehension,
     );
     Some(())
 }
 
 fn push_bounded_children<'tree>(
-    stack: &mut Vec<ScanFrame<'tree>>,
+    stack: &mut Vec<Node<'tree>>,
     children: impl DoubleEndedIterator<Item = Node<'tree>>,
-    in_comprehension: bool,
 ) {
     for child in children.rev() {
-        stack.push(ScanFrame {
-            node: child,
-            in_comprehension,
-        });
+        stack.push(child);
     }
 }
 

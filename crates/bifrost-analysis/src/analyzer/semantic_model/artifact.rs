@@ -2459,7 +2459,9 @@ pub(crate) mod tests {
         let CompiledPayload::DeclarationFacts { types, .. } = &mut wire.payload else {
             unreachable!()
         };
-        types[0].aliases.push("invalid alias".to_owned());
+        std::sync::Arc::make_mut(&mut types[0])
+            .aliases
+            .push("invalid alias".to_owned());
         let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
 
         assert!(matches!(
@@ -2484,7 +2486,8 @@ pub(crate) mod tests {
         let CompiledPayload::ProcedureSummaries { summaries } = &mut wire.payload else {
             unreachable!()
         };
-        summaries[0].model_id = "acme.procedure-summaries#summary.forged".to_owned();
+        std::sync::Arc::make_mut(&mut summaries[0]).model_id =
+            "acme.procedure-summaries#summary.forged".to_owned();
         let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
 
         let error = decode_shard(&descriptor, &raw, &DecodeLimits::default()).unwrap_err();
@@ -2514,7 +2517,7 @@ pub(crate) mod tests {
         let CompiledPayload::ProcedureSummaries { summaries } = &mut wire.payload else {
             unreachable!()
         };
-        let callee = summaries[1]
+        let callee = std::sync::Arc::make_mut(&mut summaries[1])
             .effects
             .iter_mut()
             .find_map(|effect| match effect {
@@ -2523,7 +2526,7 @@ pub(crate) mod tests {
             })
             .expect("fixture contains an exact call effect");
         *callee = "summary.missing".to_owned();
-        summaries[1].content_sha256 = content_digest(
+        std::sync::Arc::make_mut(&mut summaries[1]).content_sha256 = content_digest(
             &canonical_json(&authored_procedure_summary_from_compiled(&summaries[1])).unwrap(),
         );
         let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
@@ -2611,7 +2614,7 @@ pub(crate) mod tests {
         let CompiledPayload::DeclarationFacts { types, .. } = &mut wire.payload else {
             unreachable!()
         };
-        types[0].aliases.reverse();
+        std::sync::Arc::make_mut(&mut types[0]).aliases.reverse();
         let (descriptor, raw) = rehash_raw_descriptor(&artifact.descriptor, &wire);
 
         assert_eq!(

@@ -6317,59 +6317,91 @@ fn scala_anonymous_given_name(node: Node<'_>, source: &str) -> Option<String> {
 /// for a parent type and false inside its type arguments, where only the head
 /// of an applied type counts.
 fn scala_given_type_name(node: Node<'_>, source: &str, follow_args: bool) -> Option<String> {
-    if node.is_error() || node.is_missing() {
-        return None;
+    enum Work<'tree> {
+        Visit(Node<'tree>, bool),
+        Join(usize),
+        Validate,
     }
-    let part = match node.kind() {
-        "type_identifier" => node_text(node, source).to_owned(),
-        "stable_type_identifier" => {
-            let mut cursor = node.walk();
-            let last = node
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "type_identifier")
-                .last()?;
-            node_text(last, source).to_owned()
-        }
-        "generic_type" => {
-            let head = scala_given_type_name(node.child_by_field_name("type")?, source, false)?;
-            if !follow_args {
-                return Some(head);
+    let mut work = vec![Work::Visit(node, follow_args)];
+    let mut parts = Vec::<String>::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Visit(node, follow_args) => {
+                if node.is_error() || node.is_missing() {
+                    return None;
+                }
+                work.push(Work::Validate);
+                match node.kind() {
+                    "type_identifier" => parts.push(node_text(node, source).to_owned()),
+                    "stable_type_identifier" => {
+                        let mut cursor = node.walk();
+                        let last = node
+                            .named_children(&mut cursor)
+                            .filter(|child| child.kind() == "type_identifier")
+                            .last()?;
+                        parts.push(node_text(last, source).to_owned());
+                    }
+                    "generic_type" => {
+                        let head = node.child_by_field_name("type")?;
+                        if follow_args {
+                            let arguments = node.child_by_field_name("type_arguments")?;
+                            let mut cursor = arguments.walk();
+                            let arguments =
+                                arguments.named_children(&mut cursor).collect::<Vec<_>>();
+                            work.push(Work::Join(arguments.len() + 1));
+                            work.extend(
+                                arguments
+                                    .into_iter()
+                                    .rev()
+                                    .map(|argument| Work::Visit(argument, false)),
+                            );
+                        }
+                        work.push(Work::Visit(head, false));
+                    }
+                    "tuple_type" => {
+                        let mut cursor = node.walk();
+                        let elements = node.named_children(&mut cursor).collect::<Vec<_>>();
+                        work.push(Work::Join(elements.len()));
+                        work.extend(
+                            elements
+                                .into_iter()
+                                .rev()
+                                .map(|element| Work::Visit(element, false)),
+                        );
+                    }
+                    "infix_type" => {
+                        parts.push(
+                            node_text(node.child_by_field_name("operator")?, source).to_owned(),
+                        );
+                        if follow_args {
+                            let left = node.child_by_field_name("left")?;
+                            let right = node.child_by_field_name("right")?;
+                            work.push(Work::Join(3));
+                            work.push(Work::Visit(right, false));
+                            work.push(Work::Visit(left, false));
+                        }
+                    }
+                    _ => return None,
+                }
             }
-            let arguments = node.child_by_field_name("type_arguments")?;
-            let mut cursor = arguments.walk();
-            let names = arguments
-                .named_children(&mut cursor)
-                .map(|argument| scala_given_type_name(argument, source, false))
-                .collect::<Option<Vec<_>>>()?;
-            if names.is_empty() {
-                return Some(head);
+            Work::Join(count) => {
+                let start = parts.len() - count;
+                let part = parts[start..].join("_");
+                parts.truncate(start);
+                parts.push(part);
             }
-            format!("{head}_{}", names.join("_"))
-        }
-        "tuple_type" => {
-            let mut cursor = node.walk();
-            let names = node
-                .named_children(&mut cursor)
-                .map(|element| scala_given_type_name(element, source, false))
-                .collect::<Option<Vec<_>>>()?;
-            names.join("_")
-        }
-        "infix_type" => {
-            let operator = node_text(node.child_by_field_name("operator")?, source).to_owned();
-            if !follow_args {
-                operator
-            } else {
-                let left = scala_given_type_name(node.child_by_field_name("left")?, source, false)?;
-                let right =
-                    scala_given_type_name(node.child_by_field_name("right")?, source, false)?;
-                format!("{operator}_{left}_{right}")
+            Work::Validate => {
+                // A symbolic operator is encoded by the compiler, so only plain
+                // identifier characters name a synthesized part exactly.
+                let part = parts.last().expect("a visited type contributes one part");
+                if part.is_empty() || !part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return None;
+                }
             }
         }
-        _ => return None,
-    };
-    // A symbolic operator is encoded by the compiler, so only plain
-    // identifier characters name a synthesized part exactly.
-    (!part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(part)
+    }
+    assert_eq!(parts.len(), 1);
+    parts.pop()
 }
 
 /// One type member an export clause forwards, with the clause's owner path.
@@ -7340,6 +7372,46 @@ mod tests {
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala syntax tree");
         crate::scala::declarations::parse_scala_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[hardwon("#6942: scala_given_type_name recursion depth followed source nesting")]
+    fn scala_given_type_name_deep_tuples_are_stack_safe() {
+        let depth = 3000;
+        let source = format!("type Deep = {}Int{}", "(".repeat(depth), ")".repeat(depth));
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let ty = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("type")
+            .unwrap();
+        let mut inner = ty;
+        let mut wrappers = 0;
+        while inner.kind() == "tuple_type" {
+            wrappers += 1;
+            inner = inner.named_child(0).unwrap();
+        }
+        assert_eq!(wrappers, depth);
+        eprintln!("scala_given_type_name: parsed {wrappers} tuple wrappers");
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, || {
+                    assert_eq!(
+                        scala_given_type_name(ty, &source, true).as_deref(),
+                        Some("Int")
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
     }
 
     #[test]

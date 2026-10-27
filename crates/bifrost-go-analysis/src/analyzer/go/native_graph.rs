@@ -10,10 +10,6 @@ use brokk_bifrost_analysis::analyzer::languages::LanguageEdgeFailure;
 
 use brokk_bifrost_analysis::analyzer::languages::NativeWorkspaceGraphProvider;
 
-use brokk_bifrost_analysis::analyzer::resolution::fact_reference_edges::FactReferenceEdgeDeclarationDomain;
-
-use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
-
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
@@ -30,19 +26,11 @@ use brokk_bifrost_analysis::analyzer::store::Result;
 
 use brokk_bifrost_analysis::analyzer::store::StoreError;
 
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
-
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason;
-
-use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::NativeWorkspaceUsageGraphAccumulator;
+use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::NativeWorkspaceGraphBuilder;
 
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::canonical_workspace_graph::SelectedWorkspaceUsageGraphProjectionOutcome;
 
 use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
-
-use brokk_bifrost_analysis::analyzer::usages::workspace_graph::WorkspaceUsageCatalog;
-
-use brokk_bifrost_analysis::analyzer::usages::workspace_graph::is_graph_declaration;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -78,6 +66,14 @@ impl NativeWorkspaceGraphProvider for GoNativeWorkspaceGraphProvider {
             ));
         };
         build_go_native_workspace_graph_for_files(go, admitted_callers, cancellation)
+    }
+
+    fn excluded_sources(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer)
+            .map_or_else(|| Ok(Vec::new()), GoAnalyzer::graph_source_exclusions)
     }
 
     fn input_failure(
@@ -198,39 +194,10 @@ pub fn build_go_native_workspace_graph_for_files(
         // stage. Filtering here would lose the requested caller's evidence.
         admitted_callers.insert(file.clone());
     }
-    let mut declarations = Vec::new();
-    for file in &admitted_callers {
-        if cancellation.is_cancelled() {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-        }
-        let Some(catalog) = WorkspaceUsageCatalog::build_for_files_with_cancellation(
-            go,
-            std::slice::from_ref(file),
-            cancellation,
-        ) else {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-        };
-        declarations.extend(catalog.nodes.into_iter().map(|node| node.primary));
-    }
-    let mut declarations_with_ranges = Vec::new();
-    for unit in declarations {
-        if cancellation.is_cancelled() {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-        }
-        declarations_with_ranges.push((unit.clone(), go.ranges(&unit)));
-    }
-    let mut declarations = declarations_with_ranges;
-    let mut rooted_declarations = declarations
-        .iter()
-        .map(|(unit, _)| unit.clone())
-        .collect::<HashSet<_>>();
-    let mut rows = Vec::new();
-    let mut unresolved_names = BTreeSet::new();
-    let mut unresolved_names_complete = true;
-    let mut withheld_references = Vec::new();
-    let mut reasons = Vec::new();
-    let mut reference_count = 0_usize;
-    let mut batch_count = 0_usize;
+    let Some(mut builder) = NativeWorkspaceGraphBuilder::new(go, &admitted_callers, cancellation)
+    else {
+        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+    };
     let mut receiver_type_file = None::<(ProjectFile, Box<[(usize, usize)]>)>;
 
     let staged = operation.stage_go_graph_reference_edge_batches_in_files(
@@ -238,27 +205,11 @@ pub fn build_go_native_workspace_graph_for_files(
         base_profile,
         &admitted_callers,
         brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH,
+        go.inner.analyzer_config().parallelism(),
         cancellation,
         &mut SelectedResolutionContextMetrics,
         &mut |file, source_batch, edge_batch, _reference_owners| {
             assert_eq!(edge_batch.generation(), generation);
-            let status =
-                edge_batch.domain_status(FactReferenceEdgeDeclarationDomain::TypeOrCallable);
-            if let EdgeCompleteness::Incomplete {
-                reasons: batch_reasons,
-            } = status.completeness()
-            {
-                for reason in batch_reasons {
-                    if !reasons.contains(reason) {
-                        reasons.push(reason.clone());
-                    }
-                }
-            }
-            withheld_references.extend_from_slice(edge_batch.withheld_references());
-            match edge_batch.unresolved_names() {
-                Some(names) => unresolved_names.extend(names.iter().cloned()),
-                None => unresolved_names_complete = false,
-            }
             if receiver_type_file
                 .as_ref()
                 .is_none_or(|(cached_file, _)| cached_file != file)
@@ -287,6 +238,7 @@ pub fn build_go_native_workspace_graph_for_files(
                 .as_ref()
                 .expect("selected Go graph source was indexed")
                 .1;
+            let mut rows = Vec::with_capacity(edge_batch.edges().len());
             for row in edge_batch.edges() {
                 let mut row = row.clone();
                 if receiver_ranges
@@ -296,24 +248,15 @@ pub fn build_go_native_workspace_graph_for_files(
                     row.usage_kind =
                         brokk_bifrost_core::analyzer::usages::model::UsageHitKind::SelfReceiver;
                 }
-                for unit in row
-                    .site
-                    .enclosing
-                    .iter()
-                    .chain(std::iter::once(&row.target))
-                {
-                    if is_graph_declaration(unit) && rooted_declarations.insert(unit.clone()) {
-                        declarations.push((unit.clone(), go.ranges(unit)));
-                    }
-                }
                 rows.push(row);
             }
-            reference_count += source_batch.answers().len();
-            batch_count += 1;
+            if !builder.stage_batch(go, source_batch, edge_batch, rows, cancellation) {
+                return Ok(());
+            }
             Ok(())
         },
     )?;
-    let (mut summary, skipped) = match staged {
+    let (summary, skipped) = match staged {
         SelectedResolutionOperationOutcome::Native(result) => (result.summary, result.skipped),
         SelectedResolutionOperationOutcome::Cancelled(_) => {
             return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
@@ -327,63 +270,17 @@ pub fn build_go_native_workspace_graph_for_files(
             ));
         }
     };
-    admitted_callers.retain(|file| !skipped.contains_key(file));
-    declarations.retain(|(unit, _)| !skipped.contains_key(unit.source()));
-    assert_eq!(reference_count, summary.reference_count());
-    assert_eq!(batch_count, summary.batch_count());
     let completion = summary
         .completion()
         .combine(summary.reference_enumeration_completion());
-    summary = match operation.finish_native(summary, &completion, cancellation)? {
-        SelectedResolutionOperationOutcome::Native(summary) => summary,
-        SelectedResolutionOperationOutcome::Cancelled(_) => {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-        }
-        SelectedResolutionOperationOutcome::Stale(_) => {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale);
-        }
-        SelectedResolutionOperationOutcome::Unavailable(reason) => {
-            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
-                format!("{reason:?}"),
-            ));
-        }
-    };
-    if cancellation.is_cancelled() {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-    }
-    if summary.reference_enumeration_completion() != &ResolutionCompletion::Complete
-        && !reasons.contains(&EdgeIncompleteReason::ReferenceEnumerationIncomplete)
-    {
-        reasons.push(EdgeIncompleteReason::ReferenceEnumerationIncomplete);
-    }
-    let completeness = if reasons.is_empty() {
-        EdgeCompleteness::Complete
-    } else {
-        EdgeCompleteness::Incomplete { reasons }
-    };
-    let Some(mut accumulator) = NativeWorkspaceUsageGraphAccumulator::new(
-        declarations,
-        generation,
+    let projection = builder.finish(
+        &mut operation,
+        summary,
+        skipped,
+        admitted_callers,
         UsageEcosystem::Go,
-        &admitted_callers,
         cancellation,
-    ) else {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-    };
-    accumulator.record_skipped_callers(skipped);
-    if !accumulator.stage(&rows, cancellation) {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-    }
-    if !accumulator.note_withheld_references(&withheld_references, cancellation) {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-    }
-    if !accumulator.note_unresolved_names(
-        unresolved_names_complete.then_some(&unresolved_names),
-        cancellation,
-    ) {
-        return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
-    }
-    let projection = accumulator.finish(&completeness, &summary, rows.len(), cancellation);
+    )?;
     let mut domain_failures = BTreeSet::new();
     for publication in operation.bound_go_context_publications() {
         if let Some(failure) = operation.go_domain_discovery_failure(publication.context_id)? {

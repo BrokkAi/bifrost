@@ -96,6 +96,8 @@ pub(crate) enum Effect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EventOrdering {
     Positioned,
+    /// The event's order relative to the observation is unknown: it ran in
+    /// another invocation, or in an earlier iteration of a loop around both.
     Unordered,
 }
 
@@ -243,6 +245,7 @@ impl TemporalSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
     struct Budget(usize);
     impl TemporalBudget for Budget {
         fn step(&mut self) -> Result<(), Stop> {
@@ -295,6 +298,49 @@ mod tests {
             &mut Budget(100),
         );
         assert_eq!(partial.selected[1].region, Region::new(vec![(1, false)]));
+    }
+    #[test]
+    #[hardwon(
+        "#6405: a write in the other arm of an if was excluded from a read in a later loop iteration"
+    )]
+    fn earlier_iteration_write_reaches_the_opposite_arm_but_a_plain_write_does_not() {
+        // The read is in the else arm of decision 1, which sits in the true arm
+        // of decision 2. Decision 2 encloses the loop and decision 1 is made
+        // inside it. A write from an earlier iteration is an unordered, uncertain
+        // event whose region has decision 1 stripped and decision 2 kept.
+        let read = Region::new(vec![(1, false), (2, true)]);
+        let alternative = |id: u32, decisions: Vec<(u64, bool)>| Event {
+            ordering: EventOrdering::Unordered,
+            certain: false,
+            region: Region::new(decisions),
+            ..event(id, None, Effect::Write)
+        };
+        let mut selection = TemporalSelection::new(read.clone());
+        selection.scope(
+            [
+                // The if-arm write of an earlier iteration: stripped of decision 1.
+                alternative(1, vec![(2, true)]),
+                // A write outside any loop, in the opposite arm of decision 1.
+                Event {
+                    region: Region::new(vec![(1, true), (2, true)]),
+                    ..event(2, None, Effect::Write)
+                },
+                // An earlier-iteration write in the other arm of the enclosing if:
+                // decision 2 is above the loop, so it is kept and still excludes.
+                alternative(3, vec![(2, false)]),
+            ],
+            false,
+            &mut Budget(100),
+        );
+        assert_eq!(
+            selection.selected,
+            [SelectedOccurrence {
+                occurrence: 1,
+                region: read.clone()
+            }]
+        );
+        assert!(selection.open);
+        assert_eq!(selection.residual, [read]);
     }
     #[test]
     fn delete_cleanup_unbound_and_class_residual() {

@@ -66,6 +66,8 @@ pub struct SelectedNativeReferenceUnits {
     pub absent_member_owners: Vec<CodeUnit>,
     #[doc(hidden)]
     pub named_reasons: Vec<(&'static str, String)>,
+    #[doc(hidden)]
+    pub diagnostic_identities: Vec<(SemanticId, String)>,
 }
 
 #[doc(hidden)]
@@ -125,6 +127,8 @@ pub enum NativeExternalMemberTarget {
 
 #[doc(hidden)]
 pub struct SelectedNativeReferenceTypes {
+    #[doc(hidden)]
+    pub diagnostic_identities: Vec<(SemanticId, String)>,
     #[doc(hidden)]
     pub named_reasons: Vec<(&'static str, String)>,
     #[doc(hidden)]
@@ -213,9 +217,17 @@ fn assignment_value_answer(
         .ok_or_else(|| StoreError::new("assignment-value probe has no observed frontier"))?;
     let observed_frontier_complete = frontier.completion() == &ResolutionCompletion::Complete;
     let named_reasons = named_reason_details(ready, answer.completion())?;
+    let diagnostic_identities = native_type_diagnostic_identities(
+        ready,
+        &answer,
+        &value_types,
+        "",
+        &CancellationToken::new(),
+    )?;
     Ok(SelectedNativeAssignmentValue {
         types: SelectedNativeReferenceTypes {
             named_reasons,
+            diagnostic_identities,
             answer,
             value_types,
             query_result_slot: Some(slot),
@@ -567,12 +579,20 @@ impl SelectedResolutionOperation<'_, '_> {
                 )?;
                 let named_reasons = named_reason_details(ready, answer.completion())?;
                 let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
+                let diagnostic_identities = native_type_diagnostic_identities(
+                    ready,
+                    &answer,
+                    &types,
+                    locator.storage_language(),
+                    cancellation,
+                )?;
                 Ok(SelectedNativeReferenceTypes {
                     answer,
                     value_types: types,
                     query_result_slot,
                     direct_target,
                     named_reasons,
+                    diagnostic_identities,
                 })
             },
         )?;
@@ -616,6 +636,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let session = query.session;
         let cancellation = query.cancellation;
         let query_result_slot = query.query_result_slot;
+        let storage_language = query.locator.storage_language();
         let outcome =
             self.resolve_reference_with_projection(query, |ready, operation, _, answer| {
                 let types = project_native_reference_types(
@@ -627,12 +648,20 @@ impl SelectedResolutionOperation<'_, '_> {
                 )?;
                 let named_reasons = named_reason_details(ready, answer.completion())?;
                 let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
+                let diagnostic_identities = native_type_diagnostic_identities(
+                    ready,
+                    &answer,
+                    &types,
+                    storage_language,
+                    cancellation,
+                )?;
                 Ok(SelectedNativeReferenceTypes {
                     answer,
                     value_types: types,
                     query_result_slot,
                     direct_target,
                     named_reasons,
+                    diagnostic_identities,
                 })
             })?;
         Ok(session.finish(outcome))
@@ -851,7 +880,14 @@ impl SelectedResolutionOperation<'_, '_> {
                     | SelectedNativeDefinitions::Cancelled => Vec::new(),
                 };
                 let member_contexts = project_native_member_contexts(ready, &answer, cancellation)?;
-                let trace_provenance = project_native_trace_provenance(ready, &answer, &definitions, &callable_applicability_candidates, &member_contexts, cancellation)?;
+                // A cancelled read keeps the binding's whole completion, which
+                // can only withhold coverage.
+                let call_applicability_reason = if crate::analyzer::resolution::resolution_diagnostics().native_rejection_projection_active() {
+                    operation.call_applicability_reason_for_callee(reference)?.flatten()
+                } else {
+                    None
+                };
+                let trace_provenance = project_native_trace_provenance(ready, &answer, call_applicability_reason, &definitions, &callable_applicability_candidates, &member_contexts, cancellation)?;
                 let declared_visibilities = project_native_declared_visibilities(
                     ready, &definitions, &callable_applicability_candidates, &member_contexts, &trace_provenance.visibility_units, cancellation,
                 )?;
@@ -862,6 +898,35 @@ impl SelectedResolutionOperation<'_, '_> {
                     session,
                 )?;
                 let direct_target = selected_external_member_target(ready, &answer, cancellation)?;
+                // Unit targets are already projected above. Only unresolved
+                // identities need to consult source/content evidence again.
+                let mut diagnostic_semantics = Vec::new();
+                if answer.binding().targets().len() > 1 || matches!(answer.binding().completion(), ResolutionCompletion::Incomplete(reasons) if reasons.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::InconsistentPrecedence(_)))) {
+                    diagnostic_semantics.extend(answer.binding().targets().iter().copied());
+                }
+                diagnostic_semantics.extend(answer.callable_candidate_applicability().iter()
+                    .filter(|candidate| candidate.verdict() == brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Inapplicable)
+                    .map(|candidate| candidate.target()));
+                if let ResolutionCompletion::Incomplete(reasons) = answer.binding().completion() {
+                    diagnostic_semantics.extend(reasons.iter().filter_map(|reason| public_reason_details(reason).1));
+                }
+                diagnostic_semantics.sort_unstable();
+                diagnostic_semantics.dedup();
+                let diagnostic_identities = diagnostic_semantics.into_iter().map(|semantic| {
+                    let unit = match &definitions {
+                        SelectedNativeDefinitions::Ready(rows) => rows.iter().find_map(|(id, definition)| {
+                            if *id != semantic { return None; }
+                            match definition { SelectedNativeDefinition::Unit(unit) => Some(unit), _ => None }
+                        }),
+                        _ => None,
+                    }.or_else(|| callable_applicability_candidates.iter().find_map(|(id, unit)| (*id == semantic).then_some(unit)));
+                    let identity = if let Some(unit) = unit {
+                        public_diagnostic_identity("semantic", Some(unit), None, None)
+                    } else {
+                        selected_public_diagnostic_identity(ready, semantic, cancellation, session)?
+                    };
+                    Ok((semantic, identity))
+                }).collect::<Result<Vec<_>>>()?;
                 Ok(SelectedNativeReferenceUnits {
                     answer,
                     definitions,
@@ -875,6 +940,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     declared_visibilities,
                     absent_member_owners,
                     named_reasons,
+                    diagnostic_identities,
                 })
             },
         )
@@ -944,8 +1010,8 @@ fn resolve_named_argument_parameter(
     };
     let Some(callee_reference) = label.callee_reference else {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "named-argument call {:?} has no selected call obligation",
-            label.call
+            "named-argument call {} has no selected call obligation",
+            selected_public_diagnostic_identity(ready, label.call, cancellation, session)?
         ))));
     };
     if cancellation.is_cancelled() || !session.scope_step() {
@@ -958,20 +1024,40 @@ fn resolve_named_argument_parameter(
     let binding = call_answer.binding();
     let [target] = binding.targets() else {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "named-argument call {:?} has no unique selected callable: targets={:?}, completion={:?}",
-            label.call,
-            binding.targets(),
-            call_answer.completion()
+            "named-argument call {} has no unique selected callable: targets={:?}, completion={}",
+            selected_public_diagnostic_identity(ready, label.call, cancellation, session)?,
+            binding
+                .targets()
+                .iter()
+                .map(|target| selected_public_diagnostic_identity(
+                    ready,
+                    *target,
+                    cancellation,
+                    session
+                ))
+                .collect::<Result<Vec<_>>>()?,
+            selected_public_completion_details(
+                ready,
+                call_answer.completion(),
+                cancellation,
+                session
+            )?
         ))));
     };
     if binding.completion() != &ResolutionCompletion::Complete
         || call_answer.completion() != &ResolutionCompletion::Complete
     {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "named-argument call {:?} has a selected callable {target:?} but its resolution is incomplete: binding={:?}, resolution={:?}",
-            label.call,
-            binding.completion(),
-            call_answer.completion()
+            "named-argument call {} has a selected callable {} but its resolution is incomplete: binding={}, resolution={}",
+            selected_public_diagnostic_identity(ready, label.call, cancellation, session)?,
+            selected_public_diagnostic_identity(ready, *target, cancellation, session)?,
+            selected_public_completion_details(ready, binding.completion(), cancellation, session)?,
+            selected_public_completion_details(
+                ready,
+                call_answer.completion(),
+                cancellation,
+                session
+            )?
         ))));
     }
     let receiver_dispositions = call_answer.callable_receiver_dispositions();
@@ -982,13 +1068,19 @@ fn resolve_named_argument_parameter(
         call_answer.callable_receiver_origin().is_none() || !receiver_dispositions.is_empty();
     if !dispatch_is_proven || !dispatch_evidence_present {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "named-argument call {:?} lacks complete dispatch evidence for callable {target:?}: receiver_dispositions={receiver_dispositions:?}",
-            label.call,
+            "named-argument call {} lacks complete dispatch evidence for callable {}: receiver_dispositions={:?}",
+            selected_public_diagnostic_identity(ready, label.call, cancellation, session)?,
+            selected_public_diagnostic_identity(ready, *target, cancellation, session)?,
+            receiver_dispositions
+                .iter()
+                .map(|value| (value.disposition().channels(), value.disposition().gap()))
+                .collect::<Vec<_>>(),
         ))));
     }
     let Some(parameter) = operation.callable_parameter_for_label(*target, &label.spelling)? else {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "selected callable {target:?} has no unique parameter named {:?}",
+            "selected callable {} has no unique parameter named {:?}",
+            selected_public_diagnostic_identity(ready, *target, cancellation, session)?,
             label.spelling
         ))));
     };
@@ -999,12 +1091,14 @@ fn resolve_named_argument_parameter(
         project_native_definition_units(ready, &[parameter], cancellation, session)?
     else {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "selected parameter {parameter:?} has no native source-unit projection"
+            "selected parameter {} has no native source-unit projection",
+            selected_public_diagnostic_identity(ready, parameter, cancellation, session)?
         ))));
     };
     let Some((projected_parameter, definition)) = parameters.pop() else {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "selected parameter {parameter:?} has no native source-unit projection"
+            "selected parameter {} has no native source-unit projection",
+            selected_public_diagnostic_identity(ready, parameter, cancellation, session)?
         ))));
     };
     assert_eq!(projected_parameter, parameter);
@@ -1308,6 +1402,328 @@ fn project_intrinsic_definition(
     Ok(result)
 }
 
+fn native_type_diagnostic_identities(
+    ready: &ReadySelectedResolution<'_, '_>,
+    answer: &FactResolutionAnswer,
+    types: &SelectedNativeTypes,
+    storage_language: &str,
+    cancellation: &CancellationToken,
+) -> Result<Vec<(SemanticId, String)>> {
+    let SelectedNativeTypes::Ready {
+        nominal,
+        intrinsic,
+        external_owners,
+    } = types
+    else {
+        return Ok(Vec::new());
+    };
+    let mut semantics = Vec::new();
+    let mut collect_reasons = |completion: &ResolutionCompletion| {
+        if let ResolutionCompletion::Incomplete(reasons) = completion {
+            semantics.extend(
+                reasons
+                    .iter()
+                    .filter_map(|reason| public_reason_details(reason).1),
+            );
+        }
+    };
+    collect_reasons(answer.completion());
+    for frontier in answer.projected_frontiers() {
+        collect_reasons(frontier.completion());
+    }
+    let alternatives = answer
+        .projected_frontiers()
+        .iter()
+        .flat_map(|frontier| {
+            frontier
+                .possible_values()
+                .iter()
+                .map(|value| (value.ty().identity(), value.ty().indirection()))
+        })
+        .collect::<BTreeSet<_>>();
+    let may_be_ambiguous = alternatives.len() > 1 || answer.projected_frontiers().len() > 1;
+    for frontier in answer.projected_frontiers() {
+        if may_be_ambiguous {
+            semantics.push(frontier.slot());
+        }
+        for value in frontier.possible_values() {
+            let identity = value.ty().identity();
+            let known = nominal.iter().any(|(id, definition)| {
+                *id == identity && !matches!(definition, SelectedNativeDefinition::Lexical(_))
+            }) || intrinsic
+                .iter()
+                .any(|descriptor| descriptor.identity() == identity)
+                || external_owners.iter().any(|(id, _)| *id == identity);
+            if may_be_ambiguous
+                || !known
+                || (storage_language != "go" && value.ty().indirection() != 0)
+            {
+                semantics.push(identity);
+            }
+        }
+    }
+    for projection in answer.projections() {
+        if !answer
+            .projected_frontiers()
+            .iter()
+            .any(|frontier| frontier.slot() == projection.output_slot())
+        {
+            semantics.push(projection.output_slot());
+        }
+    }
+    for shape in answer.projected_type_shapes() {
+        if !shape.supported() {
+            semantics.push(shape.output_slot());
+        }
+    }
+    semantics.sort_unstable();
+    semantics.dedup();
+    let session = ResolutionSession::unbounded();
+    semantics
+        .into_iter()
+        .map(|semantic| {
+            let unit = nominal
+                .iter()
+                .find_map(|(id, definition)| match definition {
+                    SelectedNativeDefinition::Unit(unit) if *id == semantic => Some(unit),
+                    _ => None,
+                });
+            let identity = if let Some(unit) = unit {
+                public_diagnostic_identity("semantic", Some(unit), None, None)
+            } else {
+                selected_public_diagnostic_identity(ready, semantic, cancellation, &session)?
+            };
+            Ok((semantic, identity))
+        })
+        .collect()
+}
+
+/// Project a semantic's available evidence into a portable public identity.
+/// Numeric semantic aliases are deliberately never an input to this policy.
+#[doc(hidden)]
+pub fn public_diagnostic_identity(
+    kind: &str,
+    declaration: Option<&CodeUnit>,
+    shared_digest: Option<&[u8; 32]>,
+    site: Option<&serde_json::Value>,
+) -> String {
+    if let Some(unit) = declaration {
+        return unit.declaration_id().to_string();
+    }
+    if let Some(digest) = shared_digest {
+        return format!(
+            "shared:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+    if let Some(site) = site
+        && let (Some(path), Some(line), Some(column)) = (
+            site.get("path").and_then(|v| v.as_str()),
+            site.get("line"),
+            site.get("column"),
+        )
+    {
+        return format!("{path}:{line}:{column}");
+    }
+    kind.to_owned()
+}
+
+/// Keep alternative multiplicity while ordering by public evidence.
+#[doc(hidden)]
+pub fn public_diagnostic_targets(
+    targets: &[SemanticId],
+    project: impl Fn(SemanticId) -> String,
+) -> Vec<String> {
+    let mut projected = targets
+        .iter()
+        .map(|target| project(*target))
+        .collect::<Vec<_>>();
+    projected.sort_unstable();
+    projected
+}
+
+/// The public structure of one incomplete reason, without Debug aliases.
+#[doc(hidden)]
+pub fn public_reason_details(
+    reason: &ResolutionIncompleteReason,
+) -> (&'static str, Option<SemanticId>) {
+    match *reason {
+        ResolutionIncompleteReason::UnsupportedSemantic(id) => ("UnsupportedSemantic", Some(id)),
+        ResolutionIncompleteReason::OpenBoundary { semantic, .. } => {
+            ("OpenBoundary", Some(semantic))
+        }
+        ResolutionIncompleteReason::CyclicPrefixDependency(id) => {
+            ("CyclicPrefixDependency", Some(id))
+        }
+        ResolutionIncompleteReason::InconsistentPrecedence(id) => {
+            ("InconsistentPrecedence", Some(id))
+        }
+        ResolutionIncompleteReason::ReceiverBudgetExhausted(id) => {
+            ("ReceiverBudgetExhausted", Some(id))
+        }
+        ResolutionIncompleteReason::TimeBudgetExceeded(id) => ("TimeBudgetExceeded", Some(id)),
+        ResolutionIncompleteReason::Cancelled => ("Cancelled", None),
+        ResolutionIncompleteReason::CyclicExpansion(_) => ("CyclicExpansion", None),
+        ResolutionIncompleteReason::UnmountedFile { .. } => ("UnmountedFile", None),
+    }
+}
+
+#[doc(hidden)]
+pub fn public_completion_details(
+    completion: &ResolutionCompletion,
+    project: impl Fn(SemanticId) -> String,
+) -> String {
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return "Complete".to_owned();
+    };
+    let mut details = reasons
+        .iter()
+        .map(|reason| {
+            let (kind, semantic) = public_reason_details(reason);
+            let mut fields = vec![kind.to_owned()];
+            if let Some(semantic) = semantic {
+                fields.push(project(semantic));
+            }
+            if let ResolutionIncompleteReason::OpenBoundary { status, .. } = reason {
+                fields.push(status.label().to_owned());
+            }
+            fields.join(": ")
+        })
+        .collect::<Vec<_>>();
+    details.sort_unstable();
+    format!("Incomplete [{}]", details.join(", "))
+}
+
+fn selected_public_completion_details(
+    ready: &ReadySelectedResolution<'_, '_>,
+    completion: &ResolutionCompletion,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<String> {
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return Ok("Complete".to_owned());
+    };
+    let projected = reasons
+        .iter()
+        .filter_map(|reason| public_reason_details(reason).1)
+        .map(|semantic| {
+            Ok((
+                semantic,
+                selected_public_diagnostic_identity(ready, semantic, cancellation, session)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(public_completion_details(completion, |semantic| {
+        projected[&semantic].clone()
+    }))
+}
+
+/// Locate the source evidence of a semantic through the native row relations.
+pub(super) fn selected_public_diagnostic_site(
+    ready: &ReadySelectedResolution<'_, '_>,
+    semantic: SemanticId,
+) -> Result<Option<serde_json::Value>> {
+    let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
+        return Ok(None);
+    };
+    let mount = ready
+        .inventory
+        .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+    let site = ready.inventory.connection().prepare_cached(
+        "SELECT source_site AS site, 0 AS priority FROM resolution_semantic_sites WHERE blob_id=?1 AND semantic_key=?2
+         UNION ALL SELECT site, 1 FROM resolution_gap_reasons WHERE blob_id=?1 AND reason=?2
+         UNION ALL SELECT site, 2 FROM resolution_definition_property_gaps WHERE blob_id=?1 AND reason=?2
+         ORDER BY priority, site LIMIT 1"
+    )?.query_row(rusqlite::params![mount.blob_id(), key], |row| row.get::<_, i64>(0)).optional()?;
+    match site {
+        Some(site) => obligation_site_details(ready, ordinal, site),
+        None => Ok(None),
+    }
+}
+
+/// Resolve evidence for one query only. No identity lookup survives its answer.
+pub(super) fn selected_public_diagnostic_identity(
+    ready: &ReadySelectedResolution<'_, '_>,
+    semantic: SemanticId,
+    cancellation: &CancellationToken,
+    _session: &ResolutionSession,
+) -> Result<String> {
+    use crate::analyzer::resolution::SharedNameInterner;
+    // Only mounted declarations can project to source CodeUnits. Runtime
+    // reason aliases have no source authority; do not ask the resolver to
+    // invent one while rendering a diagnostic.
+    let declaration = if let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key())
+    {
+        let ordinal = SelectedResolutionMountOrdinal::new(ordinal);
+        let coordinate = (ordinal, ResolutionLocalKey::new(i64::from(key)));
+        let mounts = SelectedMountTable::new(&ready.inventory);
+        let mount = mounts.mount_by_ordinal(ordinal)?;
+        // A reason operand can be an unregistered local obligation, rather
+        // than a declaration. Read the source crosswalk without requiring
+        // declaration authority from the resolver just to explain it.
+        if let Some(mut rows) = read_fragment_definition_rows(ready, &[coordinate], cancellation)? {
+            if mount.semantic_language() == Language::Rust {
+                match rows.units.remove(&coordinate) {
+                    Some(rows) => {
+                        let mut units = rows
+                            .iter()
+                            .map(|row| RustMountUnits::new(ready, &mount)?.unit(row))
+                            .collect::<Result<Vec<_>>>()?;
+                        units.sort_unstable();
+                        units.dedup();
+                        (units.len() == 1).then(|| units.remove(0))
+                    }
+                    None => None,
+                }
+            } else {
+                match project_fragment_definition(ready, coordinate, &mut rows)? {
+                    Some(SelectedNativeDefinition::Unit(unit)) => Some(unit),
+                    _ => None,
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(unit) = declaration.as_ref() {
+        return Ok(public_diagnostic_identity(
+            "semantic",
+            Some(unit),
+            None,
+            None,
+        ));
+    }
+    let digest = if let Some(name) = semantic.shared_name_id() {
+        match ready.shared_names().digest_for_id(name) {
+            Some(digest) => Some(digest),
+            None if name.is_interned() => ready
+                .inventory
+                .connection()
+                .query_row(
+                    "SELECT identity_digest FROM main.resolution_identities WHERE id=?1",
+                    [i64::from(name.get())],
+                    |row| row.get::<_, [u8; 32]>(0),
+                )
+                .optional()?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let site = selected_public_diagnostic_site(ready, semantic)?;
+    Ok(public_diagnostic_identity(
+        "semantic",
+        None,
+        digest.as_ref(),
+        site.as_ref(),
+    ))
+}
+
 fn native_reference_reason_details(
     ready: &ReadySelectedResolution<'_, '_>,
     operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
@@ -1341,31 +1757,16 @@ fn native_reference_reason_details(
     for reason in reasons.iter() {
         let mut named = named_reason_details(ready, &ResolutionCompletion::incomplete([*reason]))?;
         if named.is_empty() {
-            let (kind, semantic) = match reason {
-                ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
-                    ("UnsupportedSemantic", Some(*semantic))
-                }
-                ResolutionIncompleteReason::OpenBoundary { semantic, .. } => {
-                    ("OpenBoundary", Some(*semantic))
-                }
-                ResolutionIncompleteReason::Cancelled => ("Cancelled", None),
-                ResolutionIncompleteReason::CyclicExpansion(_) => ("CyclicExpansion", None),
-                ResolutionIncompleteReason::CyclicPrefixDependency(semantic) => {
-                    ("CyclicPrefixDependency", Some(*semantic))
-                }
-                ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
-                    ("InconsistentPrecedence", Some(*semantic))
-                }
-                ResolutionIncompleteReason::ReceiverBudgetExhausted(semantic) => {
-                    ("ReceiverBudgetExhausted", Some(*semantic))
-                }
-                ResolutionIncompleteReason::TimeBudgetExceeded(semantic) => {
-                    ("TimeBudgetExceeded", Some(*semantic))
-                }
-                ResolutionIncompleteReason::UnmountedFile { .. } => ("UnmountedFile", None),
-            };
-            let mut evidence = format!("{reason:?}");
+            let (kind, semantic) = public_reason_details(reason);
+            let cancellation = CancellationToken::new();
+            let session = ResolutionSession::unbounded();
+            let mut evidence = kind.to_owned();
             if let Some(semantic) = semantic {
+                let identity =
+                    selected_public_diagnostic_identity(ready, semantic, &cancellation, &session)?;
+                if identity != "semantic" {
+                    evidence = format!("{kind}: {identity}");
+                }
                 if let Some((operation_name, semantics)) =
                     operation.service_reason_details(semantic)
                 {
@@ -1379,7 +1780,7 @@ fn native_reference_reason_details(
                         };
                         let descriptor = operation.read_intrinsic_type_descriptors(&[anchor])?;
                         operands.push(serde_json::json!({
-                            "identity": anchor.get(),
+                            "identity": selected_public_diagnostic_identity(ready, anchor, &cancellation, &session)?,
                             "site": source_site,
                             "intrinsic_types": descriptor.map(|values| values.iter().map(|value| value.spelling().to_owned()).collect::<Vec<_>>()),
                         }));
@@ -1391,18 +1792,26 @@ fn native_reference_reason_details(
                     operation.read_intrinsic_type_descriptors(&[semantic])?
                     && !descriptors.is_empty()
                 {
-                    evidence = format!("{descriptors:?}");
+                    evidence = serde_json::json!({"identity": identity, "intrinsic_types": descriptors.iter().map(|value| value.spelling()).collect::<Vec<_>>()}).to_string();
                 }
             }
-            named.push((kind, evidence));
+            // The message below embeds this evidence as a string, so sorting
+            // the outer message cannot reach its keys (#6112).
+            named.push((kind, feature_invariant_reason_json(evidence)));
         }
         for (kind, evidence) in named {
             // Named provider reasons retain their complete evidence. The query
             // site also anchors context-owned obligations with no persisted site.
             let message = match serde_json::from_str::<serde_json::Value>(&evidence) {
                 Ok(value) if value.get("site").is_some() => evidence,
-                _ => serde_json::json!({"kind": kind, "site": site, "semantic": evidence})
-                    .to_string(),
+                // The outer sort cannot reach JSON nested as a string, so sort
+                // it before nesting (#6112).
+                _ => serde_json::json!({
+                    "kind": kind,
+                    "site": site,
+                    "semantic": feature_invariant_reason_json(evidence),
+                })
+                .to_string(),
             };
             details.push((kind, feature_invariant_reason_json(message)));
         }
@@ -1747,6 +2156,7 @@ pub struct ProjectedNativeTraceProvenance {
 fn project_native_trace_provenance(
     ready: &ReadySelectedResolution<'_, '_>,
     answer: &FactResolutionAnswer,
+    call_applicability_reason: Option<SemanticId>,
     definitions: &SelectedNativeDefinitions,
     callable_candidates: &[(SemanticId, CodeUnit)],
     member_contexts: &[ProjectedNativeMemberContext],
@@ -1758,22 +2168,51 @@ fn project_native_trace_provenance(
     if !crate::analyzer::resolution::resolution_diagnostics().native_rejection_projection_active() {
         return Ok(ProjectedNativeTraceProvenance::default());
     }
+    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
     let binding = answer.binding();
+    // An inapplicable or less specific candidate is refused by the call, not
+    // by its lookup; both keep their row as a callable rejection.
+    let refused_by_call = |verdict: ApplicabilityVerdict| {
+        matches!(
+            verdict,
+            ApplicabilityVerdict::Inapplicable | ApplicabilityVerdict::LessSpecific
+        )
+    };
     let outcome_of = |witness: &crate::analyzer::resolution::ResolutionWitness| {
         let recorded = witness.candidate_outcome();
         match recorded {
             Some(CandidateOutcome::Rejected(_)) => recorded,
             _ if binding.targets().contains(&witness.target()) => Some(CandidateOutcome::Selected),
-            _ if answer.callable_candidate_applicability().iter().any(|candidate| {
-                candidate.target() == witness.target() && candidate.verdict()
-                    == brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Inapplicable
-            }) => Some(CandidateOutcome::Rejected(crate::analyzer::structural::RejectionReason::CallableApplicabilityDeferred)),
+            _ if answer
+                .callable_candidate_applicability()
+                .iter()
+                .any(|candidate| {
+                    candidate.target() == witness.target() && refused_by_call(candidate.verdict())
+                }) =>
+            {
+                Some(CandidateOutcome::Rejected(
+                    crate::analyzer::structural::RejectionReason::CallableApplicabilityDeferred,
+                ))
+            }
             _ => None,
         }
     };
 
+    // The call's own applicability obligation stays open while the verdicts
+    // do not prove one unique winner (an ambiguity, an undecided candidate).
+    // That is a fact about the selection, which the rows report; it is not a
+    // candidate the lookup failed to enumerate.
+    let enumerated_completion = call_applicability_reason.map_or_else(
+        || binding.completion().clone(),
+        |reason| {
+            crate::analyzer::resolution::completion_without_unsupported_semantic(
+                binding.completion(),
+                reason,
+            )
+        },
+    );
     let mut covered =
-        !binding.witnesses().is_empty() && binding.completion() == &ResolutionCompletion::Complete;
+        !binding.witnesses().is_empty() && enumerated_completion == ResolutionCompletion::Complete;
     let mut identities = binding
         .witnesses()
         .iter()
@@ -1971,19 +2410,43 @@ fn project_native_trace_provenance(
     }
     // Applicability is a later native selection stage. Every computed loser
     // needs either its actual witness outcome or the shared applicability row.
-    covered &= answer.callable_candidate_applicability().iter().all(|candidate| {
-        if binding.targets().contains(&candidate.target()) { return true; }
-        // A later phase may have erased the whole lookup group that supplied
-        // this candidate. Its callable verdict alone cannot prove route coverage.
-        if !binding.witnesses().iter().any(|witness| witness.target() == candidate.target() && witness.native_provenance().is_some()) {
-            return false;
-        }
-        let Some((_, unit)) = callable_candidates.iter().find(|(target, _)| *target == candidate.target()) else {
-            return false;
-        };
-        candidate.verdict() == brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Inapplicable
-            || rows.iter().any(|row| !row.is_selected() && matches!(&row.candidate, TraceCandidateRef::Unit(found) if found == unit))
+    //
+    // A later phase may have erased the whole lookup group that supplied a
+    // loser, so its callable verdict alone cannot prove route coverage. The
+    // applicability filters drop a refused candidate's witness, so its route
+    // was read when the check received it; the group survived when every
+    // selected target was classified by that same check.
+    let selection_classified = binding.targets().iter().all(|target| {
+        answer
+            .callable_candidate_applicability()
+            .iter()
+            .any(|candidate| candidate.target() == *target)
     });
+    covered &= answer
+        .callable_candidate_applicability()
+        .iter()
+        .all(|candidate| {
+            if binding.targets().contains(&candidate.target()) {
+                return true;
+            }
+            let witnessed = binding.witnesses().iter().any(|witness| {
+                witness.target() == candidate.target() && witness.native_provenance().is_some()
+            });
+            if !witnessed && !(candidate.traced_route() && selection_classified) {
+                return false;
+            }
+            let Some((_, unit)) = callable_candidates
+                .iter()
+                .find(|(target, _)| *target == candidate.target())
+            else {
+                return false;
+            };
+            refused_by_call(candidate.verdict())
+                || rows.iter().any(|row| {
+                    !row.is_selected()
+                        && matches!(&row.candidate, TraceCandidateRef::Unit(found) if found == unit)
+                })
+        });
     covered &= answer.member_rejections().len()
         == member_contexts
             .iter()
@@ -2055,7 +2518,7 @@ fn project_native_import_binder(
     let ordinal = provenance.mount().ordinal();
     let record = ready.inventory.mount_record_by_ordinal(ordinal)?;
     let Some(import) = super::jvm_context::selected_import_route(
-        ready.inventory.connection(),
+        &ready.inventory,
         record.blob_id(),
         ordinal,
         token,

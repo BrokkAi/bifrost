@@ -12,13 +12,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::super::inverted_edges::MAX_CALLSITES;
 use super::super::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
 use super::*;
-use crate::analyzer::resolution::ResolutionBatchMetrics;
 #[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::resolution::{
     BindingFragmentId, FactReferenceEdgeCatalog, FactReferenceEdgeDeclarationDomain,
     FactReferenceEdgeDomainStatus, FactResolutionSource, SelectedFactResolutionSnapshot,
     stage_selected_reference_edge_batches, validate_selected_reference_edge_coverage,
 };
+use crate::analyzer::resolution::{ResolutionBatchMetrics, ResolutionCompletion};
+use crate::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome;
 use crate::analyzer::store::{Result as StoreResult, StoreError};
 use crate::analyzer::structural::reference_edges::{
     EdgeCompleteness, EdgeIncompleteReason, ReferenceEdgeRow,
@@ -1796,6 +1797,200 @@ impl NativeWorkspaceUsageGraphAccumulator {
         } else {
             SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(projection)
         }
+    }
+}
+
+/// Query-owned native graph collection shared by language providers. Language
+/// rules classify rows before submission; this builder owns catalog growth,
+/// incompleteness, revalidation and the canonical accumulator.
+#[doc(hidden)]
+pub struct NativeWorkspaceGraphBuilder {
+    declarations: Vec<(CodeUnit, Vec<Range>)>,
+    rooted_declarations: HashSet<CodeUnit>,
+    rows: Vec<ReferenceEdgeRow>,
+    unresolved_names: BTreeSet<String>,
+    unresolved_names_complete: bool,
+    withheld_references: Vec<WithheldReference>,
+    reasons: Vec<EdgeIncompleteReason>,
+    reference_count: usize,
+    batch_count: usize,
+    generation: u64,
+}
+
+impl NativeWorkspaceGraphBuilder {
+    pub fn new(
+        analyzer: &dyn IAnalyzer,
+        admitted_callers: &HashSet<ProjectFile>,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let mut declarations = Vec::new();
+        for file in admitted_callers {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let catalog = WorkspaceUsageCatalog::build_for_files_with_cancellation(
+                analyzer,
+                std::slice::from_ref(file),
+                cancellation,
+            )?;
+            declarations.extend(catalog.nodes.into_iter().map(|node| node.primary));
+        }
+        let mut declarations_with_ranges = Vec::new();
+        for unit in declarations {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            declarations_with_ranges.push((unit.clone(), analyzer.ranges(&unit)));
+        }
+        let declarations = declarations_with_ranges;
+
+        let rooted_declarations = declarations.iter().map(|(unit, _)| unit.clone()).collect();
+        Some(Self {
+            declarations,
+            rooted_declarations,
+            rows: Vec::new(),
+            unresolved_names: BTreeSet::new(),
+            unresolved_names_complete: true,
+            withheld_references: Vec::new(),
+            reasons: Vec::new(),
+            reference_count: 0,
+            batch_count: 0,
+            generation: analyzer.project().analysis_generation(),
+        })
+    }
+
+    pub fn stage_batch(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        source_batch: &crate::analyzer::resolution::FactReferenceBatchAnswer,
+        edge_batch: &crate::analyzer::resolution::FactReferenceEdgeBatch,
+        rows: impl IntoIterator<Item = ReferenceEdgeRow>,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        assert_eq!(edge_batch.generation(), self.generation);
+        let status = edge_batch.domain_status(crate::analyzer::resolution::fact_reference_edges::FactReferenceEdgeDeclarationDomain::TypeOrCallable);
+        if let EdgeCompleteness::Incomplete { reasons } = status.completeness() {
+            for reason in reasons {
+                if !self.reasons.contains(reason) {
+                    self.reasons.push(reason.clone());
+                }
+            }
+        }
+        self.withheld_references
+            .extend_from_slice(edge_batch.withheld_references());
+        match edge_batch.unresolved_names() {
+            Some(names) => self.unresolved_names.extend(names.iter().cloned()),
+            None => self.unresolved_names_complete = false,
+        }
+        for row in rows {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            for unit in row
+                .site
+                .enclosing
+                .iter()
+                .chain(std::iter::once(&row.target))
+            {
+                if is_graph_declaration(unit) && self.rooted_declarations.insert(unit.clone()) {
+                    self.declarations
+                        .push((unit.clone(), analyzer.ranges(unit)));
+                }
+            }
+            self.rows.push(row);
+        }
+        self.reference_count += source_batch.answers().len();
+        self.batch_count += 1;
+        true
+    }
+
+    pub fn finish(
+        self,
+        operation: &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
+            '_,
+            '_,
+        >,
+        mut summary: crate::analyzer::resolution::FactResolutionBatchSummary,
+        skipped: GraphSkippedCallers,
+        mut admitted_callers: HashSet<ProjectFile>,
+        ecosystem: UsageEcosystem,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<SelectedWorkspaceUsageGraphProjectionOutcome> {
+        let Self {
+            mut declarations,
+            rows,
+            mut reasons,
+            unresolved_names,
+            unresolved_names_complete,
+            withheld_references,
+            reference_count,
+            batch_count,
+            generation,
+            ..
+        } = self;
+        admitted_callers.retain(|file| !skipped.contains_key(file));
+        // Caller exclusion does not exclude endpoints: admitted rows can retain
+        // unproven alternatives from platform files outside the fallback build.
+        let referenced_targets = rows.iter().map(|row| &row.target).collect::<HashSet<_>>();
+        declarations.retain(|(unit, _)| {
+            !skipped.contains_key(unit.source()) || referenced_targets.contains(unit)
+        });
+        assert_eq!(reference_count, summary.reference_count());
+        assert_eq!(batch_count, summary.batch_count());
+        let completion = summary
+            .completion()
+            .combine(summary.reference_enumeration_completion());
+        summary = match operation.finish_native(summary, &completion, cancellation)? {
+            SelectedResolutionOperationOutcome::Native(summary) => summary,
+            SelectedResolutionOperationOutcome::Cancelled(_) => {
+                return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+            }
+            SelectedResolutionOperationOutcome::Stale(_) => {
+                return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale);
+            }
+            SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Unavailable(
+                    format!("{reason:?}"),
+                ));
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+        }
+        if summary.reference_enumeration_completion() != &ResolutionCompletion::Complete
+            && !reasons.contains(&EdgeIncompleteReason::ReferenceEnumerationIncomplete)
+        {
+            reasons.push(EdgeIncompleteReason::ReferenceEnumerationIncomplete);
+        }
+        let completeness = if reasons.is_empty() {
+            EdgeCompleteness::Complete
+        } else {
+            EdgeCompleteness::Incomplete { reasons }
+        };
+        let Some(mut accumulator) = NativeWorkspaceUsageGraphAccumulator::new(
+            declarations,
+            generation,
+            ecosystem,
+            &admitted_callers,
+            cancellation,
+        ) else {
+            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+        };
+        accumulator.record_skipped_callers(skipped);
+        if !accumulator.stage(&rows, cancellation) {
+            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+        }
+        if !accumulator.note_withheld_references(&withheld_references, cancellation) {
+            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+        }
+        if !accumulator.note_unresolved_names(
+            unresolved_names_complete.then_some(&unresolved_names),
+            cancellation,
+        ) {
+            return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
+        }
+        let projection = accumulator.finish(&completeness, &summary, rows.len(), cancellation);
+        Ok(projection)
     }
 }
 

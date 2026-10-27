@@ -170,9 +170,11 @@ pub fn cpp_callable_definitions_share_identity_evidence(
 /// at file scope - so string equality alone refuses to unify the very pair this
 /// predicate exists to unify (#2010). [`VisibilityIndex::same_logical_callable`]
 /// compares the strings first and resolves the written parameter names only
-/// when they differ, so this is strictly the wider relation; every other
-/// conjunct - equal `fq_name`, external linkage on both sides, and the include
-/// evidence relating the two files - is unchanged.
+/// when they differ, so this is strictly the wider relation. Equal `fq_name`
+/// and external linkage on both sides are unchanged; the include evidence may
+/// also cross from a header member declaration to an identical class
+/// definition in a header the body's translation unit includes
+/// ([`VisibilityIndex::member_declaration_bridges_to_body`]).
 ///
 /// Definition lookup uses this variant. The workspace-scale scans keep the
 /// string form above, where the candidate set is the whole index.
@@ -192,7 +194,19 @@ pub fn cpp_callable_definitions_share_identity_evidence_with_visibility(
             ) && matches!(
                 visibility.callable_linkage(right),
                 Some(CallableLinkage::External)
-            ) && header_body_related(left.source(), right.source())))
+            ) && (header_body_related(left.source(), right.source())
+                || visibility.member_declaration_bridges_to_body(
+                    analyzer,
+                    left,
+                    right,
+                    &header_body_related,
+                )
+                || visibility.member_declaration_bridges_to_body(
+                    analyzer,
+                    right,
+                    left,
+                    &header_body_related,
+                ))))
 }
 
 /// Return whether `node` is one of the names declared by a range-for
@@ -934,7 +948,7 @@ const CANDIDATE_BUCKETING_POLL_STRIDE: usize = 256;
 ///
 /// Deliberately **not** a workspace-wide index: building one would need a full
 /// declaration scan, and a warm forward lookup must not trigger one
-/// (`tests/analyzer_persistence.rs`'s candidate-bounded contract). Instead each
+/// (`tests/suite_persistence/analyzer_persistence.rs`'s candidate-bounded contract). Instead each
 /// group reconciles only the candidates the persisted terminal identifier
 /// index already offers, which is the same bounded lookup the ordinary
 /// resolution path uses.
@@ -1275,6 +1289,94 @@ fn cpp_single_owner_context(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn range_for_binder_grammar() {
+        use crate::grammar_test_support::{SOURCE, at, field, nodes, tree};
+
+        let parsed = tree(SOURCE);
+        let cases = [
+            (
+                314..348,
+                "structured_binding_declarator",
+                324..336,
+                None,
+                339..344,
+                &[(325..328, "key"), (330..335, "value")][..],
+            ),
+            (
+                350..376,
+                "reference_declarator",
+                360..365,
+                None,
+                368..372,
+                &[(361..365, "same")][..],
+            ),
+            (
+                378..407,
+                "pointer_declarator",
+                388..392,
+                Some(389..392),
+                395..403,
+                &[(389..392, "ptr")][..],
+            ),
+            (
+                409..452,
+                "attributed_declarator",
+                419..440,
+                None,
+                443..448,
+                &[(419..423, "item")][..],
+            ),
+            (
+                454..480,
+                "reference_declarator",
+                464..467,
+                None,
+                470..476,
+                &[(465..467, "\u{3bb}")][..],
+            ),
+        ];
+        for (span, kind, declarator_span, inner_field, iterable_span, binders) in cases {
+            let range = at(parsed.root_node(), "for_range_loop", span);
+            field(range, "declarator", kind, declarator_span);
+            field(range, "right", "identifier", iterable_span.clone());
+            let declarator = range.child_by_field_name("declarator").unwrap();
+            assert_eq!(
+                declarator
+                    .child_by_field_name("declarator")
+                    .map(|node| node.byte_range()),
+                inner_field
+            );
+            for (binder_span, text) in binders {
+                let binder = at(range, "identifier", binder_span.clone());
+                assert_eq!(binder.utf8_text(SOURCE.as_bytes()).unwrap(), *text);
+                assert!(crate::identity::cpp_is_range_for_binding_name(binder));
+            }
+            // Include attributes and the identically spelled iterable: only the
+            // hand-written binder node identities belong to the declarator.
+            for identifier in nodes(range)
+                .into_iter()
+                .filter(|node| node.kind() == "identifier")
+            {
+                let expected = binders
+                    .iter()
+                    .any(|(span, _)| identifier.byte_range() == *span);
+                assert_eq!(
+                    crate::identity::cpp_is_range_for_binding_name(identifier),
+                    expected,
+                    "identifier {:?}",
+                    identifier.byte_range()
+                );
+            }
+            assert!(!crate::identity::cpp_is_range_for_binding_name(at(
+                range,
+                "identifier",
+                iterable_span
+            )));
+        }
+    }
+
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
 
@@ -1822,5 +1924,32 @@ mod tests {
             vec![CppOccurrenceRole::Definition],
             "a complete class stays a definition"
         );
+    }
+
+    #[test]
+    fn partial_declaration_range_grammar_boundary() {
+        for prefix in ["", "// offset\n"] {
+            let source = format!("{prefix}void first(); void later() {{}}");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let declaration = tree
+                .root_node()
+                .named_child(if prefix.is_empty() { 0 } else { 1 })
+                .unwrap();
+            assert_eq!(declaration.kind(), "declaration");
+            assert_eq!(declaration.byte_range(), prefix.len()..prefix.len() + 13);
+            let mut range = brokk_bifrost_core::analyzer::tree_walk::node_range(declaration);
+            range.end_byte -= 1; // Omit only the semicolon: no named node has this range.
+            assert!(super::node_for_exact_range(tree.root_node(), &range).is_none());
+            let selected = super::cpp_declaration_node_for_range(tree.root_node(), &range).unwrap();
+            assert_eq!(
+                (selected.kind(), selected.byte_range()),
+                ("declaration", prefix.len()..prefix.len() + 13)
+            );
+        }
     }
 }

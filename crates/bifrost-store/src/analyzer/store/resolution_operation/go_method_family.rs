@@ -81,7 +81,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .inventory
             .connection()
             .query_row(
-                GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL,
+                GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL.as_str(),
                 params![mount, key, context_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -105,7 +105,7 @@ impl SelectedResolutionOperation<'_, '_> {
         // that can promote an indexed method from another interface.
         // Keep the selected mount before packages and declarations: the package-first
         // plan repeats the file-scope declaration inventory for every package.
-        let mut statement = connection.prepare_cached(GO_INTERVAL_GO_METHOD_FAMILY_1_SQL)?;
+        let mut statement = connection.prepare_cached(&GO_INTERVAL_GO_METHOD_FAMILY_1_SQL)?;
         let interfaces = statement
             .query_map(params![context_id, target.identifier()], |row| {
                 Ok((
@@ -233,7 +233,10 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
-pub(crate) const GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL: &str = "SELECT callable.name,package.package_id
+pub(crate) static GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"SELECT callable.name,package.package_id
              FROM temp.selected_resolution_mounts AS mount
              JOIN main.resolution_semantic_sites AS semantic ON semantic.blob_id=mount.blob_id
               AND semantic.semantic_key=?2 AND semantic.semantic_role='definition'
@@ -241,14 +244,20 @@ pub(crate) const GO_INTERVAL_GO_METHOD_IDENTITY_0_SQL: &str = "SELECT callable.n
               AND bridge.source_site=semantic.source_site
              JOIN main.source_go_callables AS callable ON callable.blob_id=bridge.blob_id
               AND callable.declaration_id=bridge.declaration_id AND callable.is_method=1
-             JOIN temp.selected_go_context_source_files AS file ON file.file_version_id=coalesce(mount.file_version_id,
+             JOIN ({}) AS file ON file.file_version_id=coalesce(mount.file_version_id,
                (SELECT placement.file_version_id FROM temp.selected_go_transient_placements AS placement
                 WHERE placement.mount_ordinal=mount.mount_ordinal)) AND file.source_role<>'ignored'
              JOIN main.go_package_instances AS package ON package.package_id=file.package_id
               AND package.context_id=?3 AND package.for_test=''
-             WHERE mount.mount_ordinal=?1 LIMIT 1";
+             WHERE mount.mount_ordinal=?1 LIMIT 1"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });
 
-pub(crate) const GO_INTERVAL_GO_METHOD_FAMILY_1_SQL: &str = "WITH RECURSIVE family_embeddings(blob_id,owner_type_id,type_id) AS (
+pub(crate) static GO_INTERVAL_GO_METHOD_FAMILY_1_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"WITH RECURSIVE family_embeddings(blob_id,owner_type_id,type_id) AS (
                SELECT DISTINCT embedding.blob_id,embedding.owner_type_id,embedding.type_id
                FROM temp.selected_resolution_mounts AS selected
                JOIN main.source_go_embeddings AS embedding ON embedding.blob_id=selected.blob_id
@@ -266,7 +275,7 @@ pub(crate) const GO_INTERVAL_GO_METHOD_FAMILY_1_SQL: &str = "WITH RECURSIVE fami
              SELECT DISTINCT mount.mount_ordinal,definition.semantic_key,package.package_id,
                     package.tool_import_path,declaration.name
              FROM temp.selected_resolution_mounts AS mount
-             CROSS JOIN temp.selected_go_context_source_files AS file ON file.file_version_id=coalesce(mount.file_version_id,
+             CROSS JOIN ({}) AS file ON file.file_version_id=coalesce(mount.file_version_id,
                (SELECT placement.file_version_id FROM temp.selected_go_transient_placements AS placement
                 WHERE placement.mount_ordinal=mount.mount_ordinal)) AND file.source_role<>'ignored'
              CROSS JOIN main.go_package_instances AS package ON package.package_id=file.package_id
@@ -284,4 +293,7 @@ pub(crate) const GO_INTERVAL_GO_METHOD_FAMILY_1_SQL: &str = "WITH RECURSIVE fami
                  OR EXISTS (SELECT 1 FROM family_embeddings AS embedding
                     JOIN main.source_go_types AS embedded ON embedded.blob_id=embedding.blob_id
                      AND embedded.type_id=embedding.type_id AND embedded.kind IN (0,7,13)
-                    WHERE embedding.blob_id=declaration.blob_id AND embedding.owner_type_id=declaration.type_id))";
+                    WHERE embedding.blob_id=declaration.blob_id AND embedding.owner_type_id=declaration.type_id))"#,
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+        )
+    });

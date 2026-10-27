@@ -229,21 +229,18 @@ fn string_suffixes(value: &str) -> impl Iterator<Item = &str> {
     value.char_indices().map(|(index, _)| &value[index..])
 }
 
-pub fn parse_quoted_include(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let quote_start = trimmed.find('"')?;
-    let quote_end = trimmed[quote_start + 1..].find('"')?;
-    Some(trimmed[quote_start + 1..quote_start + 1 + quote_end].to_string())
-}
-
-pub fn parse_include_path(line: &str) -> Option<String> {
-    if let Some(path) = parse_quoted_include(line) {
-        return Some(path);
-    }
-    let trimmed = line.trim();
-    let angle_start = trimmed.find('<')?;
-    let angle_end = trimmed[angle_start + 1..].find('>')?;
-    Some(trimmed[angle_start + 1..angle_start + 1 + angle_end].to_string())
+// Claim discovery receives the generic import projection before canonical
+// source facts are mounted. Parse that boundary with the same include grammar;
+// quoted text in a comment or an angle directive is never a claim edge.
+fn parse_quoted_include(statement: &str) -> Option<String> {
+    let tree = crate::diagnostics::parse_cpp_tree(statement);
+    let mut cursor = tree.root_node().walk();
+    tree.root_node()
+        .named_children(&mut cursor)
+        .find_map(|node| {
+            let (path, quoted) = include_path_from_node(node, statement)?;
+            quoted.then(|| path.to_owned())
+        })
 }
 
 pub fn resolve_include_targets(
@@ -325,14 +322,6 @@ fn header_template_include_spelling(include: &str) -> Option<String> {
     let path = Path::new(include);
     (path.extension() == Some(std::ffi::OsStr::new("h")))
         .then(|| path.with_extension("hin").to_string_lossy().into_owned())
-}
-
-pub fn resolve_direct_include_targets_with_index(
-    source_file: &ProjectFile,
-    include: &str,
-    include_targets: &IncludeTargetIndex,
-) -> Vec<ProjectFile> {
-    include_targets.resolve_direct(source_file, include)
 }
 
 fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Option<PathBuf> {
@@ -484,20 +473,6 @@ fn collect_include_demand_keys(
     }
 }
 
-pub fn quoted_include_paths(parsed: &[String]) -> Vec<String> {
-    parsed
-        .iter()
-        .filter_map(|line| parse_quoted_include(line))
-        .collect()
-}
-
-pub fn include_paths(parsed: &[String]) -> Vec<String> {
-    parsed
-        .iter()
-        .filter_map(|line| parse_include_path(line))
-        .collect()
-}
-
 /// Return the literal path and delimiter kind from one parsed `#include`.
 ///
 /// The path is read from the grammar's `path` child, so malformed directives
@@ -589,6 +564,22 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: angle include comments fabricated quoted claim paths"
+    )]
+    fn quoted_include_uses_the_directive_path_node() {
+        assert_eq!(
+            parse_quoted_include("#include <fields.inc> // \"bogus.inc\""),
+            None
+        );
+        assert_eq!(
+            parse_quoted_include("#include /* \"bogus.inc\" */ \"real.inc\""),
+            Some("real.inc".to_string())
+        );
+        assert_eq!(parse_quoted_include("// #include \"bogus.inc\""), None);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "4b224ec22cdb: C/C++ include resolution missed the unique source-reachable header or selected a conflicting path"
     )]
     fn indexed_include_resolution_uses_unique_suffix_fallback() {
@@ -650,18 +641,18 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let source = write_file(&root, "src/lib/asn1/asn1_obj.cpp", "");
-        let target = write_file(&root, "src/lib/asn1/asn1_obj.h", "");
+        let target = write_file(&root, "src/lib/asn1/Widget.h", "");
         let index = IncludeTargetIndex::build([&source, &target]);
 
         assert_eq!(
-            resolve_include_targets_with_index(&source, "botan/asn1_obj.h", &index),
+            resolve_include_targets_with_index(&source, "botan/Widget.h", &index),
             vec![target.clone()]
         );
 
-        let duplicate = write_file(&root, "vendor/asn1_obj.h", "");
+        let duplicate = write_file(&root, "vendor/Widget.h", "");
         let ambiguous = IncludeTargetIndex::build([&source, &target, &duplicate]);
         assert!(
-            resolve_include_targets_with_index(&source, "botan/asn1_obj.h", &ambiguous).is_empty()
+            resolve_include_targets_with_index(&source, "botan/Widget.h", &ambiguous).is_empty()
         );
     }
 
@@ -694,5 +685,28 @@ mod tests {
 
         let resolved = resolve_include_targets_with_index(&stub, "krb5/krb5.h", &index);
         assert_eq!(resolved, vec![generated]);
+    }
+
+    #[test]
+    fn include_literal_grammar_boundary() {
+        for (source, kind, quoted) in [
+            ("#include \"fields.inc\"\n", "string_literal", true),
+            ("#include <fields.inc>\n", "system_lib_string", false),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(!tree.root_node().has_error());
+            let directive = tree.root_node().named_child(0).unwrap();
+            assert_eq!(directive.kind(), "preproc_include");
+            let path = directive.child_by_field_name("path").unwrap();
+            assert_eq!((path.kind(), path.byte_range()), (kind, 9..21));
+            assert_eq!(
+                include_path_from_node(directive, source),
+                Some(("fields.inc", quoted))
+            );
+        }
     }
 }

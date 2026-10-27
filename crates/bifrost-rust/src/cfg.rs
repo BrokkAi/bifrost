@@ -4,7 +4,8 @@
 //! An atom set spells each enabled cfg as source predicates do: `name`, or
 //! `name = "value"`. It comes from `cargo_config`: the build target's values,
 //! `test`, `debug_assertions`, and the `--cfg` rustflags Cargo configuration
-//! sets.
+//! sets. Persisted inventories may also carry the internal completeness
+//! annotation below when retained manifests cannot prove the full feature set.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -13,6 +14,38 @@ use std::sync::OnceLock;
 use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustCfgInstruction};
 
 use crate::selected_context::{RustCallerTargetProfile, RustSelectedActivation};
+
+/// Internal annotation in a persisted cfg atom set: retained Cargo manifests
+/// do not establish the complete feature set. When present, an absent
+/// `feature = "..."` atom must evaluate to Unknown, not Inactive; proven enabled
+/// features remain Active. This is metadata, not a rustc cfg flag.
+///
+/// Readers of this contract are `crate_activation`, `crate_site_cfg_activation`,
+/// `crate_activation_under_site_cfg` and `crate_cfg_literal_activation`, through
+/// `absent_crate_atom`. A site query can then choose an explicit satisfying
+/// assignment; that assumption does not prove unconditional activation.
+///
+/// The SQLite functions `cr_cfg` and `cr_authority_cfg`, registered in
+/// `crates/bifrost-store/src/analyzer/store/rust_crates.rs`, must preserve the
+/// annotation when decoding cfg atom JSON and delegate to `crate_activation`.
+/// This covers SQL readers in `rust_crate_point_unindexed_scope.sql`,
+/// `rust_crate_point_export.sql`, `rust_crate_published_macro_prelude.sql`,
+/// `rust_demand/rows.rs` and `rust_crate_context.rs` under `resolution_operation`.
+/// Rust readers in that directory's `rust_crate_access.rs` and
+/// `rust_reverse_rows.rs` must likewise preserve it when calling these shared
+/// evaluators. Their detached evaluators already leave absent features Unknown.
+/// Topology persistence, `rust_crate_context.rs` and `rust_unit_summaries.rs`
+/// transport cfg atom JSON intact, including this annotation. Do not replace
+/// these evaluations with a raw feature-membership test.
+pub(crate) const INCOMPLETE_FEATURES_ATOM: &str = "bifrost_incomplete_features";
+
+fn absent_crate_atom(atoms: &BTreeSet<String>, name: &str) -> RustSelectedActivation {
+    if name.starts_with("feature = ") && !atoms.contains(INCOMPLETE_FEATURES_ATOM) {
+        RustSelectedActivation::Inactive
+    } else {
+        RustSelectedActivation::Unknown
+    }
+}
 
 /// The cfg keys whose complete value set a described target fixes, so a value
 /// the set does not hold is false. Every other key stays unknown when absent,
@@ -88,8 +121,9 @@ pub fn detached_activation(
     )
 }
 
-/// One complete Cargo feature set: absent features are false; custom atoms
-/// without an inventory remain unknown. No crate state is retained.
+/// A Cargo feature set: absent features are false when its inventory is
+/// complete, and unknown when it carries the incomplete-feature annotation.
+/// Custom atoms without an inventory remain unknown. No crate state is retained.
 pub fn crate_activation(
     atoms: &BTreeSet<String>,
     condition: &RustCfgCondition,
@@ -97,13 +131,7 @@ pub fn crate_activation(
     evaluate(
         condition,
         |name| atoms.contains(name),
-        |name| {
-            if name.starts_with("feature = ") {
-                RustSelectedActivation::Inactive
-            } else {
-                RustSelectedActivation::Unknown
-            }
-        },
+        |name| absent_crate_atom(atoms, name),
     )
 }
 
@@ -124,13 +152,7 @@ pub fn crate_site_cfg_activation(
         condition,
         |literal| crate_cfg_literal_activation(atoms, literal),
         |name| atoms.contains(name),
-        |name| {
-            if name.starts_with("feature = ") {
-                RustSelectedActivation::Inactive
-            } else {
-                RustSelectedActivation::Unknown
-            }
-        },
+        |name| absent_crate_atom(atoms, name),
     )
 }
 
@@ -158,13 +180,7 @@ pub fn crate_activation_under_site_cfg(
     evaluate_with_assumptions(
         condition,
         |name| atoms.contains(name),
-        |name| {
-            if name.starts_with("feature = ") {
-                RustSelectedActivation::Inactive
-            } else {
-                RustSelectedActivation::Unknown
-            }
-        },
+        |name| absent_crate_atom(atoms, name),
         assumptions,
     )
 }
@@ -185,39 +201,10 @@ pub fn detached_activation_under_site_cfg(
     )
 }
 
-/// Evaluate a candidate condition after selecting one satisfying assignment
-/// for the site's undecidable literals. This convenience form uses one cfg
-/// inventory for both the reference site and candidate.
-pub fn crate_activation_assuming_site_cfg(
-    atoms: &BTreeSet<String>,
-    condition: &RustCfgCondition,
-    site_condition: &RustCfgCondition,
-) -> RustSelectedActivation {
-    let (site_activation, _, assignment) = crate_site_cfg_activation(atoms, site_condition);
-    if site_activation != RustSelectedActivation::Active {
-        return site_activation;
-    }
-    crate_activation_under_site_cfg(atoms, condition, assignment.as_ref())
-}
-
-/// Detached sources have no complete Cargo feature inventory, so feature
-/// literals stay unknown unless the reference site's cfg itself assumes them.
-pub fn detached_activation_assuming_site_cfg(
-    atoms: &BTreeSet<String>,
-    condition: &RustCfgCondition,
-    site_condition: &RustCfgCondition,
-) -> RustSelectedActivation {
-    let (site_activation, _, assignment) = detached_site_cfg_activation(atoms, site_condition);
-    if site_activation != RustSelectedActivation::Active {
-        return site_activation;
-    }
-    detached_activation_under_site_cfg(atoms, condition, assignment.as_ref())
-}
-
 /// Evaluate `condition` over the atom set `contains` answers for. An absent
 /// `test` or `debug_assertions` is false, and so is an absent target value
-/// when the set describes its target. `absent` decides every other atom the
-/// set does not hold; an absent value of any other key is unknown.
+/// when the set describes its target. `absent` decides every other atom and
+/// key-value literal the set does not hold.
 fn evaluate(
     condition: &RustCfgCondition,
     contains: impl Fn(&str) -> bool,
@@ -614,7 +601,7 @@ fn evaluate_with_assumptions(
         } else if described && TARGET_CFG_KEYS.contains(&key) {
             Inactive
         } else {
-            Unknown
+            absent(&format!("{key} = {value:?}"))
         }
     };
     let instructions = match condition {
@@ -693,17 +680,12 @@ fn crate_cfg_literal_activation(
 ) -> RustSelectedActivation {
     if let CfgLiteral::KeyValue { key, value } = literal
         && key == "feature"
+        && !atoms.contains(INCOMPLETE_FEATURES_ATOM)
         && !atoms.contains(&format!("{key} = {value:?}"))
     {
         return RustSelectedActivation::Inactive;
     }
-    cfg_literal_activation(atoms, literal, |name| {
-        if name.starts_with("feature = ") {
-            RustSelectedActivation::Inactive
-        } else {
-            RustSelectedActivation::Unknown
-        }
-    })
+    cfg_literal_activation(atoms, literal, |name| absent_crate_atom(atoms, name))
 }
 
 fn detached_cfg_literal_activation(
@@ -945,5 +927,213 @@ mod tests {
             assumptions[0],
             (CfgLiteral::Atom("shared".to_owned()), Some(true))
         );
+    }
+}
+
+#[cfg(test)]
+mod site_worlds_properties {
+    use super::{
+        RustCfgCondition, RustCfgInstruction, RustSelectedActivation, crate_activation,
+        crate_activation_under_site_cfg, crate_site_cfg_activation, detached_activation,
+        detached_activation_under_site_cfg, detached_site_cfg_activation,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    // This bounded test AST is independent of the production postfix evaluator
+    // and SAT representation. Recursion is bounded to three generated levels
+    // plus the contradiction/tautology wrapper below.
+    #[derive(Clone, Debug)]
+    enum Predicate {
+        Literal(usize),
+        Not(Box<Self>),
+        All(Vec<Self>),
+        Any(Vec<Self>),
+    }
+
+    impl Predicate {
+        fn eval(&self, values: &[i8]) -> i8 {
+            match self {
+                Self::Literal(index) => values[*index],
+                Self::Not(child) => -child.eval(values),
+                Self::All(children) => children
+                    .iter()
+                    .map(|child| child.eval(values))
+                    .min()
+                    .unwrap_or(1),
+                Self::Any(children) => children
+                    .iter()
+                    .map(|child| child.eval(values))
+                    .max()
+                    .unwrap_or(-1),
+            }
+        }
+
+        fn emit(&self, literals: &[RustCfgInstruction], output: &mut Vec<RustCfgInstruction>) {
+            match self {
+                Self::Literal(index) => output.push(literals[*index].clone()),
+                Self::Not(child) => {
+                    child.emit(literals, output);
+                    output.push(RustCfgInstruction::Not);
+                }
+                Self::All(children) | Self::Any(children) => {
+                    for child in children {
+                        child.emit(literals, output);
+                    }
+                    output.push(match self {
+                        Self::All(_) => RustCfgInstruction::All(children.len()),
+                        Self::Any(_) => RustCfgInstruction::Any(children.len()),
+                        _ => unreachable!(),
+                    });
+                }
+            }
+        }
+
+        fn condition(&self, literals: &[RustCfgInstruction]) -> RustCfgCondition {
+            let mut output = Vec::new();
+            self.emit(literals, &mut output);
+            RustCfgCondition::Expression(output.into_boxed_slice())
+        }
+
+        fn used(&self, used: &mut [bool]) {
+            match self {
+                Self::Literal(index) => used[*index] = true,
+                Self::Not(child) => child.used(used),
+                Self::All(children) | Self::Any(children) => {
+                    for child in children {
+                        child.used(used);
+                    }
+                }
+            }
+        }
+    }
+
+    fn predicate(count: usize) -> BoxedStrategy<Predicate> {
+        (0..count)
+            .prop_map(Predicate::Literal)
+            .prop_recursive(3, 24, 3, |inner| {
+                prop_oneof![
+                    inner
+                        .clone()
+                        .prop_map(|child| Predicate::Not(Box::new(child))),
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(Predicate::All),
+                    prop::collection::vec(inner, 0..4).prop_map(Predicate::Any),
+                ]
+            })
+            .boxed()
+    }
+
+    fn activation(value: i8) -> RustSelectedActivation {
+        match value {
+            -1 => RustSelectedActivation::Inactive,
+            0 => RustSelectedActivation::Unknown,
+            1 => RustSelectedActivation::Active,
+            _ => unreachable!(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        #[hardwon("a48b9658c627: quicksilver round 3 on brokk-bifrost-rust: absent key-value features stayed unknown in complete cfg inventories")]
+        fn site_worlds_match_exhaustive_assignments(
+            (selected, site, candidate) in prop::collection::btree_set(0usize..10, 2..5)
+                .prop_flat_map(|selected| {
+                    let count = selected.len();
+                    (Just(selected), predicate(count), predicate(count))
+                }),
+            enabled in 0u16..1024,
+            described in any::<bool>(),
+        ) {
+            // Each pool entry has an independently specified spelling, source
+            // instruction, and absent value for an ordinary three-valued read.
+            let pool = [
+                ("custom_a", RustCfgInstruction::Atom("custom_a".into()), 0),
+                ("custom_b", RustCfgInstruction::Atom("custom_b".into()), 0),
+                ("feature = \"fast\"", RustCfgInstruction::KeyValue { key: "feature".into(), value: "fast".into() }, 0),
+                ("feature = \"slow\"", RustCfgInstruction::KeyValue { key: "feature".into(), value: "slow".into() }, 0),
+                ("target_os = \"linux\"", RustCfgInstruction::KeyValue { key: "target_os".into(), value: "linux".into() }, if described { -1 } else { 0 }),
+                ("target_endian = \"big\"", RustCfgInstruction::KeyValue { key: "target_endian".into(), value: "big".into() }, if described { -1 } else { 0 }),
+                ("test", RustCfgInstruction::Atom("test".into()), -1),
+                ("debug_assertions", RustCfgInstruction::Atom("debug_assertions".into()), -1),
+                ("unix", RustCfgInstruction::Atom("unix".into()), if described { -1 } else { 0 }),
+                ("windows", RustCfgInstruction::Atom("windows".into()), if described { -1 } else { 0 }),
+            ];
+            // Endianness is inserted only here, so an undescribed inventory
+            // cannot accidentally become described through the enabled mask.
+            let atoms: BTreeSet<String> = pool.iter().enumerate()
+                .filter(|(index, _)| *index != 5 && enabled & (1 << index) != 0)
+                .map(|(_, (name, _, _))| (*name).to_owned())
+                .chain(described.then(|| "target_endian = \"little\"".to_owned()))
+                .collect();
+            let selected: Vec<_> = selected.into_iter().collect();
+            let literals: Vec<_> = selected.iter().map(|index| pool[*index].1.clone()).collect();
+            let ordinary: Vec<_> = selected.iter().map(|index| {
+                if atoms.contains(pool[*index].0) { 1 } else { pool[*index].2 }
+            }).collect();
+            let negated = Predicate::Not(Box::new(site.clone()));
+            // Every generated case also exercises repeated literals and both
+            // correlated extremes, rather than relying on random discovery.
+            let sites = [site.clone(), Predicate::All(vec![site.clone(), negated.clone()]),
+                Predicate::Any(vec![site, negated]), Predicate::All(vec![]), Predicate::Any(vec![])];
+            for complete in [false, true] {
+                let read = if complete { crate_activation } else { detached_activation };
+                let site_read = if complete { crate_site_cfg_activation } else { detached_site_cfg_activation };
+                let under = if complete { crate_activation_under_site_cfg } else { detached_activation_under_site_cfg };
+                let ordinary: Vec<_> = ordinary.iter().enumerate().map(|(local, value)| {
+                    if complete && matches!(selected[local], 2 | 3) && *value == 0 { -1 } else { *value }
+                }).collect();
+                prop_assert_eq!(read(&atoms, &candidate.condition(&literals)), activation(candidate.eval(&ordinary)));
+                prop_assert_eq!(under(&atoms, &candidate.condition(&literals), None), activation(candidate.eval(&ordinary)));
+                for site in &sites {
+                    let condition = site.condition(&literals);
+                    let mut used = vec![false; selected.len()];
+                    site.used(&mut used);
+                    let fixed = ordinary.clone();
+                    let unknown: Vec<_> = (0..selected.len()).filter(|index| used[*index] && fixed[*index] == 0).collect();
+                    let worlds: Vec<_> = (0..(1 << unknown.len())).map(|mask| {
+                        let mut world = fixed.clone();
+                        for (bit, index) in unknown.iter().enumerate() {
+                            world[*index] = if mask & (1 << bit) != 0 { 1 } else { -1 };
+                        }
+                        world
+                    }).filter(|world| site.eval(world) == 1).collect();
+                    let expected = if unknown.is_empty() {
+                        activation(site.eval(&ordinary))
+                    } else if worlds.is_empty() {
+                        RustSelectedActivation::Inactive
+                    } else {
+                        RustSelectedActivation::Active
+                    };
+                    let (actual, conditional, assignment) = site_read(&atoms, &condition);
+                    prop_assert_eq!(actual, expected, "site={:?}, complete={}, atoms={:?}", site, complete, atoms);
+                    prop_assert_eq!(conditional, !unknown.is_empty() && !worlds.is_empty());
+                    prop_assert_eq!(assignment.is_some(), conditional);
+                    if let Some(assignment) = assignment {
+                        prop_assert_eq!(under(&atoms, &condition, Some(&assignment)), RustSelectedActivation::Active);
+                        prop_assert_eq!(under(&atoms, &Predicate::Not(Box::new(site.clone())).condition(&literals), Some(&assignment)), RustSelectedActivation::Inactive);
+                        // Recover the chosen truth values using the public
+                        // candidate API, never the solver's internal formula.
+                        let mut witnessed = ordinary.clone();
+                        for index in &unknown {
+                            let value = under(&atoms, &Predicate::Literal(*index).condition(&literals), Some(&assignment));
+                            prop_assert_ne!(value, RustSelectedActivation::Unknown);
+                            witnessed[*index] = if value == RustSelectedActivation::Active { 1 } else { -1 };
+                        }
+                        prop_assert!(worlds.iter().any(|world| unknown.iter().all(|index| world[*index] == witnessed[*index])));
+                        prop_assert_eq!(under(&atoms, &candidate.condition(&literals), Some(&assignment)), activation(candidate.eval(&witnessed)));
+                        prop_assert_eq!(under(&atoms, &RustCfgCondition::Atom("unrelated".into()), Some(&assignment)), RustSelectedActivation::Unknown);
+                        // Contradiction with the selected world must be false.
+                        for index in &unknown {
+                            let literal = Predicate::Literal(*index);
+                            let opposite = if witnessed[*index] == 1 { Predicate::Not(Box::new(literal)) } else { literal };
+                            prop_assert_eq!(under(&atoms, &opposite.condition(&literals), Some(&assignment)), RustSelectedActivation::Inactive);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

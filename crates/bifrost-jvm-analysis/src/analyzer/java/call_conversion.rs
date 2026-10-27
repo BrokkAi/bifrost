@@ -1768,7 +1768,7 @@ fn classify_java_conversion_applicability(
     };
     let cancellation = java.active_query_cancellation();
     let hierarchy =
-        overlay.java_reference_widening(source_symbol, target_symbol, 256, cancellation.as_ref());
+        overlay.java_reference_widening(&source_symbol, &target_symbol, 256, cancellation.as_ref());
     use brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyIncomplete;
     let terminal = [
         JavaHierarchyIncomplete::Cancelled,

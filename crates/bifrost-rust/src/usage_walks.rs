@@ -304,8 +304,9 @@ where
 
     {
         let mut state = walk.borrow_mut();
+        let initial = Arc::new(seed(key)?);
         state.running = true;
-        state.partial.insert(key.clone(), Arc::new(seed(key)?));
+        state.partial.insert(key.clone(), initial);
         state.queue.push_back(key.clone());
         state.queued.insert(key.clone());
     }
@@ -1429,15 +1430,6 @@ impl<'a> RustUsageWalks<'a> {
             .insert(module.clone(), effective.clone());
         Ok(effective)
     }
-    /// The structured positive and negative lookups that can change this
-    /// importer's file edges. Candidates come from import facts and
-    /// Cargo/module identities, never from rendered source text.
-    pub fn import_resolution_dependencies_of(
-        &self,
-        file: &ProjectFile,
-    ) -> Result<ImportResolutionDependencies, RustCargoRouteError> {
-        self.import_resolution_dependencies_for_ordinals(file, None)
-    }
 
     /// The structured lookup facts for selected source import ordinals. An
     /// empty selection produces no facts; None means every import in the file.
@@ -2550,67 +2542,6 @@ impl<'a> RustUsageWalks<'a> {
 
     // --------------------------------------------------------- macro scopes
 
-    /// Macro declarations imported by `#[macro_use] extern crate` for the
-    /// Cargo target that owns `file`.
-    ///
-    /// The extern-crate fact proves which dependency root is imported, and the
-    /// existing export walk proves which declaration that root publishes under
-    /// `name`, including through public glob re-exports. The final kind check
-    /// keeps this lookup in Rust's macro namespace.
-    pub fn macro_use_imported_declarations_named(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> Result<Vec<CodeUnit>, RustCargoRouteError> {
-        if self.cancelled() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        let mut candidates = Vec::new();
-        for root in self.owner_roots_of(file)?.iter() {
-            if self.cancelled() {
-                return Err(RustCargoRouteError::Cancelled);
-            }
-            let Some(root_module) = self.queries.module_at_byte(root, 0)? else {
-                continue;
-            };
-            for binding in self
-                .queries
-                .import_bindings_of(root)?
-                .iter()
-                .filter(|binding| {
-                    binding.is_extern_crate
-                        && binding.is_macro_use
-                        && !binding.extent.is_local_only()
-                        && binding.importer_module == root_module
-                })
-            {
-                for route in self.resolve_segments(root, &binding.owner_module, &binding.path)? {
-                    if self.cancelled() {
-                        return Err(RustCargoRouteError::Cancelled);
-                    }
-                    let module_files = [route.target_file];
-                    for (target_file, target_name) in
-                        self.export_targets_from_files(self.analyzer, &module_files, name)?
-                    {
-                        candidates.extend(
-                            self.analyzer.declarations(&target_file).into_iter().filter(
-                                |candidate| {
-                                    candidate.identifier() == target_name && candidate.is_macro()
-                                },
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-        candidates.sort();
-        candidates.dedup();
-        if self.cancelled() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        Ok(candidates)
-    }
-
     /// Structured `#[macro_use]` candidates for one bare invocation.
     ///
     /// The module route reuses the exact scope-edge walk. The extern-crate
@@ -3471,4 +3402,160 @@ fn path_parent_candidates(file: &ProjectFile) -> Vec<ProjectFile> {
         }
     }
     candidates
+}
+
+#[cfg(test)]
+mod cycle_walk_properties {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("a48b9658c627: qs3 triage: a failed initial seed left the cycle walk marked running")]
+    fn failed_initial_seed_can_retry() {
+        let walk = RefCell::new(CycleWalk::default());
+        let fail = Cell::new(true);
+        let seed = |key: &usize| {
+            if fail.replace(false) {
+                Err("initial seed")
+            } else {
+                Ok(vec![*key])
+            }
+        };
+        assert!(resolve_with_cycles(&walk, &0, &|| false, &seed, &seed).is_err());
+        let answer = resolve_with_cycles(&walk, &0, &|| false, &seed, &seed).unwrap();
+        let CycleAnswer::Settled { value, settled } = answer else {
+            panic!("retry did not settle")
+        };
+        assert_eq!(*value, vec![0]);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].0, 0);
+        assert_eq!(*settled[0].1, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod reachable_labels_properties {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    type Walk = RefCell<CycleWalk<usize, Arc<Vec<usize>>>>;
+    type Answer = CycleAnswer<usize, Arc<Vec<usize>>>;
+
+    // Independent oracle: an ordinary BFS, without partial values or requeueing.
+    fn bfs(graph: &[Vec<usize>], root: usize) -> BTreeSet<usize> {
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::from([root]);
+        while let Some(node) = queue.pop_front() {
+            if seen.insert(node) {
+                queue.extend(graph[node].iter().copied());
+            }
+        }
+        seen
+    }
+
+    fn evaluate(
+        walk: &Walk,
+        graph: &[Vec<usize>],
+        root: usize,
+        cancelled: &dyn Fn() -> bool,
+        after_compute: &dyn Fn() -> Result<(), &'static str>,
+        provisional_edges: &Cell<usize>,
+    ) -> Result<Answer, &'static str> {
+        let seed = |key: &usize| Ok(vec![*key]);
+        resolve_with_cycles(walk, &root, cancelled, &seed, &|key| {
+            let mut labels = vec![*key];
+            for dependency in &graph[*key] {
+                let answer = resolve_with_cycles(walk, dependency, cancelled, &seed, &|_| {
+                    panic!("nested lookup must not run compute")
+                })?;
+                let CycleAnswer::Provisional(value) = answer else {
+                    panic!("nested edge must be provisional")
+                };
+                provisional_edges.set(provisional_edges.get() + 1);
+                labels.extend(value.iter().copied());
+            }
+            labels.sort_unstable();
+            labels.dedup();
+            after_compute()?;
+            Ok(labels)
+        })
+    }
+
+    fn settled(
+        graph: &[Vec<usize>],
+        root: usize,
+        answer: Answer,
+    ) -> BTreeMap<usize, BTreeSet<usize>> {
+        let CycleAnswer::Settled { value, settled } = answer else {
+            panic!("outermost walk must settle")
+        };
+        assert_eq!(
+            value.iter().copied().collect::<BTreeSet<_>>(),
+            bfs(graph, root)
+        );
+        let values: BTreeMap<_, _> = settled
+            .into_iter()
+            .map(|(key, value)| (key, value.iter().copied().collect::<BTreeSet<_>>()))
+            .collect();
+        assert_eq!(
+            values.keys().copied().collect::<BTreeSet<_>>(),
+            bfs(graph, root)
+        );
+        for (key, value) in &values {
+            assert_eq!(*value, bfs(graph, *key));
+        }
+        values
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn closure_and_retry_match_bfs(
+            graph in (1usize..7).prop_flat_map(|n| {
+                proptest::collection::vec(any::<bool>(), n*n).prop_map(move |edges| {
+                    (0..n).map(|from| (0..n).filter(|to| edges[from*n+to]).collect::<Vec<_>>()).collect::<Vec<_>>()
+                })
+            })
+        ) {
+            let provisional_edges = Cell::new(0);
+            // Always include the important shapes, including unreachable vertices.
+            for mut graph in [
+                vec![vec![0]],
+                vec![vec![1, 2], vec![3], vec![3], vec![], vec![]],
+                vec![vec![1], vec![2], vec![0, 3], vec![4], vec![], vec![]],
+                graph,
+            ] {
+                for _ in 0..2 {
+                    for root in 0..graph.len() {
+                        let walk = Walk::default();
+                        let fresh = settled(&graph, root, evaluate(&walk, &graph, root, &|| false, &|| Ok(()), &provisional_edges).unwrap());
+
+                        // Cancellation after the root computed must publish no entries.
+                        let computes = Cell::new(0);
+                        let cancelled = || computes.get() > 0;
+                        let cancel_after_compute = || { computes.set(computes.get() + 1); Ok(()) };
+                        let answer = evaluate(&walk, &graph, root, &cancelled, &cancel_after_compute, &provisional_edges).unwrap();
+                        assert!(computes.get() > 0, "cancelled path must actually compute");
+                        let CycleAnswer::Settled { settled: published, .. } = answer else { panic!("outermost answer") };
+                        assert!(published.is_empty(), "cancelled walk published {published:?}");
+                        assert_eq!(settled(&graph, root, evaluate(&walk, &graph, root, &|| false, &|| Ok(()), &provisional_edges).unwrap()), fresh);
+
+                        // Fail a later queued compute where the graph reaches another node.
+                        let fail_at = if fresh.len() > 1 { 2 } else { 1 };
+                        let computes = Cell::new(0);
+                        let fail_compute = || {
+                            computes.set(computes.get() + 1);
+                            if computes.get() == fail_at { Err("compute failed") } else { Ok(()) }
+                        };
+                        assert!(matches!(evaluate(&walk, &graph, root, &|| false, &fail_compute, &provisional_edges), Err("compute failed")));
+                        assert_eq!(computes.get(), fail_at);
+                        assert_eq!(settled(&graph, root, evaluate(&walk, &graph, root, &|| false, &|| Ok(()), &provisional_edges).unwrap()), fresh);
+                    }
+                    for neighbours in &mut graph { neighbours.reverse(); }
+                }
+            }
+            assert!(provisional_edges.get() > 0, "no nested dependency edge was traversed");
+        }
+    }
 }

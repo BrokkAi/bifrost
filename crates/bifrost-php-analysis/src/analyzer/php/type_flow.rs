@@ -622,8 +622,8 @@ fn external_member_lookup(
         }
         let relevant = records
             .iter()
-            .copied()
-            .filter(|symbol| external_member_has_kind(symbol, kind))
+            .filter(|&symbol| external_member_has_kind(symbol, kind))
+            .cloned()
             .collect::<Vec<_>>();
         incompatible |= relevant.is_empty();
         if relevant.is_empty() {

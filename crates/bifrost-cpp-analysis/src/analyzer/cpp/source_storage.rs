@@ -188,6 +188,57 @@ impl CppSourceStorage for AnalyzerStore {
                 }
             );
 
+            let mut alias_paths: HashMap<(usize, i64), Vec<String>> = HashMap::default();
+            read_rows!(
+                "SELECT alias_ordinal, path_kind, ordinal, component
+             FROM source_cpp_namespace_alias_paths
+             WHERE blob_id = ?1 ORDER BY alias_ordinal, path_kind, ordinal",
+                row,
+                {
+                    let list = alias_paths.entry((row.get(0)?, row.get(1)?)).or_default();
+                    let ordinal: usize = row.get(2)?;
+                    if ordinal != list.len() {
+                        return Err(StoreError::new("non-dense C++ namespace alias path"));
+                    }
+                    list.push(row.get(3)?);
+                }
+            );
+            let mut namespace_aliases = Vec::new();
+            read_rows!(
+                "SELECT ordinal, occurrence_id, name, target_present, target_global,
+                    block_occurrence_id, guards
+             FROM source_cpp_namespace_aliases WHERE blob_id = ?1 ORDER BY ordinal",
+                row,
+                {
+                    let ordinal: usize = row.get(0)?;
+                    if ordinal != namespace_aliases.len() {
+                        return Err(StoreError::new("non-dense C++ namespace alias ordinals"));
+                    }
+                    let target = alias_paths.remove(&(ordinal, 0));
+                    if target.is_some()
+                        != strict_bool(row.get(3)?, "C++ namespace alias target presence")?
+                    {
+                        return Err(StoreError::new("inconsistent C++ namespace alias target"));
+                    }
+                    namespace_aliases.push(CppNamespaceAliasFact {
+                        occurrence: SourceOccurrenceId::new(row.get(1)?),
+                        name: row.get(2)?,
+                        target,
+                        target_global: strict_bool(row.get(4)?, "C++ namespace alias global")?,
+                        namespace: alias_paths.remove(&(ordinal, 1)).unwrap_or_default(),
+                        block: row.get::<_, Option<u32>>(5)?.map(SourceOccurrenceId::new),
+                        guards: row
+                            .get::<_, Option<String>>(6)?
+                            .as_deref()
+                            .map(crate::analyzer::cpp::source_publication_context::guard_set_from_json)
+                            .transpose()?,
+                    });
+                }
+            );
+            if !alias_paths.is_empty() {
+                return Err(StoreError::new("orphan C++ namespace alias paths"));
+            }
+
             let mut paths: HashMap<(u32, i64), Vec<String>> = HashMap::default();
             read_rows!(
                 "SELECT declaration_id, path_kind, ordinal, component
@@ -397,6 +448,7 @@ impl CppSourceStorage for AnalyzerStore {
                 includes,
                 declarations: Vec::new(),
                 using_namespaces,
+                namespace_aliases,
                 expressions: Vec::new(),
                 statement_facts: Default::default(),
             };

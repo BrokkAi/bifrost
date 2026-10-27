@@ -197,6 +197,11 @@ pub(super) struct PythonMemberRoute<'a> {
 pub(super) enum PythonMemberRow {
     Declared(Box<PythonDeclaredMemberRow>),
     Operation(operations::OperationRow),
+    AttributeSpace {
+        owner: SemanticId,
+        metaclass: Option<SemanticId>,
+        operations: Vec<operations::OperationRow>,
+    },
 }
 
 pub(super) struct PythonDeclaredMemberRow {
@@ -246,12 +251,28 @@ pub(super) fn is_class(
         rusqlite::params![mount.blob_id(),key],|row| row.get(0))?)
 }
 
+// object implements the ordinary dictionary lookup itself; a source hook can
+// supply an undeclared name or replace the value of a declared name (#6509).
+fn dynamic_attribute_hook(
+    property: &LoweredMemberOwnerProperty,
+    object: Option<SemanticId>,
+) -> bool {
+    property.member_name() == "__getattr__"
+        || (property.member_name() == "__getattribute__"
+            && Some(property.owner_definition()) != object)
+}
+
 pub(super) fn member_rows(
     half: &PythonMemberContext<'_, '_, '_>,
     route: &PythonMemberRoute<'_>,
     owner: SemanticId,
 ) -> Result<Read<Vec<PythonMemberRow>>> {
     let mut rows = Vec::new();
+    let cached_hooks = half.rules.attribute_hooks.borrow().get(&owner).cloned();
+    let mut hooks = cached_hooks
+        .clone()
+        .unwrap_or(ResolutionCompletion::Complete);
+    let object = builtin(half.rules.ready, "object");
     let typed = half.rules.ready.typed_source();
     let read = typed.visit_member_owner_pages_for_owners(
         TypedFactRequest::new(&[owner]),
@@ -260,6 +281,11 @@ pub(super) fn member_rows(
             for row in page {
                 if !half.rules.session.scope_step() || half.rules.cancellation.is_cancelled() {
                     return Ok(false);
+                }
+                if cached_hooks.is_none() && dynamic_attribute_hook(row.row(), object) {
+                    hooks = hooks.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(owner),
+                    ]));
                 }
                 if row.row().member_name() == route.lookup.spelling() {
                     rows.push((row.row().clone(), row.identity().clone()));
@@ -271,7 +297,22 @@ pub(super) fn member_rows(
     if read.is_cancelled() {
         return Ok(Read::Cancelled(read.evidence().clone()));
     }
+    if cached_hooks.is_none() && read.is_exhausted() {
+        half.rules
+            .attribute_hooks
+            .borrow_mut()
+            .insert(owner, hooks.clone());
+    }
     let mut dictionary_completion = read.evidence().clone();
+    // Every owner in the shared MRO walk contributes even on a dictionary
+    // miss. Runtime hooks can supply a missing name or replace a declared one.
+    if half
+        .member_values
+        .iter()
+        .any(|value| matches!(value, ResolutionSlotValue::Runtime { .. }))
+    {
+        dictionary_completion = dictionary_completion.combine(&hooks);
+    }
     let mut reaching = None;
     let mut annotation_only = Vec::new();
     if let (Some(ordinal), Some(key)) = (owner.ordinal(), owner.local_key()) {
@@ -287,12 +328,9 @@ pub(super) fn member_rows(
             let bindings = if mount.blob_id() == half.blob {
                 half.rows
             } else {
-                let Some(loaded) =
-                    crate::analyzer::store::python_binding_rows::PythonBindingRows::load(
-                        half.rules.ready.inventory.connection(),
-                        mount.blob_id(),
-                        half.rules.cancellation,
-                    )?
+                let Some(loaded) = half
+                    .rules
+                    .load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))?
                 else {
                     return Ok(Read::Cancelled(dictionary_completion));
                 };
@@ -423,9 +461,97 @@ pub(super) fn member_rows(
     }
     receivers.sort_unstable();
     receivers.dedup();
+    // Unlike the spelling-specific mutation path, closure is about the whole
+    // attribute space. Retain a prerequisite row even when no declaration has
+    // the requested name.
+    let mut attribute_rows = Vec::new();
+    let mutations = half.rules.attribute_mutations.borrow().get(&owner).cloned();
+    let operations = if let Some(mutations) = &mutations {
+        dictionary_completion = dictionary_completion.combine(mutations);
+        Vec::new()
+    } else {
+        match operations::attribute_rows(half, owner)? {
+            Read::Ready { value, completion } => {
+                dictionary_completion = dictionary_completion.combine(&completion);
+                value
+            }
+            Read::Cancelled(completion) => {
+                return Ok(Read::Cancelled(dictionary_completion.combine(&completion)));
+            }
+            Read::Unavailable { reason, completion } => {
+                return Ok(Read::Unavailable {
+                    reason,
+                    completion: dictionary_completion.combine(&completion),
+                });
+            }
+        }
+    };
+    let class_object = half
+        .member_values
+        .iter()
+        .any(|value| matches!(value, ResolutionSlotValue::TypeObject(_, _)));
+    let cached_metaclass = half
+        .rules
+        .attribute_metaclasses
+        .borrow()
+        .get(&owner)
+        .cloned();
+    let metaclass = if class_object {
+        if let Some(cached) = &cached_metaclass {
+            dictionary_completion = dictionary_completion.combine(cached);
+            None
+        } else if let (Some(ordinal), Some(key)) = (owner.ordinal(), owner.local_key()) {
+            let mount = half
+                .rules
+                .ready
+                .inventory
+                .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+            half.rules.ready.inventory.connection().query_row(
+                "SELECT reference.semantic_key FROM resolution_semantic_sites definition
+                 JOIN python_member_classes class ON class.blob_id=definition.blob_id AND class.class=definition.source_site
+                 LEFT JOIN resolution_semantic_sites reference ON reference.blob_id=class.blob_id AND reference.source_site=class.metaclass AND reference.semantic_role='reference'
+                 WHERE definition.blob_id=?1 AND definition.semantic_key=?2 AND definition.semantic_role='definition' AND class.metaclass IS NOT NULL",
+                rusqlite::params![mount.blob_id(), key], |row| row.get::<_, Option<u32>>(0),
+            ).optional()?.map(|reference| reference.map(|key| SemanticId::local(ordinal, key)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if class_object && cached_metaclass.is_none() && metaclass.is_none() {
+        half.rules
+            .attribute_metaclasses
+            .borrow_mut()
+            .insert(owner, ResolutionCompletion::Complete);
+    }
+    if metaclass == Some(None) {
+        let completion =
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                owner,
+            )]);
+        half.rules
+            .attribute_metaclasses
+            .borrow_mut()
+            .insert(owner, completion.clone());
+        dictionary_completion = dictionary_completion.combine(&completion);
+    }
+    if operations.is_empty() && mutations.is_none() {
+        half.rules
+            .attribute_mutations
+            .borrow_mut()
+            .insert(owner, ResolutionCompletion::Complete);
+    }
+    if !operations.is_empty() || metaclass.flatten().is_some() {
+        attribute_rows.push(PythonMemberRow::AttributeSpace {
+            owner,
+            metaclass: metaclass.flatten(),
+            operations,
+        });
+    }
     if rows.is_empty() {
         return Ok(Read::Ready {
-            value: Vec::new(),
+            value: attribute_rows,
             completion: dictionary_completion,
         });
     }
@@ -548,6 +674,7 @@ pub(super) fn member_rows(
         value: selected
             .into_iter()
             .map(|row| PythonMemberRow::Declared(Box::new(row)))
+            .chain(attribute_rows)
             .collect(),
         completion: dictionary_completion,
     })
@@ -650,26 +777,178 @@ impl PythonMemberContext<'_, '_, '_> {
         })))
     }
 
-    fn interception_request(
+    fn attribute_mutations(
+        &self,
+        owner: SemanticId,
+        operations: &[operations::OperationRow],
+        answers: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<std::ops::ControlFlow<DemandReferenceKey, ResolutionCompletion>> {
+        if let Some(cached) = self.rules.attribute_mutations.borrow().get(&owner) {
+            return Ok(std::ops::ControlFlow::Continue(cached.clone()));
+        }
+        let mut completion = ResolutionCompletion::Complete;
+        for operation in operations {
+            match operations::prove(self.rules, operation, answers)? {
+                operations::OperationProof::Reference(key) => {
+                    return Ok(std::ops::ControlFlow::Break(key));
+                }
+                operations::OperationProof::NoEffect | operations::OperationProof::Instance(_) => {}
+                operations::OperationProof::Possible {
+                    completion: evidence,
+                    ..
+                } => {
+                    completion =
+                        completion
+                            .combine(&evidence)
+                            .combine(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::UnsupportedSemantic(owner),
+                            ]));
+                }
+            }
+        }
+        self.rules
+            .attribute_mutations
+            .borrow_mut()
+            .insert(owner, completion.clone());
+        Ok(std::ops::ControlFlow::Continue(completion))
+    }
+
+    fn attribute_space(
         &self,
         context: &MemberAccessContext<'_>,
-        receiver: ResolutionSlotValue,
-    ) -> DemandMemberSelectionRequest {
-        let lookup = super::ResolutionLookupSemanticRecipe::new(
-            crate::analyzer::Language::Python,
-            brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Value,
-            "__getattribute__",
-        )
-        .semantic(&self.rules.ready.shared_names());
-        DemandMemberSelectionRequest {
-            policy: &PYTHON_HIERARCHY,
-            order: None,
-            reference: context.reference,
-            values: vec![receiver],
-            lookup,
-            namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Value,
-            language: crate::analyzer::Language::Python,
+        owner: SemanticId,
+        metaclass: Option<SemanticId>,
+        operations: &[operations::OperationRow],
+        input: AccessRowInput<'_>,
+    ) -> Result<AccessRowPoll> {
+        let replies = match input {
+            AccessRowInput::Start => &[][..],
+            AccessRowInput::Replies(replies) => replies,
+        };
+        let answers = operations::replies(AccessRowInput::Replies(replies));
+        let mut completion = match self.attribute_mutations(owner, operations, &answers)? {
+            std::ops::ControlFlow::Break(key) => return Ok(AccessRowPoll::Reference(key)),
+            std::ops::ControlFlow::Continue(completion) => completion,
+        };
+        if let Some(reference) = metaclass {
+            if let Some(cached) = self.rules.attribute_metaclasses.borrow().get(&owner) {
+                return Ok(AccessRowPoll::Observed(completion.combine(cached)));
+            }
+            let Some((_, answer)) = answers.iter().find(|(key, _)| key.reference == reference)
+            else {
+                return Ok(AccessRowPoll::Reference(DemandReferenceKey::caller(
+                    reference,
+                )));
+            };
+            let binding = answer.binding();
+            completion = completion.combine(answer.completion());
+            let [target] = binding.targets() else {
+                return Ok(AccessRowPoll::Observed(completion.combine(
+                    &ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(owner),
+                    ]),
+                )));
+            };
+            let request = self.member_request(
+                reference,
+                vec![
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(*target, 0))
+                        .constructed_instance(),
+                ],
+                context.lookup,
+                context.namespace,
+            );
+            let selected = replies.iter().find_map(|reply| match reply {
+                AccessPrerequisiteReply::Members {
+                    reference,
+                    lookup,
+                    selection,
+                } if *reference == request.reference && *lookup == request.lookup => {
+                    Some(selection)
+                }
+                _ => None,
+            });
+            let Some(selected) = selected else {
+                return Ok(AccessRowPoll::Members(request));
+            };
+            completion = completion.combine(&selected.completion);
+            let object = builtin(self.rules.ready, "object");
+            let read = self
+                .rules
+                .ready
+                .typed_source()
+                .visit_member_owner_pages_for_owners(
+                    TypedFactRequest::new(&selected.owners),
+                    self.rules.cancellation,
+                    &mut FactPageVisitor::new(&mut |page| {
+                        for row in page {
+                            if !self.rules.session.scope_step()
+                                || self.rules.cancellation.is_cancelled()
+                            {
+                                return Ok(false);
+                            }
+                            if dynamic_attribute_hook(row.row(), object) {
+                                completion =
+                                    completion.combine(&ResolutionCompletion::incomplete([
+                                        ResolutionIncompleteReason::UnsupportedSemantic(owner),
+                                    ]));
+                            }
+                        }
+                        Ok(true)
+                    }),
+                )?;
+            completion = completion.combine(read.evidence());
+            if read.is_cancelled() {
+                return Ok(AccessRowPoll::Ready(Read::Cancelled(completion)));
+            }
+            for meta_owner in &selected.owners {
+                let cached = self
+                    .rules
+                    .attribute_mutations
+                    .borrow()
+                    .get(meta_owner)
+                    .cloned();
+                let mutations = if let Some(cached) = cached {
+                    cached
+                } else {
+                    let operations = match operations::attribute_rows(self, *meta_owner)? {
+                        Read::Ready {
+                            value,
+                            completion: read_completion,
+                        } => {
+                            completion = completion.combine(&read_completion);
+                            value
+                        }
+                        Read::Cancelled(evidence) => {
+                            return Ok(AccessRowPoll::Ready(Read::Cancelled(
+                                completion.combine(&evidence),
+                            )));
+                        }
+                        Read::Unavailable {
+                            reason,
+                            completion: evidence,
+                        } => {
+                            return Ok(AccessRowPoll::Ready(Read::Unavailable {
+                                reason,
+                                completion: completion.combine(&evidence),
+                            }));
+                        }
+                    };
+                    match self.attribute_mutations(*meta_owner, &operations, &answers)? {
+                        std::ops::ControlFlow::Break(key) => {
+                            return Ok(AccessRowPoll::Reference(key));
+                        }
+                        std::ops::ControlFlow::Continue(completion) => completion,
+                    }
+                };
+                completion = completion.combine(&mutations);
+            }
+            self.rules
+                .attribute_metaclasses
+                .borrow_mut()
+                .insert(owner, completion.clone());
         }
+        Ok(AccessRowPoll::Observed(completion))
     }
 }
 
@@ -693,6 +972,13 @@ impl MemberAccessRules<PythonMemberRow> for PythonMemberContext<'_, '_, '_> {
             PythonMemberRow::Declared(row) => row,
             PythonMemberRow::Operation(operation) => {
                 return operations::classify(self, context, operation, input);
+            }
+            PythonMemberRow::AttributeSpace {
+                owner,
+                metaclass,
+                operations,
+            } => {
+                return self.attribute_space(context, *owner, *metaclass, operations, input);
             }
         };
         let replies = match input {
@@ -729,8 +1015,8 @@ impl MemberAccessRules<PythonMemberRow> for PythonMemberContext<'_, '_, '_> {
             let Some(answer) = reply else {
                 return Ok(AccessRowPoll::Reference(*key));
             };
-            completion = completion.combine(answer.completion());
             let binding = answer.binding();
+            completion = completion.combine(binding.completion());
             let selected = if binding.completion() == &ResolutionCompletion::Complete
                 && binding.targets().len() == 1
             {
@@ -785,6 +1071,13 @@ impl MemberAccessRules<PythonMemberRow> for PythonMemberContext<'_, '_, '_> {
             })
             .collect::<Vec<_>>();
         for operation in row.operations.iter() {
+            for (key, answer) in &answers {
+                if Some(key.reference) == operation.receiver
+                    || Some(key.reference) == operation.callee
+                {
+                    completion = completion.combine(answer.completion());
+                }
+            }
             match operations::prove(self.rules, operation, &answers)? {
                 operations::OperationProof::Reference(key) => {
                     return Ok(AccessRowPoll::Reference(key));
@@ -818,90 +1111,7 @@ impl MemberAccessRules<PythonMemberRow> for PythonMemberContext<'_, '_, '_> {
                 }
             }
         }
-        let mut coverage = vec![row.provider.clone()];
-        // Instance dispatch can be intercepted independently of which dictionary
-        // defines the requested name. Shared collection supplies the owners;
-        // the ordinary batched typed reader supplies the one protocol inventory.
-        if self.super_cursor.is_none()
-            && matches!(row.receiver, ResolutionSlotValue::Runtime { .. })
-            && let Some(object) = builtin(self.rules.ready, "object")
-        {
-            let request = self.interception_request(context, row.receiver);
-            let selected = if request.lookup == context.lookup {
-                Some(context.selection)
-            } else {
-                replies.iter().find_map(|reply| match reply {
-                    AccessPrerequisiteReply::Members {
-                        reference,
-                        lookup,
-                        selection,
-                    } if *reference == request.reference && *lookup == request.lookup => {
-                        Some(selection)
-                    }
-                    _ => None,
-                })
-            };
-            let Some(selected) = selected else {
-                return Ok(AccessRowPoll::Members(request));
-            };
-            let mut interception = None;
-            let outcome = self
-                .rules
-                .ready
-                .typed_source()
-                .visit_member_owner_pages_for_owners(
-                    TypedFactRequest::new(&selected.owners),
-                    self.rules.cancellation,
-                    &mut FactPageVisitor::new(&mut |page| {
-                        for property in page {
-                            if !self.rules.session.scope_step()
-                                || self.rules.cancellation.is_cancelled()
-                            {
-                                return Ok(false);
-                            }
-                            if property.row().member_name() == "__getattribute__"
-                                && property.row().owner_definition() != object
-                            {
-                                interception = Some(property.row().definition());
-                            }
-                        }
-                        Ok(true)
-                    }),
-                )?;
-            if outcome.is_cancelled() {
-                return Ok(AccessRowPoll::Ready(Read::Cancelled(
-                    completion.combine(outcome.evidence()),
-                )));
-            }
-            completion = completion
-                .combine(outcome.evidence())
-                .combine(&selected.completion);
-            if let Some(target) = interception {
-                binding = MemberBinding::Unknown;
-                let evidence = ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::UnsupportedSemantic(target),
-                ]);
-                completion = completion.combine(&evidence);
-                let provider = HierarchyProviderKey::source(
-                    row.receiver.ty().identity(),
-                    request.lookup,
-                    request.namespace,
-                    HierarchyProviderAuthority::Declaration(target),
-                    HierarchyProviderOperand::Access { target },
-                    context.reference,
-                    context.step as u32,
-                );
-                coverage.push(provider.clone());
-                self.member_observations
-                    .borrow_mut()
-                    .push(HierarchyProviderObservation {
-                        provider,
-                        visit: HierarchyProviderVisit::Observed,
-                        completion: evidence,
-                        inventory_complete: None,
-                    });
-            }
-        }
+        let coverage = vec![row.provider.clone()];
         if matches!(binding, MemberBinding::Unknown) {
             completion = completion.combine(&ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(row.property.definition()),

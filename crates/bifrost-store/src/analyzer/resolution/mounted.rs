@@ -42,7 +42,7 @@ use super::common_fact_lowering::LoweredDeferredMemberOwner;
 use super::engine::ResolutionQuery;
 use super::fact_source::{
     CompanionTypeRelation, DeclarationAccessDecision, DeferredMemberOwnerLookupName,
-    FactPageVisitor, FactReadOutcome, LoweredIntrinsicTypeDescriptor,
+    FactPageVisitor, FactReadOutcome, JvmAliasProperty, LoweredIntrinsicTypeDescriptor,
     LoweredRustDeclarationAuthority, LoweredRustReferenceContext, QualifiedRouteSlotLookup,
     RustImplementedTraits, SelectedGapReasonProvenance, SelectedQualifiedRoute,
     SelectedTypeFrontierCompletion, SelectedTypedFactSource, SelectedTypedRow,
@@ -820,6 +820,15 @@ impl SpliceMount for SelectedTypeFrontierCompletion {
     }
 }
 
+impl SpliceMount for JvmAliasProperty {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            definition: translation.semantic(self.definition),
+            ..self.clone()
+        }
+    }
+}
+
 impl SpliceMount for CompanionTypeRelation {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         CompanionTypeRelation::new(
@@ -1187,6 +1196,10 @@ where
     S: std::ops::Deref,
     S::Target: BatchResolutionFragmentSource,
 {
+    fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
+        self.inner.candidate_admission_session()
+    }
+
     fn identity_content_digest(
         &self,
         key: super::ResolutionIdentityDigestKey,
@@ -1219,6 +1232,10 @@ where
     ) -> ResolutionCompletion {
         let completion = self.argument(completion);
         self.result(&self.inner.scope_reverse_inventory_completion(&completion))
+    }
+
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        self.inner.namespace_definition_languages()
     }
 
     fn semantic_language_of(
@@ -1704,6 +1721,7 @@ where
     }
 
     spliced_batch!(rust_module_definitions(definitions: &[SemanticId]) -> Vec<SemanticId>);
+    spliced_batch!(namespace_definitions(definitions: &[SemanticId]) -> Vec<SemanticId>);
     spliced_batch!(module_definitions(definitions: &[SemanticId]) -> Vec<SemanticId>);
 
     fn rust_implemented_traits_nameable_at(
@@ -1914,6 +1932,38 @@ where
     ) -> StoreResult<Option<Vec<bool>>> {
         self.inner
             .deferred_member_participation(&self.arguments(definitions), cancellation)
+    }
+
+    fn go_package_member_sources(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<Option<Vec<SemanticId>>>>> {
+        Ok(self
+            .inner
+            .go_package_member_sources(&self.arguments(definitions), cancellation)?
+            .map(|packages| {
+                packages
+                    .into_iter()
+                    .map(|sources| {
+                        sources.map(|sources| {
+                            sources
+                                .into_iter()
+                                .map(|source| self.result(&source))
+                                .collect()
+                        })
+                    })
+                    .collect()
+            }))
+    }
+
+    fn go_source_placement_proofs(
+        &self,
+        sources: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<bool>>> {
+        self.inner
+            .go_source_placement_proofs(&self.arguments(sources), cancellation)
     }
 
     fn deferred_member_owner_proofs(
@@ -2210,6 +2260,11 @@ where
         SelectedTypedRow<LoweredMemberScopeProperty>
     );
     spliced_typed_pages!(
+        visit_jvm_alias_pages_for_definitions,
+        SemanticId,
+        SelectedTypedRow<JvmAliasProperty>
+    );
+    spliced_typed_pages!(
         visit_companion_relation_pages_for_enclosing_types,
         SemanticId,
         SelectedTypedRow<CompanionTypeRelation>
@@ -2390,10 +2445,11 @@ mod tests {
             declared_methods(&typed_crlf, "SelectedTypedFactSource"),
             typed
         );
-        assert_eq!(batch.len(), 35, "BatchResolutionFragmentSource: {batch:?}");
+        // #5671: forward the root-inventory admission session with the other seam methods.
+        assert_eq!(batch.len(), 37, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        assert_eq!(typed.len(), 88, "SelectedTypedFactSource: {typed:?}");
+        assert_eq!(typed.len(), 92, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

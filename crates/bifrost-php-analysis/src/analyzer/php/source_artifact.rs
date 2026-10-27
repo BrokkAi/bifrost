@@ -525,6 +525,8 @@ fn project_type<'tree>(
     };
     record_namespace(&work.namespace, namespaces);
     types.push(TypeFact {
+        implemented_traits_complete: false,
+        generic_trait_impls_complete: false,
         jvm_inventory: None,
         type_parameter_defaults: Vec::new(),
         implemented_traits: Vec::new(),
@@ -939,6 +941,8 @@ fn namespace_fact(
     entry_path: &str,
 ) -> TypeFact {
     TypeFact {
+        implemented_traits_complete: false,
+        generic_trait_impls_complete: false,
         jvm_inventory: None,
         type_parameter_defaults: Vec::new(),
         implemented_traits: Vec::new(),

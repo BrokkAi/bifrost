@@ -664,6 +664,7 @@ mod tests {
             active.activation_report()
         );
         assert_eq!(active.types_named("widget.Widget").records.len(), 1);
+        let active = std::sync::Arc::new(active);
         let overlay =
             SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 * 1024 * 1024)
                 .unwrap();
@@ -799,6 +800,7 @@ mod tests {
                 SemanticModelResolutionOutcome::Ready(active) => active,
                 outcome => panic!("expected ready Rust dependency model, got {outcome:#?}"),
             };
+            let active = std::sync::Arc::new(active);
             let overlay =
                 SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 * 1024 * 1024)
                     .unwrap();

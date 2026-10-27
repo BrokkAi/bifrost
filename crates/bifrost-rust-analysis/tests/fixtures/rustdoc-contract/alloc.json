@@ -21,7 +21,9 @@
             30,
             15,
             40,
-            50
+            50,
+            110,
+            112
           ],
           "is_stripped": false
         }
@@ -510,7 +512,8 @@
             "where_predicates": []
           },
           "impls": [
-            51
+            51,
+            120
           ]
         }
       }
@@ -592,6 +595,314 @@
           "blanket_impl": {
             "generic": "I"
           }
+        }
+      }
+    },
+    "110": {
+      "id": 110,
+      "crate_id": 0,
+      "name": null,
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "impl": {
+          "is_unsafe": false,
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "provided_trait_methods": [],
+          "trait": null,
+          "for": {
+            "slice": {
+              "generic": "T"
+            }
+          },
+          "items": [
+            111
+          ],
+          "is_negative": false,
+          "is_synthetic": false,
+          "blanket_impl": null
+        }
+      }
+    },
+    "111": {
+      "id": 111,
+      "crate_id": 0,
+      "name": "iter",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [
+              [
+                "self",
+                {
+                  "borrowed_ref": {
+                    "lifetime": null,
+                    "is_mutable": false,
+                    "type": {
+                      "generic": "Self"
+                    }
+                  }
+                }
+              ]
+            ],
+            "output": {
+              "primitive": "usize"
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true,
+          "default_unstable": null
+        }
+      }
+    },
+    "112": {
+      "id": 112,
+      "crate_id": 0,
+      "name": null,
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "impl": {
+          "is_unsafe": false,
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "provided_trait_methods": [],
+          "trait": null,
+          "for": {
+            "primitive": "i128"
+          },
+          "items": [
+            113
+          ],
+          "is_negative": false,
+          "is_synthetic": false,
+          "blanket_impl": null
+        }
+      }
+    },
+    "113": {
+      "id": 113,
+      "crate_id": 0,
+      "name": "missing_owner",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [
+              [
+                "self",
+                {
+                  "borrowed_ref": {
+                    "lifetime": null,
+                    "is_mutable": true,
+                    "type": {
+                      "generic": "Self"
+                    }
+                  }
+                }
+              ]
+            ],
+            "output": {
+              "primitive": "usize"
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true,
+          "default_unstable": null
+        }
+      }
+    },
+    "120": {
+      "id": 120,
+      "crate_id": 0,
+      "name": null,
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "impl": {
+          "is_unsafe": false,
+          "generics": {
+            "params": [
+              {
+                "name": "I",
+                "kind": {
+                  "type": {
+                    "bounds": [],
+                    "default": null,
+                    "is_synthetic": false
+                  }
+                }
+              }
+            ],
+            "where_predicates": []
+          },
+          "provided_trait_methods": [],
+          "trait": null,
+          "for": {
+            "resolved_path": {
+              "path": "Box",
+              "id": 50,
+              "args": {
+                "angle_bracketed": {
+                  "args": [
+                    {
+                      "type": {
+                        "generic": "I"
+                      }
+                    },
+                    {
+                      "type": {
+                        "primitive": "u8"
+                      }
+                    }
+                  ],
+                  "constraints": []
+                }
+              }
+            }
+          },
+          "items": [
+            121,
+            122
+          ],
+          "is_negative": false,
+          "is_synthetic": false,
+          "blanket_impl": null
+        }
+      }
+    },
+    "121": {
+      "id": 121,
+      "crate_id": 0,
+      "name": "new",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [],
+            "output": {
+              "generic": "Self"
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true,
+          "default_unstable": null
+        }
+      }
+    },
+    "122": {
+      "id": 122,
+      "crate_id": 0,
+      "name": "as_self",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [
+              [
+                "self",
+                {
+                  "borrowed_ref": {
+                    "lifetime": null,
+                    "is_mutable": true,
+                    "type": {
+                      "generic": "Self"
+                    }
+                  }
+                }
+              ]
+            ],
+            "output": {
+              "borrowed_ref": {
+                "lifetime": null,
+                "is_mutable": false,
+                "type": {
+                  "generic": "Self"
+                }
+              }
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true,
+          "default_unstable": null
         }
       }
     }

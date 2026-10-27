@@ -89,16 +89,6 @@ pub struct JavaFileUsageEvidence {
     pub raw_match_count: usize,
 }
 
-impl JavaFileUsageEvidence {
-    pub fn empty() -> Self {
-        Self {
-            hits: BTreeSet::new(),
-            unproven_hits: BTreeSet::new(),
-            raw_match_count: 0,
-        }
-    }
-}
-
 /// Result of one uncapped Java file evidence build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JavaFileEvidenceBuildOutcome {
@@ -192,27 +182,6 @@ impl ScanCtx<'_> {
             components,
         )
     }
-}
-
-pub fn scan_file(
-    java: &dyn JavaSource,
-    _token: QueryToken<'_>,
-    graph: &JavaGraphSource<'_>,
-    file: &ProjectFile,
-    spec: &TargetSpec,
-    return_caches: &ReturnTypeCaches<'_>,
-    state: &mut ScanState<'_>,
-) {
-    if *state.limit_exceeded {
-        return;
-    }
-    let Ok(source) = file.read_to_string() else {
-        return;
-    };
-    let Ok(prepared) = prepare_file(graph, file, spec, source) else {
-        return;
-    };
-    scan_prepared_file(java, graph, file, spec, return_caches, &prepared, state);
 }
 
 /// Build exact, uncapped evidence for one Java file.
@@ -417,56 +386,102 @@ fn tree_contains_target_terminal(root: Node<'_>, source: &str, target: &str) -> 
 }
 
 fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
-        return;
+    enum Work<'tree> {
+        Visit(Node<'tree>),
+        ExitScope,
+        ExitClassScope,
+        SeedResource(Node<'tree>),
     }
-    if node.kind() == "try_with_resources_statement" {
-        scan_try_with_resources(node, token, ctx);
-        return;
-    }
-    let enters_class_scope = is_java_type_body(node.kind());
-    let enters_scope = enters_class_scope
-        || matches!(
-            node.kind(),
-            "method_declaration"
-                | "constructor_declaration"
-                | "compact_constructor_declaration"
-                | "block"
-                | "lambda_expression"
-                | "catch_clause"
-                | "enhanced_for_statement"
-                | "for_statement"
-        );
-
-    if enters_scope {
-        ctx.bindings.enter_scope();
-        if enters_class_scope {
-            ctx.class_scope_depths.push(ctx.bindings.scope_depth());
-        }
-        seed_declarations(node, token, ctx);
-    } else {
-        seed_inline_declarations(node, token, ctx);
-    }
-
-    if node.kind() == "import_declaration" {
-        maybe_record_import_hit(node, token, ctx);
-    } else {
-        maybe_record_hit(node, token, ctx);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(child, token, ctx);
+    let mut work = vec![Work::Visit(node)];
+    while let Some(item) = work.pop() {
+        let node = match item {
+            // Unwind scopes even after a hit limit stops further visits.
+            Work::ExitScope => {
+                ctx.bindings.exit_scope();
+                continue;
+            }
+            Work::ExitClassScope => {
+                ctx.class_scope_depths.pop();
+                continue;
+            }
+            Work::SeedResource(resource) => {
+                if !*ctx.limit_exceeded {
+                    seed_typed_binding(resource, token, ctx);
+                }
+                continue;
+            }
+            Work::Visit(node) => node,
+        };
         if *ctx.limit_exceeded {
-            break;
+            continue;
         }
-    }
+        if node.kind() == "try_with_resources_statement" {
+            ctx.bindings.enter_scope();
+            let resources = node.child_by_field_name("resources");
+            let body = node.child_by_field_name("body");
+            brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_where_as(
+                node,
+                &mut work,
+                |child| Some(child) != resources && Some(child) != body,
+                Work::Visit,
+            );
+            work.push(Work::ExitScope);
+            if let Some(body) = body {
+                work.push(Work::Visit(body));
+            }
+            if let Some(resources) = resources {
+                let mut cursor = resources.walk();
+                let resources = resources.named_children(&mut cursor).collect::<Vec<_>>();
+                for resource in resources.into_iter().rev() {
+                    if resource.kind() == "resource" {
+                        work.push(Work::SeedResource(resource));
+                    }
+                    work.push(Work::Visit(resource));
+                }
+            }
+            continue;
+        }
+        let enters_class_scope = is_java_type_body(node.kind());
+        let enters_scope = enters_class_scope
+            || matches!(
+                node.kind(),
+                "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "block"
+                    | "lambda_expression"
+                    | "catch_clause"
+                    | "enhanced_for_statement"
+                    | "for_statement"
+            );
 
-    if enters_class_scope {
-        ctx.class_scope_depths.pop();
-    }
-    if enters_scope {
-        ctx.bindings.exit_scope();
+        if enters_scope {
+            ctx.bindings.enter_scope();
+            if enters_class_scope {
+                ctx.class_scope_depths.push(ctx.bindings.scope_depth());
+            }
+            seed_declarations(node, token, ctx);
+        } else {
+            seed_inline_declarations(node, token, ctx);
+        }
+
+        if node.kind() == "import_declaration" {
+            maybe_record_import_hit(node, token, ctx);
+        } else {
+            maybe_record_hit(node, token, ctx);
+        }
+
+        if enters_scope {
+            work.push(Work::ExitScope);
+        }
+        if enters_class_scope {
+            work.push(Work::ExitClassScope);
+        }
+        brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+            node,
+            &mut work,
+            Work::Visit,
+        );
     }
 }
 
@@ -483,44 +498,6 @@ fn is_java_type_body(kind: &str) -> bool {
         kind,
         "class_body" | "enum_body" | "interface_body" | "annotation_type_body"
     )
-}
-
-fn scan_try_with_resources(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
-    ctx.bindings.enter_scope();
-    if let Some(resources) = node.child_by_field_name("resources") {
-        let mut cursor = resources.walk();
-        for resource in resources.named_children(&mut cursor) {
-            scan_node(resource, token, ctx);
-            if *ctx.limit_exceeded {
-                break;
-            }
-            if resource.kind() == "resource" {
-                seed_typed_binding(resource, token, ctx);
-            }
-        }
-    }
-    if !*ctx.limit_exceeded
-        && let Some(body) = node.child_by_field_name("body")
-    {
-        scan_node(body, token, ctx);
-    }
-    ctx.bindings.exit_scope();
-
-    if *ctx.limit_exceeded {
-        return;
-    }
-    let resources = node.child_by_field_name("resources");
-    let body = node.child_by_field_name("body");
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if Some(child) == resources || Some(child) == body {
-            continue;
-        }
-        scan_node(child, token, ctx);
-        if *ctx.limit_exceeded {
-            break;
-        }
-    }
 }
 
 fn seed_declarations(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {

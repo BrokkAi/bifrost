@@ -50,7 +50,7 @@ use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v28";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v30";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -360,6 +360,14 @@ struct LoweringContext<'tree, 'targets> {
     array_values: HashSet<ValueId>,
     non_null_values: HashSet<ValueId>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
+    /// The value of each switch expression in this procedure, keyed by the
+    /// point its `yield` completions end at. A `yield` resolves its
+    /// completion route and reads the result it feeds from here.
+    yield_results: HashMap<ProgramPointId, ValueId>,
+    /// The names `instanceof` and record patterns bind in this procedure.
+    /// The lowering has no binding for them, so a bare reference to one of
+    /// these names that resolves to no local or parameter carries a gap.
+    pattern_variable_names: HashSet<Box<str>>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     /// The per-procedure, per-field-name "virtual local" carrier #2573's

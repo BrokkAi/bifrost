@@ -1206,21 +1206,6 @@ pub fn rust_import_body(raw_import: &str) -> Option<&str> {
     (visibility.starts_with("pub(") || visibility == "crate").then_some(body.trim())
 }
 
-pub fn split_rust_import_module_and_name(raw_import: &str) -> Option<(String, String)> {
-    let body = rust_import_body(raw_import)?;
-    let path = body
-        .rsplit_once(" as ")
-        .map(|(path, _)| path)
-        .unwrap_or(body)
-        .trim();
-    if path.ends_with("::*") {
-        return None;
-    }
-
-    let (module_specifier, imported_name) = path.rsplit_once("::")?;
-    Some((module_specifier.to_string(), imported_name.to_string()))
-}
-
 pub fn resolve_rust_module_path_with_crate(
     package: &str,
     crate_package: &str,
@@ -1264,34 +1249,6 @@ pub fn resolve_rust_import_package_scoped(
         file,
         module_specifier,
         lexical_package.as_deref(),
-        &segments,
-    )
-}
-
-/// Resolve an import using an already established lexical module identity.
-/// Both live query syntax and canonical declaration contexts use this route.
-pub fn resolve_rust_import_package_in_lexical_package(
-    rust: &dyn RustSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    lexical_package: &str,
-    module_specifier: &str,
-) -> ReferenceContextResult<Option<String>> {
-    let segments = parse_symbol_path(Language::Rust, module_specifier);
-    if segments.is_empty() {
-        return Ok(None);
-    }
-    let first = segments
-        .first()
-        .map(String::as_str)
-        .expect("the import path has at least one segment");
-    let lexical_package = matches!(first, "self" | "super").then_some(lexical_package);
-    resolve_rust_import_package_segments(
-        rust,
-        token,
-        file,
-        module_specifier,
-        lexical_package,
         &segments,
     )
 }
@@ -1770,6 +1727,342 @@ mod tests {
                 expected.map(str::to_string),
                 "structured import path {:?}",
                 import.path.as_ref().expect("test import path").segments
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod use_grammar_boundary {
+    use super::*;
+    use crate::test_helpers::{PATH_GRAMMAR_SOURCE, grammar_node, parse_rust};
+
+    #[test]
+    fn use_tree_grammar_fields_and_byte_spans() {
+        let source = PATH_GRAMMAR_SOURCE;
+        let tree = parse_rust(source);
+        let root = tree.root_node();
+        assert!(!root.has_error());
+        // Every field below is prescribed by the pinned grammar, independently
+        // of the import walk. Unfielded use-list leaves are checked below too.
+        for (kind, start, end, text, field, child_kind, a, b, child_text) in [
+            (
+                "use_declaration",
+                41,
+                110,
+                "use crate::{self, r#type as Alias, nest::{self as Here, \u{0394} as _, *}};",
+                "argument",
+                "scoped_use_list",
+                45,
+                109,
+                "crate::{self, r#type as Alias, nest::{self as Here, \u{0394} as _, *}}",
+            ),
+            (
+                "scoped_use_list",
+                45,
+                109,
+                "crate::{self, r#type as Alias, nest::{self as Here, \u{0394} as _, *}}",
+                "path",
+                "crate",
+                45,
+                50,
+                "crate",
+            ),
+            (
+                "scoped_use_list",
+                76,
+                108,
+                "nest::{self as Here, \u{0394} as _, *}",
+                "path",
+                "identifier",
+                76,
+                80,
+                "nest",
+            ),
+            (
+                "scoped_use_list",
+                76,
+                108,
+                "nest::{self as Here, \u{0394} as _, *}",
+                "list",
+                "use_list",
+                82,
+                108,
+                "{self as Here, \u{0394} as _, *}",
+            ),
+            (
+                "use_as_clause",
+                59,
+                74,
+                "r#type as Alias",
+                "path",
+                "identifier",
+                59,
+                65,
+                "r#type",
+            ),
+            (
+                "use_as_clause",
+                59,
+                74,
+                "r#type as Alias",
+                "alias",
+                "identifier",
+                69,
+                74,
+                "Alias",
+            ),
+            (
+                "use_as_clause",
+                83,
+                95,
+                "self as Here",
+                "path",
+                "self",
+                83,
+                87,
+                "self",
+            ),
+            (
+                "use_as_clause",
+                83,
+                95,
+                "self as Here",
+                "alias",
+                "identifier",
+                91,
+                95,
+                "Here",
+            ),
+            (
+                "use_as_clause",
+                97,
+                104,
+                "\u{0394} as _",
+                "path",
+                "identifier",
+                97,
+                99,
+                "\u{0394}",
+            ),
+            (
+                "use_as_clause",
+                97,
+                104,
+                "\u{0394} as _",
+                "alias",
+                "identifier",
+                103,
+                104,
+                "_",
+            ),
+            (
+                "scoped_identifier",
+                115,
+                127,
+                "::dep::r#mod",
+                "path",
+                "scoped_identifier",
+                115,
+                120,
+                "::dep",
+            ),
+            (
+                "scoped_identifier",
+                115,
+                127,
+                "::dep::r#mod",
+                "name",
+                "identifier",
+                122,
+                127,
+                "r#mod",
+            ),
+        ] {
+            let parent = grammar_node(root, kind, start, end, text);
+            let child = grammar_node(root, child_kind, a, b, child_text);
+            assert_eq!(parent.child_by_field_name(field), Some(child));
+        }
+        let wrapped = grammar_node(
+            root,
+            "use_declaration",
+            41,
+            110,
+            "use crate::{self, r#type as Alias, nest::{self as Here, \u{0394} as _, *}};",
+        );
+        let wrapper = wrapped.parent().unwrap();
+        assert_eq!(wrapper.kind(), "declaration_with_attribute");
+        assert_eq!(wrapper.byte_range(), 28..110);
+        assert_eq!(wrapper.child_by_field_name("declaration"), Some(wrapped));
+        let attributes = grammar_node(root, "attributes", 28, 40, "#[cfg(test)]");
+        assert_eq!(wrapper.child_by_field_name("attributes"), Some(attributes));
+        assert_eq!(
+            outer_attributes(wrapped).next().unwrap().byte_range(),
+            28..40
+        );
+        assert_eq!(outer_attributes(wrapped).count(), 1);
+        assert_eq!(
+            rust_import_body(&source[wrapped.byte_range()]),
+            Some("crate::{self, r#type as Alias, nest::{self as Here, \u{0394} as _, *}}")
+        );
+        let absolute = grammar_node(root, "use_declaration", 111, 128, "use ::dep::r#mod;");
+        assert_eq!(
+            rust_import_body(&source[absolute.byte_range()]),
+            Some("::dep::r#mod")
+        );
+
+        // Paths, target tokens, alias tokens and binding names are handwritten
+        // expansions of the source use tree; no name resolution is involved.
+        let expected = [
+            (
+                vec!["crate"],
+                Some(("self", 53, 57, "self")),
+                None,
+                Some("crate"),
+            ),
+            (
+                vec!["crate", "type"],
+                Some(("identifier", 59, 65, "r#type")),
+                Some((69, 74, "Alias")),
+                Some("Alias"),
+            ),
+            (
+                vec!["crate", "nest"],
+                Some(("self", 83, 87, "self")),
+                Some((91, 95, "Here")),
+                Some("Here"),
+            ),
+            (
+                vec!["crate", "nest", "\u{0394}"],
+                Some(("identifier", 97, 99, "\u{0394}")),
+                Some((103, 104, "_")),
+                None,
+            ),
+            (vec!["crate", "nest"], None, None, None),
+            (
+                vec!["dep", "mod"],
+                Some(("identifier", 122, 127, "r#mod")),
+                None,
+                Some("mod"),
+            ),
+        ];
+        let imports = rust_import_projection_with_source_nodes(root, source, "");
+        assert_eq!(imports.len(), expected.len());
+        for ((projected, nodes), (path, target, alias, binder)) in imports.iter().zip(expected) {
+            assert_eq!(projected.import.path(), path);
+            assert_eq!(projected.import.binding_name().named(), binder);
+            assert_eq!(projected.import.binding_name().is_glob(), target.is_none());
+            let focused = target.map(|(kind, a, b, text)| grammar_node(root, kind, a, b, text));
+            assert_eq!(nodes.target, focused);
+            assert_eq!(
+                nodes.alias,
+                alias.map(|(a, b, text)| grammar_node(root, "identifier", a, b, text))
+            );
+            let focused =
+                focused.unwrap_or_else(|| grammar_node(root, "use_wildcard", 106, 107, "*"));
+            let written = rust_focused_use_path(focused, source).expect("use path");
+            assert_eq!(written.segments, path);
+            assert_eq!(written.full_path, path.join("::"));
+            assert_eq!(
+                (written.root.start_byte(), written.root.end_byte()),
+                if path[0] == "dep" {
+                    (115, 120)
+                } else {
+                    (45, 50)
+                }
+            );
+        }
+        // The low-level path walkers return only the structurally selected
+        // path's own tokens, with normalized names and original UTF-8 coordinates.
+        for (kind, a, b, text, expected) in [
+            ("identifier", 97, 99, "\u{0394}", vec![("\u{0394}", 97, 99)]),
+            (
+                "scoped_identifier",
+                115,
+                127,
+                "::dep::r#mod",
+                vec![("dep", 117, 120), ("mod", 122, 127)],
+            ),
+            ("identifier", 59, 65, "r#type", vec![("type", 59, 65)]),
+        ] {
+            let node = grammar_node(root, kind, a, b, text);
+            assert_eq!(
+                rust_use_path_segments(node, source),
+                expected.iter().map(|v| v.0).collect::<Vec<_>>()
+            );
+            let segments = rust_use_path_segments_with_spans(node, source);
+            assert_eq!(
+                segments
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.span.start_byte, s.span.end_byte))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for segment in segments {
+                assert_eq!(
+                    segment.node.byte_range(),
+                    segment.span.start_byte..segment.span.end_byte
+                );
+            }
+        }
+        assert!(
+            rust_focused_use_path(grammar_node(root, "identifier", 339, 344, "value"), source)
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod qs3_anchor_contract {
+    use super::*;
+
+    #[test]
+    fn qs3_resolved_mount_anchor_table() {
+        // The mount contract compares complete components, not string prefixes.
+        for (specifier, resolved, file, expected) in [
+            (
+                "crate::inner",
+                "pkg.inner",
+                "pkg.nested",
+                RustModuleAnchor::Crate,
+            ),
+            (
+                "::crate::inner",
+                "pkg.inner",
+                "pkg.nested",
+                RustModuleAnchor::Crate,
+            ),
+            (
+                "super",
+                "pkg",
+                "pkg.nested",
+                RustModuleAnchor::OwnModule { pop: 1 },
+            ),
+            (
+                "self",
+                "pkg.nested",
+                "pkg.nested",
+                RustModuleAnchor::OwnModule { pop: 0 },
+            ),
+            (
+                "child",
+                "pkg.nested.child",
+                "pkg.nested",
+                RustModuleAnchor::OwnModule { pop: 0 },
+            ),
+            (
+                "other",
+                "pkg.other",
+                "pkg.nested",
+                RustModuleAnchor::External,
+            ),
+            ("other", "a.bc", "a.b", RustModuleAnchor::External),
+        ] {
+            let rooted = rust_module_specifier_is_crate_rooted(specifier);
+            assert_eq!(rooted, matches!(expected, RustModuleAnchor::Crate));
+            assert_eq!(
+                rust_anchor_for_resolved_package(resolved, file, rooted),
+                expected
             );
         }
     }

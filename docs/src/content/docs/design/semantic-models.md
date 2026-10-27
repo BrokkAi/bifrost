@@ -109,6 +109,19 @@ shared, and a completed inventory cannot override a current reader's stop. The
 inventory retains no resolution or model answers and is discarded with its
 query or operation; it is not a persistent cache.
 
+A Python module field that a pack types with `value_type`, such as
+`os.environ` declared as `os._Environ`, is the exact receiver class of a member
+call made on it, so `os.environ.get(key)` can resolve to a declared `get`
+member. The import binder selects the field by identity: a parameter, local or
+rebound name that spells the module is not the module, and neither is a
+workspace module of the same name. A workspace write to the field
+(`os.environ = fake`), or a module object that escapes to an unseen writer,
+withholds the declared class, and the call stays typed incomplete instead of
+reading clean. Reading the field from the module's own namespace runs no
+descriptor, so the declaration also retires that read's descriptor claim; the
+member call still needs its own declared member and, under a policy that
+requires models, a complete external model.
+
 ## Source and model precedence
 
 Workspace source bodies are analyzed directly. An external summary can stand
@@ -121,6 +134,24 @@ Source and model evidence also make different claims:
 - an authored external model remains an authored claim, even when the pack
   declares that claim complete; and
 - a generated model remains tied to its producer and exact generation inputs.
+
+Schema 19 gives compiled packs an optional artifact-extraction claim: the
+producer kind and an exact single-input SHA-256 or source-set digest. Bifrost's
+artifact producers supply it to the compiler in memory; authored pack documents
+cannot set it. The manifest and every shard repeat the same claim, and both
+semantic digests include it. Catalog rows and hydrated provenance retain it.
+Older and curated packs have no extraction authority. Producer names and
+activation-source labels alone do not establish authority.
+
+Rust implementation inventories make two independent claims within one artifact
+source set: a type's direct implementations of source-set traits, and a trait's
+generic implementation rules. Inventory-based absence requires both claims,
+no applicable positive concrete implementation, and no potentially applicable
+blanket rule under its bounds. An applicable explicit negative implementation
+is direct evidence of absence. Unsupported predicates remain explicit unknown
+applicability conditions in an exhaustive inventory. Compiler-derived auto
+traits, including Send, Sync, Unpin and Sized, have no completeness claim. Consumers must preserve unknown results
+when bounds or coverage cannot be proved.
 
 Some reviewed external summaries may close a modeled call boundary under an
 explicit policy. That closure applies only to the modeled call boundary.

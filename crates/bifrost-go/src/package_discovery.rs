@@ -4,6 +4,46 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryConfig;
+
+/// The effective Go build selection shared by discovery, graph admission and
+/// context identity. `host_goos` and `host_goarch` come from `go env` when it
+/// is available, or from the current host for the pre-discovery fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoBuildConfiguration {
+    pub goos: String,
+    pub goarch: String,
+    pub cgo_enabled: bool,
+    pub tags: Vec<String>,
+}
+
+pub fn selected_build_configuration(
+    config: &GoDependencyDiscoveryConfig,
+    host_goos: &str,
+    host_goarch: &str,
+) -> GoBuildConfiguration {
+    GoBuildConfiguration {
+        goos: config.goos.as_deref().unwrap_or(host_goos).to_owned(),
+        goarch: config.goarch.as_deref().unwrap_or(host_goarch).to_owned(),
+        cgo_enabled: false,
+        tags: config.build_tags.clone(),
+    }
+}
+
+pub fn host_build_configuration(config: &GoDependencyDiscoveryConfig) -> GoBuildConfiguration {
+    let goos = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let goarch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        other => other,
+    };
+    selected_build_configuration(config, goos, goarch)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub struct GoEnvironment {
@@ -94,9 +134,7 @@ pub struct GoPackageDiscovery {
     pub failure: Option<String>,
     pub packages: Vec<GoPackage>,
     pub environment: GoEnvironment,
-    pub goos: String,
-    pub goarch: String,
-    pub build_tags: Vec<String>,
+    pub build_configuration: GoBuildConfiguration,
     pub workspace_patterns: Vec<String>,
     pub vendor: bool,
 }

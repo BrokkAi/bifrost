@@ -92,11 +92,18 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 ///
 /// Bumped for Kotlin Batch 6: the semantic identity now accompanies the
 /// Kotlin B1/A6 syntax hooks and their conservative result boundaries.
+///
+/// Bumped for quicksilver round 5: value-class construction from a literal
+/// proves a match only when the literal fits the carrier type (range, sign and
+/// the L, u, uL, f and F suffixes).
+///
+/// Bumped for #6940: control-flow and carrier sites now read hexadecimal,
+/// binary and unsigned integer literals.
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v14";
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v16";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 

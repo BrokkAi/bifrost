@@ -8,8 +8,6 @@ use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicab
 
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::ConversionEvidence;
 
-use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::ConversionKind;
-
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::FactEvaluation;
 
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::ImplicitReceiverLookup;
@@ -234,36 +232,25 @@ impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
         )
     }
 
+    fn candidate_formal_is_subtype(
+        &self,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        subtype: SemanticId,
+        supertype: SemanticId,
+        states: &StateMap,
+    ) -> Result<Option<bool>> {
+        evaluation.kotlin_type_is_subtype(subtype, supertype, states)
+    }
+
     fn compare_conversion(
         &self,
         left: ConversionEvidence,
         right: ConversionEvidence,
         subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
     ) -> PartialOrder {
-        if left.kind == ConversionKind::Unknown || right.kind == ConversionKind::Unknown {
-            return PartialOrder::Unknown;
-        }
-        let (Some(left_source), Some(right_source), Some(left_target), Some(right_target)) = (
-            left.source_type,
-            right.source_type,
-            left.target_type,
-            right.target_type,
-        ) else {
-            return PartialOrder::Unknown;
-        };
-        if left_source != right_source {
-            return PartialOrder::Incomparable;
-        }
-        if left_target == right_target {
-            return PartialOrder::Equal;
-        }
-        if subtype_relations.contains_key(&(left_target, right_target)) {
-            PartialOrder::Better
-        } else if subtype_relations.contains_key(&(right_target, left_target)) {
-            PartialOrder::Worse
-        } else {
-            PartialOrder::Incomparable
-        }
+        brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::compare_formal_types(
+            left, right, subtype_relations,
+        )
     }
 
     fn compare_specificity(

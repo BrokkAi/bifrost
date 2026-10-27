@@ -1473,31 +1473,6 @@ fn rust_declaration_targets_in_files_with_progress(
     Ok(targets)
 }
 
-pub fn resolve_visible_import_targets_forward(
-    rust: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    binder: &ImportBinder,
-    reference: &str,
-) -> ReferenceContextResult<Vec<(ProjectFile, String)>> {
-    let mut targets =
-        resolve_imported_export_from_binder_forward(rust, token, file, binder, reference)?;
-    for (local_name, binding) in &binder.bindings {
-        if local_name != reference || binding.kind != ImportKind::Named {
-            continue;
-        }
-        let imported = binding.imported_name.as_deref().unwrap_or(reference);
-        targets.extend(
-            resolve_module_files(rust, token, file, &binding.module_specifier)?
-                .into_iter()
-                .map(|target_file| (target_file, imported.to_string())),
-        );
-    }
-    targets.sort();
-    targets.dedup();
-    Ok(targets)
-}
-
 fn declaration_source_properties_while(
     rust: &dyn RustSource,
     file: &ProjectFile,
@@ -2079,40 +2054,6 @@ pub fn canonical_export_fqn_from_files(
     single_rust_target_fqn(rust, targets, progress)
 }
 
-pub fn forward_export_fqn_from_files(
-    rust: &dyn RustFactSource,
-    token: QueryToken<'_>,
-    module_files: &[ProjectFile],
-    name: &str,
-) -> ReferenceContextResult<Option<String>> {
-    if let Some(fqn) =
-        canonical_export_fqn_from_files(rust, token, module_files, name, true, &|| true)?
-    {
-        return Ok(Some(fqn));
-    }
-    let mut member_fqns = BTreeSet::new();
-    for file in module_files {
-        let index = rust.export_index_of(file)?;
-        let Some(ExportEntry::ReexportedNamed {
-            module_specifier,
-            imported_name,
-        }) = index.exports_by_name.get(name)
-        else {
-            continue;
-        };
-        let Some(owner_fqn) = resolve_module_package(rust, token, file, module_specifier)? else {
-            continue;
-        };
-        let target_fqn = join_rust_fqn(&owner_fqn, imported_name);
-        if rust.definitions(&target_fqn).next().is_some() {
-            member_fqns.insert(target_fqn);
-        }
-    }
-    Ok((member_fqns.len() == 1)
-        .then(|| member_fqns.into_iter().next())
-        .flatten())
-}
-
 pub fn forward_exported_targets_from_files(
     rust: &dyn RustSource,
     token: QueryToken<'_>,
@@ -2149,16 +2090,6 @@ fn forward_exported_targets_from_files_with_progress(
         ModuleResolutionValue::Targets(targets) => Ok(targets),
         _ => unreachable!("forward export walk returns targets"),
     }
-}
-
-pub fn rust_member_reexport_targets(
-    rust: &dyn RustSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    owner_path: &str,
-    member_name: &str,
-) -> ReferenceContextResult<BTreeSet<(ProjectFile, String)>> {
-    rust_member_reexport_targets_while(rust, token, file, owner_path, member_name, &|| true)
 }
 
 fn rust_member_reexport_targets_while(
@@ -3626,7 +3557,8 @@ fn rust_impl_resolves_to_trait_owner(
 ///
 /// One blob can be mounted at more than one path, so each blob contributes
 /// every path it is mounted at.
-pub(crate) fn impl_files_of_trait(
+#[doc(hidden)]
+pub fn impl_files_of_trait(
     rust: &dyn RustFactSource,
     trait_owner: &CodeUnit,
 ) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
@@ -3894,18 +3826,6 @@ pub fn is_rust_free_function_declaration(
     })
 }
 
-pub fn is_rust_module_type_alias_declaration(
-    rust: &dyn RustSource,
-    code_unit: &CodeUnit,
-) -> Result<bool, RustCargoRouteError> {
-    if !rust.is_type_alias(code_unit) {
-        return Ok(false);
-    }
-    any_canonical_declaration_property(rust, code_unit, |property| {
-        property.kind == RustDeclarationKind::TypeAlias && !property.has_impl_or_trait_ancestor
-    })
-}
-
 pub fn is_rust_module_value_declaration(
     rust: &dyn RustSource,
     code_unit: &CodeUnit,
@@ -3958,30 +3878,6 @@ pub fn is_rust_export_visible_declaration(
         .get(code_unit)
         .ok_or(RustCargoRouteError::Unavailable)?;
     declaration_properties_are_export_visible(rows, &|| true).map_err(Into::into)
-}
-
-/// Check export visibility with a source-aware owner walk.
-///
-/// Rust permits separate Cargo targets to reuse the same module FQN. The
-/// generic CodeUnitIndex parent lookup returns the first matching definition,
-/// which can select a private module from a Python binding target instead of
-/// the public module that owns this declaration. Keep the owner walk on the
-/// declaration's Cargo target so export indexes do not lose valid symbols.
-pub fn is_module_export_candidate(
-    rust: &dyn RustSource,
-    file: &ProjectFile,
-    code_unit: &CodeUnit,
-    export_visible: &HashSet<CodeUnit>,
-    external_visibility: &mut HashMap<CodeUnit, bool>,
-) -> ReferenceContextResult<bool> {
-    is_module_export_candidate_while(
-        rust,
-        file,
-        code_unit,
-        export_visible,
-        external_visibility,
-        &|| true,
-    )
 }
 
 fn is_module_export_candidate_while(
@@ -4123,24 +4019,6 @@ pub fn is_external_module_declaration(
     })
 }
 
-pub fn rust_declaration_node_is<F>(
-    index: &dyn CodeUnitIndex,
-    code_unit: &CodeUnit,
-    predicate: F,
-) -> bool
-where
-    F: for<'tree> Fn(Node<'tree>, &str) -> bool,
-{
-    let Ok(source) = index.project().read_source(code_unit.source()) else {
-        return false;
-    };
-    let Some(tree) = crate::lexical_scope::parse_rust_tree(&source) else {
-        return false;
-    };
-    inspect_rust_named_declaration_node(index, code_unit, tree.root_node(), &source, predicate)
-        .unwrap_or(false)
-}
-
 /// Inspect the syntax node for a declaration, including an item written inside
 /// one or more item-position macro invocations.
 ///
@@ -4159,46 +4037,6 @@ pub fn inspect_rust_named_declaration_node<T>(
     let range = index.ranges(code_unit).into_iter().next()?;
     inspect_rust_named_declaration_node_at_range(code_unit, root, source, range, &|| true, &inspect)
         .flatten()
-}
-
-/// Inspect every recorded source occurrence of a declaration in deterministic order.
-///
-/// `CodeUnit` equality intentionally collapses duplicate declarations such as two
-/// `#[cfg]` alternatives or two item-macro expansions. Their navigation ranges still
-/// identify distinct syntax occurrences, so metadata readers must inspect each range
-/// before grouping it by identity. The inner `None` means that one occurrence has no
-/// recoverable AST; the outer `None` means the walk was cancelled.
-pub fn inspect_rust_named_declaration_nodes_while<T>(
-    index: &dyn CodeUnitIndex,
-    code_unit: &CodeUnit,
-    root: Node<'_>,
-    source: &str,
-    keep_going: &impl Fn() -> bool,
-    inspect: impl for<'tree> Fn(Node<'tree>, &str) -> T,
-) -> Option<Vec<Option<T>>> {
-    let mut ranges = index.ranges(code_unit);
-    ranges.sort_unstable_by_key(|range| {
-        (
-            range.start_byte,
-            range.end_byte,
-            range.start_line,
-            range.end_line,
-        )
-    });
-
-    let mut occurrences = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        if !keep_going() {
-            return None;
-        }
-        occurrences.push(inspect_rust_named_declaration_node_at_range(
-            code_unit, root, source, range, keep_going, &inspect,
-        )?);
-    }
-    if !keep_going() {
-        return None;
-    }
-    Some(occurrences)
 }
 
 fn inspect_rust_named_declaration_node_at_range<T>(
@@ -4267,16 +4105,6 @@ fn enclosing_macro_token_tree_interior(
     }
 }
 
-pub fn rust_named_declaration_node<'tree>(
-    index: &dyn CodeUnitIndex,
-    code_unit: &CodeUnit,
-    root: Node<'tree>,
-    source: &str,
-) -> Option<Node<'tree>> {
-    let range = index.ranges(code_unit).into_iter().next()?;
-    rust_named_declaration_node_at_range(code_unit, root, source, range)
-}
-
 fn rust_named_declaration_node_at_range<'tree>(
     code_unit: &CodeUnit,
     root: Node<'tree>,
@@ -4297,16 +4125,6 @@ fn rust_named_declaration_node_at_range<'tree>(
 
 fn rust_declaration_name_matches(name: Node<'_>, source: &str, identifier: &str) -> bool {
     rust_node_text(name, source).trim() == identifier
-}
-
-pub fn rust_declaration_node<'tree>(
-    index: &dyn CodeUnitIndex,
-    code_unit: &CodeUnit,
-    root: Node<'tree>,
-) -> Option<Node<'tree>> {
-    let ranges = index.ranges(code_unit);
-    let range = ranges.first()?;
-    root.descendant_for_byte_range(range.start_byte, range.end_byte)
 }
 
 /// The visibility constraints on the value constructor introduced by a tuple
@@ -4400,16 +4218,6 @@ pub fn rust_module_files_at(file: &ProjectFile, relative_module: &Path) -> Vec<P
 
 pub fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
     let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
-        return Vec::new();
-    };
-    rust_module_files_at(file, &relative_module)
-}
-
-pub fn rust_module_files_from_segments(
-    file: &ProjectFile,
-    segments: &[String],
-) -> Vec<ProjectFile> {
-    let Some(relative_module) = rust_relative_module_segments(file, segments) else {
         return Vec::new();
     };
     rust_module_files_at(file, &relative_module)

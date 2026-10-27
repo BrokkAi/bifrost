@@ -36,23 +36,34 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagno
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvider;
+use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
+    IncomingCallProjection, IncomingFile, IncomingFileBudget, IncomingProjectionIssue,
+    finish_incoming_sites, project_selected_incoming,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallSite;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::call_relations::is_call_relation_unit;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::call_relations::raw_call_site;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::CallSiteSyntax;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::get_definition::call_sites::call_site_syntax_for_reference;
 
+#[cfg(test)]
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProofAuthority;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::usages::proof_rank;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
@@ -189,7 +200,6 @@ pub(crate) fn project_rust_rich_call_relation(
 ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CallRelationResult>> {
     use brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH;
 
-    use crate::analyzer::usages::call_relations::CallRelationWork;
     use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 
     assert_eq!(selected.edges.len(), references.len());
@@ -197,117 +207,20 @@ pub(crate) fn project_rust_rich_call_relation(
         diagnostics: incomplete_diagnostics(selected, target),
         ..CallRelationResult::default()
     };
-    let mut facts_by_file = HashMap::default();
-    let mut rejected_files = brokk_bifrost_core::hash::HashSet::default();
-    let mut incomplete_binding_references = Vec::new();
+    let Some(sites) = project_selected_incoming(
+        &mut RustIncomingProjection(rust),
+        target,
+        selected.edges.iter().zip(references.iter().copied()),
+        limits,
+        cancellation,
+        &mut result,
+    )?
+    else {
+        return Ok(None);
+    };
+    let incomplete_binding_references = finish_incoming_sites(sites, &mut result);
     let mut time_budget_exhausted = false;
     let mut omitted_by_lane = HashMap::<&str, usize>::default();
-    let mut work = CallRelationWork::default();
-    for (edge, &reference) in selected.edges.iter().zip(references) {
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        assert_eq!(
-            &edge.target, target,
-            "reverse batch preserves target identity"
-        );
-        if rejected_files.contains(&edge.site.file) {
-            continue;
-        }
-        if !facts_by_file.contains_key(&edge.site.file) {
-            let source = rust.indexed_source(&edge.site.file).ok_or_else(|| {
-                brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
-                    "selected incoming call has no indexed source for {}",
-                    edge.site.file
-                ))
-            })?;
-            if work.scanned_files >= limits.max_files
-                || source.len()
-                    > limits
-                        .max_source_bytes
-                        .saturating_sub(work.scanned_source_bytes)
-            {
-                result.truncated = true;
-                rejected_files.insert(edge.site.file.clone());
-                continue;
-            }
-            work.scanned_files += 1;
-            work.scanned_source_bytes += source.len();
-            let facts = rust
-                .structural_fact_providers()
-                .into_iter()
-                .find_map(|provider| provider.structural_facts(&edge.site.file));
-            if !rust
-                .inner
-                .source_matches_selected_native_content(&edge.site.file, &source)
-                || facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.source() != source.as_str())
-            {
-                return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                    format!(
-                        "selected Rust incoming call source authority changed for {}",
-                        edge.site.file
-                    ),
-                ));
-            }
-            facts_by_file.insert(edge.site.file.clone(), facts);
-        }
-        let Some(facts) = facts_by_file.get(&edge.site.file).and_then(Option::as_ref) else {
-            result.diagnostics.push(diagnostic(
-                "structural_facts_unavailable",
-                format!(
-                    "structured Rust facts are unavailable in {}",
-                    edge.site.file
-                ),
-                edge.site.file.to_string(),
-            ));
-            continue;
-        };
-        let Some(syntax) = call_site_syntax_for_reference(
-            facts,
-            edge.site.range.start_byte,
-            edge.site.range.end_byte,
-        ) else {
-            continue;
-        };
-        // Each incoming row has one requested target arm. The limit applies
-        // independently at every call, not to the number of incoming calls.
-        if limits.max_candidates == 0 {
-            result.truncated = true;
-            continue;
-        }
-        work.examined_candidates += 1;
-        let Some(caller) = edge
-            .site
-            .enclosing
-            .as_ref()
-            .filter(|unit| is_call_relation_unit(unit))
-        else {
-            result.diagnostics.push(diagnostic(
-                "enclosing_caller_unavailable",
-                format!(
-                    "selected Rust call at {:?} has no callable owner",
-                    edge.site
-                ),
-                edge.site.file.to_string(),
-            ));
-            continue;
-        };
-        // The selected reverse edge already proves this callee binding.
-        // Argument and receiver semantics are independent and are resolved
-        // only for rows whose binding itself is unproven.
-        if edge.proof != UsageProof::Proven {
-            incomplete_binding_references.push(reference);
-        }
-        result.sites.push(call_site(
-            edge.site.file.clone(),
-            caller.clone(),
-            target,
-            syntax,
-            edge.proof,
-        ));
-    }
     let projection_limits_exceeded = result.truncated;
     for references in incomplete_binding_references.chunks(MAX_REFERENCE_SEEDS_PER_BATCH) {
         if time_budget_exhausted {
@@ -384,23 +297,70 @@ pub(crate) fn project_rust_rich_call_relation(
             reason_kind: None,
         });
     }
-    result.sites.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
-            .then_with(|| left.range.start_byte.cmp(&right.range.start_byte))
-            .then_with(|| left.range.end_byte.cmp(&right.range.end_byte))
-            .then_with(|| left.caller.cmp(&right.caller))
-            .then_with(|| left.callee.cmp(&right.callee))
-            .then_with(|| proof_rank(left.proof).cmp(&proof_rank(right.proof)))
-    });
-    result.sites.dedup();
     result.diagnostics.sort();
     result.diagnostics.dedup();
-    result.work = work;
     if cancellation.is_cancelled() {
         return Ok(None);
     }
     Ok(Some(result))
+}
+
+struct RustIncomingProjection<'a>(&'a RustAnalyzer);
+
+impl IncomingCallProjection for RustIncomingProjection<'_> {
+    type Error = brokk_bifrost_analysis::analyzer::store::StoreError;
+
+    fn load_file(
+        &mut self,
+        file: &ProjectFile,
+        budget: &mut IncomingFileBudget<'_>,
+        _diagnostics: &mut Vec<CallRelationDiagnostic>,
+    ) -> Result<IncomingFile, Self::Error> {
+        let source = self.0.indexed_source(file).ok_or_else(|| {
+            Self::Error::new(format!(
+                "selected incoming call has no indexed source for {file}"
+            ))
+        })?;
+        if !budget.admit_source(source.len()) {
+            return Ok(IncomingFile::Rejected);
+        }
+        let facts = self
+            .0
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(file));
+        if !self
+            .0
+            .inner
+            .source_matches_selected_native_content(file, &source)
+            || facts
+                .as_ref()
+                .is_some_and(|facts| facts.source() != source.as_str())
+        {
+            return Err(Self::Error::new(format!(
+                "selected Rust incoming call source authority changed for {file}",
+            )));
+        }
+        Ok(IncomingFile::Loaded(facts))
+    }
+
+    fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {
+        match issue {
+            IncomingProjectionIssue::FactsUnavailable(file) => diagnostic(
+                "structural_facts_unavailable",
+                format!("structured Rust facts are unavailable in {file}"),
+                file.to_string(),
+            ),
+            IncomingProjectionIssue::OwnerUnavailable(edge) => diagnostic(
+                "enclosing_caller_unavailable",
+                format!(
+                    "selected Rust call at {:?} has no callable owner",
+                    edge.site
+                ),
+                edge.site.file.to_string(),
+            ),
+        }
+    }
 }
 
 /// Project one completed selected reverse result into the public call
@@ -568,6 +528,7 @@ pub(crate) fn project_rust_call_relation(
     }
 }
 
+#[cfg(test)]
 fn call_site(
     file: ProjectFile,
     caller: CodeUnit,
@@ -827,9 +788,23 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == CallRelationDiagnosticCode::TargetsAmbiguous)
         );
-        assert_eq!(bounded[0].sites.len(), 2, "{bounded:?}");
-        assert!(!bounded[0].truncated);
-        assert_eq!(bounded[0].work.examined_candidates, 2);
+        assert_eq!(bounded[0].sites.len(), 1, "{bounded:?}");
+        assert!(bounded[0].truncated);
+        assert_eq!(bounded[0].work.examined_candidates, 1);
+        let limits = CallRelationLimits {
+            max_candidates: 1,
+            ..rich_limits()
+        };
+        assert!(
+            bounded[0].diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CallRelationDiagnosticCode::BudgetExhausted
+                    && diagnostic.message
+                        == format!(
+                            "selected Rust incoming call projection exceeded limits {limits:?}"
+                        )
+            }),
+            "{bounded:?}"
+        );
         assert!(empty[0].sites.is_empty());
         assert!(empty[0].truncated);
         assert!(omitted[0].sites.is_empty());

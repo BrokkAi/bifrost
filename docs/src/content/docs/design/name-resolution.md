@@ -154,8 +154,12 @@ write's positioned left-hand reference and its right-hand value from syntax;
 shared lowering resolves the reference to its exact lexical binder. The
 initializer and subsequent writes feed one `ValueJoin` output, followed by one
 `Assignment` transfer to the binder's observed-value slot. Inferred local
-types read the same join. An explicitly declared static type stays separate
-from observed values. The persisted `ObservedValue` declaration property links
+types read the same join unless the language fixes an inferred local's type
+to its initializer's type (`LanguageKnowledge::inferred_local_type_is_initializer_type`,
+true for Kotlin). There, writes must conform to that type and only reach the
+observed-value slot, so a write that reads the binding, such as `x = x + 1`,
+cannot make the static type depend on itself. An explicitly declared static
+type stays separate from observed values. The persisted `ObservedValue` declaration property links
 the exact local definition to its `AssignmentValue` slot, including locals with
 only an initializer. Readers can select that slot without replacing the
 declaration's static `Value` property. Its completion is independent of whether
@@ -164,7 +168,8 @@ lexical binding found one definition.
 Member-definition lookup on an explicitly typed local retains declared-type
 precedence. The observed alternatives do not turn that lookup into runtime
 dispatch. Inferred locals instead expose the initializer and write alternatives
-through their shared inferred type. Tests of an explicitly typed local therefore
+through their shared inferred type, except in a language whose initializer
+alone decides that type. Tests of an explicitly typed local therefore
 check its static member target and its observed-value join independently.
 
 This contract retains every alternative and every input's incompleteness. It
@@ -460,6 +465,17 @@ summary publication can finish without changing the workspace revision. The
 writer fallback explicitly invalidates its selection after publication because
 SQLite's data version does not include that connection's own commits.
 
+On the writer fallback, the query's connection is the store's only connection,
+and the caller of a Rust reverse query reads the store between the query's
+answers. The query therefore lends its connection to the caller and takes it
+back for each answer; it publishes macro capsules on that same connection.
+Ordinary reads share the query's revision rows. A read of other snapshots
+replaces them, and the query restores them when it takes the connection back.
+Any other change made while the connection was lent, such as another query
+staging its own selection, makes the query stale. A request that waits for the
+connection, to open a query or to take its connection back, stops waiting when
+it is cancelled.
+
 A query can narrow which mounts a name may bind into. A forward Rust lookup,
 for example, binds only into the crates that the referencing crate can see. A
 gap in an unrelated crate cannot hide a candidate, so it cannot make the answer
@@ -603,6 +619,34 @@ its established ancestors; it does not change that planning. Unknown arguments,
 conversions, defaults, expanded varargs and multiple applicable candidates do
 not establish the proof, and unrelated completion reasons stay attached. The
 proof keeps only query-local roots and ancestors and walks them iteratively.
+
+Java overload selection records a verdict for every member candidate it
+classifies, including the ones it refuses. A candidate whose arity does not fit
+fails potential applicability (JLS 15.12.2.1) before any invocation phase and
+records no phase. A strict-invocation test (JLS 15.12.2.2) makes a candidate
+applicable, or inapplicable at its first failing argument with the conversion
+that argument would need. Among the applicable candidates of one phase, one
+that another is strictly more specific than is `less_specific` (JLS 15.12.2.5):
+it accepts the call but cannot win, so overload selection counts neither it nor
+a refusal. This holds for primitive formals and for reference formals whose
+subtype relation is proved; the row comes from the same dominance test that
+drops the candidate from the selection.
+
+The phases after the strict one are decided only where the code can decide
+them. A candidate that needs boxing is `unknown` when no candidate is strictly
+applicable, because the loose phase is then never evaluated, and the site stays
+`unknown_shape`. When a strict candidate exists, the loose phase is never
+reached, so a boxing-only sibling is refused at the strict phase with reason
+`requires_boxing`; the legacy classifier reports it the same way. A candidate
+that is applicable only through variable-arity expansion is `applicable` with
+phase `variable_arity`. A variable-arity sibling of a fixed-arity applicable
+candidate is dropped by phase selection without a row, and its site stays
+`unknown_shape`.
+
+A refused candidate's witness leaves the answer, so the check reads its route
+before the witness is dropped, and the answer keeps its member owner. The
+call's own applicability obligation stays open while the verdicts prove no
+unique winner; it describes the selection, not a missing candidate.
 
 Rust inherent implementations can share a nominal head while specializing its
 written type arguments, as in typestate APIs. Candidate selection compares

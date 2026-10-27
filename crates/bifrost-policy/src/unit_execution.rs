@@ -53,6 +53,7 @@ use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryExecutionLimits};
 
 use super::budget::PolicyBudget;
 use super::definition::PolicyId;
+use super::evaluator::SubjectQueryBatch;
 use super::resolved::LoadedPolicy;
 use super::units::{
     IncrementalMode, PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitKey,
@@ -171,9 +172,6 @@ impl<'a> UnitReuse<'a> {
     /// store that cannot answer has said nothing about what was published, so
     /// the policy widens instead of reading its silence as absence.
     pub(crate) fn prefetch(&self, keys: &[PolicyUnitKey]) -> Result<(), WidenReason> {
-        if !self.incremental.reuses_existing() {
-            return Ok(());
-        }
         if let Err(error) = self
             .incremental
             .store()
@@ -201,9 +199,6 @@ impl<'a> UnitReuse<'a> {
         &mut self,
         key: &PolicyUnitKey,
     ) -> Result<Option<PolicyUnitProduct>, WidenReason> {
-        if !self.incremental.reuses_existing() {
-            return Ok(None);
-        }
         let store = self
             .incremental
             .store()
@@ -384,6 +379,10 @@ pub(crate) struct UnitQueryExecution<'a> {
     pub(crate) cancellation: Option<&'a CancellationToken>,
     pub(crate) limits: CodeQueryExecutionLimits,
     pub(crate) workspace_files: &'a [ProjectFile],
+    /// The policy batch whose other consumers of the same query a unit's
+    /// execution is shared with. A unit it serves replays the reads of the
+    /// execution that produced it, so it publishes under the same ledger.
+    pub(crate) subject_batch: Option<&'a SubjectQueryBatch<'a>>,
 }
 
 /// The seed file one query unit covers, as a partition spelling needs it.
@@ -444,7 +443,8 @@ pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<WidenReaso
 /// [`query_slicing_widen_reason`] accepts plus an `except` over rows whose
 /// identity names their file ([`PlanPartitioning::restricts_to_seed_file`]).
 /// Unit reuse keeps the stricter rule: a unit's rows must merge into the whole
-/// execution's rows, and an `except` there consults rows of every seed. The
+/// execution's rows in its order, so it also needs the except's minuend to
+/// order its rows by seed ([`PlanPartitioning::classify`]). The
 /// workspace field-index prepass would be repeated per blob either way. A plan
 /// with a step that can move its rows out of the seed's file (a reverse or
 /// forward relation, see `QueryStepOp::rows_may_leave_seed_file`) has rows
@@ -492,6 +492,14 @@ pub(crate) fn sliced_query_units(
 
     let seed_files = plan_seed_files(&query.plan, execution.workspace_files);
     attempt.enumerated(seed_files.len());
+    let shared = execution.subject_batch.and_then(|batch| {
+        batch.query_units(
+            query,
+            execution.analyzer,
+            execution.workspace,
+            execution.limits,
+        )
+    });
     let inputs = incremental.inputs();
 
     let mut keys = Vec::with_capacity(seed_files.len());
@@ -532,20 +540,31 @@ pub(crate) fn sliced_query_units(
             None => {
                 attempt.recomputed();
                 let (rows, reads) = recompute_unit(execution.analyzer, || {
-                    let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
-                        format!("policy.query_unit[{}]", rel_path_string(file))
-                    });
-                    execute_code_query_unit(
-                        execution.analyzer,
-                        execution.workspace,
-                        query,
-                        execution.limits,
-                        execution.cancellation,
-                        CodeQueryExecutionScope::for_seed_files(
-                            std::slice::from_ref(file),
-                            execution.workspace_files,
+                    let execute = || {
+                        let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+                            format!("policy.query_unit[{}]", rel_path_string(file))
+                        });
+                        execute_code_query_unit(
+                            execution.analyzer,
+                            execution.workspace,
+                            query,
+                            execution.limits,
+                            execution.cancellation,
+                            CodeQueryExecutionScope::for_seed_files(
+                                std::slice::from_ref(file),
+                                execution.workspace_files,
+                            ),
+                        )
+                    };
+                    match &shared {
+                        Some(shared) => shared.execute(
+                            Some(file),
+                            execution.analyzer,
+                            execution.cancellation,
+                            execute,
                         ),
-                    )
+                        None => execute(),
+                    }
                 });
                 let Some(reads) = reads else {
                     attempt.unbounded();

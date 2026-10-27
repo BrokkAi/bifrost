@@ -112,6 +112,7 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "merge" => merge_command(arguments, format),
         "verify" => verify_command(arguments, format),
         "install" => install_command(arguments, format),
+        "reindex" => reindex_command(arguments, format),
         "summary-corpus-join" => summary_corpus_join_command(arguments, format),
         "sanitizer-pack" => sanitizer_pack_command(arguments, format),
         "framework-decl-pack" => framework_decl_pack_command(arguments, format),
@@ -575,6 +576,26 @@ fn print_release_rejects(rejects: &ReleaseBundleRejects) {
     }
 }
 
+fn reindex_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, CommandFailure> {
+    let [root] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    let catalog = SemanticPackCatalog::open(
+        Path::new(root),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .map_err(|error| failure(2, error.to_string(), format))?;
+    let shards = catalog
+        .reindex(&CancellationToken::default())
+        .map_err(|error| failure(2, error.to_string(), format))?;
+    match format {
+        OutputFormat::Json => print_json(&json!({"reindexed_shards":shards})),
+        OutputFormat::Human => println!("reindexed {shards} semantic shards"),
+    }
+    Ok(0)
+}
+
 fn install_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, CommandFailure> {
     require_human_release_output(format)?;
     let [bundle_root, catalog_root] = arguments.as_slice() else {
@@ -590,6 +611,14 @@ fn install_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8,
     .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     let installed = install_release_bundle(&bundle_root, &catalog)
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    for pack in &installed {
+        if !pack.diagnostics.is_empty() {
+            println!(
+                "{} install diagnostics: {:?}",
+                pack.pack_id, pack.diagnostics
+            );
+        }
+    }
     println!(
         "installed {} pinned semantic packs from {} into {}",
         installed.len(),
@@ -1118,5 +1147,24 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack csmi-check FILE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack export-embedded-registry OUTPUT\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack merge OUTPUT INPUT...\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
+    concat!(
+        "usage:\n",
+        "  bifrost-semantic-pack validate SOURCE [--format human|json]\n",
+        "  bifrost-semantic-pack lint SOURCE [--format human|json]\n",
+        "  bifrost-semantic-pack csmi-check FILE [--format human|json]\n",
+        "  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n",
+        "  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n",
+        "  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n",
+        "  bifrost-semantic-pack export-embedded-registry OUTPUT\n",
+        "  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n",
+        "  bifrost-semantic-pack merge OUTPUT INPUT...\n",
+        "  bifrost-semantic-pack verify OUTPUT\n",
+        "  bifrost-semantic-pack install BUNDLE CATALOG\n",
+        "  bifrost-semantic-pack reindex CATALOG [--format human|json]\n",
+        "  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS ",
+        "JOERN_SOURCE REPORT.json [JVM_SOURCES]\n",
+        "  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n",
+        "  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n",
+        "  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM",
+    )
 }

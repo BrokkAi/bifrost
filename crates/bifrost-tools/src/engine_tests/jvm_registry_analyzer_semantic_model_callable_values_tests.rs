@@ -105,19 +105,20 @@ mod jvm_registry_tests {
             .file("Probe.java", "class Probe {}")
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let active = std::sync::Arc::new(active);
         let overlay =
             SemanticModelOverlay::build(workspace.analyzer(), &active, &cancellation, 1 << 26)
                 .unwrap();
         let factory = overlay
             .symbols()
-            .iter()
+            .into_iter()
             .find(|symbol| symbol.provenance.record_id == "member.widget.create")
             .unwrap();
         let limits = CallableValuesQueryLimits { max_records: 64 };
         let query = activated_returned_callable_targets(
             &catalog,
             &active,
-            factory,
+            &factory,
             0,
             limits,
             &cancellation,
@@ -132,11 +133,11 @@ mod jvm_registry_tests {
             query.publications[0].rows.executable_coverage,
             CsmiCoverageStatus::Unknown
         );
-        let reader = catalog.runtime_source_reader();
+        let reader = active.source_reader().unwrap();
         let reader_query = activated_returned_callable_targets_from_reader(
-            &reader,
+            reader,
             &active,
-            factory,
+            &factory,
             0,
             limits,
             &cancellation,
@@ -155,7 +156,7 @@ mod jvm_registry_tests {
         let missing = activated_returned_callable_targets(
             &catalog,
             &active,
-            factory,
+            &factory,
             1,
             limits,
             &cancellation,
@@ -165,7 +166,9 @@ mod jvm_registry_tests {
         assert_eq!(missing.publications[0].rows.coverage_claims.len(), 1);
         assert_eq!(missing.executable_coverage, CsmiCoverageStatus::Unknown);
         let mut stale = factory.clone();
-        stale.provenance.active_model_set_hash = "different-activation".to_owned();
+        std::sync::Arc::make_mut(&mut stale)
+            .provenance
+            .active_model_set_hash = "different-activation".to_owned();
         let rejected = activated_returned_callable_targets(
             &catalog,
             &active,
@@ -181,7 +184,7 @@ mod jvm_registry_tests {
         );
         assert!(rejected.publications.is_empty());
         let mut foreign_artifact = factory.clone();
-        foreign_artifact
+        std::sync::Arc::make_mut(&mut foreign_artifact)
             .provenance
             .activation
             .matched_evidence
@@ -201,7 +204,7 @@ mod jvm_registry_tests {
         );
         assert!(rejected.publications.is_empty());
         let mut foreign_configuration = factory.clone();
-        foreign_configuration
+        std::sync::Arc::make_mut(&mut foreign_configuration)
             .provenance
             .activation
             .matched_evidence
@@ -223,7 +226,7 @@ mod jvm_registry_tests {
         let bounded = activated_returned_callable_targets(
             &catalog,
             &active,
-            factory,
+            &factory,
             0,
             CallableValuesQueryLimits { max_records: 0 },
             &cancellation,
@@ -237,7 +240,7 @@ mod jvm_registry_tests {
         let stopped = activated_returned_callable_targets(
             &catalog,
             &active,
-            factory,
+            &factory,
             0,
             limits,
             &cancellation,

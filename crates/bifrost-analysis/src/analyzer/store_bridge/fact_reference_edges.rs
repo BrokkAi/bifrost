@@ -22,6 +22,8 @@ use crate::analyzer::resolution::fact_resolution::{
 use crate::analyzer::resolution::fact_source::{
     FactResolutionSource, language_callables_occupy_value_namespace,
 };
+use crate::analyzer::resolution::local_identity::ResolutionIdentityTranslation;
+use crate::analyzer::resolution::worker_transport::WorkerAnswer;
 use crate::analyzer::resolution::{
     BindingFragmentId, FactReferenceSiteMetadata, MAX_REFERENCE_SEEDS_PER_BATCH, ResolutionAnswer,
     ResolutionBatchMetrics, ResolutionCompletion, ResolutionIncompleteReason, SemanticId,
@@ -1657,6 +1659,66 @@ pub struct FactReferenceEdgeBatch {
     pub type_or_callable_completeness: EdgeCompleteness,
     #[doc(hidden)]
     pub field_completeness: EdgeCompleteness,
+}
+
+// Canonical edge rows carry stable CodeUnits. Only fragments and projection
+// gaps retain runtime aliases; raw answers use the store's complete visitor.
+impl WorkerAnswer for FactReferenceEdgeBatch {
+    fn translate(mut self, translation: &impl ResolutionIdentityTranslation) -> Self {
+        self.fragment = translation.fragment(self.fragment);
+        self.gaps = self
+            .gaps
+            .into_vec()
+            .into_iter()
+            .map(|gap| {
+                use FactReferenceEdgeGap::*;
+                match gap {
+                    IncompleteBinding { reference, domain } => IncompleteBinding {
+                        reference: translation.semantic(reference),
+                        domain,
+                    },
+                    ReceiverAdmission {
+                        reference,
+                        target,
+                        gap,
+                        domain,
+                    } => ReceiverAdmission {
+                        reference: translation.semantic(reference),
+                        target: translation.semantic(target),
+                        gap,
+                        domain,
+                    },
+                    MissingSiteMetadata { reference, domain } => MissingSiteMetadata {
+                        reference: translation.semantic(reference),
+                        domain,
+                    },
+                    UnknownReferenceOwner { reference, domain } => UnknownReferenceOwner {
+                        reference: translation.semantic(reference),
+                        domain,
+                    },
+                    OutOfGraphReferenceOwner {
+                        reference,
+                        owner,
+                        domain,
+                    } => OutOfGraphReferenceOwner {
+                        reference: translation.semantic(reference),
+                        owner: translation.semantic(owner),
+                        domain,
+                    },
+                    MissingReferenceKind {
+                        reference,
+                        target,
+                        domain,
+                    } => MissingReferenceKind {
+                        reference: translation.semantic(reference),
+                        target: translation.semantic(target),
+                        domain,
+                    },
+                }
+            })
+            .collect();
+        self
+    }
 }
 
 impl FactReferenceEdgeBatch {

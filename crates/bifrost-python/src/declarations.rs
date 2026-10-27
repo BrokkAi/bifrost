@@ -28,6 +28,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -84,6 +85,23 @@ fn python_module_components_from_root(file: &ProjectFile, import_root_rel: &Path
     components
 }
 
+/// Structured, selected inputs to the shared Python packaging-root algorithm.
+pub trait PythonImportRootInputs {
+    fn contains(&self, relative_path: &Path) -> bool;
+    fn configuration_source(&self, relative_path: &Path) -> Option<Cow<'_, str>>;
+}
+
+struct ProjectImportRootInputs<'a>(&'a dyn Project);
+impl PythonImportRootInputs for ProjectImportRootInputs<'_> {
+    fn contains(&self, relative_path: &Path) -> bool {
+        self.0.file_by_rel_path(relative_path).is_some()
+    }
+    fn configuration_source(&self, relative_path: &Path) -> Option<Cow<'_, str>> {
+        let file = self.0.file_by_rel_path(relative_path)?;
+        self.0.read_source(&file).ok().map(Cow::Owned)
+    }
+}
+
 /// The directory `file`'s path-derived Python module name is relative to: the
 /// analyzer's stand-in for the `sys.path` entry an absolute import of that
 /// module would be resolved against.
@@ -96,31 +114,34 @@ fn python_module_components_from_root(file: &ProjectFile, import_root_rel: &Path
 /// `registry/sql-registry/registry/models.py` are both the module
 /// `registry.models`, but they belong to different roots (#3475).
 pub fn python_import_root(project: &dyn Project, file: &ProjectFile) -> PathBuf {
-    let Some(parent_rel) = file.rel_path().parent() else {
+    python_import_root_with_inputs(
+        file.root(),
+        file.rel_path(),
+        &ProjectImportRootInputs(project),
+    )
+}
+
+/// Select a root using configuration bytes and membership from one snapshot.
+pub fn python_import_root_with_inputs(
+    root: &Path,
+    relative_path: &Path,
+    inputs: &impl PythonImportRootInputs,
+) -> PathBuf {
+    let Some(parent_rel) = relative_path.parent() else {
         return PathBuf::new();
     };
     if parent_rel.as_os_str().is_empty() {
         return PathBuf::new();
     }
-
-    if let Some(import_root_rel) = python_configured_import_root(project, file, parent_rel) {
+    if let Some(import_root_rel) = python_configured_import_root(root, parent_rel, inputs) {
         return import_root_rel;
     }
-
     let mut effective_package_root_rel: Option<&Path> = None;
-    let mut current_rel = Some(parent_rel);
-    while let Some(path) = current_rel {
-        if project
-            .file_by_rel_path(&path.join("__init__.py"))
-            .is_some()
-        {
+    for path in parent_rel.ancestors() {
+        if inputs.contains(&path.join("__init__.py")) {
             effective_package_root_rel = Some(path);
         }
-        current_rel = path.parent();
     }
-
-    // A package root's own parent is the import root; a file in no package at
-    // all is named from the project root.
     effective_package_root_rel
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new(""))
@@ -143,30 +164,36 @@ fn python_package_components_for_file(file: &ProjectFile, import_root_rel: &Path
 /// each ancestor. An unrelated or malformed packaging file does not change the
 /// existing `__init__.py` package-root convention.
 fn python_configured_import_root(
-    project: &dyn Project,
-    file: &ProjectFile,
+    workspace_root: &Path,
     parent_rel: &Path,
+    inputs: &impl PythonImportRootInputs,
 ) -> Option<PathBuf> {
     let mut manifest_dir_rel = Some(parent_rel);
     while let Some(directory) = manifest_dir_rel {
-        let manifest_dir = file.root().join(directory);
-        let mut roots = snapshot_source(project, &directory.join("pyproject.toml"))
+        let manifest_dir = workspace_root.join(directory);
+        let mut roots = inputs
+            .configuration_source(&directory.join("pyproject.toml"))
             .map(|source| parse_setuptools_where_entries(&source))
             .unwrap_or_default()
             .iter()
             .map(|entry| manifest_dir.join(entry).normalize())
-            .filter_map(|root| root.strip_prefix(file.root()).ok().map(Path::to_path_buf))
+            .filter_map(|root| {
+                root.strip_prefix(workspace_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
             .filter(|root| parent_rel.starts_with(root))
             .collect::<Vec<_>>();
         roots.sort_by_key(|root| root.components().count());
         if let Some(root) = roots.pop() {
             return Some(root);
         }
-        if let Some(package_dir) = snapshot_source(project, &directory.join("setup.py"))
+        if let Some(package_dir) = inputs
+            .configuration_source(&directory.join("setup.py"))
             .and_then(|source| parse_setuptools_setup_py_import_root(&source))
         {
             let root = manifest_dir.join(package_dir).normalize();
-            if let Ok(root) = root.strip_prefix(file.root())
+            if let Ok(root) = root.strip_prefix(workspace_root)
                 && parent_rel.starts_with(root)
             {
                 return Some(root.to_path_buf());
@@ -193,7 +220,7 @@ pub fn python_declared_import_root(project: &dyn Project, file: &ProjectFile) ->
     if parent_rel.as_os_str().is_empty() {
         return None;
     }
-    python_configured_import_root(project, file, parent_rel)
+    python_configured_import_root(file.root(), parent_rel, &ProjectImportRootInputs(project))
 }
 
 /// The directory the package a repeated spelling starts from has to add to its
@@ -233,13 +260,6 @@ pub(crate) fn python_repeated_root_extension_dir(
         return None;
     }
     Some(source_root_rel.join(implied_rel))
-}
-
-// Root selection is snapshot placement, not a content-only source fact. Read
-// through the selected project and keep the parsed roots within this operation.
-fn snapshot_source(project: &dyn Project, relative_path: &Path) -> Option<String> {
-    let file = project.file_by_rel_path(relative_path)?;
-    project.read_source(&file).ok()
 }
 
 /// Interpret a legacy setuptools root statically, without executing setup.py.
@@ -1467,31 +1487,18 @@ where
                 short_name,
                 fq,
             );
-            if scope
-                .last()
-                .is_some_and(|parent| parent.kind == ScopeKind::Class)
-            {
-                // Reassigning a class attribute does not mint a new logical
-                // member. Preserve every physical binding range so class-body
-                // references between assignments can select the active one.
-                self.parsed
-                    .add_code_unit(code_unit.clone(), node, self.source, None, None);
-            } else {
-                self.parsed
-                    .replace_code_unit(code_unit.clone(), node, self.source, None, None);
-            }
+            // Reassigning a module or class attribute does not mint a new
+            // logical member. Keep every writer's range and exact
+            // SourceDeclarationId: references between assignments select the
+            // active writer, and the native bridge looks up each writer's
+            // exact declaration.
+            self.parsed
+                .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed.add_signature(
                 code_unit.clone(),
                 py_node_text(node, self.source).trim().to_string(),
             );
-            if scope
-                .last()
-                .is_some_and(|parent| parent.kind == ScopeKind::Class)
-            {
-                self.record_source_declaration(node, Some(name_node), code_unit.clone(), None);
-            } else {
-                self.replace_source_declaration(node, Some(name_node), code_unit.clone(), None);
-            }
+            self.record_source_declaration(node, Some(name_node), code_unit.clone(), None);
             if let Some(module) = &self.module
                 && scope.is_empty()
             {
@@ -1678,6 +1685,7 @@ pub fn parse_python_file(
 
 /// Build coordinated Python source and native facts for producer validation.
 /// Production callers keep using [`parse_python_file`] until the reader switch.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_python_file_with_native_facts(
     project: &dyn Project,
     file: &ProjectFile,
@@ -2240,39 +2248,42 @@ fn collect_direct_self_assigned_attributes<'tree>(
     receiver_name: &str,
     attributes: &mut Vec<(String, Node<'tree>)>,
 ) {
-    match node.kind() {
-        "attribute" => {
-            let Some(object) = node.child_by_field_name("object") else {
-                return;
-            };
-            if object.kind() != "identifier" || py_node_text(object, source).trim() != receiver_name
-            {
-                return;
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "attribute" => {
+                let Some(object) = node.child_by_field_name("object") else {
+                    continue;
+                };
+                if object.kind() != "identifier"
+                    || py_node_text(object, source).trim() != receiver_name
+                {
+                    continue;
+                }
+                let Some(attribute) = node.child_by_field_name("attribute") else {
+                    continue;
+                };
+                let name = py_node_text(attribute, source).trim();
+                if !name.is_empty() {
+                    attributes.push((name.to_string(), attribute));
+                }
             }
-            let Some(attribute) = node.child_by_field_name("attribute") else {
-                return;
-            };
-            let name = py_node_text(attribute, source).trim();
-            if !name.is_empty() {
-                attributes.push((name.to_string(), attribute));
+            // The grammar spells an unpacking target three ways: a bare comma list
+            // is a `pattern_list`, and parentheses or brackets around it make a
+            // `tuple_pattern` or a `list_pattern`. Omitting the bracketed forms
+            // dropped every attribute a multi-line unpacking assigns.
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "tuple"
+            | "list"
+            | "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                pending.extend(children.into_iter().rev());
             }
+            _ => {}
         }
-        // The grammar spells an unpacking target three ways: a bare comma list
-        // is a `pattern_list`, and parentheses or brackets around it make a
-        // `tuple_pattern` or a `list_pattern`. Omitting the bracketed forms
-        // dropped every attribute a multi-line unpacking assigns.
-        "pattern_list"
-        | "tuple_pattern"
-        | "list_pattern"
-        | "tuple"
-        | "list"
-        | "parenthesized_expression" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_direct_self_assigned_attributes(child, source, receiver_name, attributes);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -2371,6 +2382,76 @@ mod primary_tests {
             source,
             &tree,
         )
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: nested assignment targets recursively exhausted the stack"
+    )]
+    fn qs6_nested_unpacking_is_stack_safe() {
+        let depth = 1024;
+        let source = format!(
+            "{}self.first, self.last{} = pair\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let tree = parse_python_tree(&source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let assignment = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let target = assignment.child_by_field_name("left").unwrap();
+        let attributes = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn_scoped(scope, || {
+                    collect_self_assigned_attributes(target, &source, "self")
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            attributes
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"]
+        );
+    }
+
+    #[test]
+    fn qs6_setuptools_literal_dependency_boundary() {
+        // setup.py is an external artifact: tuples and lists both encode a
+        // sequence; executing an expression is outside static acquisition.
+        let source = "from setuptools import setup\nsetup(install_requires=('requests>=2',), setup_requires=['wheel'], tests_require=('pytest',), extras_require={'speed': ('orjson',)})\nsetup(install_requires=dynamic())\n";
+        let arguments = setuptools_setup_py_literal_arguments(source).unwrap();
+        let rendered = arguments
+            .iter()
+            .map(|argument| {
+                format!(
+                    "{} {} {:?} {}",
+                    argument.call_index,
+                    argument.name,
+                    argument.value,
+                    &source[argument.byte_range.clone()]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            concat!(
+                "0 install_requires Some(Strings([\"requests>=2\"])) ('requests>=2',)\n",
+                "0 setup_requires Some(Strings([\"wheel\"])) ['wheel']\n",
+                "0 tests_require Some(Strings([\"pytest\"])) ('pytest',)\n",
+                "0 extras_require Some(Extras([(\"speed\", [\"orjson\"])])) {'speed': ('orjson',)}\n",
+                "1 install_requires None dynamic()",
+            )
+        );
     }
 
     #[test]

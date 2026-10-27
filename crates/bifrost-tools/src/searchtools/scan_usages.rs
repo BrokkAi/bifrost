@@ -311,8 +311,11 @@ pub struct ScanUsagesEntry {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unproven_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub model_relations:
-        Vec<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelRelation>,
+    pub model_relations: Vec<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelRelation,
+        >,
+    >,
     #[serde(skip_serializing_if = "is_zero", default)]
     pub model_relations_omitted: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -398,8 +401,11 @@ pub struct SymbolUsages {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unproven_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub model_relations:
-        Vec<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelRelation>,
+    pub model_relations: Vec<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelRelation,
+        >,
+    >,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1796,7 +1802,7 @@ pub(crate) fn resolve_scan_usages_target(
         modeled.sort_by(|left, right| left.id.cmp(&right.id));
         modeled.dedup_by(|left, right| left.id == right.id);
         if modeled.len() == 1 && !modeled[0].provenance.ambiguous {
-            let symbol = modeled[0];
+            let symbol = modeled[0].clone();
             return ScanUsageTargetResolution::Modeled {
                 symbol: symbol.qualified_name.clone(),
                 definition: ResolvedUsageDefinition {
@@ -3622,6 +3628,41 @@ pub struct UsageGraphResult {
     pub incomplete_reasons: Vec<UsageGraphIncompleteReason>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub file_notes: Vec<UsageGraphFileNote>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub build_configurations: Vec<UsageGraphBuildConfiguration>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphBuildConfiguration {
+    pub language: &'static str,
+    pub goos: String,
+    pub goarch: String,
+    pub cgo_enabled: bool,
+    pub tags: Vec<String>,
+}
+
+fn usage_graph_build_configurations(analyzer: &dyn IAnalyzer) -> Vec<UsageGraphBuildConfiguration> {
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    use brokk_bifrost_core::analyzer::common::language_for_file;
+
+    if !analyzer
+        .analyzed_files()
+        .iter()
+        .any(|file| language_for_file(file) == brokk_bifrost_core::analyzer::model::Language::Go)
+    {
+        return Vec::new();
+    }
+    let Some(go) = resolve_analyzer::<brokk_bifrost_go_analysis::GoAnalyzer>(analyzer) else {
+        return Vec::new();
+    };
+    let selected = go.selected_build_configuration();
+    vec![UsageGraphBuildConfiguration {
+        language: "go",
+        goos: selected.goos,
+        goarch: selected.goarch,
+        cgo_enabled: selected.cgo_enabled,
+        tags: selected.tags,
+    }]
 }
 
 /// Atomic selected-Java result for the exact whole-workspace usage-graph
@@ -4308,6 +4349,30 @@ fn usage_graph_with_passes(
                     entry.id.as_str(),
                     failure.reason,
                     failure.files
+                ),
+            ));
+            continue;
+        }
+        // An excluded source contributes no edges and no declarations, so
+        // the graph is partial over it rather than unavailable.
+        let excluded = match entry.backend.excluded_sources(analyzer) {
+            Ok(excluded) => excluded,
+            Err(error) => {
+                return unavailable_usage_graph_result(
+                    analyzer,
+                    &unmatched_paths,
+                    "query_failed",
+                    error.to_string(),
+                );
+            }
+        };
+        for (file, reason) in excluded {
+            incomplete.insert((
+                "source_admission_refused".to_string(),
+                format!(
+                    "{}: {}: source admission refused this file ({reason}); the graph has no edges from it",
+                    entry.id.as_str(),
+                    rel_path_string(&file)
                 ),
             ));
         }
@@ -5526,7 +5591,15 @@ fn usage_graph_with_passes(
             .filter(|node| dispatch_endpoint_ids.contains(&node.key.id))
             .map(|node| (node.primary.clone(), node.primary_range)),
     );
-    declarations.retain(|(unit, _)| !skipped_callers.contains_key(unit.source()));
+    // Caller exclusion does not exclude endpoints of rendered edges. Keep
+    // referenced declarations as target-only nodes even when their files skip.
+    let referenced_targets = edge_sites
+        .values()
+        .map(|(_, target, _, _)| target)
+        .collect::<HashSet<_>>();
+    declarations.retain(|(unit, _)| {
+        !skipped_callers.contains_key(unit.source()) || referenced_targets.contains(unit)
+    });
     // A withheld target remains an endpoint even when its file is not an
     // admitted caller file. Consumers must be able to follow every `to_id`.
     for reference in &withheld {
@@ -5887,6 +5960,7 @@ fn finalize_usage_graph_result(
         truncated_symbols,
         incomplete_reasons,
         file_notes: Vec::new(),
+        build_configurations: usage_graph_build_configurations(analyzer),
     };
     record_unnamed_module_exclusions(&mut result, analyzer);
     result
@@ -6131,6 +6205,7 @@ fn finalize_selected_usage_graph_result(
         truncated_symbols,
         incomplete_reasons,
         file_notes: Vec::new(),
+        build_configurations: Vec::new(),
     })
 }
 
@@ -7365,8 +7440,9 @@ fn attach_model_relations_to_entries(
             {
                 let authored_name = entry.fq_name.as_deref().unwrap_or_default();
                 let mut inverse_relations = overlay
-                    .relations()
-                    .iter()
+                    .relations_to(authored_name)
+                    .records
+                    .into_iter()
                     // Navigation locates a modeled declaration's authored anchor; only an
                     // explicit reference relation makes that declaration an inverse usage.
                     .filter(|relation| {
@@ -7392,7 +7468,7 @@ fn attach_model_relations_to_entries(
                     {
                         continue;
                     }
-                    for file in authored_model_references(analyzer, overlay, source.records[0]) {
+                    for file in authored_model_references(analyzer, overlay, &source.records[0]) {
                         modeled_references
                             .entry(file.path)
                             .or_default()
@@ -7438,7 +7514,6 @@ fn attach_model_relations_to_entries(
                 entry.model_relations = inverse_relations
                     .into_iter()
                     .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
-                    .cloned()
                     .collect();
                 entry.model_relations_omitted =
                     total_model_relations.saturating_sub(entry.model_relations.len());
@@ -7471,7 +7546,7 @@ fn attach_model_relations_to_entries(
             }
             continue;
         }
-        let model_symbol = symbol.records[0];
+        let model_symbol = &symbol.records[0];
         if whole_workspace {
             let authored_references = authored_model_references(analyzer, overlay, model_symbol);
             let authored_hits = authored_references
@@ -7524,7 +7599,6 @@ fn attach_model_relations_to_entries(
             .records
             .into_iter()
             .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
-            .cloned()
             .collect();
         entry.model_relations_omitted =
             total_model_relations.saturating_sub(entry.model_relations.len());

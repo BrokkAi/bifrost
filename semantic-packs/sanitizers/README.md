@@ -13,7 +13,7 @@ taint labels on the modeled value flow.
 The content comes from the audited k3 sanitizer candidates in
 `.agents/foundry/candidates/sanitizers/`. The converter reads those candidates,
 gates each one, and writes the packs and the audit report here. Do not edit the
-generated files by hand. Change the candidates and regenerate.
+generated files by hand.
 
 ## Shipping model
 
@@ -97,7 +97,11 @@ cargo run --locked --release --features release-tooling \
   sanitizer-pack .agents/foundry/candidates/sanitizers semantic-packs/sanitizers
 ```
 
-`tests/suite_bench_policy/sanitizer_pack_shipping.rs` proves the checked-in
-files match the converter, every pack compiles through the production compiler,
-and a shipped sanitizer neutralizes end to end through the production taint
-route.
+The files here are frozen at the semantic-model schema they were generated
+at, and the converter has moved on, so rerunning it would rewrite frozen bytes
+that `node scripts/check-pack-authoring-drift.mjs` rejects. No engine test
+compares them with the converter (#6667). The converter's contracts are tested
+with inline candidates in
+`crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs`, and
+`tests/suite_bench_policy/sanitizer_summary_pack.rs` proves a `Sanitize` effect
+neutralizes end to end through the production taint route.

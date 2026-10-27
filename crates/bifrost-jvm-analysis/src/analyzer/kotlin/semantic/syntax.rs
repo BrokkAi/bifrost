@@ -20,12 +20,13 @@ pub(super) use brokk_bifrost_core::analyzer::tree_walk::has_token_child as has_t
 
 pub(super) use brokk_bifrost_jvm::kotlin::declarations::kotlin_has_modifier as has_modifier;
 pub(super) use brokk_bifrost_jvm::kotlin::syntax::{
-    kotlin_binding_name_nodes as binding_names, kotlin_binding_node as binding_node,
-    kotlin_binding_type_node, kotlin_call_arity,
+    KotlinIntegerSuffix, kotlin_binding_name_nodes as binding_names,
+    kotlin_binding_node as binding_node, kotlin_binding_type_node, kotlin_call_arity,
     kotlin_call_trailing_lambda_body as trailing_lambda, kotlin_callee,
-    kotlin_decimal_integer_value, kotlin_declared_return_type_node, kotlin_declared_scalar_type,
-    kotlin_first_token as first_token, kotlin_literal_scalar_type, kotlin_named_argument_label,
-    kotlin_navigation_member as navigation_member, kotlin_navigation_receiver,
+    kotlin_declared_return_type_node, kotlin_declared_scalar_type,
+    kotlin_first_token as first_token, kotlin_integer_literal_value, kotlin_literal_scalar_type,
+    kotlin_named_argument_label, kotlin_navigation_member as navigation_member,
+    kotlin_navigation_receiver,
     kotlin_property_delegate_expression as property_delegate_expression, kotlin_unwrap_receiver,
     kotlin_value_arguments,
 };
@@ -689,7 +690,9 @@ pub(in crate::analyzer::kotlin::semantic) fn typed_expression_value_kind(
     source: &str,
     node: Node<'_>,
 ) -> SemanticValueKind {
-    if let Some(value) = kotlin_decimal_integer_value(node, source) {
+    if let Some((value, suffix)) = kotlin_integer_literal_value(node, source)
+        && (!suffix.is_unsigned() || (0..=u64::MAX as i128).contains(&value))
+    {
         return if value < 0 {
             SemanticValueKind::SignedInteger(value)
         } else {

@@ -1268,11 +1268,7 @@ impl RustPrimaryMacroState {
         name: &str,
         invocation_start: usize,
     ) -> bool {
-        self.definitions
-            .iter()
-            .rfind(|definition| {
-                definition.name == name && definition.visible_after <= invocation_start
-            })
+        rust_latest_visible_rules_item_macro_definition(&self.definitions, name, invocation_start)
             .is_some_and(|definition| definition.arguments_only)
     }
 
@@ -1697,6 +1693,9 @@ struct RustPrimaryParseState<'source, 'parsed, 'tree> {
     module_sources: crate::facts::RustModuleSourceCollector<'source>,
     item_sources: RustItemSourceCollector,
     primary_macros: RustPrimaryMacroState,
+    root: Node<'tree>,
+    // Shared by primary and embedded replay; dropped with this file's parse.
+    exported_macros: std::cell::OnceCell<crate::macro_matcher::ExportedMacroDefinitions<'tree>>,
     native_enabled: bool,
     structural: StructuralFactCollector<'source, 'tree>,
     structural_parents: Vec<Option<u32>>,
@@ -1745,6 +1744,8 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             module_sources,
             item_sources: RustItemSourceCollector::new(),
             primary_macros: RustPrimaryMacroState::default(),
+            root,
+            exported_macros: std::cell::OnceCell::new(),
             native_enabled,
             structural: StructuralFactCollector::new(
                 &crate::structural::RUST_STRUCTURAL_SPEC,
@@ -1881,6 +1882,15 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                             .primary_macros
                             .latest_visible_expands_to_arguments_only(name, node.start_byte())
                 },
+            ) || crate::macro_matcher::local_macro_invocation_replays_items_only(
+                node,
+                self.declarations.source,
+                self.exported_macros.get_or_init(|| {
+                    crate::macro_matcher::ExportedMacroDefinitions::from_root(
+                        self.root,
+                        self.declarations.source,
+                    )
+                }),
             ) || (crate::cfg_if::is_cfg_if(node, self.declarations.source)
                 && rust_item_macro_invocation_name(node, self.declarations.source).is_some_and(
                     |name| {
@@ -1914,6 +1924,12 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                 request.parent.as_ref(),
                 &request.package_name,
                 self.primary_macros.as_slice(),
+                self.exported_macros.get_or_init(|| {
+                    crate::macro_matcher::ExportedMacroDefinitions::from_root(
+                        self.root,
+                        self.declarations.source,
+                    )
+                }),
                 request.in_test_region,
                 request.scope,
                 self.declarations.parsed,
@@ -2720,6 +2736,7 @@ fn visit_rust_macro_invocation_definitions<'source>(
     parent: Option<&CodeUnit>,
     package_name: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
+    exported_macros: &crate::macro_matcher::ExportedMacroDefinitions<'_>,
     parent_in_test_region: bool,
     scope: RustEmbeddedReplayScope,
     parsed: &mut ParsedFile,
@@ -2733,6 +2750,7 @@ fn visit_rust_macro_invocation_definitions<'source>(
         node,
         source,
         item_macro_definitions,
+        exported_macros,
         parent_in_test_region,
         trees,
         root_tree_id,
@@ -2744,6 +2762,7 @@ fn visit_rust_macro_invocation_definitions<'source>(
         file,
         source,
         item_macro_definitions,
+        exported_macros,
         parsed,
         source_bridge,
         source_imports,
@@ -2757,6 +2776,7 @@ fn rust_embedded_macro_invocation_admission(
     node: Node<'_>,
     source: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
+    exported_macros: &crate::macro_matcher::ExportedMacroDefinitions<'_>,
     parent_in_test_region: bool,
     trees: &[RustEmbeddedReplayTree],
     tree_id: usize,
@@ -2772,7 +2792,16 @@ fn rust_embedded_macro_invocation_admission(
         invoked_macro,
         node.start_byte(),
     ) {
-        Some(false) => return None,
+        Some(false) => {
+            if !crate::macro_matcher::local_macro_invocation_replays_items_only(
+                node,
+                source,
+                exported_macros,
+            ) {
+                return None;
+            }
+            true
+        }
         Some(true) => true,
         None => false,
     };
@@ -2860,6 +2889,7 @@ struct RustEmbeddedReplayDriver<'graph, 'source, 'external, 'collector> {
     file: &'external ProjectFile,
     source: &'source str,
     item_macro_definitions: &'external [RustRulesItemMacroDefinition],
+    exported_macros: &'external crate::macro_matcher::ExportedMacroDefinitions<'external>,
     parsed: &'external mut ParsedFile,
     source_bridge: &'external mut RustEmbeddedDeclarationSourceBridge<'collector, 'source>,
     source_imports: &'external [SourceImportFact],
@@ -2890,6 +2920,7 @@ impl<'graph, 'source, 'external, 'collector>
         file: &'external ProjectFile,
         source: &'source str,
         item_macro_definitions: &'external [RustRulesItemMacroDefinition],
+        exported_macros: &'external crate::macro_matcher::ExportedMacroDefinitions<'external>,
         parsed: &'external mut ParsedFile,
         source_bridge: &'external mut RustEmbeddedDeclarationSourceBridge<'collector, 'source>,
         source_imports: &'external [SourceImportFact],
@@ -2900,6 +2931,7 @@ impl<'graph, 'source, 'external, 'collector>
             file,
             source,
             item_macro_definitions,
+            exported_macros,
             parsed,
             source_bridge,
             source_imports,
@@ -3317,6 +3349,7 @@ impl<'graph, 'source, 'external, 'collector>
                     node,
                     self.source,
                     self.item_macro_definitions,
+                    self.exported_macros,
                     parent_in_test_region,
                     self.trees,
                     child_tree_id,
@@ -3864,7 +3897,8 @@ fn rust_builtin_macro_does_not_replay_item_arguments(name: &str) -> bool {
 /// the expansion does not give it.
 ///
 /// So the persisted lowering declares a macro's items only when the expansion
-/// adds nothing at all. Every named node of every transcriber must be the
+/// adds nothing at all and the pattern binds no separate meta attributes that
+/// the expansion could drop. Every named node of every transcriber must be the
 /// repetition scaffolding or a metavariable; one added token anywhere rejects
 /// the definition.
 pub(crate) fn rust_macro_definition_expands_to_its_arguments_only(
@@ -3879,25 +3913,43 @@ pub(crate) fn rust_macro_definition_expands_to_its_arguments_only(
     if rules.is_empty() {
         return false;
     }
-    if !rust_macro_definition_all_rules_replay_item_parameters(node, source) {
+    rules
+        .into_iter()
+        .all(|rule| rust_macro_rule_expands_to_its_arguments_only(rule, source))
+}
+
+pub(crate) fn rust_macro_rule_expands_to_its_arguments_only(rule: Node<'_>, source: &str) -> bool {
+    if !rust_macro_rule_replays_item_parameters(rule, source) {
         return false;
     }
-    rules.into_iter().all(|rule| {
-        let Some(expansion) = rule.child_by_field_name("right") else {
+    let pattern = rule
+        .child_by_field_name("left")
+        .expect("replaying rule has a pattern");
+    let mut pending = vec![pattern];
+    while let Some(current) = pending.pop() {
+        if current.kind() == "token_binding_pattern"
+            && rust_macro_binding_fragment(current, source) == Some("meta")
+        {
+            // Replaying the original input would restore attributes the arm drops.
             return false;
-        };
-        let mut pending = vec![expansion];
-        while let Some(current) = pending.pop() {
-            let mut cursor = current.walk();
-            for child in current.named_children(&mut cursor) {
-                if !matches!(child.kind(), "token_repetition" | "metavariable") {
-                    return false;
-                }
-                pending.push(child);
-            }
         }
-        true
-    })
+        let mut cursor = current.walk();
+        pending.extend(current.named_children(&mut cursor));
+    }
+    let Some(expansion) = rule.child_by_field_name("right") else {
+        return false;
+    };
+    let mut pending = vec![expansion];
+    while let Some(current) = pending.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if !matches!(child.kind(), "token_repetition" | "metavariable") {
+                return false;
+            }
+            pending.push(child);
+        }
+    }
+    true
 }
 
 /// Whether no rule of this `macro_rules!` can write an item, so an
@@ -4461,6 +4513,14 @@ fn rust_item_repetition_pattern_is_safe(
     source: &str,
     item_parameters: &HashMap<String, usize>,
 ) -> bool {
+    // A separated repetition such as `$($item:item),*` consumes separator
+    // tokens that no Item capture holds, so whole-input reparse would replay
+    // them. The grammar emits no node for the separator; parse_repetition reads it.
+    if crate::macro_matcher::parse_repetition(repetition, source)
+        .is_none_or(|repetition| repetition.separator.is_some())
+    {
+        return false;
+    }
     let mut saw_item = false;
     let mut cursor = repetition.walk();
     for child in repetition.children(&mut cursor) {
@@ -5997,12 +6057,19 @@ fn rust_parameter_pattern_label_node(pattern: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
-    rust_node_text(node, source)
-        .lines()
-        .find(|line| line.contains("macro_rules!"))
-        .map(str::trim)
-        .unwrap_or("macro_rules!")
-        .to_string()
+    let name = node
+        .child_by_field_name("name")
+        .expect("macro definition name");
+    let mut cursor = node.walk();
+    let delimiter = node
+        .children(&mut cursor)
+        .find(|child| matches!(child.kind(), "{" | "(" | "["))
+        .expect("macro definition opening delimiter");
+    format!(
+        "macro_rules! {} {}",
+        rust_node_text(name, source),
+        delimiter.kind()
+    )
 }
 
 /// Every type identifier named anywhere in `source`, parsed standalone rather
@@ -6048,6 +6115,329 @@ mod embedded_replay_tests {
 
     fn parse_fixture(source: &str) -> ParsedFile {
         crate::test_helpers::parse_rust_fixture(source)
+    }
+
+    #[test]
+    fn grammar_macro_expansion_publication() {
+        use brokk_bifrost_core::analyzer::rust_facts::{
+            RustItemMacroExpansion, RustMacroParseFailure,
+        };
+        let source = "cfg_if::cfg_if!{ else {} }\nempty!{}\nouter!{expr_child!(value + 1); empty_child!{} inner!{mod nested;}}\nmacro_rules! splice { ($($t:tt)*) => { $($t)* }; }\nmacro_rules! args { ($($t:tt)*) => { consume($($t)*) }; }\nfn target() {}\nfn consume(_: usize, _: fn()) {}\nfn run() { splice!(crate::target()); args!(0, crate::target); }";
+        let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "opaque arguments are valid token trees"
+        );
+        let parsed = parse_fixture(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let text = |id| {
+            let range = facts.occurrences.occurrence(id).range;
+            &source[range.start_byte..range.end_byte]
+        };
+        let expansion = |spelling| {
+            facts
+                .rust_items
+                .macros
+                .iter()
+                .find(|item| text(item.invocation) == spelling)
+                .unwrap()
+                .expansion
+        };
+        assert_eq!(
+            expansion("cfg_if::cfg_if!{ else {} }"),
+            RustItemMacroExpansion::Unavailable(RustMacroParseFailure::ParseUnavailable)
+        );
+        assert_eq!(expansion("empty!{}"), RustItemMacroExpansion::EmptyInterior);
+        assert!(matches!(
+            expansion("outer!{expr_child!(value + 1); empty_child!{} inner!{mod nested;}}"),
+            RustItemMacroExpansion::Parsed(_)
+        ));
+        assert!(matches!(
+            expansion("inner!{mod nested;}"),
+            RustItemMacroExpansion::Parsed(_)
+        ));
+
+        // Every route gate is a foreign key into the canonical invocation
+        // registry. Nested raw replays must publish their gate as well.
+        let modules = facts.rust_modules.as_ref().unwrap();
+        for spelling in [
+            "expr_child!(value + 1)",
+            "empty_child!{}",
+            "inner!{mod nested;}",
+        ] {
+            let rows = modules
+                .invocations
+                .iter()
+                .filter(|row| text(row.occurrence) == spelling)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                1,
+                "invocation {spelling}: registry={:?}",
+                modules.invocations
+            );
+        }
+        let RustItemMacroExpansion::Parsed(expression_root) = expansion("expr_child!(value + 1)")
+        else {
+            panic!("raw expression root is retained");
+        };
+        assert!(
+            facts
+                .rust_items
+                .syntax
+                .iter()
+                .any(|row| row.occurrence == expression_root && row.has_error)
+        );
+        let nested = modules
+            .declarations
+            .iter()
+            .find(|module| module.name == "nested")
+            .unwrap();
+        let route = modules
+            .routes
+            .iter()
+            .find(|route| route.declaration == nested.declaration)
+            .unwrap();
+        assert_eq!(
+            route.gates.iter().map(|id| text(*id)).collect::<Vec<_>>(),
+            [
+                "outer!{expr_child!(value + 1); empty_child!{} inner!{mod nested;}}",
+                "inner!{mod nested;}"
+            ]
+        );
+        for gate in &route.gates {
+            assert!(
+                modules
+                    .invocations
+                    .iter()
+                    .any(|invocation| invocation.occurrence == *gate),
+                "unpublished gate {}: registry={:?}",
+                text(*gate),
+                modules.invocations
+            );
+        }
+
+        let call = parsed
+            .resolution_facts
+            .sites
+            .iter()
+            .find(|site| {
+                site.kind
+                    == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::Call
+                    && source.get(site.start_byte..site.end_byte) == Some("crate::target()")
+            })
+            .expect("scoped tt replay publishes its boundary call");
+        let occurrence = facts
+            .occurrences
+            .occurrence(facts.native_site_occurrences[call.id.index()]);
+        assert_eq!(
+            occurrence.provenance,
+            brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded,
+            "{occurrence:?}"
+        );
+
+        let endpoint = source.rfind("crate::target").unwrap() + "crate::".len();
+        let references = parsed.resolution_facts.sites.iter().filter(|site|
+            site.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ValueReference
+                && site.start_byte == endpoint && site.end_byte == endpoint + "target".len()
+        ).collect::<Vec<_>>();
+        assert!(
+            !references.is_empty(),
+            "bare tt path publishes its endpoint reference"
+        );
+        for reference in references {
+            let occurrence = facts
+                .occurrences
+                .occurrence(facts.native_site_occurrences[reference.id.index()]);
+            assert_eq!(
+                occurrence.provenance,
+                brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded,
+                "{occurrence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_procedural_macro_namespace_publication() {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
+        // Rust attributes supply additional macro-namespace declarations for
+        // bang and attribute entry points, but derive publishes its argument
+        // rather than the implementation function's name.
+        let source = "extern crate proc_macro; use proc_macro::TokenStream;\n#[proc_macro] pub fn bang(input: TokenStream) -> TokenStream { input }\n#[proc_macro_attribute] pub fn attribute(_: TokenStream, input: TokenStream) -> TokenStream { input }\n#[proc_macro_derive(Derived)] pub fn derive_impl(input: TokenStream) -> TokenStream { input }\npub fn ordinary() {}";
+        let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let parsed = parse_fixture(source);
+        let facts = &parsed.resolution_facts;
+        let names = facts
+            .additional_definition_namespaces
+            .iter()
+            .filter(|row| row.namespace == ResolutionNamespace::Macro)
+            .map(|row| {
+                let site = &facts.sites[row.declaration.index()];
+                &source[site.start_byte..site.end_byte]
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["attribute", "bang"])
+        );
+        for row in facts
+            .additional_definition_namespaces
+            .iter()
+            .filter(|row| row.namespace == ResolutionNamespace::Macro)
+        {
+            assert!(
+                facts
+                    .root_exports
+                    .iter()
+                    .any(|export| export.declaration == row.declaration
+                        && export.namespace == ResolutionNamespace::Macro),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_macro_qualified_head_identity() {
+        for (source, path, item_name) in [
+            ("crate::nested::emit!{}", "crate::nested::emit", None),
+            ("r#name::r#emit!{}", "name::emit", None),
+            (
+                "cfg_if::cfg_if!{}",
+                "cfg_if::cfg_if",
+                Some("cfg_if::cfg_if"),
+            ),
+            ("emit!{}", "emit", Some("emit")),
+        ] {
+            let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let invocation = tree.root_node().named_child(0).unwrap();
+            assert_eq!(invocation.kind(), "macro_invocation");
+            assert!(invocation.child_by_field_name("macro").is_some());
+            assert_eq!(
+                rust_macro_invocation_path_name(invocation, source).as_deref(),
+                Some(path)
+            );
+            assert_eq!(
+                rust_item_macro_invocation_name(invocation, source),
+                item_name
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_item_attribute_authority() {
+        for (attribute, documentation_only) in [
+            ("cfg_attr(flag)", false),
+            ("cfg_attr(flag, doc = \"text\")", true),
+            ("cfg_attr(flag, doc = \"text\", inline)", false),
+        ] {
+            let source = format!("#[{attribute}] use crate::Item;");
+            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let wrapper = tree.root_node().named_child(0).unwrap();
+            assert_eq!(wrapper.kind(), "declaration_with_attribute");
+            let item = crate::syntax::unwrap_attributes(wrapper);
+            assert_eq!(item.kind(), "use_declaration");
+            assert!(rust_node_can_carry_item_attributes(item.kind()));
+            let attribute = crate::syntax::outer_attributes(item).next().unwrap();
+            let arguments = attribute
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("arguments")
+                .unwrap();
+            assert_eq!(arguments.kind(), "token_tree");
+            assert_eq!(
+                rust_cfg_attr_adds_only_documentation(arguments, &source),
+                documentation_only,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_macro_item_frontier_proofs() {
+        // A proof applies to every arm. Item/tt/ident splices may introduce
+        // declarations; type splices cannot replace the surrounding impl.
+        for (rules, no_items, only_impls, replay_items, delegate) in [
+            ("", false, false, false, None),
+            ("() => {}", true, false, false, None),
+            (
+                "($t:ty) => { impl Trait for $t {} }",
+                false,
+                true,
+                false,
+                None,
+            ),
+            (
+                "($($t:tt)*) => { impl Trait for $($t)* {} }",
+                false,
+                false,
+                false,
+                None,
+            ),
+            (
+                "($t:ty) => { impl Trait for $t; }",
+                false,
+                false,
+                false,
+                None,
+            ),
+            (
+                "($i:item) => { $i }; ($a:item $b:item) => {}",
+                false,
+                false,
+                false,
+                None,
+            ),
+            (
+                "($i:item) => { $i }; ($a:item $b:item) => { $a $b }",
+                false,
+                false,
+                true,
+                None,
+            ),
+            (
+                "($($i:item)+) => { pass!($($i)+) }; ($($j:item)*) => { pass!($($j)*) }",
+                false,
+                false,
+                false,
+                Some("pass"),
+            ),
+            (
+                "($($i:item)+) => { pass!($($i)+) }; ($($j:item)*) => { other!($($j)*) }",
+                false,
+                false,
+                false,
+                None,
+            ),
+        ] {
+            let source = format!("macro_rules! check {{ {rules} }}");
+            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let definition = tree.root_node().named_child(0).unwrap();
+            assert_eq!(definition.kind(), "macro_definition");
+            assert_eq!(
+                rust_macro_definition_declares_no_item(definition, &source),
+                no_items,
+                "{source}"
+            );
+            assert_eq!(
+                rust_macro_definition_writes_only_impls(definition, &source),
+                only_impls,
+                "{source}"
+            );
+            assert_eq!(
+                rust_macro_definition_all_rules_replay_item_parameters(definition, &source),
+                replay_items,
+                "{source}"
+            );
+            assert_eq!(
+                rust_macro_definition_item_delegate(definition, &source).as_deref(),
+                delegate,
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -7891,9 +8281,73 @@ wrap! { pub mod second; }
 #[cfg(test)]
 mod passthrough_macro_tests {
     use super::*;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse_fixture(source: &str) -> ParsedFile {
         crate::test_helpers::parse_rust_fixture(source)
+    }
+
+    #[test]
+    #[hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: closed inner macro scope suppressed outer native replay"
+    )]
+    fn closed_macro_scope_preserves_outer_native_replay() {
+        let parsed = crate::test_helpers::parse_rust_fixture(
+            r#"
+macro_rules! keep { ($($item:item)*) => { $($item)* }; }
+mod inner {
+    macro_rules! keep { ($($item:item)*) => { $( #[cfg(unix)] $item )* }; }
+}
+keep! { pub fn visible() {} }
+"#,
+        );
+        let facts = parsed.source_facts.as_ref().expect("source facts");
+        let functions = facts
+            .rust_declaration_properties
+            .iter()
+            .filter(|property| {
+                property.kind
+                    == brokk_bifrost_core::analyzer::rust_facts::RustDeclarationKind::Function
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions.len(),
+            1,
+            "{:?}",
+            facts.rust_declaration_properties
+        );
+        assert!(
+            facts
+                .native_declaration_sources
+                .iter()
+                .any(|&(_, declaration)| declaration == functions[0].declaration),
+            "{:?}",
+            facts.native_declaration_sources
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: macro signature scanning lost the name in a multiline header"
+    )]
+    fn macro_signature_uses_definition_header() {
+        let source = r#"macro_rules!
+outer {
+    () => { const TEXT: &str = "macro_rules! decoy"; };
+}"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(node.kind(), "macro_definition");
+        assert_eq!(rust_macro_signature(node, source), "macro_rules! outer {");
     }
 
     /// One source item inside a macro invocation is one source declaration.
@@ -7964,6 +8418,41 @@ mod declaration_property_tests {
     };
     use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn oversized_labels_elide_values_and_bound_utf8_headers() {
+        // A UTF-8 boundary at byte 8192 falls inside a three-byte character.
+        // Initializers must not leak into short-header labels; long headers
+        // must remain valid UTF-8 and bounded independently of payload size.
+        let payload = "    \"\\u{03bb}\",\n".repeat(2000);
+        let short = format!("pub static TABLE: &[&str] = &[\n{payload}];");
+        let tree = crate::test_helpers::parse_rust(&short);
+        assert!(!tree.root_node().has_error());
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(
+            node.child_by_field_name("value").unwrap().kind(),
+            "reference_expression"
+        );
+        assert_eq!(
+            rust_bounded_declaration_label(node, &short),
+            "pub static TABLE: &[&str] = /* ... */;"
+        );
+
+        let long = format!(
+            "pub static TABLE: /* {}*/ &[&str] = &[\n{payload}];",
+            "\u{20ac}\u{20ac}\n".repeat(1600)
+        );
+        assert!(!long.is_char_boundary(8192));
+        let tree = crate::test_helpers::parse_rust(&long);
+        assert!(!tree.root_node().has_error());
+        let label = rust_bounded_declaration_label(tree.root_node().named_child(0).unwrap(), &long);
+        assert!(label.len() <= 8192 + " /* ... */".len());
+        assert!(label.ends_with(" /* ... */"));
+        assert!(
+            !label.contains("&[&str] ="),
+            "oversized header must be truncated before the value: {label:?}"
+        );
+    }
 
     fn parse_fixture(source: &str) -> (ParsedFile, String) {
         let parsed = crate::test_helpers::parse_rust_fixture(source);
@@ -8952,6 +9441,32 @@ mod test_region_taint_tests {
 
     #[test]
     #[hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: cfg test evidence depended on trivia and literal contents"
+    )]
+    fn cfg_test_evidence_is_structural() {
+        for (predicate, expected) in [
+            ("test", true),
+            ("not(test)", false),
+            ("not (test)", false),
+            ("not(/* test */ test)", false),
+            ("feature = \"test\"", false),
+            ("feature = r#\"test\"#", false),
+            ("unix /* test */", false),
+            ("all(test, feature = \"x\")", true),
+            ("any(not(test), test)", true),
+            ("not(not(test))", true),
+        ] {
+            let source = format!("#[cfg({predicate})] fn candidate() {{}}");
+            assert_eq!(
+                tainted_short_names(&source).contains("candidate"),
+                expected,
+                "{predicate}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
         "79b4093815f9: The issue reproduction taints the inline test module and child while preserving production declarations before and after."
     )]
     fn inline_cfg_test_module_taints_only_the_test_symbols() {
@@ -9165,5 +9680,911 @@ pub fn free<T>(value: T) -> T { value }
             ],
             "a callable's type parameters stay unrecorded; every type declaration records"
         );
+    }
+}
+
+#[cfg(test)]
+mod path_grammar_boundary {
+    use super::*;
+    use crate::structural::RustStructuralSpec;
+    use crate::test_helpers::{PATH_GRAMMAR_SOURCE, grammar_node, parse_rust};
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+
+    #[test]
+    fn path_chain_grammar_fields_and_byte_spans() {
+        let source = PATH_GRAMMAR_SOURCE;
+        let tree = parse_rust(source);
+        let root = tree.root_node();
+        assert!(!root.has_error());
+        let spec = RustStructuralSpec;
+        // Scoped nodes have path/name fields; wrappers carry type/function
+        // and type_arguments instead. This table describes that boundary.
+        for (kind, a, b, text, field, child_kind, c, d, child_text) in [
+            (
+                "scoped_identifier",
+                193,
+                205,
+                "::dep::r#mod",
+                "path",
+                "scoped_identifier",
+                193,
+                198,
+                "::dep",
+            ),
+            (
+                "scoped_identifier",
+                193,
+                198,
+                "::dep",
+                "name",
+                "identifier",
+                195,
+                198,
+                "dep",
+            ),
+            (
+                "scoped_identifier",
+                193,
+                205,
+                "::dep::r#mod",
+                "name",
+                "identifier",
+                200,
+                205,
+                "r#mod",
+            ),
+            (
+                "scoped_identifier",
+                209,
+                220,
+                "crate::item",
+                "path",
+                "crate",
+                209,
+                214,
+                "crate",
+            ),
+            (
+                "scoped_identifier",
+                224,
+                234,
+                "self::item",
+                "path",
+                "self",
+                224,
+                228,
+                "self",
+            ),
+            (
+                "scoped_identifier",
+                238,
+                249,
+                "super::item",
+                "path",
+                "super",
+                238,
+                243,
+                "super",
+            ),
+            (
+                "generic_function",
+                257,
+                282,
+                "a::Type::<T>::method::<U>",
+                "function",
+                "scoped_identifier",
+                257,
+                277,
+                "a::Type::<T>::method",
+            ),
+            (
+                "generic_function",
+                257,
+                282,
+                "a::Type::<T>::method::<U>",
+                "type_arguments",
+                "type_arguments",
+                279,
+                282,
+                "<U>",
+            ),
+            (
+                "scoped_identifier",
+                257,
+                277,
+                "a::Type::<T>::method",
+                "path",
+                "generic_type",
+                257,
+                269,
+                "a::Type::<T>",
+            ),
+            (
+                "scoped_identifier",
+                257,
+                277,
+                "a::Type::<T>::method",
+                "name",
+                "identifier",
+                271,
+                277,
+                "method",
+            ),
+            (
+                "generic_type",
+                257,
+                269,
+                "a::Type::<T>",
+                "type",
+                "scoped_identifier",
+                257,
+                264,
+                "a::Type",
+            ),
+            (
+                "generic_type",
+                257,
+                269,
+                "a::Type::<T>",
+                "type_arguments",
+                "type_arguments",
+                266,
+                269,
+                "<T>",
+            ),
+            (
+                "generic_type",
+                297,
+                324,
+                "crate::Wrap<self::Inner<T>>",
+                "type",
+                "scoped_type_identifier",
+                297,
+                308,
+                "crate::Wrap",
+            ),
+            (
+                "generic_type",
+                297,
+                324,
+                "crate::Wrap<self::Inner<T>>",
+                "type_arguments",
+                "type_arguments",
+                308,
+                324,
+                "<self::Inner<T>>",
+            ),
+            (
+                "generic_type",
+                309,
+                323,
+                "self::Inner<T>",
+                "type",
+                "scoped_type_identifier",
+                309,
+                320,
+                "self::Inner",
+            ),
+            (
+                "generic_type",
+                309,
+                323,
+                "self::Inner<T>",
+                "type_arguments",
+                "type_arguments",
+                320,
+                323,
+                "<T>",
+            ),
+        ] {
+            let parent = grammar_node(root, kind, a, b, text);
+            assert_eq!(
+                parent.child_by_field_name(field),
+                Some(grammar_node(root, child_kind, c, d, child_text))
+            );
+        }
+        let absolute_head = grammar_node(root, "scoped_identifier", 193, 198, "::dep");
+        assert!(absolute_head.child_by_field_name("path").is_none());
+        // root kind/range/text, first syntax root, chain tokens with original
+        // coordinates and per-segment generic arity. Absolute chains lack a
+        // scope child at their head, so the shared chain API reports them as
+        // unenumerable (empty); the Rust syntax walker still reads their names.
+        type Token = (&'static str, usize, usize, &'static str, Option<u32>);
+        type ChainCase = (
+            &'static str,
+            usize,
+            usize,
+            &'static str,
+            (usize, usize),
+            &'static [Token],
+        );
+        let cases: &[ChainCase] = &[
+            (
+                "scoped_identifier",
+                193,
+                205,
+                "::dep::r#mod",
+                (193, 198),
+                &[],
+            ),
+            (
+                "scoped_identifier",
+                209,
+                220,
+                "crate::item",
+                (209, 214),
+                &[
+                    ("crate", 209, 214, "crate", None),
+                    ("identifier", 216, 220, "item", None),
+                ],
+            ),
+            (
+                "scoped_identifier",
+                224,
+                234,
+                "self::item",
+                (224, 228),
+                &[
+                    ("self", 224, 228, "self", None),
+                    ("identifier", 230, 234, "item", None),
+                ],
+            ),
+            (
+                "scoped_identifier",
+                238,
+                249,
+                "super::item",
+                (238, 243),
+                &[
+                    ("super", 238, 243, "super", None),
+                    ("identifier", 245, 249, "item", None),
+                ],
+            ),
+            (
+                "scoped_identifier",
+                257,
+                277,
+                "a::Type::<T>::method",
+                (257, 269),
+                &[
+                    ("identifier", 257, 258, "a", None),
+                    ("identifier", 260, 264, "Type", Some(1)),
+                    ("identifier", 271, 277, "method", Some(1)),
+                ],
+            ),
+            (
+                "scoped_type_identifier",
+                297,
+                308,
+                "crate::Wrap",
+                (297, 302),
+                &[
+                    ("crate", 297, 302, "crate", None),
+                    ("type_identifier", 304, 308, "Wrap", Some(1)),
+                ],
+            ),
+            (
+                "scoped_type_identifier",
+                309,
+                320,
+                "self::Inner",
+                (309, 313),
+                &[
+                    ("self", 309, 313, "self", None),
+                    ("type_identifier", 315, 320, "Inner", Some(1)),
+                ],
+            ),
+        ];
+        for &(kind, a, b, text, syntax_root, tokens) in cases {
+            let path = grammar_node(root, kind, a, b, text);
+            let first = crate::syntax::rust_path_root(path);
+            assert_eq!((first.start_byte(), first.end_byte()), syntax_root);
+            let expected = tokens
+                .iter()
+                .map(|&(kind, a, b, text, _)| grammar_node(root, kind, a, b, text))
+                .collect::<Vec<_>>();
+            assert_eq!(spec.path_segment_tokens(path), expected);
+            for (&token, &(_, _, _, _, arity)) in expected.iter().zip(tokens) {
+                assert_eq!(spec.segment_generic_arity(token), arity);
+            }
+        }
+        // Generic wrappers delimit chain-root climbing: Type belongs to the
+        // inner a::Type chain; method belongs to the outer scoped chain.
+        for (kind, a, b, text, expected_kind, c, d, expected_text) in [
+            (
+                "identifier",
+                200,
+                205,
+                "r#mod",
+                "scoped_identifier",
+                193,
+                205,
+                "::dep::r#mod",
+            ),
+            (
+                "identifier",
+                216,
+                220,
+                "item",
+                "scoped_identifier",
+                209,
+                220,
+                "crate::item",
+            ),
+            (
+                "identifier",
+                260,
+                264,
+                "Type",
+                "scoped_identifier",
+                257,
+                264,
+                "a::Type",
+            ),
+            (
+                "identifier",
+                271,
+                277,
+                "method",
+                "scoped_identifier",
+                257,
+                277,
+                "a::Type::<T>::method",
+            ),
+            (
+                "type_identifier",
+                304,
+                308,
+                "Wrap",
+                "scoped_type_identifier",
+                297,
+                308,
+                "crate::Wrap",
+            ),
+        ] {
+            let token = grammar_node(root, kind, a, b, text);
+            assert_eq!(
+                spec.qualified_path_root(token),
+                Some(grammar_node(root, expected_kind, c, d, expected_text))
+            );
+        }
+        for (kind, a, b, text, components) in [
+            (
+                "scoped_identifier",
+                193,
+                205,
+                "::dep::r#mod",
+                vec!["dep", "mod"],
+            ),
+            (
+                "scoped_identifier",
+                209,
+                220,
+                "crate::item",
+                vec!["crate", "item"],
+            ),
+            (
+                "scoped_identifier",
+                224,
+                234,
+                "self::item",
+                vec!["self", "item"],
+            ),
+            (
+                "scoped_identifier",
+                238,
+                249,
+                "super::item",
+                vec!["super", "item"],
+            ),
+            ("scoped_identifier", 257, 264, "a::Type", vec!["a", "Type"]),
+            (
+                "scoped_type_identifier",
+                297,
+                308,
+                "crate::Wrap",
+                vec!["crate", "Wrap"],
+            ),
+        ] {
+            assert_eq!(
+                rust_path_components(grammar_node(root, kind, a, b, text), source),
+                components
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_callable_grammar_boundary {
+    use super::*;
+    use crate::structural::RUST_STRUCTURAL_SPEC;
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+
+    #[test]
+    fn ownership_callable_grammar_contract() {
+        // The owner kind and optional trait field are the grammar boundary;
+        // dispatch follows Rust's distinction between trait and inherent items.
+        let source = concat!(
+            "fn free(ref value: u8, /* trivia */ mut other: u16, r#type: bool) {}\n",
+            "struct S; impl S { async fn inherent() {} }\n",
+            "trait T { async fn signature(); fn defaulted() { fn nested() {} } }\n",
+            "impl T for S { async fn signature() {} }\n",
+        );
+        let tree = crate::test_helpers::parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let mut pending = vec![tree.root_node()];
+        let mut callables = Vec::new();
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "function_item" | "function_signature_item") {
+                callables.push(node);
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        callables.sort_by_key(Node::start_byte);
+        let expected = [
+            (
+                "free",
+                "function_item",
+                "source_file",
+                false,
+                false,
+                DispatchExtensibility::Closed,
+            ),
+            (
+                "inherent",
+                "function_item",
+                "impl_item",
+                false,
+                true,
+                DispatchExtensibility::Closed,
+            ),
+            (
+                "signature",
+                "function_signature_item",
+                "trait_item",
+                false,
+                true,
+                DispatchExtensibility::Open,
+            ),
+            (
+                "defaulted",
+                "function_item",
+                "trait_item",
+                false,
+                false,
+                DispatchExtensibility::Open,
+            ),
+            (
+                "nested",
+                "function_item",
+                "function_item",
+                false,
+                false,
+                DispatchExtensibility::Closed,
+            ),
+            (
+                "signature",
+                "function_item",
+                "impl_item",
+                true,
+                true,
+                DispatchExtensibility::Open,
+            ),
+        ];
+        assert_eq!(callables.len(), expected.len(), "{callables:?}");
+        for (node, (name, kind, owner_kind, trait_impl, asynchronous, dispatch)) in
+            callables.into_iter().zip(expected)
+        {
+            assert_eq!(node.kind(), kind);
+            assert_eq!(
+                rust_node_text(node.child_by_field_name("name").unwrap(), source),
+                name
+            );
+            let mut owner = node.parent().unwrap();
+            while matches!(owner.kind(), "block" | "declaration_list") {
+                owner = owner.parent().unwrap();
+            }
+            assert_eq!(owner.kind(), owner_kind, "{name}");
+            assert_eq!(owner.child_by_field_name("trait").is_some(), trait_impl);
+            assert_eq!(
+                rust_callable_dispatch_extensibility(node),
+                dispatch,
+                "{name}"
+            );
+            assert_eq!(
+                RUST_STRUCTURAL_SPEC.async_callable_value(node),
+                Some(asynchronous),
+                "{name}"
+            );
+        }
+        let function = tree.root_node().named_child(0).unwrap();
+        let parameters = function.child_by_field_name("parameters").unwrap();
+        assert_eq!(parameters.kind(), "parameters");
+        assert_eq!(
+            rust_callable_parameter_type_spellings(parameters, source),
+            Some(vec!["u8".into(), "u16".into(), "bool".into()])
+        );
+        // Offsets are handwritten from the identifier tokens, excluding ref/mut.
+        let labels = rust_parameter_label_nodes(parameters)
+            .into_iter()
+            .map(|label| {
+                (
+                    label.kind(),
+                    label.start_byte(),
+                    label.end_byte(),
+                    rust_node_text(label, source),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                ("identifier", 12, 17, "value"),
+                ("identifier", 40, 45, "other"),
+                ("identifier", 52, 58, "type")
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod qs3_declaration_contract {
+    use super::*;
+    use crate::test_helpers::{occurrence_text, parse_rust_fixture};
+
+    #[test]
+    fn qs3_item_grammar_boundary() {
+        // Equivalent grammar roles must survive the replay-tree boundary.
+        let items = r#"
+extern "C" { fn foreign_fn(x: i32); static foreign_value: i32; }
+struct Owner;
+impl Owner { fn method(&self) {} const LIMIT: u8 = 1; type Alias = u8; }
+enum Choice { Record { field: u8 }, Tuple(u8), Unit }
+"#;
+        for source in [items.to_string(), format!("wrap! {{ {items} }}")] {
+            let parsed = parse_rust_fixture(&source);
+            let mut actual = parsed
+                .declarations()
+                .iter()
+                .map(|unit| (unit.short_name().to_string(), unit.kind()))
+                .collect::<Vec<_>>();
+            actual.sort_by(|a, b| a.0.cmp(&b.0));
+            use CodeUnitType::*;
+            let expected = [
+                ("Choice", Class),
+                ("Choice.Record", Field),
+                ("Choice.Record.field", Field),
+                ("Choice.Tuple", Field),
+                ("Choice.Unit", Field),
+                ("Owner", Class),
+                ("Owner.Alias", Class),
+                ("Owner.LIMIT", Field),
+                ("Owner.method", Function),
+                ("_module_.foreign_value", Field),
+                ("foreign_fn", Function),
+            ]
+            .map(|(name, kind)| (name.to_string(), kind));
+            assert_eq!(actual, expected, "{source}");
+            for (name, identity) in [
+                ("Choice.Record", "Choice"),
+                ("Choice.Tuple", "Choice"),
+                ("Choice.Unit", "Choice"),
+            ] {
+                let unit = parsed
+                    .declarations()
+                    .iter()
+                    .find(|unit| unit.short_name() == name)
+                    .unwrap();
+                let metadata = &parsed.signature_metadata[unit][0];
+                let owner = metadata
+                    .return_type_identity()
+                    .expect("enum constructor returns its enum");
+                assert_eq!(owner.nominal_name().unwrap().path(), &[identity]);
+            }
+        }
+    }
+
+    #[test]
+    fn qs3_structured_declaration_identity() {
+        let source = r#"
+mod nested {
+    pub struct Item;
+    macro_rules! Item { () => { macro_rules! hidden { () => {} } }; }
+    type Alias = Item;
+    impl crate::Root { fn method(&self) {} const LIMIT: u8 = 0; type Output = Item; }
+}
+"#;
+        let tree = crate::test_helpers::parse_rust(source);
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "src/nested.rs");
+        let parsed = parse_rust_file(&file, source, &tree);
+        let units = parsed.declarations();
+        for (name, last_kind) in [
+            ("nested", SegmentKind::Package),
+            ("nested.Item", SegmentKind::Type),
+        ] {
+            let unit = units
+                .iter()
+                .find(|unit| unit.short_name() == name && unit.kind() != CodeUnitType::Macro)
+                .unwrap();
+            assert_eq!(unit.fq().resolved_segments().last().unwrap().1, last_kind);
+        }
+        let macro_unit = units
+            .iter()
+            .find(|unit| unit.kind() == CodeUnitType::Macro)
+            .unwrap();
+        assert_eq!(
+            macro_unit.fq().resolved_segments().last(),
+            Some(("Item", SegmentKind::Member))
+        );
+        let alias = units
+            .iter()
+            .find(|unit| unit.identifier() == "Alias")
+            .unwrap();
+        assert!(parsed.type_aliases.contains(alias));
+        for member in ["method", "LIMIT", "Output"] {
+            let unit = units
+                .iter()
+                .find(|unit| unit.identifier() == member)
+                .unwrap();
+            assert_eq!(
+                unit.package_anchor(),
+                Some(PackageAnchor::CrateRoot),
+                "{unit:?}"
+            );
+        }
+        assert_eq!(rust_package_anchor(RustModuleAnchor::External), None);
+        assert_eq!(
+            rust_package_anchor(RustModuleAnchor::OwnModule { pop: 2 }),
+            Some(PackageAnchor::OwnModule { pop: 2 })
+        );
+    }
+
+    #[test]
+    fn qs3_source_visibility_and_annotation_boundary() {
+        let source = r#"
+struct Named;
+pub struct Tuple(Named, pub Named, pub(crate) Named);
+pub enum E { Tuple(Named), Record { field: Named } }
+struct Record { private: Named, pub public: Named, pub(crate) restricted: Named }
+const VALUE: Named = Named;
+static STATIC: Named = Named;
+mod inner {
+    pub fn public() {}
+    fn private() {}
+    pub(crate) fn restricted() {}
+    pub(super) fn parent() {}
+    pub(in crate::inner) fn within() {}
+}
+"#;
+        let parsed = parse_rust_fixture(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let rows = &facts.occurrences;
+        let text = |id| occurrence_text(source, rows, id);
+        let declaration_name = |id| rows.declaration(id).name.map(text).unwrap_or("");
+        let visibilities = facts.declaration_visibilities.as_ref().unwrap();
+        use DeclaredVisibility::*;
+        for (name, visibility) in [
+            ("public", Public),
+            ("private", Private),
+            ("restricted", CrateOrModule),
+            ("parent", CrateOrModule),
+            ("within", CrateOrModule),
+        ] {
+            let values = visibilities
+                .iter()
+                .filter(|row| declaration_name(row.declaration) == name)
+                .map(|row| row.visibility)
+                .collect::<Vec<_>>();
+            assert!(!values.is_empty(), "missing {name}");
+            assert!(
+                values.iter().all(|value| *value == visibility),
+                "{name}: {values:?}"
+            );
+        }
+        let positional = facts
+            .rust_declaration_properties
+            .iter()
+            .filter(|row| {
+                let declaration = rows.declaration(row.declaration);
+                text(declaration.occurrence) == "Named"
+                    && declaration.name.is_some_and(|name| text(name).is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positional.len(), 4);
+        let mut positional = positional;
+        positional.sort_by_key(|row| {
+            rows.occurrence(rows.declaration(row.declaration).occurrence)
+                .range
+                .start_byte
+        });
+        for (row, public) in positional.into_iter().zip([false, true, false, true]) {
+            let native = &parsed.resolution_facts;
+            let site = facts
+                .native_declaration_sources
+                .iter()
+                .find(|(_, declaration)| *declaration == row.declaration)
+                .unwrap()
+                .0;
+            assert_eq!(
+                native
+                    .declaration_visibilities
+                    .iter()
+                    .any(|visibility| visibility.declaration == site
+                        && visibility.visibility == Public),
+                public
+            );
+            let declaration = rows.declaration(row.declaration);
+            let range = rows.occurrence(declaration.occurrence).range;
+            let name = rows.occurrence(declaration.name.unwrap()).range;
+            assert_eq!(
+                (name.start_byte, name.end_byte),
+                (range.end_byte, range.end_byte)
+            );
+        }
+        let mut annotated = facts
+            .rust_items
+            .values
+            .iter()
+            .map(|row| {
+                (
+                    declaration_name(row.declaration),
+                    row.declared_type.map(text),
+                )
+            })
+            .collect::<Vec<_>>();
+        annotated.sort();
+        assert_eq!(
+            annotated,
+            [
+                ("Record", None),
+                ("STATIC", Some("Named")),
+                ("Tuple", None),
+                ("VALUE", Some("Named")),
+                ("field", Some("Named")),
+                ("private", Some("Named")),
+                ("public", Some("Named")),
+                ("restricted", Some("Named"))
+            ]
+        );
+        // Native field visibility is a separate projection. Enum fields are
+        // public; struct fields require an explicit public modifier.
+        let native = &parsed.resolution_facts;
+        let public_fields = native
+            .declaration_visibilities
+            .iter()
+            .filter(|row| row.visibility == Public)
+            .filter_map(|row| {
+                let site = &native.sites[row.declaration.index()];
+                let spelling = &source[site.start_byte..site.end_byte];
+                matches!(spelling, "public" | "field" | "Named").then_some(spelling)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(public_fields, ["field", "public", "public"]);
+    }
+
+    #[test]
+    fn qs3_import_grammar_source_boundary() {
+        let source = "extern crate dependency as dep;\npub use crate::inner::Item;\nuse crate::inner::{Thing as Local, Other};\n";
+        let tree = crate::test_helpers::parse_rust(source);
+        let external = tree.root_node().named_child(0).unwrap();
+        assert_eq!(external.kind(), "extern_crate_declaration");
+        assert_eq!(
+            &source[external.child_by_field_name("name").unwrap().byte_range()],
+            "dependency"
+        );
+        assert_eq!(
+            &source[external.child_by_field_name("alias").unwrap().byte_range()],
+            "dep"
+        );
+        let parsed = parse_rust_fixture(source);
+        let projection = crate::imports::rust_import_projection(tree.root_node(), source, "");
+        let mut binders = projection
+            .iter()
+            .map(|row| {
+                let span = row.import.info.binder_span.unwrap();
+                &source[span.start_byte..span.end_byte]
+            })
+            .collect::<Vec<_>>();
+        binders.sort_unstable();
+        assert_eq!(binders, ["Item", "Local", "Other", "dep"]);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let mut imports = facts
+            .imports
+            .iter()
+            .map(|row| {
+                (
+                    row.statement.as_str(),
+                    row.target
+                        .map(|id| occurrence_text(source, &facts.occurrences, id)),
+                    row.alias_occurrence
+                        .map(|id| occurrence_text(source, &facts.occurrences, id)),
+                )
+            })
+            .collect::<Vec<_>>();
+        imports.sort();
+        assert_eq!(
+            imports,
+            [
+                (
+                    "extern crate dependency as dep;",
+                    Some("dependency"),
+                    Some("dep")
+                ),
+                ("pub use crate::inner::Item;", Some("Item"), None),
+                ("use crate::inner::Other;", Some("Other"), None),
+                (
+                    "use crate::inner::Thing as Local;",
+                    Some("Thing"),
+                    Some("Local")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn qs3_string_grammar_value_boundary() {
+        use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+        for (literal, value, absent) in [
+            ("\"\"", Some(""), false),
+            ("\"plain\"", Some("plain"), false),
+            ("\"line\\n\"", Some("line\n"), false),
+            ("\"text\\q\"", None, true),
+        ] {
+            let source = format!("const X: &str = {literal};");
+            let tree = crate::test_helpers::parse_rust(&source);
+            let declaration = tree.root_node().named_child(0).unwrap();
+            assert_eq!(declaration.kind(), "const_item");
+            let node = declaration.child_by_field_name("value").unwrap();
+            assert_eq!(node.kind(), "string_literal");
+            assert_eq!(
+                crate::cargo_routes::rust_static_string_literal(node, &source).as_deref(),
+                value
+            );
+            assert_eq!(
+                crate::structural::RUST_STRUCTURAL_SPEC
+                    .string_literal_value_may_be_absent(node, &source),
+                absent
+            );
+        }
+    }
+
+    #[test]
+    fn qs3_source_context_module_boundary() {
+        use crate::hierarchy::RustHierarchySourceFacts;
+        use crate::hierarchy_source_context::RustSourceContextIndex;
+        use brokk_bifrost_core::analyzer::rust_facts::RustSourceContextKind;
+        let source = "mod a { use crate::Item; impl Item { fn method() { use crate::Other; } } }";
+        let parsed = parse_rust_fixture(source);
+        let facts = parsed.source_facts.as_ref().unwrap();
+        let hierarchy = RustHierarchySourceFacts {
+            items: facts.rust_items.clone(),
+            types: facts.rust_types.clone(),
+            declarations: facts.occurrences.declarations().to_vec(),
+            declaration_units: parsed.source_declaration_units.clone(),
+            module_names: HashMap::default(),
+            imports: facts.imports.clone(),
+        };
+        let index = RustSourceContextIndex::new(&hierarchy, &|| true).unwrap();
+        let module = hierarchy
+            .items
+            .contexts
+            .iter()
+            .find(|row| row.kind == RustSourceContextKind::Module)
+            .unwrap();
+        assert!(hierarchy.items.contexts.len() > 3);
+        for context in &hierarchy.items.contexts {
+            let expected = if context.kind == RustSourceContextKind::FileRoot {
+                context.context
+            } else {
+                module.context
+            };
+            assert_eq!(
+                index.nearest_module_or_file_root(context.context).unwrap(),
+                expected,
+                "{context:?}"
+            );
+        }
     }
 }

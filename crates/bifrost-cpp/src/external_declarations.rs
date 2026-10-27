@@ -307,7 +307,17 @@ pub fn extract_external_declarations(
     let mut parent_by_child = HashMap::default();
     for (parent, children) in &parsed.children {
         for child in children {
-            parent_by_child.insert(child.clone(), parent.clone());
+            // An out-of-line member has both a lexical namespace placement
+            // and a class declaration edge. Its semantic owner is the class,
+            // regardless of HashMap iteration order over those placements.
+            parent_by_child
+                .entry(child.clone())
+                .and_modify(|owner: &mut CodeUnit| {
+                    if parent.is_class() && !owner.is_class() {
+                        *owner = parent.clone();
+                    }
+                })
+                .or_insert_with(|| parent.clone());
         }
     }
 
@@ -700,6 +710,7 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::model::CallableArity;
     use brokk_bifrost_core::analyzer::model::StructuredTypeNodeView;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn extract(source: &str) -> CppExternalDeclarationSet {
         let temp = tempfile::tempdir().expect("temp root");
@@ -867,26 +878,124 @@ mod tests {
         );
     }
 
+    // This manifest checks the neutral header records consumed by model export,
+    // independently of the workspace query layer's declaration projection.
     #[test]
-    fn preserves_callable_parameter_names() {
-        let declarations = extract("int connect(int fd, const char *address, unsigned length);\n");
-        let connect_candidates = declarations
+    #[hardwon(
+        "6ec52f232835: quicksilver round 4 survivor review: lexical namespaces stole out-of-line exported member owners"
+    )]
+    fn recovered_external_api_manifest() {
+        let declarations = extract(
+            r#"
+#define EXPORT_MARKER
+namespace n { class Widget; int damaged = ; }
+class EXPORT_MARKER Widget { public: void first(); };
+class EXPORT(2,0) Attributed final {
+public:
+    ATTRIBUTE("old") int value();
+    void following();
+};
+namespace a::a {
+struct C { void f(); void f()const; void g()&; void g()&&; };
+void ::a::a::C::f() {}
+void ::a::a::C::f()const {}
+void C::g()& {}
+void C::g()&& {}
+}
+DEPRECATED /* between name and arguments */ (
+    EXPORT_MARKER int old(int value), "hint"
+);
+EXPORT_MARKER int next();
+void after() {}
+"#,
+        );
+        let mut types = declarations
+            .types
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>();
+        types.sort_unstable();
+        assert_eq!(
+            types,
+            ["Attributed", "a", "a::a", "a::a.C", "n", "n.Widget"]
+        );
+        let mut callables = declarations
             .members
             .iter()
-            .filter(|member| member.name == "connect")
+            .filter(|record| record.kind == CppExternalMemberKind::Function)
+            .map(|record| {
+                (
+                    record.owner.as_ref().map(CppExternalOwner::name),
+                    record.name.as_str(),
+                    record.signature.as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
-        let [connect] = connect_candidates.as_slice() else {
-            panic!("connect declaration: {declarations:#?}");
-        };
-        assert_eq!(
-            Some(vec![
-                Some("fd".to_owned()),
-                Some("address".to_owned()),
-                Some("length".to_owned()),
-            ]),
-            connect.parameter_names,
-            "formal names must remain aligned with the declaration's argument slots"
+        callables.sort_unstable();
+        let mut expected = vec![
+            (None, "after", Some("()")),
+            (None, "next", Some("()")),
+            (None, "old", Some("(int)")),
+            (Some("Attributed"), "following", Some("()")),
+            (Some("Attributed"), "value", Some("()")),
+            (Some("a::a.C"), "f", Some("()")),
+            (Some("a::a.C"), "f", Some("() const")),
+            (Some("a::a.C"), "g", Some("() &")),
+            (Some("a::a.C"), "g", Some("() &&")),
+            (Some("n.Widget"), "first", Some("()")),
+        ];
+        expected.sort_unstable();
+        assert_eq!(callables, expected);
+    }
+
+    // The external-declaration producer feeds a separately versioned pack model.
+    // Names belong to the outer formal, never to a nested callback's formal or
+    // an array bound. This manifest comes from the header's API declarations.
+    #[test]
+    fn preserves_callable_parameter_names() {
+        let declarations = extract(
+            "struct Owner {};\n\
+             void connect(int fd, const char *address, unsigned length);\n\
+             void callbacks(void (*callback)(int argument), int array[extent], int (Owner::*member)(int nested));\n",
         );
+        for (name, expected) in [
+            ("connect", vec![Some("fd"), Some("address"), Some("length")]),
+            (
+                "callbacks",
+                vec![Some("callback"), Some("array"), Some("member")],
+            ),
+        ] {
+            let candidates = declarations
+                .members
+                .iter()
+                .filter(|member| member.name == name)
+                .collect::<Vec<_>>();
+            let [member] = candidates.as_slice() else {
+                panic!("{name} declaration: {declarations:#?}");
+            };
+            assert_eq!(
+                member.parameter_names,
+                Some(
+                    expected
+                        .into_iter()
+                        .map(|name| name.map(str::to_owned))
+                        .collect()
+                ),
+                "{name}: outer parameter slots must agree with the API manifest"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "5e79db920891: quicksilver round 4 survivor tests: unnamed formals inherit nested names"
+    )]
+    fn unnamed_callable_parameter_names() {
+        let declarations = extract("void unnamed(void (*)(int argument), int [extent]);\n");
+        let [member] = declarations.members.as_slice() else {
+            panic!("one exported callable: {declarations:#?}");
+        };
+        assert_eq!(member.parameter_names, Some(vec![None, None]));
     }
 
     #[test]

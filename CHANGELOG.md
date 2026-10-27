@@ -5,6 +5,228 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.14.2] - 2026-10-26
+
+### Changed
+
+- C and C++ count a declaration in another file as proven visible only when
+  the reference's effective preprocessor context implies the declaration's
+  guards. That context is the reference's own guards, the
+  `compile_commands.json` defines and the translation unit's `__cplusplus`
+  state. A declaration whose guards are only compatible stays an unproven
+  candidate, so definitions and usages behind platform or feature guards can
+  now report incomplete results until the configuration is stated (#6902).
+- Rust workspace excludes name literal directories, as in Cargo. Persisted
+  module placement uses the feature set that
+  `cargo build --workspace --all-targets` selects. When the retained manifests
+  cannot establish that set, absent features stay unknown rather than
+  inactive (#6846).
+
+### Added
+
+- Go usage-graph responses report the platform, architecture, cgo setting and
+  build tags used by graph exclusion. Environment-only platform overrides can
+  still differ from discovery; that discrepancy remains tracked (#6978, #6977).
+- RQL `callable_applicability` rows can report a `less_specific` verdict for an
+  applicable overload that a more specific one beats (JLS 15.12.2.5), plus
+  optional `phase`, `failing_argument` and `failing_conversion` fields that
+  name the invocation phase and the first argument that keeps a candidate from
+  applying. Native Java resolution produces them, so Java selections there
+  resolve to a unique or ambiguous overload instead of `unknown_shape`; legacy
+  Java output is unchanged. The Python `CodeQueryCallableApplicability` model
+  decodes the new fields (#6491).
+
+### Fixed
+
+- Java exception-catch taint policies report definite findings and complete
+  nonflow results again. Since v0.14.0, release builds could not prove that a
+  thrown exception type reaches a `java.lang` root such as `Exception`, so no
+  catch binding was refuted and the run stayed inconclusive. Simple names such
+  as `Object`, `String` and `RuntimeException` now resolve to their `java.lang`
+  identity through the implicit import in every build (#7006).
+- Native Go navigation resolves a member of a receiver whose type is known
+  from that type's own method set, so a same-name method on an unrelated type
+  elsewhere in the workspace no longer withholds the reference. Method values
+  on named types that are not structs, such as `m.Iter` on a named slice, now
+  resolve as well (#6924, #6926).
+- Rust analysis no longer panics on reference- or pointer-typed generic
+  defaults, or on macro-replayed trait methods that use `Self` (#6953).
+- Rust macro navigation recovers definitions inside certified macro input and
+  usages of uniquely exported literal-argument calls. Ambiguous duplicate
+  exports retain uncertainty instead of manufacturing proven references
+  (#6909).
+- Native Go usage graphs resolve a call on the result of a sibling-file method
+  even when the declaring file is outside the caller set, in chunked and
+  rooted requests alike (#6927).
+- Go analysis handles named types over generic instantiations and keeps struct
+  fields and interface members out of lexical name lookup, so they cannot hide
+  package constants or types (#6916, #6956, #6984).
+- Kotlin arithmetic operators type their results through numeric promotion,
+  and an inferred local keeps its initializer's type across self-referential
+  writes. Sink calls on `object` members after arithmetic or loop-carried
+  writes now resolve, so taint policies prove those flows instead of reporting
+  them inconclusive (#7007).
+- C++ declaration inventories recover class-body K&R prototype macros, keep
+  aliases inside classes fragmented by a namespace sentinel, own out-of-line
+  members through a `using` declaration, resolve types qualified through a
+  namespace alias, and link out-of-line class-template members to their
+  in-class declarations (#6902).
+- Java reverse usage scans attribute a `return` in a local or anonymous
+  class's method to that innermost method, so its anonymous return type no
+  longer becomes a wrong proven call target (#6910).
+- Rust macro replay binds an attributed item to a `$i:item` fragment, and
+  each `derive(...)` path, including one reached through `cfg_attr`, publishes
+  a macro reference (#6912).
+- Python test detection reads the parsed tree, so it finds `async def test_`
+  functions and ignores test-like text in strings and comments (#6961).
+  Regular-expression analysis handles verbose-mode comments, quantified and
+  comment groups, repeated quantifiers and scoped flag groups, removing
+  several false risk reports (#6999).
+- C++ test-assertion smell reports reuse the analyzer's prepared syntax trees
+  instead of reparsing every test file on each request. An unreadable test
+  file now makes the report incomplete instead of silently empty (#7001).
+- C definition lookup in a C translation unit no longer selects a declaration
+  from a `#ifdef __cplusplus` arm, and an arm that a build-proven define rules
+  out is no longer selected either (#1465).
+- JS/TS test detection follows the syntax tree: `test.only`, `it.skip` and
+  curried `it.each(table)(name, fn)` count as tests, and a RegExp
+  `pattern.test(s)` call no longer does. Tap-style `t.test(...)` is no longer
+  recognized, for the same reason. The assertion-smell report reads
+  `expect(...)`, `node:assert` and chai assertions from the tree, so tests
+  whose `expect` argument contains parentheses or spans lines are no longer
+  reported as having no assertions (#7079).
+- Python call bindings report the same receiver dispatch outcome in policy
+  runs and `--query-file` runs whatever the cache holds, and a call inside a
+  `finally` body that is lowered once per exit path no longer makes its
+  procedure's dispatch reads unbounded (#6638).
+- C/C++ resolution and usage graphs preserve recovered member calls, local
+  alias shadowing and include-chain ownership. Declaration and source-fact
+  handling respects grammar structure, and grammar 0.24.6 accepts anonymous
+  enums with an underlying type (#6891, #6936).
+- Kotlin integer analysis handles hexadecimal, binary and suffixed literals
+  consistently while respecting signedness and width; Long literals no longer
+  supply invalid Int comparisons or offsets (#6952).
+- Python assertion-smell detection uses parsed syntax, avoiding string
+  lookalikes, nested-helper assertions and duplicate decorated tests. Semantic
+  diagnostics also bind exception aliases from the handler declaration
+  (#6960).
+- Python source listings and legacy definition lookup retain the first
+  declaration of a reassigned module constant, matching class-attribute
+  behavior, while module export precedence still follows the last writer
+  (#6987).
+- The policy-scan action's default pack source pins public rules 0.5.1 with
+  packs 0.6.0 instead of the incompatible rules 0.1.1, and each release requires
+  its engine to admit that pin. Public pack acquisition downloads release assets
+  outside GitHub's API rate limit, the action authenticates the remaining API
+  reads with the job token, including on pull requests, and failed acquisitions
+  print the receipt's message with the failure class. `bifrost pack-admission`
+  without `--request-path` checks the `PACK_SOURCE` request (#6617).
+- Go navigation resolves promoted methods through embedded interfaces in
+  locally replaced modules, keeps imports separate across build contexts, and
+  finds methods declared in a different file from their receiver type.
+  Unknown build participation still leaves results incomplete
+  (#6726, #6831, #6835).
+- Rust analysis respects lexical scope for macro replay and function-local
+  imports around `include!`, recognizes structured test configuration, and
+  refreshes Cargo dependency routes after package-version changes. Workspace
+  excludes also recognize a leading `./` (#6853).
+- Rust cfg evaluation treats disabled features as false when the Cargo feature
+  inventory is complete, while detached inventories retain uncertainty.
+  Cached unit summaries refresh when their crate topology changes (#6822).
+- C++ class analysis recognizes rvalue-reference move parameters and non-const
+  copy constructors and assignments instead of misclassifying them. Clone
+  detection no longer discards ordinary calls just because a string argument
+  contains a logging name (#6849, #6850).
+- Definition, type and RQL call-binding diagnostics use stable declaration or
+  source identities instead of runtime numeric aliases, keeping messages
+  consistent across worker counts and fresh caches (#6783).
+- Kotlin definition lookup recognizes simple and destructured `for`-loop
+  bindings within loop bodies. Element-type inference and same-name parameter
+  shadowing remain separately limited (#6655).
+- Rust parsing accepts prefix inclusive ranges such as `..=end` instead of
+  marking valid syntax incomplete (#6605).
+- Native Go navigation resolves locally replaced sibling modules and keeps
+  reverse callers in their owning build context. Usage graphs retain targeted
+  declarations from skipped caller files without admitting their outgoing
+  edges (#6621, #6689).
+- Java reference casts preserve operand value flow for policy findings.
+  Shared JVM lookup clears stale unsupported-traversal diagnostics after a
+  completed-empty inherited-member search (#6694).
+- Policy reports deduplicate diagnostics before applying retention limits,
+  so repeated messages no longer consume the cap and hide distinct reasons
+  for incomplete analysis (#6657).
+- Maven project discovery decodes XML entity and character references and
+  keeps unresolved dependency scopes unknown instead of treating them as
+  compile scope (#6719).
+- C# definition lookup and usage scans resolve the parameter type behind a
+  call-argument `new() { ... }` where the callee declares it. A visible global
+  type now outranks a `using` import, and a global type whose compilation
+  membership is unproven leaves the answer incomplete instead of resolving the
+  initializer member on the imported type. Overload refinement shares the
+  resolution (#6472).
+- Python calls on a module field that a semantic pack types, such as
+  `os.environ.get(key)` with `os.environ` declared as `os._Environ`, resolve to
+  the pack's declared member, so a policy can select them with a declared
+  `resolved-call`. A workspace write to the field, or a module object that
+  escapes, withholds the declared class. The shipped process-input policy is
+  unchanged; its `get` source ships with the pack repository (#3488).
+- Rust reverse queries such as usages and incoming calls no longer hang when
+  the analyzer falls back to its single in-memory store connection, which
+  happens when a temporary cache file cannot be created. A request waiting for
+  that connection now stops when it is cancelled or reaches its deadline
+  (#6018).
+- Rust call-site callee provenance follows a local alias such as
+  `let f = init;`, so `f(0)` reports the same origin as `init(0)`. A `mut`
+  alias or source that the code might write, borrow mutably, call a method on
+  or pass to a macro stays `unknown`, and callable fields are unchanged
+  (#6235).
+- `call_bindings` rows for a modeled external call, such as a Rust
+  `std::io::stdout().lock().write(..)` bound to its standard-library model,
+  report an exact selector (`selector_exact` true, `selector_proof` `derived`,
+  no `call_binding_dispatch_partial` diagnostic) when dispatch is resolved,
+  exhaustive, proven and complete on that one target. Model authors need not
+  declare `covers_overrides`, and authored-summary selectors keep their tier.
+  Policies that select calls with `call_proof: exact` can now match these
+  rows (#5224).
+- Go analysis no longer loses canonical package identities and usage graphs
+  for the whole workspace when one source file is refused, such as a file with
+  a line longer than 16,000 bytes. The refused file is recorded with its
+  reason, packages that compile it and graphs that reach it report it as
+  partial coverage, and every other package keeps its Go tool identities
+  and edges (#6650).
+- Java semantic lowering no longer drops the value of an expression result.
+  Narrowing and unboxing casts, value-position `&&` and `||`, switch
+  expressions and `yield`, `instanceof`, array creation and initializers, and
+  string templates now carry a value flow from their operands, or an explicit
+  gap, so a tainted value cannot vanish inside one of them while the run still
+  reports complete evidence. A reference to an `instanceof` pattern variable
+  and a string-template processor call stay open (#6523).
+
+### Performance
+
+- A full policy scan reuses the verified policy units of an earlier scan of
+  the same tree, so a repeated `bifrost --policy` run no longer costs as much
+  as a cold one. Match policies in one policy batch whose selectors are
+  byte-identical run the selector once and share its result, in incremental,
+  widened and `--no-incremental` scans (#7004).
+- Rust semantic packs load indexed catalog rows on demand instead of decoding
+  entire shards during activation. Shared cached composition and search data
+  reduce repeat work, and search reads single-contributor groups directly from
+  matching catalog rows instead of composing them. Mixed and generated groups
+  still require composition; other languages retain their existing loading
+  path (#6874, #6886).
+- Analyzer-store caches share a configurable byte budget, defaulting to
+  256 MiB, instead of independent entry limits. Oversized entries remain usable
+  by the current request without being retained across requests (#6754).
+- CLI and MCP incremental policy scans reuse eligible committed full-scan
+  results as diff bases. File-local set-difference policies can reuse unchanged
+  units instead of repeating whole-workspace evaluation; missing proof still
+  widens the scan (#6645, #6649).
+- Analyzer-store publication batches resolution writes and reduces repeated
+  change-stamp reads. Go context queries reuse per-operation membership and
+  definition evidence, reducing repeated database work (#6661, #6666, #6695,
+  #6705).
+
 ## [0.14.1] - 2026-10-24
 
 ### Changed

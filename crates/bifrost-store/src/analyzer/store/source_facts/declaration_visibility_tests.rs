@@ -226,28 +226,18 @@ pub fn assert_source_visibility_properties(state: &FileState) {
         .iter()
         .map(|(_, declaration)| *declaration)
         .collect::<std::collections::HashSet<_>>();
-    for source_only in ["left", "right"] {
-        let ids = visibilities
-            .iter()
-            .filter(|fact| declaration_name(facts, JAVA_SOURCE, fact.declaration) == source_only)
-            .map(|fact| fact.declaration)
-            .collect::<Vec<_>>();
-        assert!(!ids.is_empty(), "source-only declaration {source_only}");
-        assert!(
-            ids.iter().all(|id| !native_declarations.contains(id)),
-            "{source_only} must remain source-only"
-        );
-    }
-    for native in ["FIRST", "SECOND"] {
+    // #6291 / 406536ca0c: record components now bridge to native fields
+    // and accessors as well as the canonical constructor formals.
+    for native in ["FIRST", "SECOND", "left", "right"] {
         let ids = visibilities
             .iter()
             .filter(|fact| declaration_name(facts, JAVA_SOURCE, fact.declaration) == native)
             .map(|fact| fact.declaration)
             .collect::<Vec<_>>();
-        assert!(!ids.is_empty(), "enum constant {native}");
+        assert!(!ids.is_empty(), "native declaration {native}");
         assert!(
             ids.iter().all(|id| native_declarations.contains(id)),
-            "enum constant {native} must have a native source declaration"
+            "{native} must have a native source declaration"
         );
     }
 

@@ -476,9 +476,9 @@ mod value_domain {
     };
     use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
     use brokk_bifrost_core::analyzer::structural::callable::{
-        ApplicabilityVerdict, ArgumentListKind, CallKind, CallShapeCoverage,
-        CallableRejectionReason, DeclarationRole, ReceiverContract, SelectionResolution,
-        SignatureCoverage,
+        ApplicabilityVerdict, ArgumentConversion, ArgumentListKind, CallKind, CallShapeCoverage,
+        CallableRejectionReason, DeclarationRole, InvocationPhase, ReceiverContract,
+        SelectionResolution, SignatureCoverage,
     };
     use brokk_bifrost_core::analyzer::structural::control_relation::{
         ControlExitPartition, ControlRelationKind,
@@ -963,6 +963,8 @@ mod value_domain {
     pub(super) const RECEIVER_CONTRACT: &[&str] = ReceiverContract::LABELS;
     pub(super) const APPLICABILITY_VERDICT: &[&str] = ApplicabilityVerdict::LABELS;
     pub(super) const CALLABLE_REJECTION_REASON: &[&str] = CallableRejectionReason::LABELS;
+    pub(super) const INVOCATION_PHASE: &[&str] = InvocationPhase::LABELS;
+    pub(super) const ARGUMENT_CONVERSION: &[&str] = ArgumentConversion::LABELS;
     pub(super) const PRECEDENCE_TIER: &[&str] = PrecedenceTier::LABELS;
     pub(super) const SELECTION_RESOLUTION: &[&str] = SelectionResolution::LABELS;
 
@@ -2529,6 +2531,12 @@ detailed_row_domains! {
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
                     CodeQueryRowField::required_enum("verdict", value_domain::APPLICABILITY_VERDICT),
                     CodeQueryRowField::optional_enum("reason", value_domain::CALLABLE_REJECTION_REASON),
+                    CodeQueryRowField::optional_enum("phase", value_domain::INVOCATION_PHASE),
+                    CodeQueryRowField::optional("failing_argument", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "failing_conversion",
+                        value_domain::ARGUMENT_CONVERSION
+                    ),
                     CodeQueryRowField::optional_enum("tier", value_domain::PRECEDENCE_TIER),
                     CodeQueryRowField::required("selected", Scalar::Boolean),
                     // The candidate declaration's identity, so an applicability row
@@ -4415,6 +4423,15 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallableApplicability { value }, "reason") => {
             value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "phase") => {
+            value.phase.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "failing_argument") => value
+            .failing_argument
+            .map(|ordinal| Scalar::Integer(u64::from(ordinal))),
+        (CodeQueryResultValue::CallableApplicability { value }, "failing_conversion") => {
+            value.failing_conversion.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::CallableApplicability { value }, "tier") => {
             value.tier.map(Scalar::ConstrainedEnum)

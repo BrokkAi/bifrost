@@ -1000,4 +1000,68 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn signature_parameter_grammar_nested_commas() {
+        // The grammar independently identifies complete outer parameters.
+        // A metadata splitter must retain commas owned by templates and
+        // callback declarators without swallowing the following parameter.
+        for (signature, expected) in [
+            (
+                "void f(Pair<int, long> value, char tail)",
+                vec!["Pair<int, long> value", "char tail"],
+            ),
+            (
+                "void f(void (*callback)(int, char), char tail)",
+                vec!["void (*callback)(int, char)", "char tail"],
+            ),
+        ] {
+            let source = format!("{signature};");
+            let tree = parse(&source);
+            assert!(!tree.root_node().has_error());
+            let parameters = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("declarator")
+                .unwrap()
+                .child_by_field_name("parameters")
+                .unwrap();
+            assert_eq!(parameters.kind(), "parameter_list");
+            let ast_parameters: Vec<_> = parameters
+                .named_children(&mut parameters.walk())
+                .map(|node| cpp_node_text(node, &source))
+                .collect();
+            assert_eq!(ast_parameters, expected, "{signature}");
+            let contents = &source[parameters.start_byte() + 1..parameters.end_byte() - 1];
+            let split: Vec<_> = cpp_split_top_level_commas(contents)
+                .map(str::trim)
+                .collect();
+            assert_eq!(split, expected, "{signature}");
+        }
+    }
+
+    #[test]
+    fn template_deduction_keeps_mixed_overload_set_open() {
+        // A dependent parameter cannot be ruled out by textual comparison.
+        // Its presence prevents this partial filter from ranking the exact
+        // non-template against another overload requiring a conversion.
+        let candidates = vec![
+            function("pick", "void pick(int value)"),
+            function("pick", "<typename T> void pick(T value)"),
+            function("pick", "void pick(char* value)"),
+        ];
+        let filtered = cpp_filter_candidates_by_args(
+            candidates.clone(),
+            &[Some(CppArgType {
+                name: "int".into(),
+                unit: None,
+                indirection: 0,
+                pointee_const: false,
+            })],
+            &|_| None,
+            &|_, _| false,
+        );
+        assert_eq!(filtered, candidates);
+    }
 }

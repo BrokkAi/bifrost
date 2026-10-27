@@ -382,3 +382,49 @@ pub(crate) fn cpp_guard_set_to_runtime(guards: &CppGuardSet) -> Option<HashSet<P
     }
     Some(result)
 }
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    #[test]
+    fn displaced_namespace_brace_adjacency() {
+        for gap in ["", "\n"] {
+            let source = format!(
+                "#define FMT_API\nFMT_API void vformat_to(int& out);{gap}}}\nvoid run(){{}}"
+            );
+            let tree = crate::diagnostics::parse_cpp_tree(&source);
+            let mut cursor = tree.root_node().walk();
+            let declaration = tree
+                .root_node()
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "declaration")
+                .unwrap();
+            let brace_start = source.find('}').unwrap();
+            assert_eq!(declaration.end_byte() + gap.len(), brace_start);
+            let brace = super::namespace_closing_brace(declaration).unwrap();
+            assert_eq!(brace.byte_range(), brace_start..brace_start + 1);
+            assert!(brace.is_error());
+            let clean = tree
+                .root_node()
+                .named_children(&mut tree.root_node().walk())
+                .find(|node| node.kind() == "function_definition")
+                .unwrap();
+            assert!(super::namespace_closing_brace(clean).is_none());
+        }
+    }
+    #[test]
+    fn boolean_constant_row_round_trip() {
+        use super::{BooleanGuardExpression as Bool, PreprocessorGuard as Guard};
+        for value in [false, true] {
+            for expression in [
+                Bool::All(vec![Bool::Defined("ON".into()), Bool::Constant(value)]),
+                Bool::Any(vec![Bool::Defined("ON".into()), Bool::Constant(value)]),
+            ] {
+                let runtime = [Guard::Boolean(expression), Guard::Constant(value)]
+                    .into_iter()
+                    .collect();
+                let rows = super::cpp_guard_set_from_runtime(&runtime);
+                assert_eq!(super::cpp_guard_set_to_runtime(&rows), Some(runtime));
+            }
+        }
+    }
+}

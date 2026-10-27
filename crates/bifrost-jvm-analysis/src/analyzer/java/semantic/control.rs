@@ -20,6 +20,11 @@ use brokk_bifrost_analysis::analyzer::java_integral_parameter::JavaScalarType;
 
 use brokk_bifrost_analysis::analyzer::java_integral_parameter::decimal_integer_value;
 
+/// How many elements of one array initializer are stored. A generated lookup
+/// table can hold far more, and every stored element is a memory location the
+/// flow solver tracks, so the elements past the cap are left to a write gap.
+const JAVA_ARRAY_INITIALIZER_ELEMENT_CAP: usize = 1024;
+
 pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
@@ -59,6 +64,8 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         array_values: HashSet::default(),
         non_null_values: HashSet::default(),
         catch_binders: HashMap::default(),
+        yield_results: HashMap::default(),
+        pattern_variable_names: HashSet::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
         implicit_field_values: HashMap::default(),
@@ -1324,6 +1331,74 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         preserves.then_some(operand)
     }
 
+    /// Publish the transfer of an expression that hands its operand on
+    /// unchanged: the result is the operand's own value, so the flow is a
+    /// local copy and the assignment is the identity transfer used by
+    /// local-copy proofs.
+    fn emit_identity_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), JavaLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source,
+                target,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )
+    }
+
+    /// Lower an expression whose result is computed from its operands: each
+    /// operand is evaluated in order, then the result takes a language-defined
+    /// flow from every one of them. The flows sit on the returned terminal
+    /// point, so a caller attaches whatever else the evaluation does, such as
+    /// an abort edge or a gap, to that same point.
+    #[allow(clippy::too_many_arguments)]
+    fn derive_result_from_operands(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        operands: &[Node<'tree>],
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, JavaLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let sources = operands
+            .iter()
+            .map(|operand| {
+                self.expression_value(builder, *operand, expression_value_kind(*operand))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .append_language_defined_value_flows(builder, terminal, sources, result)?;
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            operands,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )?;
+        Ok(terminal)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn statement(
         &mut self,
@@ -1459,6 +1534,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value_node = first_named_child(node)
                     .ok_or_else(|| missing_field(node, "yield expression"))?;
                 let terminal = self.point(builder, node, Vec::new())?;
+                // The operand is the value of the switch expression the yield
+                // completes (JLS 14.21). Java evaluates it before any `finally`
+                // on the way out runs, so the flow sits ahead of the route.
+                if let Some(route) = builder
+                    .resolve_completion(scope, &CompletionRequest::new(CompletionKind::Yield, None))
+                    && let Some(result) = self
+                        .yield_results
+                        .get(&route.destination().target())
+                        .copied()
+                {
+                    let operand = self.expression_value(
+                        builder,
+                        value_node,
+                        expression_value_kind(value_node),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: operand,
+                            target: result,
+                        },
+                    )?;
+                }
                 stack.push(Work::Expression {
                     node: value_node,
                     entry,
@@ -1817,6 +1917,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // (the only case `emit_lexical_input_flow` above leaves as a
             // no-op) may still name an implicit `this.field` access.
             self.emit_implicit_field_load(builder, node, entry, result)?;
+            // A name that an `instanceof` or record pattern binds has no
+            // lowered binding, so a reference to it that resolves to no local
+            // or parameter holds a value with no source.
+            if self.lexical_reference_binding(node).is_none()
+                && node_text(self.prepared.source(), node)
+                    .is_some_and(|name| self.pattern_variable_names.contains(name))
+            {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "a pattern variable has no lowered binding, so its value has no source",
+                )?;
+            }
         }
         match node.kind() {
             "method_invocation" | "object_creation_expression" | "enum_constant" => {
@@ -1902,10 +2018,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
+                // The result is the left operand when it decides the outcome
+                // and the right operand otherwise (JLS 15.23, 15.24). Each way
+                // out therefore leaves through its own point, which carries
+                // that one flow, as the conditional expression's branches do.
+                // The left operand is lowered as a condition, so a nested
+                // `&&`, `||`, conditional or parenthesized operand has no
+                // value of its own; the leaves that can decide it stand in.
+                let decided = self.point(builder, node, Vec::new())?;
+                let right_merge = self.point(builder, node, Vec::new())?;
+                let deciders = short_circuit_decider_leaves(left)
+                    .into_iter()
+                    .map(|leaf| self.expression_value(builder, leaf, expression_value_kind(leaf)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, decided, deciders, result)?;
+                let right_value =
+                    self.expression_value(builder, right, expression_value_kind(right))?;
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    right_merge,
+                    [right_value],
+                    result,
+                )?;
+                self.edge(builder, decided, next)?;
+                self.edge(builder, right_merge, next)?;
                 stack.push(Work::Expression {
                     node: right,
                     entry: right_entry,
-                    next,
+                    next: EdgeTarget::normal(right_merge),
                     scope,
                 });
                 let (when_true, when_false) = if binary_operator(node) == Some("&&") {
@@ -1915,14 +2056,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::ConditionalTrue,
                         },
                         EdgeTarget {
-                            point: next.point,
+                            point: decided,
                             kind: ControlEdgeKind::ConditionalFalse,
                         },
                     )
                 } else {
                     (
                         EdgeTarget {
-                            point: next.point,
+                            point: decided,
                             kind: ControlEdgeKind::ConditionalTrue,
                         },
                         EdgeTarget {
@@ -1945,25 +2086,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let terminal = self.point(builder, node, Vec::new())?;
                     let inner =
                         self.expression_value(builder, value, expression_value_kind(value))?;
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Local,
-                            source: inner,
-                            target: result,
-                        },
-                    )?;
                     // Parentheses preserve the evaluated value without a conversion.
-                    // Publish the same identity transfer used by local-copy proofs.
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::Assignment {
-                            target: result,
-                            value: inner,
-                        },
-                    )?;
+                    self.emit_identity_flow(builder, terminal, inner, result)?;
                     self.edge(builder, terminal, next)?;
                     stack.push(Work::Expression {
                         node: value,
@@ -2088,16 +2212,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "string_literal" => {
-                let interpolations = named_children(node)
-                    .into_iter()
-                    .filter(|child| child.kind() == "string_interpolation")
-                    .collect::<Vec<_>>();
-                self.schedule_expressions(builder, entry, &interpolations, next, scope, stack)
-            }
-            "string_interpolation" => {
-                let values = named_children(node);
-                self.schedule_expressions(builder, entry, &values, next, scope, stack)
+            "string_literal" | "string_interpolation" => {
+                // The embedded expressions are the only runtime parts of a
+                // template fragment. The joined text derives from each of them.
+                let embedded = if node.kind() == "string_literal" {
+                    named_children(node)
+                        .into_iter()
+                        .filter(|child| child.kind() == "string_interpolation")
+                        .collect::<Vec<_>>()
+                } else {
+                    named_children(node)
+                };
+                if embedded.is_empty() {
+                    return self.edge(builder, entry, next);
+                }
+                self.derive_result_from_operands(
+                    builder, node, entry, next, scope, &embedded, stack,
+                )?;
+                Ok(())
             }
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
@@ -2172,22 +2304,87 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "cast_expression"
-            | "instanceof_expression"
-            | "array_creation_expression"
-            | "array_initializer"
-            | "dimensions_expr"
-            | "template_expression" => {
+            "cast_expression" => {
+                // Every cast the arm above does not take checks or converts
+                // its operand: a reference cast, a narrowing, a boxing and an
+                // unboxing. JLS 15.16/5.5: the result derives from the
+                // operand, and none of them is an identity transfer. Use the
+                // shared conversion-flow emitter, as Kotlin and C/C++ do.
+                // Publish the result only after the check succeeds, so a
+                // ClassCastException or an unboxing NullPointerException does
+                // not manufacture a normal result.
+                let operand = required_field(node, "value")?;
+                let source =
+                    self.expression_value(builder, operand, expression_value_kind(operand))?;
+                let checked = self.point(builder, node, Vec::new())?;
+                let normal = self.point(builder, node, Vec::new())?;
+                self.session.append_language_defined_value_flows(
+                    builder,
+                    normal,
+                    [source],
+                    result,
+                )?;
+                self.edge(builder, checked, EdgeTarget::normal(normal))?;
+                self.edge(builder, normal, next)?;
+                self.implicit_abort_edge(builder, node, checked, scope, None, stack)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[operand],
+                    EdgeTarget::normal(checked),
+                    scope,
+                    stack,
+                )
+            }
+            "instanceof_expression" => {
+                // The test yields a boolean computed from its operand, as a
+                // comparison does (JLS 15.20.2). It cannot throw. A pattern
+                // also binds the operand to new variables; a reference to one
+                // of them carries the gap, not the test.
+                let operand = required_field(node, "left")?;
+                self.derive_result_from_operands(
+                    builder,
+                    node,
+                    entry,
+                    next,
+                    scope,
+                    &[operand],
+                    stack,
+                )?;
+                Ok(())
+            }
+            "array_creation_expression" => {
+                // NegativeArraySizeException leaves from the terminal point
+                // that the dimension expressions reach first.
                 let children = runtime_expression_children(node);
-                if !operation_can_throw_implicitly(node) {
-                    return self
-                        .schedule_expressions(builder, entry, &children, next, scope, stack);
-                }
-                // ClassCastException, NegativeArraySizeException, and
-                // NullPointerException on unboxing. This arm appends no effect
-                // of its own, so the abort leaves a terminal point that the
-                // operands reach first.
                 let terminal = self.point(builder, node, Vec::new())?;
+                if let Some(initializer) = node.child_by_field_name("value") {
+                    // `new T[] { ... }` is the array its initializer builds.
+                    let source = self.expression_value(
+                        builder,
+                        initializer,
+                        expression_value_kind(initializer),
+                    )?;
+                    self.emit_identity_flow(builder, terminal, source, result)?;
+                } else {
+                    // A fresh array. Its length derives from the dimension
+                    // expressions, which `length` reads back from the array.
+                    self.session.add_allocation(
+                        builder,
+                        terminal,
+                        result,
+                        AllocationKind::Array,
+                    )?;
+                    let lengths = children
+                        .iter()
+                        .flat_map(|dimension| runtime_expression_children(*dimension))
+                        .map(|length| {
+                            self.expression_value(builder, length, expression_value_kind(length))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.session
+                        .append_language_defined_value_flows(builder, terminal, lengths, result)?;
+                }
                 self.edge(builder, terminal, next)?;
                 self.implicit_abort_edge(builder, node, terminal, scope, None, stack)?;
                 self.schedule_expressions(
@@ -2198,6 +2395,106 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                     stack,
                 )
+            }
+            "array_initializer" => {
+                // A fresh array whose element `i` is initialized as if by
+                // `array[i] = element` (JLS 10.6). The stores follow the
+                // elements' evaluation, so they sit on the terminal point.
+                let terminal = self.point(builder, node, Vec::new())?;
+                self.session
+                    .add_allocation(builder, terminal, result, AllocationKind::Array)?;
+                let elements = runtime_expression_children(node);
+                for (ordinal, element) in elements
+                    .iter()
+                    .take(JAVA_ARRAY_INITIALIZER_ELEMENT_CAP)
+                    .enumerate()
+                {
+                    let mut value =
+                        self.expression_value(builder, *element, expression_value_kind(*element))?;
+                    if element.kind() == "array_initializer" {
+                        // An initializer nested in an initializer is an
+                        // implicit array creation (JLS 10.6), so the element
+                        // is the creation's result: the nested array through
+                        // an identity transfer, as `new T[] { ... }` gives.
+                        let creation =
+                            self.value(builder, terminal, SemanticValueKind::Temporary)?;
+                        self.emit_identity_flow(builder, terminal, value, creation)?;
+                        value = creation;
+                    }
+                    let index = self.ordinal_index_value(builder, terminal, ordinal)?;
+                    let location = self.session.add_memory_location(
+                        builder,
+                        terminal,
+                        MemoryLocationKind::Index {
+                            base: result,
+                            index: Some(index),
+                            constant_index: None,
+                            identity: brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            value,
+                        },
+                    )?;
+                }
+                if elements.len() > JAVA_ARRAY_INITIALIZER_ELEMENT_CAP {
+                    // The array is complete as an allocation, but its later
+                    // elements are not stored. The gap is discharged when
+                    // nothing ever reads or publishes the array.
+                    self.session.add_partitioned_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::IndexMemory,
+                        SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                        SemanticGapKind::Unsupported,
+                        "array initializer elements past the per-initializer cap are not stored",
+                    )?;
+                }
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &elements,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "dimensions_expr" => {
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "template_expression" => {
+                // The processor's `process` call produces the result from the
+                // template. The call is not lowered, so the result keeps the
+                // flow of both operands and a gap that the result's own
+                // reachability can discharge.
+                let processor = required_field(node, "template_processor")?;
+                let template = required_field(node, "template_argument")?;
+                let terminal = self.derive_result_from_operands(
+                    builder,
+                    node,
+                    entry,
+                    next,
+                    scope,
+                    &[processor, template],
+                    stack,
+                )?;
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unknown,
+                    "string template processor invocation is not yet lowered as a call",
+                )?;
+                self.implicit_abort_edge(builder, node, terminal, scope, None, stack)
             }
             kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry),
@@ -2498,6 +2795,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             next
         };
+        // The value of a switch expression is the operand of the rule or
+        // `yield` that completes it (JLS 15.28.1, 14.21). A `yield` finds the
+        // result through the point its completion route ends at.
+        let switch_result = if expression_mode {
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let previous = self.yield_results.insert(switch_next.point, result);
+            assert!(
+                previous.is_none(),
+                "every switch expression has its own merge point"
+            );
+            Some(result)
+        } else {
+            None
+        };
         let switch_scope = if expression_mode {
             builder.push_scope(
                 Some(scope),
@@ -2564,14 +2875,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         EdgeTarget::normal(entry)
                     } else if expression_mode {
                         let missing_yield = self.point(builder, arm.node, Vec::new())?;
-                        self.add_gap(
-                            builder,
-                            missing_yield,
-                            SemanticGapSubject::Point,
-                            SemanticCapability::NormalControlFlow,
-                            SemanticGapKind::Unsupported,
-                            "switch-expression statement group can complete without a represented yield",
-                        )?;
+                        // A last group that ends in `yield` or `throw` cannot
+                        // complete normally, so nothing reaches this point.
+                        if !ends_in_yield_or_throw(arm.body.last().copied()) {
+                            self.add_gap(
+                                builder,
+                                missing_yield,
+                                SemanticGapSubject::Point,
+                                SemanticCapability::NormalControlFlow,
+                                SemanticGapKind::Unsupported,
+                                "switch-expression statement group can complete without a represented yield",
+                            )?;
+                        }
                         EdgeTarget::normal(missing_yield)
                     } else {
                         switch_next
@@ -2592,10 +2907,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             if expression_mode && action.kind() == "expression_statement" =>
                         {
                             if let Some(value) = first_named_child(action) {
+                                // The rule's operand is the switch's value, so
+                                // it leaves through its own point, which
+                                // carries that one flow.
+                                let rule_merge = self.point(builder, value, Vec::new())?;
+                                let operand = self.expression_value(
+                                    builder,
+                                    value,
+                                    expression_value_kind(value),
+                                )?;
+                                self.append_effect(
+                                    builder,
+                                    rule_merge,
+                                    SemanticEffect::ValueFlow {
+                                        kind: ValueFlowKind::Local,
+                                        source: operand,
+                                        target: switch_result
+                                            .expect("a rule value exists in expression mode"),
+                                    },
+                                )?;
+                                self.edge(builder, rule_merge, switch_next)?;
                                 stack.push(Work::Expression {
                                     node: value,
                                     entry: arm_entries[index],
-                                    next: switch_next,
+                                    next: EdgeTarget::normal(rule_merge),
                                     scope: switch_scope,
                                 });
                             } else {
@@ -2611,14 +2946,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         }
                         Some(action) if expression_mode && action.kind() == "block" => {
                             let missing_yield = self.point(builder, action, Vec::new())?;
-                            self.add_gap(
-                                builder,
-                                missing_yield,
-                                SemanticGapSubject::Point,
-                                SemanticCapability::NormalControlFlow,
-                                SemanticGapKind::Unsupported,
-                                "switch-expression block rule can complete without a represented yield",
-                            )?;
+                            // A block that ends in `yield` or `throw` cannot
+                            // complete normally, so nothing reaches this point.
+                            if !ends_in_yield_or_throw(Some(action)) {
+                                self.add_gap(
+                                    builder,
+                                    missing_yield,
+                                    SemanticGapSubject::Point,
+                                    SemanticCapability::NormalControlFlow,
+                                    SemanticGapKind::Unsupported,
+                                    "switch-expression block rule can complete without a represented yield",
+                                )?;
+                            }
                             stack.push(Work::Statement {
                                 node: action,
                                 entry: arm_entries[index],
@@ -3973,4 +4312,86 @@ fn try_with_resources_values(node: Node<'_>) -> Vec<Node<'_>> {
                 .or_else(|| first_runtime_named_child(resource))
         })
         .collect()
+}
+
+/// The operands that can decide the value of the left operand of a
+/// short-circuit `&&` or `||`.
+///
+/// `condition` splits a nested `&&`, `||`, conditional expression, or
+/// parenthesized expression into control edges and never evaluates the nested
+/// node as a value, so only its leaves have values to flow from. A literal
+/// `true` or `false` is folded away and contributes no operand.
+fn short_circuit_decider_leaves(operand: Node<'_>) -> Vec<Node<'_>> {
+    let mut leaves = Vec::new();
+    let mut pending = vec![operand];
+    while let Some(node) = pending.pop() {
+        match (node.kind(), binary_operator(node)) {
+            ("true" | "false", _) => {}
+            ("parenthesized_expression", _) => pending.extend(first_named_child(node)),
+            ("binary_expression", Some("&&" | "||")) => {
+                pending.extend(node.child_by_field_name("right"));
+                pending.extend(node.child_by_field_name("left"));
+            }
+            ("ternary_expression", _) => {
+                pending.extend(node.child_by_field_name("alternative"));
+                pending.extend(node.child_by_field_name("consequence"));
+            }
+            _ => leaves.push(node),
+        }
+    }
+    leaves
+}
+
+/// Whether `statement`, the last statement of a switch-expression rule block
+/// or statement group, completes abruptly whenever control reaches it. A rule
+/// block or last group that can complete normally is a compile-time error
+/// (JLS 15.28.1), so such a statement means the fall-off-the-end path has no
+/// predecessor.
+///
+/// The answer is `true` only when every path ends in `yield` or `throw`, so
+/// the walk follows a block's last statement, both branches of an `if` with an
+/// `else`, and the body and every `catch` of a `try`. A `finally` that itself
+/// cannot complete normally is not credited. Anything else stays unproven.
+fn ends_in_yield_or_throw(statement: Option<Node<'_>>) -> bool {
+    let Some(statement) = statement else {
+        return false;
+    };
+    let mut pending = vec![statement];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "yield_statement" | "throw_statement" => {}
+            "block" => match named_children(node).last() {
+                Some(last) => pending.push(*last),
+                None => return false,
+            },
+            "if_statement" => {
+                let (Some(consequence), Some(alternative)) = (
+                    node.child_by_field_name("consequence"),
+                    node.child_by_field_name("alternative"),
+                ) else {
+                    return false;
+                };
+                pending.push(consequence);
+                pending.push(alternative);
+            }
+            "try_statement" | "try_with_resources_statement" => {
+                let Some(body) = node.child_by_field_name("body") else {
+                    return false;
+                };
+                pending.push(body);
+                pending.extend(
+                    named_children(node)
+                        .into_iter()
+                        .filter(|child| child.kind() == "catch_clause")
+                        .filter_map(|catch| catch.child_by_field_name("body")),
+                );
+            }
+            "synchronized_statement" => match node.child_by_field_name("body") {
+                Some(body) => pending.push(body),
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }

@@ -1911,7 +1911,11 @@ struct Value : virtual Base {
   int run(const Base *value) const;
   void empty();
 };
-int Value::run(const Base *value) const { return 1; }
+int Value::run(const Base *value) const { namespace local = ns; return 1; }
+namespace root = ::ns;
+#if defined(USE_FAST_VALUE)
+namespace fast = ns::detail;
+#endif
 }
 "#;
         #[test]
@@ -2050,6 +2054,50 @@ int Value::run(const Base *value) const { return 1; }
             assert_eq!(first.facts.includes, expected.includes);
             assert_eq!(first.facts.declarations, expected.declarations);
             assert_eq!(first.facts.using_namespaces, expected.using_namespaces);
+            // Block scope, a global target, a nested target and guards each
+            // cross the relational and JSON columns of the alias rows.
+            let aliases = &expected.namespace_aliases;
+            assert_eq!(
+                aliases
+                    .iter()
+                    .map(|alias| (
+                        alias.name.as_str(),
+                        alias.target.clone(),
+                        alias.target_global,
+                        alias.namespace.clone(),
+                        alias.block.is_some(),
+                        alias.guards.as_ref().map(|guards| guards.is_empty()),
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    (
+                        "local",
+                        Some(vec!["ns".into()]),
+                        false,
+                        vec!["ns".into()],
+                        true,
+                        Some(true)
+                    ),
+                    (
+                        "root",
+                        Some(vec!["ns".into()]),
+                        true,
+                        vec!["ns".into()],
+                        false,
+                        Some(true)
+                    ),
+                    (
+                        "fast",
+                        Some(vec!["ns".into(), "detail".into()]),
+                        false,
+                        vec!["ns".into()],
+                        false,
+                        Some(false),
+                    ),
+                ],
+                "{aliases:?}"
+            );
+            assert_eq!(first.facts.namespace_aliases, expected.namespace_aliases);
             assert!(first.facts.expressions.is_empty());
             assert_eq!(first.facts.statement_facts, Default::default());
             assert_eq!(

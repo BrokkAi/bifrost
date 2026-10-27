@@ -2,6 +2,9 @@
 
 use super::{CodeUnit, IAnalyzer, Project, ProjectFile};
 
+#[doc(hidden)]
+pub mod exact;
+
 pub const MAX_RENAME_IDENTIFIER_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy)]

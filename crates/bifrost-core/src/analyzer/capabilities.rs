@@ -1082,3 +1082,132 @@ where
 
     result
 }
+
+#[cfg(test)]
+mod hierarchy_traversal_properties {
+    use super::*;
+    use crate::analyzer::model::CodeUnitType;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    const NODES: usize = 8;
+
+    fn node(index: usize) -> CodeUnit {
+        CodeUnit::new(
+            ProjectFile::new(std::env::temp_dir(), "Hierarchy.java"),
+            CodeUnitType::Class,
+            "",
+            format!("N{index}"),
+        )
+    }
+
+    fn index_of(unit: &CodeUnit) -> usize {
+        unit.fq_name()[1..].parse().expect("test node name")
+    }
+
+    /// Edge lists may repeat a target, hold self loops and form cycles.
+    fn graphs() -> impl Strategy<Value = Vec<Vec<usize>>> {
+        proptest::collection::vec(proptest::collection::vec(0..NODES, 0..5), NODES)
+    }
+
+    /// Reference by relaxation: `distance[n]` is the fewest edges on a path
+    /// from `root` to `n` that uses at least one edge. This makes the root
+    /// reachable only through a cycle, which is what the traversal reports.
+    fn reference_distances(graph: &[Vec<usize>], root: usize) -> BTreeMap<usize, usize> {
+        let mut distance: BTreeMap<usize, usize> = BTreeMap::new();
+        for &next in &graph[root] {
+            distance.insert(next, 1);
+        }
+        loop {
+            let mut changed = false;
+            for (from, edges) in graph.iter().enumerate() {
+                let Some(&base) = distance.get(&from) else {
+                    continue;
+                };
+                for &to in edges {
+                    if distance.get(&to).is_none_or(|&known| known > base + 1) {
+                        distance.insert(to, base + 1);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return distance;
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// On any graph, cyclic or not, the traversal terminates, returns each
+        /// reachable declaration exactly once in breadth-first order, and asks
+        /// for each declaration's neighbours once (the root twice when a cycle
+        /// returns to it).
+        #[test]
+        fn visits_exactly_the_reachable_set_once_in_breadth_first_order(
+            graph in graphs(),
+            root in 0..NODES,
+        ) {
+            let mut calls: BTreeMap<usize, usize> = BTreeMap::new();
+            let result = traverse_hierarchy(&node(root), |unit| {
+                let id = index_of(unit);
+                *calls.entry(id).or_default() += 1;
+                graph[id].iter().map(|&to| node(to)).collect()
+            });
+            let found: Vec<usize> = result.iter().map(index_of).collect();
+
+            let distance = reference_distances(&graph, root);
+            let unique: BTreeSet<usize> = found.iter().copied().collect();
+            prop_assert_eq!(found.len(), unique.len(), "a declaration was returned twice: {:?}", found);
+            prop_assert_eq!(unique, distance.keys().copied().collect::<BTreeSet<_>>());
+            prop_assert!(
+                found.windows(2).all(|pair| distance[&pair[0]] <= distance[&pair[1]]),
+                "not breadth-first: {:?} with distances {:?}", found, distance
+            );
+            // The root is not in the seen set when the walk starts, so a cycle
+            // back to it expands it a second time; every other node once.
+            prop_assert!(
+                calls.iter().all(|(&id, &count)| count == 1 || (id == root && count == 2)),
+                "repeated expansion: {:?}", calls
+            );
+
+            // The deadline-aware variant agrees when never cancelled.
+            let live = CancellationToken::new();
+            let guarded = traverse_hierarchy_while(&node(root), &live, |unit| {
+                Some(graph[index_of(unit)].iter().map(|&to| node(to)).collect())
+            });
+            prop_assert_eq!(guarded, Some(result));
+        }
+
+        /// A failed neighbour step is propagated, not hidden behind a partial
+        /// answer; a cancelled token stops a traversal that has work left but
+        /// does not disturb one whose root has no neighbours.
+        #[test]
+        fn guarded_traversal_never_returns_a_partial_answer(
+            graph in graphs(),
+            root in 0..NODES,
+            fail_on in 0..NODES,
+        ) {
+            let reachable = reference_distances(&graph, root);
+            let failing = traverse_hierarchy_while(&node(root), &CancellationToken::new(), |unit| {
+                let id = index_of(unit);
+                (id != fail_on).then(|| graph[id].iter().map(|&to| node(to)).collect())
+            });
+            // The failing node's neighbours are requested when it is the root or
+            // is itself returned, so it is only skipped when neither holds.
+            let requested = fail_on == root || reachable.contains_key(&fail_on);
+            prop_assert_eq!(failing.is_none(), requested);
+
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            let stopped = traverse_hierarchy_while(&node(root), &cancelled, |unit| {
+                Some(graph[index_of(unit)].iter().map(|&to| node(to)).collect())
+            });
+            prop_assert_eq!(stopped.is_none(), !graph[root].is_empty());
+            if graph[root].is_empty() {
+                prop_assert_eq!(stopped, Some(Vec::new()));
+            }
+        }
+    }
+}

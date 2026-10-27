@@ -161,6 +161,7 @@ impl SelectedDemandState {
             callable_receiver_dispositions,
             callable_candidate_applicability,
             call_target_boundary,
+            application_completion,
             member_owners,
             member_rejections,
             absent_member,
@@ -240,6 +241,7 @@ impl SelectedDemandState {
             && binding.targets().iter().copied().all(semantic)
             && completion(binding.completion())
             && completion(call_target_boundary)
+            && application_completion.as_ref().is_none_or(completion)
             && binding.witnesses().iter().all(|witness| {
                 semantic(witness.reference())
                     && semantic(witness.target())

@@ -241,3 +241,40 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for CppAdapte
         brokk_bifrost_core::analyzer::common::language_for_file(file).config_label()
     }
 }
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn extensionless_header_retains_the_c_tag_projection() {
+        let source = "struct Outer { struct Nested { int member; } nested; };";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let root = std::env::temp_dir();
+        for path in ["types.h", "fragment"] {
+            let file = ProjectFile::new(root.clone(), path);
+            let (cpp, projections) = CppAdapter.parse_file_with_projections(&file, source, &tree);
+            let [(language, c)] = projections.as_slice() else {
+                panic!("nested tags require a distinct C projection for {path}");
+            };
+            assert_eq!(*language, "cpp:c");
+            let classes = |parsed: &brokk_bifrost_core::analyzer::parsed_file::ParsedFile| {
+                let mut names: Vec<_> = parsed
+                    .declarations()
+                    .iter()
+                    .filter(|u| u.is_class())
+                    .map(|u| u.fq_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            assert_eq!(classes(&cpp), ["Outer", "Outer$Nested"]);
+            assert_eq!(classes(c), ["Nested", "Outer"]);
+        }
+    }
+}

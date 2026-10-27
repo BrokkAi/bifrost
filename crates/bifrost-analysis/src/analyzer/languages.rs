@@ -492,12 +492,12 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
     }
 
     /// Select an effective external member under this language's inheritance rules.
-    fn external_member_declaration<'a>(
+    fn external_member_declaration(
         &self,
-        _overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+        _overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
         _owner_id: &str,
         _member: &str,
-    ) -> Option<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>> {
         None
     }
 
@@ -1821,6 +1821,40 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// Grammar nodes that own ordinary formal parameters. None retains the
+    /// shared legacy grammar table for languages not yet providing this hook.
+    fn formal_parameter_owner_kinds(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+
+    /// The syntax declaration supplying a callable's parameters. Most
+    /// callables write their own list; compact forms may inherit an owner's.
+    fn formal_parameter_source_owner<'tree>(
+        &self,
+        owner: tree_sitter::Node<'tree>,
+        _scope_step: &mut dyn FnMut() -> bool,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        Some(owner)
+    }
+
+    /// A type header can supply constructor formals without making them
+    /// lexical parameters throughout the type's body.
+    fn parameter_owner_has_lexical_bindings(&self, _owner: tree_sitter::Node<'_>) -> bool {
+        true
+    }
+
+    /// A compiler-supplied callable may have exact formals without a written
+    /// callable AST node. A language must prove its source member shape here.
+    fn implicit_callable_parameter_layout(
+        &self,
+        _unit: &CodeUnit,
+        _root: tree_sitter::Node<'_>,
+        _source: &str,
+        _range: &Range,
+    ) -> Option<crate::analyzer::lexical_definitions::FormalParameterLayout> {
+        None
+    }
+
     /// Whether a lexical definition may be resolved from the focused node at all. Rust
     /// says no for struct-field names, whose owning type -- not the enclosing scope --
     /// decides what they denote, so resolving them lexically would answer with the wrong
@@ -1947,6 +1981,17 @@ pub trait LanguageEdgePass: Send + Sync {
         None
     }
 
+    /// Sources this pass omits as explained exclusions while its input stays
+    /// available: files that source admission refused, each with the recorded
+    /// reason object as JSON text. A consumer names each one as partial
+    /// coverage and never treats the missing references as proof of absence.
+    fn excluded_sources(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Whether an FQN-only edge can be a proven relation to a logical callable
     /// family even when no single physical overload is selected. Consumers
     /// retain every candidate endpoint and report the non-exact relation.
@@ -2022,6 +2067,20 @@ impl LanguageGraphBackend {
             Self::Native(provider) => provider.input_failure(analyzer, request_files),
         }
     }
+
+    /// The explained exclusions of whichever backend holds this pass. Every
+    /// consumer that passes [`Self::input_failure`] and claims completeness
+    /// must account for them.
+    #[doc(hidden)]
+    pub fn excluded_sources(
+        self,
+        analyzer: &dyn IAnalyzer,
+    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        match self {
+            Self::Legacy(pass) => pass.excluded_sources(analyzer),
+            Self::Native(provider) => provider.excluded_sources(analyzer),
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -2040,6 +2099,17 @@ pub trait NativeWorkspaceGraphProvider: Send + Sync {
         _request_files: &[ProjectFile],
     ) -> Option<LanguageEdgeFailure> {
         None
+    }
+
+    /// Sources this provider omits as explained exclusions while its input stays
+    /// available: files that source admission refused, each with the recorded
+    /// reason object as JSON text. A consumer names each one as partial
+    /// coverage and never treats the missing references as proof of absence.
+    fn excluded_sources(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+    ) -> crate::analyzer::store::Result<Vec<(ProjectFile, String)>> {
+        Ok(Vec::new())
     }
 
     /// The `callers` whose references this provider could resolve to a
@@ -2201,12 +2271,13 @@ pub fn graph_authority_digest_of(passes: &[EdgePassEntry]) -> StableDigest {
 /// Domain for [`graph_authority_digest`].
 const GRAPH_AUTHORITY_DOMAIN: &[u8] = b"bifrost-language-graph-authority:v1";
 
-/// Every distinct edge pass, deduplicated by [`EdgePassId`] and ordered by
+/// Every active edge pass, deduplicated by [`EdgePassId`] and ordered by
 /// [`EdgePassId::ALL`].
 ///
 /// The shared half of both edge consumers: iterating supports directly would run the
 /// JS/TS pass twice, and deduplicating by ecosystem would collapse the three JVM passes
-/// into one. Ecosystem selection, node-set choice and result conversion stay with each
+/// into one even while they use distinct legacy authorities. Ecosystem selection,
+/// node-set choice and result conversion stay with each
 /// consumer, because those are where the two genuinely differ.
 #[doc(hidden)]
 pub fn edge_passes() -> Vec<EdgePassEntry> {
@@ -2252,7 +2323,11 @@ pub fn edge_passes() -> Vec<EdgePassEntry> {
                 }
             }
         }
-        entries.push(entry.unwrap_or_else(|| panic!("no language owns edge pass {id:?}")));
+        // A shared native provider can replace several legacy pass IDs.
+        // Every language was checked above; an unused ordering slot needs no pass.
+        if let Some(entry) = entry {
+            entries.push(entry);
+        }
     }
     entries
 }

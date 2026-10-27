@@ -156,7 +156,18 @@ mod tests {
     #[brokk_bifrost_test_macros::hardwon(
         "2dfda468a55d: every crate stage must retain its own macro argument overlay"
     )]
+    #[hardwon("#5671: language wrappers dropped replayed worker reads")]
     fn native_rust_usage_graph_keeps_every_crate_stage_s_macro_argument_edges() {
+        for workers in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| check_crate_stage_macro_edges(workers));
+        }
+    }
+
+    fn check_crate_stage_macro_edges(workers: usize) {
         use crate::searchtools::{UsageGraphParams, usage_graph};
 
         let mut project = InlineTestProject::with_language(Language::Rust).file(
@@ -193,16 +204,52 @@ mod tests {
                 );
         }
         let fixture = project.build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
-        let graph = usage_graph(
-            &rust,
-            UsageGraphParams {
-                include_same_owner: false,
-                include_tests: true,
-                paths: None,
-                depth: 1,
-            },
-        );
+        let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig {
+            parallelism: Some(workers),
+            ..Default::default()
+        };
+        let rust = RustAnalyzer::new_with_config(fixture.project_dyn(), config);
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::graph_stage::graph_stage_worker_items_for_test;
+        let worker_items_before = graph_stage_worker_items_for_test();
+        let (graph, reads) =
+            brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(&rust, || {
+                usage_graph(
+                    &rust,
+                    UsageGraphParams {
+                        include_same_owner: false,
+                        include_tests: true,
+                        paths: None,
+                        depth: 1,
+                    },
+                )
+            });
+        if workers == 4 {
+            let dispatched = graph_stage_worker_items_for_test() - worker_items_before;
+            assert!(
+                dispatched >= 2,
+                "Rust graph must run multiple worker items: {dispatched}"
+            );
+            eprintln!("Rust two-crate macro graph: {dispatched} worker items at configured W=4");
+            use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+            use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, ReadLedger};
+            // Replay into a fresh scope after graph execution. This excludes
+            // the original read broadcasts, which would mask a no-op replay.
+            let owner = std::sync::Arc::new(ReadLedger::new());
+            let _scope = AnalyzerQueryScope::with_read_ledger(&rust, owner.clone());
+            assert!(owner.is_empty());
+            brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(&rust, &reads);
+            for path in ["alpha/src/macros.rs", "beta/src/macros.rs"] {
+                assert!(
+                    owner.keys().iter().any(|key| matches!(
+                        key, ReadKey::File { rel_path, .. } if rel_path.as_ref() == path
+                    )),
+                    "worker graph reads must replay through the Rust wrapper: {:?}",
+                    owner.keys()
+                );
+            }
+            assert_eq!(owner.keys(), reads.keys());
+            assert_eq!(owner.unattributed_reads(), reads.unattributed_reads());
+        }
         let reasons: Vec<&str> = graph
             .incomplete_reasons
             .iter()

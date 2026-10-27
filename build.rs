@@ -53,22 +53,34 @@ fn dirty_fingerprint() -> Option<String> {
     (!fingerprint.is_empty()).then_some(fingerprint)
 }
 
+// Cargo treats a rerun-if-changed path that does not exist as changed on every
+// build. Each Cargo command then reran this script and recompiled every target
+// of this package (the library, the binaries and every integration suite), so
+// only existing paths are watched. A branch ref that git has packed has no
+// loose file; the HEAD reflog, which git appends to whenever HEAD moves,
+// catches the commit that writes the loose ref again.
+fn rerun_if_exists(path: &str) {
+    if Path::new(path).exists() {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
 fn main() {
     for input in COMPILED_INPUTS {
-        println!("cargo:rerun-if-changed={input}");
+        rerun_if_exists(input);
     }
-    for git_path in ["HEAD", "index", "packed-refs"] {
+    for git_path in ["HEAD", "logs/HEAD", "index", "packed-refs"] {
         if let Some(path) = git_output(&["rev-parse", "--git-path", git_path]) {
-            println!("cargo:rerun-if-changed={path}");
+            rerun_if_exists(&path);
         }
     }
     if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"])
         && let Some(path) = git_output(&["rev-parse", "--git-path", &reference])
     {
-        println!("cargo:rerun-if-changed={path}");
+        rerun_if_exists(&path);
     }
     println!("cargo:rerun-if-env-changed=BIFROST_BUILD_IDENTITY_OVERRIDE");
-    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
+    rerun_if_exists(".cargo_vcs_info.json");
 
     let identity = std::env::var("BIFROST_BUILD_IDENTITY_OVERRIDE").unwrap_or_else(|_| {
         // The last commit that touched a compiled input, not HEAD. A shallow

@@ -2272,6 +2272,21 @@ mod tests {
             reads: AtomicUsize::new(0),
         };
         let expected = ProjectSourceSnapshot::disk("class Custom {}");
+        // Pin the snapshot's fields against independent values first, so the
+        // comparisons below cannot pass on a `disk` that builds the same wrong
+        // snapshot twice. The oid is the git blob id of the same bytes, from
+        // `printf 'class Custom {}' | git hash-object --stdin`.
+        assert_eq!(expected.source(), "class Custom {}");
+        assert_eq!(
+            expected.oid(),
+            Oid::from_str("fb6c358aff440a7e0edb6ea631eecf20eb56f166").unwrap()
+        );
+        assert_eq!(expected.origin(), ProjectSourceOrigin::Disk);
+        assert_ne!(
+            expected.oid(),
+            ProjectSourceSnapshot::disk("class Disk {}").oid(),
+            "different texts must have different content identities"
+        );
         assert_eq!(project.read_source_snapshot(&file).unwrap(), expected);
         assert_eq!(project.reads.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -2530,6 +2545,35 @@ mod tests {
         assert_eq!(project.workspace_file_listing_count(), 1);
     }
 
+    /// Invalidation must also drop the cached `.bifrostignore` matcher, or the
+    /// project keeps answering from the rules it read before the edit. The
+    /// oracle is the rule file on disk after the edit.
+    #[test]
+    fn invalidation_rereads_edited_bifrostignore_rules() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        write_file(&root, ".bifrostignore", "vendor/\n");
+        let kept = write_file(&root, "a.rs", "fn a() {}\n");
+        let vendored = write_file(&root, "vendor/x.rs", "fn x() {}\n");
+        let project = FilesystemProject::new(&root).unwrap();
+
+        assert!(project.is_bifrostignored(Path::new("vendor/x.rs")));
+        assert_eq!(
+            BTreeSet::from([kept.clone()]),
+            project.analyzable_files(Language::Rust).unwrap()
+        );
+
+        write_file(&root, ".bifrostignore", "a.rs\n");
+        project.invalidate_cached_file_listing();
+
+        assert!(!project.is_bifrostignored(Path::new("vendor/x.rs")));
+        assert!(project.is_bifrostignored(Path::new("a.rs")));
+        assert_eq!(
+            BTreeSet::from([vendored]),
+            project.analyzable_files(Language::Rust).unwrap()
+        );
+    }
+
     /// `is_bifrostignored` answers one path per call and callers ask it per
     /// path across a whole revision, so its cost must not include a
     /// whole-workspace listing once the ignore matcher exists. On a
@@ -2558,6 +2602,154 @@ mod tests {
             1,
             "the ignore matcher is built from one listing and answers every later question itself"
         );
+    }
+
+    /// `.bifrostignore` uses gitignore syntax, so Git is the oracle: the same
+    /// tree is listed by `git ls-files --others --exclude-per-directory`
+    /// naming `.bifrostignore` as the per-directory ignore file, and every
+    /// answer the project gives must agree with it.
+    ///
+    /// The rules cover a leading byte-order mark, negation and last match
+    /// wins, a negation that cannot re-include a file under an excluded
+    /// directory, directory-only rules next to a regular file of the same
+    /// name, anchored and middle-slash rules, `**` globs, a nested ignore file
+    /// whose whitelist overrides the root rule, and a directory that is named
+    /// `.bifrostignore` (Git reads no rules from it, and neither may we).
+    #[test]
+    fn bifrostignore_answers_agree_with_git_on_a_rule_family() {
+        const ROOT_RULES: &str = concat!(
+            "\u{feff}vendor/\n",
+            "!vendor/keep.rs\n",
+            "*.gen.rs\n",
+            "!keep.gen.rs\n",
+            "/anchored.rs\n",
+            "lib/inner.rs\n",
+            "docs/**/*.rs\n",
+            "**/cache/\n",
+            "out/\n",
+            "tmp.rs/\n",
+            "build\n",
+        );
+        const SUB_RULES: &str = "!kept.gen.rs\n/local.rs\n";
+        const TREE: [&str; 26] = [
+            "a.rs",
+            "vendor/x.rs",
+            "vendor/keep.rs",
+            "one.gen.rs",
+            "keep.gen.rs",
+            "sub/kept.gen.rs",
+            "sub/dropped.gen.rs",
+            "sub/local.rs",
+            "sub/deeper/local.rs",
+            "anchored.rs",
+            "src/anchored.rs",
+            "lib/inner.rs",
+            "src/lib/inner.rs",
+            "docs/a.rs",
+            "docs/x/y/b.rs",
+            "docs/readme.md",
+            "cache/a.rs",
+            "deep/cache/b.rs",
+            "out",
+            "src/out/x.rs",
+            "tmp.rs",
+            "nested/tmp.rs/inner.rs",
+            "build",
+            "tools/build/x.rs",
+            "docs2/a.rs",
+            "sub/.bifrostignore",
+        ];
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        write_file(&root, BIFROST_IGNORE_FILE_NAME, ROOT_RULES);
+        for rel in TREE {
+            if rel != "sub/.bifrostignore" {
+                write_file(&root, rel, "fn f() {}\n");
+            }
+        }
+        write_file(&root, "sub/.bifrostignore", SUB_RULES);
+        std::fs::create_dir_all(root.join("docs2").join(BIFROST_IGNORE_FILE_NAME)).unwrap();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "-q", "."]);
+        let listed = git(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-per-directory=.bifrostignore",
+        ]);
+        let git_kept: BTreeSet<PathBuf> = String::from_utf8(listed)
+            .unwrap()
+            .split('\0')
+            .filter(|rel| !rel.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        // Guard against a vacuous oracle: Git must have read the rules.
+        assert!(!git_kept.contains(Path::new("vendor/x.rs")), "{git_kept:?}");
+        assert!(
+            git_kept.contains(Path::new("sub/kept.gen.rs")),
+            "{git_kept:?}"
+        );
+
+        let project = FilesystemProject::new(&root).unwrap();
+        let disagreements: Vec<(&str, bool)> = TREE
+            .iter()
+            .map(|rel| (*rel, project.is_bifrostignored(Path::new(rel))))
+            .filter(|(rel, ignored)| *ignored == git_kept.contains(Path::new(rel)))
+            .collect();
+        assert!(
+            disagreements.is_empty(),
+            "is_bifrostignored disagrees with git on {disagreements:?}; git kept {git_kept:?}"
+        );
+
+        let all_files = project.all_files().unwrap();
+        let expected: BTreeSet<ProjectFile> = all_files
+            .iter()
+            .filter(|file| file.language() == Language::Rust)
+            .filter(|file| git_kept.contains(file.rel_path()))
+            .cloned()
+            .collect();
+        assert_eq!(expected, project.analyzable_files(Language::Rust).unwrap());
+        assert_eq!(
+            expected,
+            project
+                .analyzable_files_from(&all_files, Language::Rust)
+                .unwrap()
+        );
+    }
+
+    /// Git reads ignore files as bytes, but `.bifrostignore` rules must be
+    /// UTF-8, so here Bifrost deliberately differs from Git. Rules that cannot
+    /// be read must not be taken for "no rules": the analyzable listing fails
+    /// with the read error instead of analyzing files the user excluded. The
+    /// single-path probe returns a bool and answers "not ignored", which is its
+    /// documented fail-open choice; answering "ignored" would make an overlay
+    /// drop every buffer.
+    #[test]
+    fn unreadable_bifrostignore_fails_listing_and_ignores_nothing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        write_file(&root, "a.rs", "fn a() {}\n");
+        std::fs::write(root.join(BIFROST_IGNORE_FILE_NAME), b"vendor/\n\xff\xfe\n").unwrap();
+
+        let project = FilesystemProject::new(&root).unwrap();
+        assert!(!project.is_bifrostignored(Path::new("a.rs")));
+        let error = project.analyzable_files(Language::Rust).unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidData, error.kind(), "{error}");
     }
 
     #[test]
@@ -2609,6 +2801,46 @@ mod tests {
         assert!(
             !persistence_root.exists(),
             "constructing a project must not create cache directories"
+        );
+    }
+
+    /// Sibling roots share their parent as the workspace root, and every file
+    /// is listed relative to it. The oracle is the directory layout the test
+    /// builds. The three-root case nests two roots one level deeper than the
+    /// third, and the third sorts last, so only the last root lifts the
+    /// ancestor from `group` to the parent.
+    #[test]
+    fn multi_root_project_roots_sibling_folders_at_their_parent() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().canonicalize().unwrap().normalize();
+        let cache_root = parent.join("machine-cache");
+
+        let a = write_file(&parent, "service-a/a.rs", "fn a() {}\n");
+        let b = write_file(&parent, "service-b/b.rs", "fn b() {}\n");
+        let two = MultiRootProject::with_cache_root(
+            [parent.join("service-a"), parent.join("service-b")],
+            cache_root.clone(),
+        )
+        .unwrap();
+        assert_eq!(two.root(), parent.as_path());
+        assert_eq!(BTreeSet::from([a, b]), two.all_files().unwrap());
+
+        let grouped_a = write_file(&parent, "group/x/x.rs", "fn x() {}\n");
+        let grouped_b = write_file(&parent, "group/y/y.rs", "fn y() {}\n");
+        let lone = write_file(&parent, "lone/z.rs", "fn z() {}\n");
+        let three = MultiRootProject::with_cache_root(
+            [
+                parent.join("group").join("x"),
+                parent.join("group").join("y"),
+                parent.join("lone"),
+            ],
+            cache_root,
+        )
+        .unwrap();
+        assert_eq!(three.root(), parent.as_path());
+        assert_eq!(
+            BTreeSet::from([grouped_a, grouped_b, lone]),
+            three.all_files().unwrap()
         );
     }
 

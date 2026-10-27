@@ -918,8 +918,9 @@ fn semantic_model_source_outcome_with_anchor(
     }
     if records.is_empty() {
         records = overlay
-            .symbols()
-            .iter()
+            .symbols_named(symbol)
+            .records
+            .into_iter()
             .filter(|model| model.qualified_name == symbol)
             .collect();
     }
@@ -941,7 +942,7 @@ fn semantic_model_source_outcome_with_anchor(
     };
     match disposition {
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
-            let model = records[0];
+            let model = &records[0];
             match &model.location {
                 brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelLocation::Model(_) => {
                     let blocks = vec![semantic_model_source_block(model)];

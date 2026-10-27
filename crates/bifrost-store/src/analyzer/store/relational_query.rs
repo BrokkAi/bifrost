@@ -2167,3 +2167,1055 @@ pub mod tests {
         );
     }
 }
+
+/// Batched relational lookups against a populated store.
+///
+/// The fixture writes rows the way the parse-time writer does (one
+/// `code_units` row and its `code_unit_fq_segments` per declaration, built
+/// from `prepare_unit_fq`) and publishes a workspace snapshot through the
+/// production snapshot writer. Every expected answer below is written out by
+/// hand from the fixture table. Batches of at least `SET_QUERY_MIN_REQUESTS`
+/// requests take the set-oriented SQL, and each batched answer must also equal
+/// the answer the same request gets alone, which takes the point-query SQL.
+#[cfg(test)]
+mod batched_query_tests {
+    use std::path::PathBuf;
+
+    use brokk_bifrost_core::CancellationToken;
+    use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+    use brokk_bifrost_core::analyzer::{
+        DefinitionLanguageScope, PackageRelationKind, PackageRelationValue,
+        RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+        RelationalName,
+    };
+    use git2::Oid;
+    use rusqlite::params;
+
+    use super::{AnalyzerStore, RelationalStoreOutcome, SET_QUERY_MIN_REQUESTS, live_unit_counts};
+    use crate::analyzer::store::{
+        GenerationId, PathSymbolRow, StoreLanguageAdapter, WorkspaceAnchorRow, WorkspaceFileRow,
+        WorkspacePackageEdgeRow, WorkspacePackageFileRow, WorkspaceSnapshots,
+        code_unit_kind_to_i64, prepare_unit_fq, test_blob_oid,
+    };
+    use crate::analyzer::{
+        CodeUnit, CodeUnitType, Language, PackageAnchor, ProjectFile, sort_units,
+    };
+    use crate::hash::HashMap;
+
+    const P: SegmentKind = SegmentKind::Package;
+    const T: SegmentKind = SegmentKind::Type;
+    const M: SegmentKind = SegmentKind::Member;
+    const N: SegmentKind = SegmentKind::Nested;
+    const U: SegmentKind = SegmentKind::Unknown;
+    const PADDING_UNITS: usize = 70;
+
+    fn fq(parts: &[(&str, SegmentKind)]) -> FqName {
+        let interner = segment_interner();
+        let mut name = FqName::new();
+        for (text, kind) in parts {
+            name.push(interner.intern(text, *kind));
+        }
+        name
+    }
+
+    /// A Java-like adapter with the three hooks the relational reader
+    /// consults: a normalization that spells `$`-nested types as ordinary
+    /// types, a package anchor that mounts every file under `anchored/` at its
+    /// own package, and path-derived module units for the files it lists.
+    struct FixtureAdapter {
+        path_units: Vec<CodeUnit>,
+    }
+
+    impl StoreLanguageAdapter for FixtureAdapter {
+        fn language(&self) -> Language {
+            Language::Java
+        }
+
+        fn normalize_fq_name(&self, name: &FqName) -> FqName {
+            let interner = segment_interner();
+            let mut normalized = FqName::new();
+            for (text, kind) in name.resolved_segments() {
+                let kind = if kind == N { T } else { kind };
+                normalized.push(interner.intern(text, kind));
+            }
+            normalized
+        }
+
+        fn default_package_anchor(&self) -> Option<PackageAnchor> {
+            Some(PackageAnchor::OwnModule { pop: 0 })
+        }
+
+        fn resolve_package_anchor(
+            &self,
+            _anchor: PackageAnchor,
+            content_qualifier: &str,
+            file: &ProjectFile,
+        ) -> Option<FqName> {
+            file.rel_path()
+                .starts_with("anchored")
+                .then(|| fq(&[(content_qualifier, P)]))
+        }
+
+        fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+            self.path_units
+                .iter()
+                .find(|unit| unit.source() == file)
+                .cloned()
+        }
+
+        fn has_path_synthetic_module_units(&self) -> bool {
+            true
+        }
+    }
+
+    /// One stored declaration row and the start bytes of its ranges.
+    struct Row {
+        unit: CodeUnit,
+        starts: Vec<usize>,
+    }
+
+    struct Blob {
+        lang: &'static str,
+        rel_path: &'static str,
+        oid: Oid,
+        rows: Vec<Row>,
+        /// Whether the workspace snapshot lists this blob's file.
+        in_workspace: bool,
+        /// Whether the blob was ever parsed into the store.
+        parsed: bool,
+    }
+
+    struct Units {
+        widget: CodeUnit,
+        run_a: CodeUnit,
+        inner: CodeUnit,
+        size: CodeUnit,
+        run_b: CodeUnit,
+        mounted: CodeUnit,
+        go: CodeUnit,
+        alpha: CodeUnit,
+        pads: Vec<CodeUnit>,
+    }
+
+    struct Fixture {
+        store: AnalyzerStore,
+        adapter: FixtureAdapter,
+        root: PathBuf,
+        snapshots: WorkspaceSnapshots,
+        generations: HashMap<String, GenerationId>,
+        languages: Vec<String>,
+        units: Units,
+        blobs: Vec<Blob>,
+    }
+
+    fn root() -> PathBuf {
+        std::env::temp_dir().join("bifrost-relational-batch-fixture")
+    }
+
+    fn unit(
+        rel_path: &str,
+        kind: CodeUnitType,
+        parts: &[(&str, SegmentKind)],
+        package_segments: usize,
+    ) -> CodeUnit {
+        CodeUnit::from_fq(
+            ProjectFile::new(root(), rel_path),
+            kind,
+            fq(parts),
+            package_segments,
+            None,
+            false,
+        )
+    }
+
+    fn row(unit: &CodeUnit, starts: &[usize]) -> Row {
+        Row {
+            unit: unit.clone(),
+            starts: starts.to_vec(),
+        }
+    }
+
+    fn insert_blob(conn: &rusqlite::Connection, adapter: &FixtureAdapter, blob: &Blob) {
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 0)",
+            params![blob.oid.to_string(), blob.lang],
+        )
+        .unwrap();
+        let blob_id = conn.last_insert_rowid();
+        let range_count = blob.rows.iter().map(|row| row.starts.len()).sum::<usize>();
+        conn.execute(
+            "INSERT INTO blob_meta(
+               blob_id, lang, contains_tests, content_package, stored_unit_count,
+               range_count, signature_count, signature_metadata_count, supertype_count,
+               child_count, import_statement_count, type_identifier_count, is_complete
+             ) VALUES(?1, ?2, 0, '', ?3, ?4, 0, 0, 0, 0, 0, 0, 1)",
+            params![blob_id, blob.lang, blob.rows.len(), range_count],
+        )
+        .unwrap();
+        for (unit_key, row) in blob.rows.iter().enumerate() {
+            let unit = &row.unit;
+            let qualifier = adapter.storage_content_qualifier(unit, "");
+            let prepared = prepare_unit_fq(adapter, unit, &qualifier)
+                .unwrap()
+                .expect("fixture units have a structured name");
+            let segment_bytes = prepared
+                .segments
+                .iter()
+                .map(|(_, kind, text)| kind.len() + text.len())
+                .sum::<usize>();
+            conn.execute(
+                "INSERT INTO code_units(
+                   blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
+                   simple_type_name, signature, synthetic, is_type_alias, top_level_ordinal,
+                   in_declarations, in_definition_lookup, fq_anchor_kind, fq_anchor_pop,
+                   fq_package_tail_segments, exact_fqn_tail, normalized_fqn_tail,
+                   exact_parent_fqn_tail, normalized_parent_fqn_tail, package_fqn_tail,
+                   fq_segment_count, fq_segment_bytes
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0, 0, NULL, 1, 1, ?9, ?10,
+                          ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                params![
+                    blob_id,
+                    blob.lang,
+                    unit_key,
+                    code_unit_kind_to_i64(unit.kind()),
+                    unit.short_name(),
+                    unit.identifier(),
+                    qualifier,
+                    unit.is_class().then(|| adapter.simple_type_name(unit)),
+                    prepared.anchor_kind,
+                    prepared.anchor_pop,
+                    prepared.package_tail_segments,
+                    prepared.exact_tail,
+                    prepared.normalized_tail,
+                    prepared.exact_parent_tail,
+                    prepared.normalized_parent_tail,
+                    prepared.package_tail,
+                    prepared.segments.len(),
+                    segment_bytes,
+                ],
+            )
+            .unwrap();
+            for (ordinal, kind, text) in &prepared.segments {
+                conn.execute(
+                    "INSERT INTO code_unit_fq_segments(
+                       blob_id, lang, unit_key, seg_ordinal, seg_kind, segment
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![blob_id, blob.lang, unit_key, ordinal, kind, text],
+                )
+                .unwrap();
+            }
+            for (ordinal, start) in row.starts.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO unit_ranges(
+                       blob_id, lang, unit_key, ordinal, start_byte, end_byte, start_line,
+                       end_line
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, 0)",
+                    params![blob_id, blob.lang, unit_key, ordinal, start, start + 1],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// The fixture, by file:
+    ///
+    /// - `src/demo/Widget.java`: `demo.Widget`, `demo.Widget.run` stored twice
+    ///   (two rows, one declaration, ranges at 40 and 12), `demo.Widget$Inner`
+    ///   and `demo.Widget.size` (no ranges).
+    /// - `src/demo/Other.java`: a second `demo.Widget.run`.
+    /// - `anchored/Mounted.java`: `mnt.Mounted` and `mnt.Mounted.go`, stored
+    ///   as tails under the workspace anchor `mnt`.
+    /// - `pad/Pad.java`: `pad.Pad0` .. `pad.Pad69`, so a batch can be smaller
+    ///   or larger than the live unit count.
+    /// - `paths/alpha.java`: no rows, one path-derived module `paths.alpha`.
+    /// - `src/demo/util/Helper.java`: no rows, package `demo.util`.
+    /// - `src/gone/Gone.java`: listed in the workspace, never parsed.
+    /// - a parsed blob holding `demo.Widget.run` that no workspace file lists.
+    /// - a Kotlin blob holding `demo.Widget.run`, live for Kotlin only.
+    fn fixture() -> Fixture {
+        let root = root();
+        let widget_path = "src/demo/Widget.java";
+        let units = Units {
+            widget: unit(
+                widget_path,
+                CodeUnitType::Class,
+                &[("demo", P), ("Widget", T)],
+                1,
+            ),
+            run_a: unit(
+                widget_path,
+                CodeUnitType::Function,
+                &[("demo", P), ("Widget", T), ("run", M)],
+                1,
+            ),
+            inner: unit(
+                widget_path,
+                CodeUnitType::Class,
+                &[("demo", P), ("Widget", T), ("Inner", N)],
+                1,
+            ),
+            size: unit(
+                widget_path,
+                CodeUnitType::Field,
+                &[("demo", P), ("Widget", T), ("size", M)],
+                1,
+            ),
+            run_b: unit(
+                "src/demo/Other.java",
+                CodeUnitType::Function,
+                &[("demo", P), ("Widget", T), ("run", M)],
+                1,
+            ),
+            mounted: unit(
+                "anchored/Mounted.java",
+                CodeUnitType::Class,
+                &[("mnt", P), ("Mounted", T)],
+                1,
+            ),
+            go: unit(
+                "anchored/Mounted.java",
+                CodeUnitType::Function,
+                &[("mnt", P), ("Mounted", T), ("go", M)],
+                1,
+            ),
+            alpha: CodeUnit::from_fq(
+                ProjectFile::new(root.clone(), "paths/alpha.java"),
+                CodeUnitType::Module,
+                fq(&[("paths", P), ("alpha", P)]),
+                1,
+                None,
+                true,
+            ),
+            pads: (0..PADDING_UNITS)
+                .map(|index| {
+                    let name = format!("Pad{index}");
+                    unit(
+                        "pad/Pad.java",
+                        CodeUnitType::Class,
+                        &[("pad", P), (name.as_str(), T)],
+                        1,
+                    )
+                })
+                .collect(),
+        };
+        let blob = |lang, rel_path, rows, in_workspace, parsed| Blob {
+            lang,
+            rel_path,
+            oid: test_blob_oid(format!("{lang}:{rel_path}:{in_workspace}")),
+            rows,
+            in_workspace,
+            parsed,
+        };
+        let stale_run = unit(
+            "src/demo/Stale.java",
+            CodeUnitType::Function,
+            &[("demo", P), ("Widget", T), ("run", M)],
+            1,
+        );
+        let kotlin_run = unit(
+            "src/demo/Widget.kt",
+            CodeUnitType::Function,
+            &[("demo", P), ("Widget", T), ("run", M)],
+            1,
+        );
+        let blobs = vec![
+            blob(
+                "java",
+                widget_path,
+                vec![
+                    row(&units.widget, &[0]),
+                    row(&units.run_a, &[40]),
+                    row(&units.run_a, &[12]),
+                    row(&units.inner, &[20]),
+                    row(&units.size, &[]),
+                ],
+                true,
+                true,
+            ),
+            blob(
+                "java",
+                "src/demo/Other.java",
+                vec![row(&units.run_b, &[7])],
+                true,
+                true,
+            ),
+            blob(
+                "java",
+                "anchored/Mounted.java",
+                vec![row(&units.mounted, &[1]), row(&units.go, &[3])],
+                true,
+                true,
+            ),
+            blob(
+                "java",
+                "pad/Pad.java",
+                units.pads.iter().map(|pad| row(pad, &[])).collect(),
+                true,
+                true,
+            ),
+            blob("java", "paths/alpha.java", Vec::new(), true, true),
+            blob("java", "src/demo/util/Helper.java", Vec::new(), true, true),
+            blob("java", "src/gone/Gone.java", Vec::new(), true, false),
+            blob(
+                "java",
+                "src/demo/Stale.java",
+                vec![row(&stale_run, &[0])],
+                false,
+                true,
+            ),
+            blob(
+                "kotlin",
+                "src/demo/Widget.kt",
+                vec![row(&kotlin_run, &[0])],
+                true,
+                true,
+            ),
+        ];
+        let adapter = FixtureAdapter {
+            path_units: vec![units.alpha.clone()],
+        };
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            for blob in blobs.iter().filter(|blob| blob.parsed) {
+                insert_blob(&conn, &adapter, blob);
+            }
+        }
+        let oid_of = |rel_path: &str| {
+            blobs
+                .iter()
+                .find(|blob| blob.rel_path == rel_path)
+                .unwrap()
+                .oid
+        };
+        let mut snapshots = WorkspaceSnapshots::default();
+        for lang in ["java", "kotlin"] {
+            let files = blobs
+                .iter()
+                .filter(|blob| blob.lang == lang && blob.in_workspace)
+                .map(|blob| WorkspaceFileRow {
+                    rel_path: blob.rel_path.to_string(),
+                    blob_oid: blob.oid,
+                })
+                .collect::<Vec<_>>();
+            let java = lang == "java";
+            let path_symbols = java
+                .then(|| PathSymbolRow {
+                    rel_path: "paths/alpha.java".to_string(),
+                    blob_oid: oid_of("paths/alpha.java"),
+                    kind: CodeUnitType::Module,
+                    package_name: "paths".to_string(),
+                    short_name: "alpha".to_string(),
+                    exact_fqn: "paths.alpha".to_string(),
+                    normalized_fqn: "paths.alpha".to_string(),
+                    requires_imports: false,
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let member = |package_name: &str, rel_path: &str| WorkspacePackageFileRow {
+                package_name: package_name.to_string(),
+                rel_path: rel_path.to_string(),
+            };
+            let package_files = if java {
+                vec![
+                    member("demo", widget_path),
+                    member("demo", "src/demo/Other.java"),
+                    member("mnt", "anchored/Mounted.java"),
+                    member("pad", "pad/Pad.java"),
+                    member("paths", "paths/alpha.java"),
+                    member("demo.util", "src/demo/util/Helper.java"),
+                    member("gone", "src/gone/Gone.java"),
+                ]
+            } else {
+                vec![member("demo", "src/demo/Widget.kt")]
+            };
+            let package_edges = if java {
+                vec![
+                    WorkspacePackageEdgeRow {
+                        rel_path: widget_path.to_string(),
+                        parent_package_name: String::new(),
+                        child_package_name: "demo".to_string(),
+                    },
+                    WorkspacePackageEdgeRow {
+                        rel_path: "src/demo/util/Helper.java".to_string(),
+                        parent_package_name: "demo".to_string(),
+                        child_package_name: "demo.util".to_string(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let anchors = java
+                .then(|| WorkspaceAnchorRow {
+                    rel_path: "anchored/Mounted.java".to_string(),
+                    anchor: PackageAnchor::OwnModule { pop: 0 },
+                    package_name: "mnt".to_string(),
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let snapshot = store
+                .sync_workspace_snapshot(
+                    lang,
+                    GenerationId::BOOTSTRAP,
+                    &files,
+                    &path_symbols,
+                    &[],
+                    &package_files,
+                    &package_edges,
+                    &anchors,
+                )
+                .unwrap();
+            snapshots.insert(lang.to_string(), snapshot);
+        }
+        Fixture {
+            store,
+            adapter,
+            root,
+            snapshots,
+            generations: HashMap::from_iter([
+                ("java".to_string(), GenerationId::BOOTSTRAP),
+                ("kotlin".to_string(), GenerationId::BOOTSTRAP),
+            ]),
+            languages: vec!["java".to_string()],
+            units,
+            blobs,
+        }
+    }
+
+    impl Fixture {
+        fn values(
+            &self,
+            requests: &[RelationalDefinitionRequest],
+        ) -> Vec<RelationalDefinitionValue> {
+            let outcome = self
+                .store
+                .relational_definition_values(
+                    &self.adapter,
+                    &self.root,
+                    &self.generations,
+                    &self.languages,
+                    &self.snapshots,
+                    requests,
+                    &CancellationToken::new(),
+                    |_| {},
+                )
+                .unwrap();
+            match outcome {
+                RelationalStoreOutcome::Complete(values) => values,
+                RelationalStoreOutcome::Cancelled => panic!("an uncancelled batch completes"),
+            }
+        }
+
+        /// Run `cases` as one batch, then each case alone, and compare both
+        /// with the hand-written expectation.
+        fn assert_batch(
+            &self,
+            label: &str,
+            cases: &[(RelationalName, RelationalDefinitionQuery, Vec<CodeUnit>)],
+        ) {
+            let requests = cases
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (name, query, _))| request(ordinal, name, query))
+                .collect::<Vec<_>>();
+            let batched = self.values(&requests);
+            assert_eq!(batched.len(), cases.len(), "{label}");
+            for ((name, query, expected), value) in cases.iter().zip(batched) {
+                let mut expected = expected.clone();
+                sort_units(&mut expected);
+                assert_eq!(
+                    value,
+                    RelationalDefinitionValue::Definitions(expected),
+                    "{label}: batched {query:?} for {name:?}"
+                );
+                let alone = self.values(&[request(0, name, query)]);
+                assert_eq!(
+                    alone,
+                    vec![value],
+                    "{label}: point and batched answers differ for {query:?} on {name:?}"
+                );
+            }
+        }
+    }
+
+    fn request(
+        ordinal: usize,
+        name: &RelationalName,
+        query: &RelationalDefinitionQuery,
+    ) -> RelationalDefinitionRequest {
+        RelationalDefinitionRequest {
+            ordinal,
+            language_scope: DefinitionLanguageScope::Language(Language::Java),
+            name: name.clone(),
+            query: query.clone(),
+        }
+    }
+
+    fn stable(parts: &[(&str, SegmentKind)]) -> RelationalName {
+        RelationalName::stable(fq(parts))
+    }
+
+    fn mounted(prefix: &str, tail: &[(&str, SegmentKind)]) -> RelationalName {
+        RelationalName::new(fq(&[(prefix, P)]), fq(tail))
+    }
+
+    /// Requests about the interesting rows, padded with one hit per padding
+    /// class until the batch is `size` long.
+    fn padded<F>(
+        mut cases: Vec<(RelationalName, RelationalDefinitionQuery, Vec<CodeUnit>)>,
+        pads: &[CodeUnit],
+        size: usize,
+        pad_case: F,
+    ) -> Vec<(RelationalName, RelationalDefinitionQuery, Vec<CodeUnit>)>
+    where
+        F: Fn(usize, &CodeUnit) -> (RelationalName, RelationalDefinitionQuery, Vec<CodeUnit>),
+    {
+        let mut index = 0;
+        while cases.len() < size {
+            cases.push(pad_case(index, &pads[index % pads.len()]));
+            index += 1;
+        }
+        cases
+    }
+
+    fn live_java_rows(fixture: &Fixture) -> usize {
+        fixture
+            .blobs
+            .iter()
+            .filter(|blob| blob.lang == "java" && blob.in_workspace && blob.parsed)
+            .map(|blob| blob.rows.len())
+            .sum()
+    }
+
+    /// Runs `cases` padded to one batch no larger than the live Java row count
+    /// (the request-driven seek), and then to one larger than it (the
+    /// names-driven scan), where every case appears at least twice.
+    fn assert_seek_and_scan(
+        fixture: &Fixture,
+        label: &str,
+        cases: Vec<(RelationalName, RelationalDefinitionQuery, Vec<CodeUnit>)>,
+        pad_case: impl Fn(
+            usize,
+            &CodeUnit,
+        ) -> (RelationalName, RelationalDefinitionQuery, Vec<CodeUnit>),
+    ) {
+        let live_rows = live_java_rows(fixture);
+        assert!(SET_QUERY_MIN_REQUESTS <= live_rows);
+        let seek = padded(
+            cases,
+            &fixture.units.pads,
+            SET_QUERY_MIN_REQUESTS + 8,
+            &pad_case,
+        );
+        assert!(seek.len() <= live_rows);
+        fixture.assert_batch(&format!("{label} seek"), &seek);
+        let scan = seek.iter().chain(&seek).cloned().collect::<Vec<_>>();
+        assert!(scan.len() > live_rows);
+        fixture.assert_batch(&format!("{label} scan"), &scan);
+    }
+
+    #[test]
+    fn batched_exact_names_match_point_lookups_and_the_fixture() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let exact = RelationalDefinitionQuery::ExactName;
+        let cases = vec![
+            (
+                stable(&[("demo", P), ("Widget", T), ("run", M)]),
+                exact.clone(),
+                vec![u.run_a.clone(), u.run_b.clone()],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T)]),
+                exact.clone(),
+                vec![u.widget.clone()],
+            ),
+            // A user-typed name carries no kind claims; it matches by spelling.
+            (
+                stable(&[("demo", P), ("Widget", U), ("run", M)]),
+                exact.clone(),
+                vec![u.run_a.clone(), u.run_b.clone()],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T), ("Inner", N)]),
+                exact.clone(),
+                vec![u.inner.clone()],
+            ),
+            // Same parent and identifier columns as `Widget$Inner`, but a
+            // different structured name and a different spelling.
+            (
+                stable(&[("demo", P), ("Widget", T), ("Inner", T)]),
+                exact.clone(),
+                Vec::new(),
+            ),
+            (
+                stable(&[("demo", U), ("Widget", U), ("Inner", U)]),
+                exact.clone(),
+                Vec::new(),
+            ),
+            (
+                mounted("mnt", &[("Mounted", T), ("go", M)]),
+                exact.clone(),
+                vec![u.go.clone()],
+            ),
+            // The anchored rows answer only under their mounted prefix.
+            (
+                stable(&[("mnt", P), ("Mounted", T), ("go", M)]),
+                exact.clone(),
+                Vec::new(),
+            ),
+            (
+                stable(&[("paths", P), ("alpha", P)]),
+                exact.clone(),
+                vec![u.alpha.clone()],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T), ("size", M)]),
+                exact.clone(),
+                vec![u.size.clone()],
+            ),
+            (
+                stable(&[("gone", P), ("Gone", T)]),
+                exact.clone(),
+                Vec::new(),
+            ),
+        ];
+        assert_seek_and_scan(&fixture, "exact", cases, |_, pad| {
+            (
+                RelationalName::stable(pad.fq().clone()),
+                RelationalDefinitionQuery::ExactName,
+                vec![pad.clone()],
+            )
+        });
+    }
+
+    #[test]
+    fn batched_normalized_names_match_point_lookups_and_the_fixture() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let normalized = RelationalDefinitionQuery::NormalizedName;
+        let cases = vec![
+            // `Widget$Inner` normalizes to `Widget.Inner`.
+            (
+                stable(&[("demo", P), ("Widget", T), ("Inner", T)]),
+                normalized.clone(),
+                vec![u.inner.clone()],
+            ),
+            (
+                stable(&[("demo", U), ("Widget", U), ("Inner", U)]),
+                normalized.clone(),
+                vec![u.inner.clone()],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T), ("Inner", N)]),
+                normalized.clone(),
+                Vec::new(),
+            ),
+            // Names the normalization leaves unchanged.
+            (
+                stable(&[("demo", P), ("Widget", T), ("run", M)]),
+                normalized.clone(),
+                vec![u.run_a.clone(), u.run_b.clone()],
+            ),
+            (
+                mounted("mnt", &[("Mounted", T), ("go", M)]),
+                normalized.clone(),
+                vec![u.go.clone()],
+            ),
+            (
+                stable(&[("paths", P), ("alpha", P)]),
+                normalized.clone(),
+                vec![u.alpha.clone()],
+            ),
+            (
+                stable(&[("gone", P), ("Gone", T)]),
+                normalized.clone(),
+                Vec::new(),
+            ),
+        ];
+        assert_seek_and_scan(&fixture, "normalized", cases, |_, pad| {
+            (
+                RelationalName::stable(pad.fq().clone()),
+                RelationalDefinitionQuery::NormalizedName,
+                vec![pad.clone()],
+            )
+        });
+    }
+
+    #[test]
+    fn batched_structural_members_match_point_lookups_and_the_fixture() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let member = |identifier: &str| RelationalDefinitionQuery::StructuralMembers {
+            identifier: identifier.to_string(),
+        };
+        let widget = stable(&[("demo", P), ("Widget", T)]);
+        let cases = vec![
+            (
+                widget.clone(),
+                member("run"),
+                vec![u.run_a.clone(), u.run_b.clone()],
+            ),
+            (widget.clone(), member("Inner"), vec![u.inner.clone()]),
+            (widget.clone(), member("missing"), Vec::new()),
+            (
+                mounted("mnt", &[("Mounted", T)]),
+                member("go"),
+                vec![u.go.clone()],
+            ),
+            (
+                stable(&[("paths", P)]),
+                member("alpha"),
+                vec![u.alpha.clone()],
+            ),
+            (stable(&[("paths", P)]), member("beta"), Vec::new()),
+        ];
+        assert_seek_and_scan(&fixture, "structural members", cases, |_, pad| {
+            (
+                stable(&[("pad", P)]),
+                RelationalDefinitionQuery::StructuralMembers {
+                    identifier: pad.identifier().to_string(),
+                },
+                vec![pad.clone()],
+            )
+        });
+    }
+
+    #[test]
+    fn exact_definition_order_rows_report_each_declarations_first_range() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let cases = vec![
+            (
+                stable(&[("demo", P), ("Widget", T), ("run", M)]),
+                vec![(u.run_a.clone(), Some(12)), (u.run_b.clone(), Some(7))],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", U), ("run", M)]),
+                vec![(u.run_a.clone(), Some(12)), (u.run_b.clone(), Some(7))],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T)]),
+                vec![(u.widget.clone(), Some(0))],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T), ("Inner", N)]),
+                vec![(u.inner.clone(), Some(20))],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T), ("Inner", T)]),
+                Vec::new(),
+            ),
+            (
+                mounted("mnt", &[("Mounted", T), ("go", M)]),
+                vec![(u.go.clone(), Some(3))],
+            ),
+            (
+                stable(&[("demo", P), ("Widget", T), ("size", M)]),
+                vec![(u.size.clone(), None)],
+            ),
+            (
+                RelationalName::stable(u.pads[5].fq().clone()),
+                vec![(u.pads[5].clone(), None)],
+            ),
+            (stable(&[("gone", P), ("Gone", T)]), Vec::new()),
+            // A repeated name gets its own complete answer.
+            (
+                stable(&[("demo", P), ("Widget", T), ("run", M)]),
+                vec![(u.run_a.clone(), Some(12)), (u.run_b.clone(), Some(7))],
+            ),
+        ];
+        let order_rows = |names: &[RelationalName]| {
+            fixture
+                .store
+                .relational_exact_definition_order_rows(
+                    &fixture.adapter,
+                    &fixture.root,
+                    &fixture.generations,
+                    &fixture.languages,
+                    &fixture.snapshots,
+                    names,
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .expect("an uncancelled batch completes")
+        };
+        assert!(order_rows(&[]).is_empty());
+        let names = cases
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let rows = order_rows(&names);
+        assert_eq!(rows.len(), cases.len());
+        for ((name, expected), rows) in cases.iter().zip(rows) {
+            let mut actual = rows
+                .into_iter()
+                .map(|row| (row.unit, row.first_start_byte))
+                .collect::<Vec<_>>();
+            actual.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut expected = expected.clone();
+            expected.sort_by(|left, right| left.0.cmp(&right.0));
+            assert_eq!(actual, expected, "definition order rows for {name:?}");
+        }
+    }
+
+    #[test]
+    fn live_unit_counts_sum_rows_of_live_workspace_files_per_language() {
+        let fixture = fixture();
+        let languages = ["java", "kotlin", "python"].map(str::to_string);
+        let mut conn = fixture
+            .store
+            .read_conn_for_workspace(&fixture.snapshots)
+            .unwrap();
+        let tx = conn.transaction().unwrap();
+        let counts = live_unit_counts(&tx, &languages).unwrap();
+        // Java: 5 + 1 + 2 + 70 rows in listed, parsed files; the unlisted
+        // stale blob's row does not count. Kotlin: its one row. Python has no
+        // selected snapshot at all.
+        assert_eq!(
+            counts,
+            HashMap::from_iter([
+                ("java".to_string(), 5 + 1 + 2 + PADDING_UNITS),
+                ("kotlin".to_string(), 1),
+                ("python".to_string(), 0),
+            ])
+        );
+    }
+
+    #[test]
+    fn package_relations_distinguish_member_packages_from_ancestors() {
+        let fixture = fixture();
+        let package = |parts: &[&str]| {
+            RelationalName::stable(fq(&parts.iter().map(|part| (*part, P)).collect::<Vec<_>>()))
+        };
+        let file = |rel_path: &str| ProjectFile::new(fixture.root.clone(), rel_path);
+        let relation = RelationalDefinitionQuery::PackageRelation;
+        let cases = vec![
+            (
+                package(&["demo"]),
+                PackageRelationKind::Files,
+                PackageRelationValue::Files(vec![
+                    file("src/demo/Other.java"),
+                    file("src/demo/Widget.java"),
+                ]),
+            ),
+            (
+                package(&["gone"]),
+                PackageRelationKind::Files,
+                PackageRelationValue::Files(Vec::new()),
+            ),
+            (
+                package(&[]),
+                PackageRelationKind::Children,
+                PackageRelationValue::Packages(vec!["demo".to_string()]),
+            ),
+            (
+                package(&[]),
+                PackageRelationKind::Descendants,
+                PackageRelationValue::Packages(vec!["demo".to_string(), "demo.util".to_string()]),
+            ),
+            (
+                package(&["demo"]),
+                PackageRelationKind::Children,
+                PackageRelationValue::Packages(vec!["demo.util".to_string()]),
+            ),
+            (
+                package(&["demo", "util"]),
+                PackageRelationKind::Descendants,
+                PackageRelationValue::Packages(Vec::new()),
+            ),
+            (
+                package(&["demo"]),
+                PackageRelationKind::Exists,
+                PackageRelationValue::Exists(true),
+            ),
+            (
+                package(&["demo", "util"]),
+                PackageRelationKind::Exists,
+                PackageRelationValue::Exists(true),
+            ),
+            // The root package only has children, and `gone` only has a file
+            // that was never parsed: neither has a live member file.
+            (
+                package(&[]),
+                PackageRelationKind::Exists,
+                PackageRelationValue::Exists(false),
+            ),
+            (
+                package(&["gone"]),
+                PackageRelationKind::Exists,
+                PackageRelationValue::Exists(false),
+            ),
+        ];
+        let requests = cases
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (name, kind, _))| request(ordinal, name, &relation(*kind)))
+            .collect::<Vec<_>>();
+        let values = fixture.values(&requests);
+        for ((name, kind, expected), value) in cases.iter().zip(values) {
+            assert_eq!(
+                value,
+                RelationalDefinitionValue::PackageRelation(expected.clone()),
+                "{kind:?} of {name:?}"
+            );
+            if let PackageRelationValue::Exists(expected) = expected {
+                let rendered = name
+                    .full_name()
+                    .display_native(Language::Java, segment_interner());
+                let direct = fixture
+                    .store
+                    .workspace_package_exists_for_langs(
+                        &fixture.languages,
+                        &fixture.generations,
+                        &fixture.snapshots,
+                        &rendered,
+                    )
+                    .unwrap();
+                assert_eq!(direct, *expected, "direct existence of {rendered:?}");
+            }
+        }
+    }
+}
+
+/// `decorated_identifier_prefix_successor` turns a decorated identifier prefix
+/// (a terminal backtick, as in C# generic arity) into the exclusive upper bound
+/// of a SQLite range. The range
+/// `[prefix, successor)` under SQLite's BINARY collation must hold exactly the
+/// identifiers that start with the prefix.
+#[cfg(test)]
+mod identifier_prefix_properties {
+    use proptest::prelude::*;
+
+    use super::decorated_identifier_prefix_successor;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn successor_bounds_exactly_the_identifiers_that_extend_the_prefix(
+            stem in "[`a_b\u{e9}]{0,4}",
+            kept in 0usize..7,
+            tail in "[`a_b\u{e9}]{0,4}",
+        ) {
+            let prefix = format!("{stem}`");
+            let upper = decorated_identifier_prefix_successor(&prefix);
+            let candidate = prefix.chars().take(kept).chain(tail.chars()).collect::<String>();
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let in_range = conn
+                .query_row(
+                    "SELECT ?1 >= ?2 AND ?1 < ?3",
+                    rusqlite::params![candidate, prefix, upper],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap();
+            prop_assert_eq!(
+                in_range,
+                candidate.starts_with(&prefix),
+                "candidate {:?} against [{:?}, {:?})",
+                candidate,
+                prefix,
+                upper
+            );
+        }
+    }
+}

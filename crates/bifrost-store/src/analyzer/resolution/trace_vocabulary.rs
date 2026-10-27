@@ -12,6 +12,8 @@ use crate::analyzer::ProjectFile;
 
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
+use brokk_bifrost_core::analyzer::structural::callable::FailingArgument;
+use brokk_bifrost_core::analyzer::structural::callable::InvocationPhase;
 
 /// What a trace row points at.
 ///
@@ -137,6 +139,12 @@ pub struct TraceCandidate {
     /// Callable-applicability attribution (#1478), present only when the seam
     /// that recorded the candidate ran the language's own call-shape check.
     pub callable: Option<CallableApplicabilityRecord>,
+    /// The invocation phase whose test decided the callable verdict, present
+    /// only when the seam's language phases its overload resolution.
+    pub invocation_phase: Option<InvocationPhase>,
+    /// The first argument that keeps an inapplicable candidate from its
+    /// deciding phase, when the seam identified it.
+    pub failing_argument: Option<FailingArgument>,
 }
 
 impl TraceCandidate {
@@ -157,6 +165,8 @@ impl TraceCandidate {
             external_target: None,
             member: None,
             callable: None,
+            invocation_phase: None,
+            failing_argument: None,
         }
     }
 
@@ -180,6 +190,8 @@ impl TraceCandidate {
             external_target: None,
             member: None,
             callable: None,
+            invocation_phase: None,
+            failing_argument: None,
         }
     }
 

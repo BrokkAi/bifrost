@@ -186,7 +186,7 @@ pub fn java_expression_lambda_result_use(
                 };
                 let name = java_node_text(invocation.child_by_field_name("name")?, source);
                 let method = models.java_single_instance_method(
-                    receiver,
+                    &receiver,
                     name,
                     remaining_work,
                     cancellation,
@@ -214,7 +214,7 @@ pub fn java_expression_lambda_result_use(
                 {
                     return None;
                 }
-                ResolvedFunctionalTarget::External(target)
+                ResolvedFunctionalTarget::External(target.clone())
             }
             LambdaTarget::Parameter(method, ordinal) => {
                 let ranges = session.ranges(analyzer, &method);
@@ -277,8 +277,8 @@ pub fn java_expression_lambda_result_use(
             match target {
                 ResolvedFunctionalTarget::External(owner) => {
                     let method = models.java_functional_method(
-                        owner,
-                        object,
+                        &owner,
+                        &object,
                         remaining_work,
                         cancellation,
                     )?;
@@ -318,7 +318,7 @@ pub fn java_expression_lambda_result_use(
                             source,
                             root,
                             range,
-                            object,
+                            &object,
                             arity,
                         )
                     };
@@ -375,15 +375,15 @@ pub fn java_expression_lambda_result_use(
     }
 }
 
-enum ResolvedFunctionalTarget<'a> {
-    External(&'a SemanticModelSymbol),
+enum ResolvedFunctionalTarget {
+    External(Arc<SemanticModelSymbol>),
     Source(CodeUnit),
 }
 
-fn selected_symbol<'a>(
-    models: &'a SemanticModelOverlay,
+fn selected_symbol(
+    models: &SemanticModelOverlay,
     ty: &JvmExternalType,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let JvmExternalDeclarationSource::SemanticPack {
         pack_id,
         declaration_id,
@@ -398,7 +398,7 @@ fn selected_symbol<'a>(
     (!symbol.provenance.ambiguous
         && symbol.provenance.pack_id == *pack_id
         && symbol.qualified_name == ty.fqn())
-    .then_some(*symbol)
+    .then_some(symbol.clone())
 }
 
 enum LambdaTarget<'a> {

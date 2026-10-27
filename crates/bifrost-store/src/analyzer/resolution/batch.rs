@@ -2621,6 +2621,12 @@ impl BatchCandidateMatch {
 /// direction flag: forward and reverse candidate indexes have different SQL
 /// shapes.
 pub trait BatchResolutionFragmentSource {
+    /// Session supplied by an engine source wrapper to inventory consumers.
+    /// Plain readers have none and never charge admission themselves.
+    fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
+        None
+    }
+
     /// Content behind one demanded runtime alias. Runtime ordinals and minted
     /// numbers must not enter a derived identity's hash preimage.
     fn identity_content_digest(
@@ -2690,6 +2696,12 @@ pub trait BatchResolutionFragmentSource {
         _cancellation: &CancellationToken,
     ) -> StoreResult<Option<ReferenceLocalPathEvidence>> {
         Ok(None)
+    }
+
+    /// Selected namespace-provider languages. This fixed capability metadata
+    /// performs no reads; an empty default keeps other languages unchanged.
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        Vec::new()
     }
 
     /// The language of a selected source identity (including a typed slot).
@@ -3265,6 +3277,11 @@ impl<'a> SelectedContextPathFragmentSource<'a> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
+    fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
+        self.session
+            .or_else(|| self.base.candidate_admission_session())
+    }
+
     fn identity_content_digest(
         &self,
         key: super::ResolutionIdentityDigestKey,
@@ -3304,6 +3321,10 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
 
     fn supports_go_universe(&self) -> bool {
         self.go_package_inventory_complete.is_some() || self.base.supports_go_universe()
+    }
+
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        self.base.namespace_definition_languages()
     }
 
     fn semantic_language_of(
@@ -4991,6 +5012,11 @@ impl SelectedContextOverlayFragmentSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> {
+    fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
+        self.resolution_session
+            .or_else(|| self.base.candidate_admission_session())
+    }
+
     fn identity_content_digest(
         &self,
         key: super::ResolutionIdentityDigestKey,
@@ -5013,6 +5039,10 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
     fn go_package_inventory_complete_for_fragment(&self, fragment: BindingFragmentId) -> bool {
         self.base
             .go_package_inventory_complete_for_fragment(fragment)
+    }
+
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        self.base.namespace_definition_languages()
     }
 
     fn semantic_language_of(
@@ -6732,6 +6762,19 @@ impl DemandForwardBatchFrame {
                         matched.candidate()
                     ))
                 })?;
+            // Admission is per request/path pair, including already hydrated paths.
+            match super::engine::admit_candidate_pair(
+                engine.resolution_session,
+                parent.path.end(),
+                candidate.start(),
+            ) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    *cancelled = true;
+                    break;
+                }
+            }
             let composition = parent.path.concatenate_with_poll(candidate, &mut || {
                 poll_reverse_completion(cancellation, completion_work)
             });
@@ -7274,6 +7317,10 @@ impl ExperimentalReverseBatchFrame {
         } = self.round.as_mut().expect("prepared reverse page");
         let request_base = *request_base;
         let state_page = &expandable[request_base..request_base + request_page.len()];
+        *cancelled |= !super::engine::charge_candidate_requests(
+            engine.resolution_session,
+            request_page.len(),
+        );
         let mut seen_page_matches = HashSet::default();
         let outcome = engine
             .source
@@ -7497,6 +7544,19 @@ impl ExperimentalReverseBatchFrame {
                     matched.candidate()
                 ))
             })?;
+            // Admission is per request/path pair, including already hydrated paths.
+            match super::engine::admit_candidate_pair(
+                engine.resolution_session,
+                parent.path.start(),
+                candidate.end(),
+            ) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    *cancelled = true;
+                    break;
+                }
+            }
             let composition = candidate.concatenate_with_poll(&parent.path, &mut || {
                 *composition_attempts = composition_attempts
                     .checked_add(1)
@@ -8894,6 +8954,7 @@ pub(super) fn read_forward_candidate_artifacts<S: BatchResolutionFragmentSource 
     ResolutionCompletion,
     Box<[ResolutionCompletion]>,
 )> {
+    *cancelled |= !super::engine::charge_candidate_requests(resolution_session, requests.len());
     let mut candidates_by_request = vec![Vec::new(); requests.len()];
     let mut branch_completions = vec![None; requests.len()];
     let mut hit_requests = Vec::new();
@@ -11234,6 +11295,19 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                                 matched.candidate()
                             ))
                         })?;
+                // Admission is per request/path pair, including already hydrated paths.
+                match super::engine::admit_candidate_pair(
+                    self.resolution_session,
+                    parent.path.end(),
+                    candidate.start(),
+                ) {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => {
+                        cancelled = true;
+                        break;
+                    }
+                }
                 let composition = parent.path.concatenate_with_poll(candidate, &mut || {
                     poll_reverse_completion(cancellation, &mut completion_work)
                 });
@@ -12197,6 +12271,10 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                 if cancelled {
                     break;
                 }
+                cancelled |= !super::engine::charge_candidate_requests(
+                    self.resolution_session,
+                    request_page.len(),
+                );
                 let mut seen_page_matches = HashSet::default();
                 let outcome = self
                     .source
@@ -12410,6 +12488,19 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
                         matched.candidate()
                     ))
                 })?;
+                // Admission is per request/path pair, including already hydrated paths.
+                match super::engine::admit_candidate_pair(
+                    self.resolution_session,
+                    parent.path.start(),
+                    candidate.end(),
+                ) {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => {
+                        cancelled = true;
+                        break;
+                    }
+                }
                 let composition = candidate.concatenate_with_poll(&parent.path, &mut || {
                     composition_attempts = composition_attempts
                         .checked_add(1)
@@ -17188,6 +17279,7 @@ mod tests {
     #[cfg(test)]
     #[test]
     fn bounded_forward_candidate_pages_and_cache_hits_stop_before_publication() {
+        // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
         let fixture = shared_fixture(false);
         let requests = [BatchCandidateRequest::new(0, endpoint(fixture.first_node))];
         let cache_paths = CandidatePathStore::default();
@@ -17231,7 +17323,7 @@ mod tests {
 
         let exact_session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 4,
+                max_scope_nodes: 3,
                 ..ReceiverAnalysisBudget::default()
             },
             Some(&caller),
@@ -17257,7 +17349,7 @@ mod tests {
                 work: ReceiverAnalysisWork {
                     setup_nodes: 0,
                     summary_expansions: 0,
-                    scope_nodes: 4,
+                    scope_nodes: 3,
                     resolution_rounds: 0,
                 },
                 ..
@@ -17266,7 +17358,7 @@ mod tests {
 
         let warm_session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
+                max_scope_nodes: 2,
                 ..ReceiverAnalysisBudget::default()
             },
             Some(&caller),
@@ -17291,7 +17383,7 @@ mod tests {
                 work: ReceiverAnalysisWork {
                     setup_nodes: 0,
                     summary_expansions: 0,
-                    scope_nodes: 1,
+                    scope_nodes: 2,
                     resolution_rounds: 0,
                 },
                 ..
@@ -17302,6 +17394,7 @@ mod tests {
     #[cfg(test)]
     #[test]
     fn bounded_cached_candidate_completion_charges_before_evidence_copy() {
+        // #5671: charge site moved to engine admission; delta = rows the seek over-includes.
         let source = PreloadedFragmentSource::new([], []);
         let endpoint = endpoint(node("bounded-completion-endpoint"));
         let completion = noncanonical_candidate_completion("bounded-completion");
@@ -17363,7 +17456,7 @@ mod tests {
 
         let exact = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 3,
+                max_scope_nodes: 4,
                 ..ReceiverAnalysisBudget::default()
             },
             Some(&caller),
@@ -17390,7 +17483,7 @@ mod tests {
                 work: ReceiverAnalysisWork {
                     setup_nodes: 0,
                     summary_expansions: 0,
-                    scope_nodes: 3,
+                    scope_nodes: 4,
                     resolution_rounds: 0,
                 },
                 ..

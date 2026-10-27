@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 77db74ed43d00cb0b25fc1ef34db79782fa3110ccb8fe1290b6331b096662c76 # shrinks to (selected, site, candidate) = ({0, 3}, Not(All([All([Literal(1)])])), Literal(0)), enabled = 944, described = false

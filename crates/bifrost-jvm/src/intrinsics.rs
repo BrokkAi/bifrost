@@ -147,3 +147,124 @@ pub fn language_root_member_inventory(
         None
     }
 }
+
+/// One method in a JVM rule's fixed inventory. The parentless-interface subset
+/// contains only public instance methods. Parameter lists retain overload
+/// identity; selected providers still supply declaration and applicability
+/// evidence. The interface rule supplies its own declared modifiers.
+#[derive(Debug, Clone, Copy)]
+pub struct JvmImplicitInterfaceMethod {
+    pub name: &'static str,
+    pub parameters: &'static [&'static str],
+    pub returns: &'static str,
+}
+
+/// Language knowledge for an interface's lookup-only member root. Other JVM
+/// languages opt in independently; this is not a nominal inheritance edge.
+#[derive(Debug)]
+pub struct JvmImplicitInterfaceMembers {
+    pub owner: &'static str,
+    pub simple_name: &'static str,
+    pub methods: &'static [JvmImplicitInterfaceMethod],
+    pub visibility: brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility,
+    pub is_abstract: bool,
+}
+
+/// JLS 9.2 implicitly declares Object's public instance methods. Protected
+/// clone/finalize are deliberately absent. No Kotlin/Scala rule is assumed.
+pub fn implicit_interface_members(
+    language: Language,
+) -> Option<&'static JvmImplicitInterfaceMembers> {
+    static JAVA: JvmImplicitInterfaceMembers = JvmImplicitInterfaceMembers {
+        owner: "java.lang.Object",
+        simple_name: "Object",
+        methods: &JAVA_OBJECT_PUBLIC_METHODS,
+        visibility:
+            brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility::Public,
+        is_abstract: true,
+    };
+    match language {
+        Language::Java => Some(&JAVA),
+        _ => None,
+    }
+}
+
+// Object is special because JLS 4.3.2 fixes its members. This is a complete
+// method inventory, not a claim that other JDK declarations are enumerated.
+const JAVA_OBJECT_PUBLIC_METHODS: [JvmImplicitInterfaceMethod; 9] = [
+    JvmImplicitInterfaceMethod {
+        name: "getClass",
+        parameters: &[],
+        returns: "java.lang.Class<?>",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "hashCode",
+        parameters: &[],
+        returns: "int",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "equals",
+        parameters: &["java.lang.Object"],
+        returns: "boolean",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "toString",
+        parameters: &[],
+        returns: "java.lang.String",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "notify",
+        parameters: &[],
+        returns: "void",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "notifyAll",
+        parameters: &[],
+        returns: "void",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "wait",
+        parameters: &[],
+        returns: "void",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "wait",
+        parameters: &["long"],
+        returns: "void",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "wait",
+        parameters: &["long", "int"],
+        returns: "void",
+    },
+];
+const JAVA_OBJECT_METHODS: [JvmImplicitInterfaceMethod; 11] = [
+    JAVA_OBJECT_PUBLIC_METHODS[0],
+    JAVA_OBJECT_PUBLIC_METHODS[1],
+    JAVA_OBJECT_PUBLIC_METHODS[2],
+    JAVA_OBJECT_PUBLIC_METHODS[3],
+    JAVA_OBJECT_PUBLIC_METHODS[4],
+    JAVA_OBJECT_PUBLIC_METHODS[5],
+    JAVA_OBJECT_PUBLIC_METHODS[6],
+    JAVA_OBJECT_PUBLIC_METHODS[7],
+    JAVA_OBJECT_PUBLIC_METHODS[8],
+    JvmImplicitInterfaceMethod {
+        name: "clone",
+        parameters: &[],
+        returns: "java.lang.Object",
+    },
+    JvmImplicitInterfaceMethod {
+        name: "finalize",
+        parameters: &[],
+        returns: "void",
+    },
+];
+
+/// A method inventory fixed by the platform language specification. It proves
+/// enumeration only; actual selected declarations still supply signatures.
+pub fn specified_method_inventory(owner: &str) -> Option<&'static [JvmImplicitInterfaceMethod]> {
+    match owner {
+        "java.lang.Object" => Some(&JAVA_OBJECT_METHODS),
+        _ => None,
+    }
+}

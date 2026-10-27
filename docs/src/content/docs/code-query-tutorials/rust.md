@@ -152,9 +152,15 @@ workspace implementations: provenance describes who supplies the code, while
 dispatch describes possible targets.
 
 A local initialized directly with a closure is `local_closure`. A named function
-or path is `declared`. Other local initializers and callable fields remain
-`unknown`: following their values requires value-flow analysis. In particular,
-this fixture's call is `local_closure`, despite its parameter's bound:
+or path is `declared`. A local alias such as `let f = init;` takes the
+classification of the binding that its initializer names, through parentheses,
+borrows, dereferences and further aliases. Each step uses the nearest binding at
+that position. An alias is `unknown` when the alias or its source is declared
+`mut` and a use in its scope might replace the value: an assignment, a `&mut`
+borrow, a `ref mut` pattern, a method call or a macro argument. Other local
+initializers and callable fields remain `unknown`: following their values
+requires value-flow analysis. In particular, this fixture's call is
+`local_closure`, despite its parameter's bound:
 
 ```rust
 fn shadowed<F: Fn()>(f: F) {

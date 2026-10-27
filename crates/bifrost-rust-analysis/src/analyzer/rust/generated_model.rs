@@ -1,6 +1,7 @@
 //! Source scopes for declarations emitted by explicitly activated Rust models.
 
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 use brokk_bifrost_analysis::analyzer::declaration_range::DeclarationNameRangeContext;
@@ -121,12 +122,12 @@ fn reference_path(mut node: Node<'_>) -> Node<'_> {
 /// Resolve generated free functions using parser-derived paths, import binders,
 /// module ownership, lexical visibility, and Cargo target reachability.
 #[doc(hidden)]
-pub fn resolve_generated_functions<'a>(
+pub fn resolve_generated_functions(
     analyzer: &dyn IAnalyzer,
-    overlay: &'a SemanticModelOverlay,
+    overlay: &SemanticModelOverlay,
     file: &ProjectFile,
     reference: &ResolvedReferenceSite,
-) -> Result<Vec<&'a SemanticModelSymbol>, brokk_bifrost_rust::graph_support::RustCargoRouteError> {
+) -> Result<Vec<Arc<SemanticModelSymbol>>, brokk_bifrost_rust::graph_support::RustCargoRouteError> {
     if !overlay.has_generated_functions("rust") {
         return Ok(Vec::new());
     }
@@ -258,7 +259,7 @@ pub fn resolve_generated_functions<'a>(
             }
             if !matches
                 .iter()
-                .any(|candidate: &&SemanticModelSymbol| std::ptr::eq(*candidate, symbol))
+                .any(|candidate: &Arc<SemanticModelSymbol>| Arc::ptr_eq(candidate, &symbol))
             {
                 matches.push(symbol);
             }

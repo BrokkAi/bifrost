@@ -1,40 +1,22 @@
 use crate::declarations::py_node_text;
+use crate::syntax::{decorator_callee, python_static_attribute_path};
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
 use brokk_bifrost_core::analyzer::test_assertions::{
     CommonTestAssertionKind, TestAssertionSignal, append_test_assertion_findings,
-    classify_common_test_assertion, compact_assertion_excerpt, is_common_assertion_literal,
-    normalize_assertion_expression, oversized_quoted_literal,
+    classify_common_test_assertion, compact_assertion_excerpt,
 };
-use regex::Regex;
-use std::sync::LazyLock;
-use tree_sitter::{Node, Parser};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    WalkControl, walk_named_tree_preorder, walk_tree_preorder,
+};
+use tree_sitter::Node;
 
 const TEST_ASSERTION_EXCERPT_MAX_LEN: usize = 180;
 
-static PY_ASSERT_EQUALITY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"self\.assert(?:Equal|Is)\s*\((?P<left>[^,\n]+?)\s*,\s*(?P<right>[^,\n\)]+)"#)
-        .expect("valid regex")
-});
-static PY_ASSERT_TRUTH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"self\.assert(?P<matcher>True|False|IsNone|IsNotNone)\s*\((?P<arg>[^,\n\)]+)"#)
-        .expect("valid regex")
-});
-static PY_BARE_ASSERT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?m)^\s*assert\s+(?P<expr>[^\n]+)"#).expect("valid regex"));
-static PY_RAISES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"pytest\.raises\s*\(|self\.assertRaises\s*\("#).expect("valid regex")
-});
-static PY_VERIFY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\.\s*assert_(?:called|called_once|called_once_with|called_with|not_called)\s*\("#)
-        .expect("valid regex")
-});
-
-#[derive(Clone)]
-struct PythonTestCase {
+struct PythonTestCase<'tree> {
     name: String,
-    body: String,
-    start_byte: usize,
+    definition: Node<'tree>,
+    body: Node<'tree>,
 }
 
 pub fn detect_python_test_assertion_smells(
@@ -42,106 +24,87 @@ pub fn detect_python_test_assertion_smells(
     source: &str,
     weights: &TestAssertionWeights,
 ) -> Vec<TestAssertionSmell> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .expect("failed to load python parser");
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = crate::declarations::parse_python_tree(source) else {
         return Vec::new();
     };
-
     let mut test_cases = Vec::new();
     collect_python_test_cases(tree.root_node(), source, &mut test_cases);
-
     let mut findings = Vec::new();
     for test_case in test_cases {
-        analyze_python_test_case(file, &test_case, weights, &mut findings);
+        analyze_python_test_case(file, &test_case, source, weights, &mut findings);
     }
     findings
 }
 
-fn collect_python_test_cases(node: Node<'_>, source: &str, out: &mut Vec<PythonTestCase>) {
-    match node.kind() {
-        "function_definition" => {
-            if python_function_has_fixture_decorator(node, source) {
-                return;
-            }
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = py_node_text(name_node, source).trim().to_string();
-                if name.starts_with("test_") {
-                    let body = node
-                        .child_by_field_name("body")
-                        .map(|body| py_node_text(body, source).to_string())
-                        .unwrap_or_else(|| py_node_text(node, source).to_string());
-                    out.push(PythonTestCase {
-                        name,
-                        body,
-                        start_byte: node.start_byte(),
-                    });
+fn collect_python_test_cases<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    out: &mut Vec<PythonTestCase<'tree>>,
+) {
+    walk_named_tree_preorder(node, true, |current| {
+        if current.kind() != "function_definition" {
+            return WalkControl::Continue;
+        }
+        let mut marked = false;
+        if let Some(parent) = current
+            .parent()
+            .filter(|p| p.kind() == "decorated_definition")
+        {
+            let mut cursor = parent.walk();
+            for decorator in parent
+                .named_children(&mut cursor)
+                .filter(|n| n.kind() == "decorator")
+            {
+                let Some(path) = decorator_callee(decorator).and_then(python_static_attribute_path)
+                else {
+                    continue;
+                };
+                let names: Vec<_> = path.iter().map(|n| py_node_text(*n, source)).collect();
+                if names == ["pytest", "fixture"] {
+                    return WalkControl::SkipChildren;
                 }
+                marked |= names.len() >= 3 && names[..2] == ["pytest", "mark"];
             }
         }
-        "decorated_definition" => {
-            if python_decorated_definition_has_fixture(node, source) {
-                return;
-            }
-            let has_pytest_mark = py_node_text(node, source).contains("pytest.mark");
-            if has_pytest_mark
-                && let Some(definition) = node.child_by_field_name("definition")
-                && definition.kind() == "function_definition"
-            {
-                let name = definition
-                    .child_by_field_name("name")
-                    .map(|name_node| py_node_text(name_node, source).trim().to_string())
-                    .unwrap_or_else(|| "anonymous".to_string());
-                let body = definition
-                    .child_by_field_name("body")
-                    .map(|body| py_node_text(body, source).to_string())
-                    .unwrap_or_else(|| py_node_text(definition, source).to_string());
+        if let (Some(name), Some(body)) = (
+            current.child_by_field_name("name"),
+            current.child_by_field_name("body"),
+        ) {
+            let name = py_node_text(name, source);
+            if name.starts_with("test_") || marked {
                 out.push(PythonTestCase {
-                    name,
+                    name: name.to_string(),
+                    definition: current,
                     body,
-                    start_byte: node.start_byte(),
                 });
             }
         }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_python_test_cases(child, source, out);
-    }
+        WalkControl::Continue
+    });
 }
 
-fn python_function_has_fixture_decorator(function: Node<'_>, source: &str) -> bool {
-    let Some(parent) = function.parent() else {
-        return false;
-    };
-    parent.kind() == "decorated_definition"
-        && python_decorated_definition_has_fixture(parent, source)
-}
-
-fn python_decorated_definition_has_fixture(node: Node<'_>, source: &str) -> bool {
-    py_node_text(node, source).contains("@pytest.fixture")
+pub fn python_tree_contains_tests(root: Node<'_>, source: &str) -> bool {
+    let mut test_cases = Vec::new();
+    collect_python_test_cases(root, source, &mut test_cases);
+    !test_cases.is_empty()
 }
 
 fn analyze_python_test_case(
     file: &ProjectFile,
-    test_case: &PythonTestCase,
+    test_case: &PythonTestCase<'_>,
+    source: &str,
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let mut assertions = collect_python_assertions(&test_case.body, weights);
-    for assertion in &mut assertions {
-        assertion.start_byte = test_case.start_byte.saturating_add(assertion.start_byte);
-    }
-    let symbol = format!("{}::{}", file, test_case.name);
+    let assertions = collect_python_assertions(test_case.body, source, weights);
     append_test_assertion_findings(
         file,
-        symbol,
-        compact_assertion_excerpt(&test_case.body, TEST_ASSERTION_EXCERPT_MAX_LEN),
-        test_case.start_byte,
+        format!("{}::{}", file, test_case.name),
+        compact_assertion_excerpt(
+            py_node_text(test_case.body, source),
+            TEST_ASSERTION_EXCERPT_MAX_LEN,
+        ),
+        test_case.definition.start_byte(),
         &assertions,
         weights,
         out,
@@ -149,179 +112,287 @@ fn analyze_python_test_case(
 }
 
 fn collect_python_assertions(
-    body: &str,
+    body: Node<'_>,
+    source: &str,
     weights: &TestAssertionWeights,
 ) -> Vec<TestAssertionSignal> {
     let mut assertions = Vec::new();
-
-    for captures in PY_ASSERT_EQUALITY_RE.captures_iter(body) {
-        let whole = captures.get(0).expect("whole match");
-        let left = normalize_python_expr(captures.name("left").map(|m| m.as_str()).unwrap_or(""));
-        let right = normalize_python_expr(captures.name("right").map(|m| m.as_str()).unwrap_or(""));
-        if left.is_empty() || right.is_empty() {
-            continue;
+    walk_named_tree_preorder(body, true, |node| {
+        if matches!(
+            node.kind(),
+            "function_definition" | "class_definition" | "lambda" | "string" | "comment"
+        ) {
+            return WalkControl::SkipChildren;
         }
-        if left == right {
-            let classification = classify_common_test_assertion(
-                if is_python_literal(&left) {
-                    CommonTestAssertionKind::ConstantEquality
-                } else {
-                    CommonTestAssertionKind::SelfComparison
-                },
-                weights,
-            );
-            assertions.push(TestAssertionSignal {
-                kind: classification.kind.to_string(),
-                score: classification.score,
-                shallow: classification.shallow,
-                meaningful: false,
-                reasons: vec![classification.kind.to_string()],
-                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-                start_byte: whole.start(),
-            });
-        } else if let Some(literal) = oversized_python_literal(&left, &right, weights) {
-            assertions.push(TestAssertionSignal {
-                kind: "overspecified-literal".to_string(),
-                score: weights.overspecified_literal_weight,
-                shallow: false,
-                meaningful: false,
-                reasons: vec![format!("overspecified-literal:{literal}")],
-                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-                start_byte: whole.start(),
-            });
-        } else {
-            let classification =
-                classify_common_test_assertion(CommonTestAssertionKind::Meaningful, weights);
-            assertions.push(TestAssertionSignal {
-                kind: classification.kind.to_string(),
-                score: classification.score,
-                shallow: classification.shallow,
-                meaningful: classification.score == 0,
-                reasons: vec![classification.kind.to_string()],
-                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-                start_byte: whole.start(),
-            });
-        }
-    }
-
-    for captures in PY_ASSERT_TRUTH_RE.captures_iter(body) {
-        let whole = captures.get(0).expect("whole match");
-        let matcher = captures.name("matcher").map(|m| m.as_str()).unwrap_or("");
-        let arg = normalize_python_expr(captures.name("arg").map(|m| m.as_str()).unwrap_or(""));
-        let kind = match matcher {
-            "True" if arg == "True" => CommonTestAssertionKind::ConstantTruth,
-            "False" if arg == "False" => CommonTestAssertionKind::ConstantTruth,
-            "IsNone" | "IsNotNone" => CommonTestAssertionKind::NullnessOnly,
-            _ => CommonTestAssertionKind::Meaningful,
-        };
-        let classification = classify_common_test_assertion(kind, weights);
-        assertions.push(TestAssertionSignal {
-            kind: classification.kind.to_string(),
-            score: classification.score,
-            shallow: classification.shallow,
-            meaningful: classification.score == 0,
-            reasons: vec![classification.kind.to_string()],
-            excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-            start_byte: whole.start(),
-        });
-    }
-
-    for captures in PY_BARE_ASSERT_RE.captures_iter(body) {
-        let whole = captures.get(0).expect("whole match");
-        let expr = normalize_python_expr(captures.name("expr").map(|m| m.as_str()).unwrap_or(""));
-        let trimmed = expr.trim();
-        let maybe_signal = if trimmed == "True" || trimmed == "False" {
-            Some(("constant-truth", weights.constant_truth_weight, true))
-        } else if trimmed.contains(" is not None") || trimmed.contains(" is None") {
-            Some(("nullness-only", weights.nullness_only_weight, true))
-        } else if let Some((left, right)) = trimmed.split_once("==") {
-            let left = normalize_python_expr(left);
-            let right = normalize_python_expr(right);
-            if left == right {
-                if is_python_literal(&left) {
-                    Some(("constant-equality", weights.constant_equality_weight, false))
-                } else {
-                    Some((
-                        "self-comparison",
-                        weights.tautological_assertion_weight,
-                        false,
-                    ))
+        let mut operands = None;
+        let kind = if node.kind() == "assert_statement" {
+            let Some(expr) = node.named_child(0).map(unparenthesized) else {
+                return WalkControl::Continue;
+            };
+            match expr.kind() {
+                "true" | "false" => Some(CommonTestAssertionKind::ConstantTruth),
+                "comparison_operator" if expr.named_child_count() == 2 => {
+                    let left = expr.named_child(0).unwrap();
+                    let right = expr.named_child(1).unwrap();
+                    let operator = expr
+                        .child_by_field_name("operators")
+                        .expect("comparison has an operator");
+                    match operator.kind() {
+                        "==" => {
+                            operands = Some((left, right));
+                            Some(CommonTestAssertionKind::Meaningful)
+                        }
+                        "is" | "is not" if unparenthesized(right).kind() == "none" => {
+                            Some(CommonTestAssertionKind::NullnessOnly)
+                        }
+                        _ => Some(CommonTestAssertionKind::Meaningful),
+                    }
                 }
-            } else if oversized_python_literal(&left, &right, weights).is_some() {
-                Some((
-                    "overspecified-literal",
-                    weights.overspecified_literal_weight,
-                    false,
-                ))
+                _ => Some(CommonTestAssertionKind::Meaningful),
+            }
+        } else if node.kind() == "call" {
+            let function = node
+                .child_by_field_name("function")
+                .expect("call has a function");
+            if function.kind() == "attribute"
+                && function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|name| {
+                        matches!(
+                            py_node_text(name, source),
+                            "assert_called"
+                                | "assert_called_once"
+                                | "assert_called_once_with"
+                                | "assert_called_with"
+                                | "assert_not_called"
+                        )
+                    })
+            {
+                Some(CommonTestAssertionKind::Meaningful)
             } else {
-                None
+                let Some(path) = python_static_attribute_path(function) else {
+                    return WalkControl::Continue;
+                };
+                let names: Vec<_> = path.iter().map(|n| py_node_text(*n, source)).collect();
+                let arguments = node
+                    .child_by_field_name("arguments")
+                    .expect("call has arguments");
+                let mut cursor = arguments.walk();
+                let args: Vec<_> = arguments
+                    .named_children(&mut cursor)
+                    .filter(|n| !n.is_extra())
+                    .collect();
+                match names.as_slice() {
+                    ["self", "assertEqual" | "assertIs"] if args.len() >= 2 => {
+                        operands = Some((args[0], args[1]));
+                        Some(CommonTestAssertionKind::Meaningful)
+                    }
+                    ["self", "assertTrue"]
+                        if args
+                            .first()
+                            .is_some_and(|n| unparenthesized(*n).kind() == "true") =>
+                    {
+                        Some(CommonTestAssertionKind::ConstantTruth)
+                    }
+                    ["self", "assertFalse"]
+                        if args
+                            .first()
+                            .is_some_and(|n| unparenthesized(*n).kind() == "false") =>
+                    {
+                        Some(CommonTestAssertionKind::ConstantTruth)
+                    }
+                    ["self", "assertIsNone" | "assertIsNotNone"] => {
+                        Some(CommonTestAssertionKind::NullnessOnly)
+                    }
+                    ["self", "assertTrue" | "assertFalse" | "assertRaises"]
+                    | ["pytest", "raises"] => Some(CommonTestAssertionKind::Meaningful),
+                    _ => None,
+                }
             }
         } else {
             None
         };
-
-        if let Some((kind, score, shallow)) = maybe_signal {
-            assertions.push(TestAssertionSignal {
-                kind: kind.to_string(),
-                score,
-                shallow,
-                meaningful: false,
-                reasons: vec![kind.to_string()],
-                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-                start_byte: whole.start(),
-            });
+        let Some(mut kind) = kind else {
+            return WalkControl::Continue;
+        };
+        let mut oversized = None;
+        if let Some((left, right)) = operands {
+            if normalize_python_expr(left, source) == normalize_python_expr(right, source) {
+                kind = if is_python_literal(unparenthesized(left)) {
+                    CommonTestAssertionKind::ConstantEquality
+                } else {
+                    CommonTestAssertionKind::SelfComparison
+                };
+            } else {
+                oversized = oversized_python_literal(left, right, source, weights);
+            }
+        }
+        let classification = classify_common_test_assertion(kind, weights);
+        let (kind, score, shallow, meaningful, reasons) = if let Some(literal) = oversized {
+            (
+                "overspecified-literal",
+                weights.overspecified_literal_weight,
+                false,
+                false,
+                vec![format!("overspecified-literal:{literal}")],
+            )
         } else {
-            assertions.push(TestAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reasons: vec!["meaningful-assertion".to_string()],
-                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-                start_byte: whole.start(),
-            });
-        }
-    }
-
-    for regex in [&*PY_RAISES_RE, &*PY_VERIFY_RE] {
-        for captures in regex.captures_iter(body) {
-            let whole = captures.get(0).expect("whole match");
-            assertions.push(TestAssertionSignal {
-                kind: "meaningful-assertion".to_string(),
-                score: 0,
-                shallow: false,
-                meaningful: true,
-                reasons: vec!["meaningful-assertion".to_string()],
-                excerpt: compact_assertion_excerpt(whole.as_str(), TEST_ASSERTION_EXCERPT_MAX_LEN),
-                start_byte: whole.start(),
-            });
-        }
-    }
-
+            (
+                classification.kind,
+                classification.score,
+                classification.shallow,
+                classification.score == 0,
+                vec![classification.kind.to_string()],
+            )
+        };
+        assertions.push(TestAssertionSignal {
+            kind: kind.to_string(),
+            score,
+            shallow,
+            meaningful,
+            reasons,
+            excerpt: compact_assertion_excerpt(
+                py_node_text(node, source),
+                TEST_ASSERTION_EXCERPT_MAX_LEN,
+            ),
+            start_byte: node.start_byte(),
+        });
+        WalkControl::SkipChildren
+    });
     assertions
 }
 
-fn normalize_python_expr(expr: &str) -> String {
-    normalize_assertion_expression(expr.trim().trim_end_matches(',').trim_end_matches(':'))
+fn unparenthesized(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let mut cursor = node.walk();
+        node = node
+            .named_children(&mut cursor)
+            .find(|child| !child.is_extra())
+            .expect("parenthesized expression has an operand");
+    }
+    node
 }
 
-fn is_python_literal(expr: &str) -> bool {
-    let trimmed = expr.trim();
-    is_common_assertion_literal(trimmed)
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || matches!(trimmed, "True" | "False" | "None")
+// Compare grammar-selected tokens. Whitespace in string contents remains data;
+// comments and grouping parentheses do not change expression identity.
+fn normalize_python_expr<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Vec<(u16, &'source str)> {
+    let mut tokens = Vec::new();
+    walk_tree_preorder(node, true, |current| {
+        if current.is_extra() {
+            return WalkControl::SkipChildren;
+        }
+        if current.child_count() == 0
+            && !current
+                .parent()
+                .is_some_and(|p| p.kind() == "parenthesized_expression" && !current.is_named())
+        {
+            tokens.push((current.kind_id(), py_node_text(current, source)));
+        }
+        WalkControl::Continue
+    });
+    tokens
 }
 
-fn oversized_python_literal(
-    left: &str,
-    right: &str,
+fn is_python_literal(node: Node<'_>) -> bool {
+    match node.kind() {
+        "integer" | "float" | "true" | "false" | "none" => true,
+        "unary_operator" => {
+            node.child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "+" | "-"))
+                && node
+                    .child_by_field_name("argument")
+                    .is_some_and(|argument| {
+                        matches!(unparenthesized(argument).kind(), "integer" | "float")
+                    })
+        }
+        "string" => {
+            let mut cursor = node.walk();
+            !node
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "interpolation")
+        }
+        _ => false,
+    }
+}
+
+fn oversized_python_literal<'source>(
+    left: Node<'_>,
+    right: Node<'_>,
+    source: &'source str,
     weights: &TestAssertionWeights,
-) -> Option<String> {
-    oversized_quoted_literal(left, right, weights, &['"', '\''])
+) -> Option<&'source str> {
+    [left, right]
+        .into_iter()
+        .map(unparenthesized)
+        .find_map(|node| {
+            if node.kind() != "string" {
+                return None;
+            }
+            let mut length = 0;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "interpolation" => return None,
+                    "string_content" => length += child.end_byte() - child.start_byte(),
+                    _ => {}
+                }
+            }
+            (length >= weights.large_literal_length_threshold.max(0) as usize)
+                .then(|| py_node_text(node, source))
+        })
 }
 
-pub fn python_source_contains_tests(source: &str) -> bool {
-    static TEST_DEF_RE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"(?m)^\s*def\s+test_[A-Za-z0-9_]*\s*\(").unwrap());
-    source.contains("@pytest.mark.") || TEST_DEF_RE.is_match(source)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "6e62e856da86: source scans counted assertion lookalikes and lost operand boundaries"
+    )]
+    fn qs6_assertion_syntax_ignores_strings_and_nested_definitions() {
+        let source = "# \u{e9}\n@pytest.mark.slow\ndef test_marked():\n    self.assertEqual((one, two), (one, two))\ndef test_strings():\n    text = '''\n    assert True\n    self.assertEqual(1, 1)\n    '''\n    # self.assertTrue(True)\n    def helper():\n        assert False\ndef test_fixture_text():\n    text = '@pytest.fixture'\n    assert True\n@pytest.fixture\ndef test_fixture():\n    assert True\n";
+        let file = ProjectFile::new(std::env::temp_dir(), "test_sample.py");
+        let findings =
+            detect_python_test_assertion_smells(&file, source, &TestAssertionWeights::defaults());
+        let actual: Vec<_> = findings
+            .iter()
+            .map(|f| {
+                (
+                    f.enclosing_fq_name.rsplit("::").next().unwrap(),
+                    f.assertion_kind.as_str(),
+                    f.start_byte,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "test_marked",
+                    "self-comparison",
+                    source.find("self.assertEqual").unwrap()
+                ),
+                (
+                    "test_strings",
+                    "no-assertions",
+                    source.find("def test_strings").unwrap()
+                ),
+                (
+                    "test_fixture_text",
+                    "constant-truth",
+                    source.rfind("    assert True\n@pytest.fixture").unwrap() + 4
+                ),
+                (
+                    "test_fixture_text",
+                    "shallow-assertions-only",
+                    source.find("def test_fixture_text").unwrap()
+                ),
+            ]
+        );
+    }
 }

@@ -1579,11 +1579,11 @@ fn exact_import_target_range(targets: &[ExactImportTarget], hit: &ReferenceHit) 
     matching_ranges.next().map_or(range.range, |_| hit.range)
 }
 
-/// One language's whole-workspace selected inverse reference index.
+/// One language's generation-bound selected inverse reference handle.
 ///
 /// The index is that language's own answer to "which sites refer to this
-/// declaration", derived once from its selected resolution facts and bound to
-/// the analyzer generation it was derived in. A declaration the index does not
+/// declaration", queried lazily from its selected resolution facts and bound to
+/// the analyzer generation it was admitted in. A declaration the handle does not
 /// cover receives an explicit incomplete result, never a manufactured complete
 /// empty one.
 pub trait SelectedInverseReferenceIndex: Send + Sync {
@@ -1632,9 +1632,9 @@ enum SelectedInverseLanguage {
 /// Per-request memo of the selected inverse indexes of the languages that
 /// register a provider.
 ///
-/// One index per language per request: the index covers the whole workspace,
-/// so building it per declaration would repeat the workspace walk for every
-/// subject an `edges_of` query or an edge assert names.
+/// One handle per language per request shares admission and generation binding
+/// across the subjects an `edges_of` query or an edge assert names. Each target
+/// query owns its candidates and results; the handle retains no workspace map.
 #[derive(Default)]
 pub struct SelectedInverseEdgeCache {
     languages: HashMap<crate::analyzer::Language, SelectedInverseLanguage>,

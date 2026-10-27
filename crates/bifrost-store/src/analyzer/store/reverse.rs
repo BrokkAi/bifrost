@@ -7,7 +7,7 @@
 use super::*;
 
 use crate::analyzer::resolution::ResolutionIdentityDigestKey;
-use crate::analyzer::resolution::worker_transport::{WorkerAnswer, run_selected_worker};
+use crate::analyzer::resolution::worker_transport::{WorkerAnswer, schedule_selected_queue};
 
 pub(super) use super::reverse_candidates::*;
 
@@ -1781,44 +1781,6 @@ pub(crate) fn confirmation_partitions(
     partitions
 }
 
-fn schedule_confirmation_partitions<A: Send>(
-    partitions: &[std::ops::Range<usize>],
-    cancellation: &CancellationToken,
-    work: impl Fn(std::ops::Range<usize>) -> Result<A> + Sync,
-) -> Vec<Option<Result<A>>> {
-    crate::analyzer::ensure_global_rayon_pool();
-    let results = partitions
-        .iter()
-        .map(|_| std::sync::Mutex::new(None))
-        .collect::<Vec<_>>();
-    rayon::scope(|scope| {
-        for (range, result) in partitions.iter().zip(&results) {
-            // The dispatcher and workers share the request's deadline.
-            // Empty slots record groups which were never dispatched.
-            if cancellation.soft_deadline_passed() {
-                break;
-            }
-            let work = &work;
-            scope.spawn(move |_| {
-                let outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(range.clone())));
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(panic) => Err(StoreError::new(format!(
-                        "reverse worker panicked for partition {range:?}: {}",
-                        brokk_bifrost_core::panic_report::panic_payload_message(panic.as_ref()),
-                    ))),
-                };
-                *result.lock().expect("worker result lock") = Some(outcome);
-            });
-        }
-    });
-    results
-        .into_iter()
-        .map(|result| result.into_inner().expect("worker result lock"))
-        .collect()
-}
-
 pub(crate) struct ReversePartitionResult<A> {
     pub(crate) range: std::ops::Range<usize>,
     pub(crate) outcome: Option<SelectedResolutionOperationOutcome<A>>,
@@ -1869,28 +1831,45 @@ pub(crate) fn execute_reverse_partitions<A: WorkerAnswer>(
     ) -> Result<SelectedResolutionOperationOutcome<A>>,
     anchors: impl Fn(&A) -> Vec<(ResolutionIdentityDigestKey, ResolutionIdentityDigestKey)>,
 ) -> Result<Vec<ReversePartitionResult<A>>> {
-    if selected.worker_store().uses_single_connection_reads() {
+    let partitions = confirmation_partitions(admitted);
+    let worker_count = crate::analyzer::default_parallelism().min(partitions.len().max(1));
+    if worker_count == 1 || selected.worker_store().uses_single_connection_reads() {
         return Ok(vec![ReversePartitionResult {
             range: 0..admitted.len(),
-            outcome: Some(execute_reverse_inline(|| inline(selected))?),
+            outcome: if cancellation.soft_deadline_passed() {
+                None
+            } else {
+                Some(execute_reverse_inline(|| inline(selected))?)
+            },
         }]);
     }
-    let partitions = confirmation_partitions(admitted);
     let store = selected.worker_store();
     let input = selected.worker_input();
-    let results = schedule_confirmation_partitions(&partitions, cancellation, |range| {
-        run_selected_worker(store, input, cancellation, |operation| {
-            worker(operation, range)
-        })
-    });
+    let dispatch_order = (0..partitions.len()).collect::<Vec<_>>();
+    let mut answers = (0..partitions.len()).map(|_| None).collect::<Vec<_>>();
+    let results = schedule_selected_queue(
+        store,
+        input,
+        &partitions,
+        &dispatch_order,
+        worker_count,
+        cancellation,
+        |operation, range| worker(operation, range.clone()),
+        |index, answer| {
+            let anchors = anchors(answer.answer());
+            answers[index] = Some(answer.reintern(selected, anchors, cancellation)?);
+            Ok(())
+        },
+    )?;
     let mut imported = Vec::with_capacity(partitions.len());
     for (range, result) in partitions.into_iter().zip(results) {
         let result = match result.transpose()? {
             None => None,
-            Some(SelectedResolutionOperationOutcome::Native(answer)) => {
-                let anchors = anchors(answer.answer());
+            Some(SelectedResolutionOperationOutcome::Native(())) => {
                 Some(SelectedResolutionOperationOutcome::Native(
-                    answer.reintern(selected, anchors, cancellation)?,
+                    answers[imported.len()]
+                        .take()
+                        .expect("successful ordered delivery"),
                 ))
             }
             Some(SelectedResolutionOperationOutcome::Unavailable(reason)) => {

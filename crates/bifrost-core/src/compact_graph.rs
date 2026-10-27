@@ -274,3 +274,144 @@ mod tests {
         assert_eq!(rows.row(2), [3]);
     }
 }
+
+#[cfg(test)]
+mod compact_graph_properties {
+    use super::{CompactDirectedGraph, CompactRows, CompactRowsBuilder, normalize_indexed_edges};
+    use crate::hash::HashMap;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    /// A node count and an edge list over it. The list may contain duplicates,
+    /// self loops and any ordering; it is empty when there are no nodes.
+    fn graph_input() -> impl Strategy<Value = (usize, Vec<(u32, u32)>)> {
+        (0usize..9).prop_flat_map(|count| {
+            let edges = if count == 0 {
+                Just(Vec::new()).boxed()
+            } else {
+                let node = 0..count as u32;
+                prop::collection::vec((node.clone(), node), 0..40).boxed()
+            };
+            (Just(count), edges)
+        })
+    }
+
+    fn node_names(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("node-{index}")).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Normalization yields the sorted, deduplicated edge set.
+        #[test]
+        fn normalize_indexed_edges_is_sorted_set((count, edges) in graph_input()) {
+            let nodes = node_names(count);
+            let index_by_node: HashMap<String, u32> = nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.clone(), index as u32))
+                .collect();
+            let expected: Vec<(u32, u32)> =
+                edges.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+
+            let mut actual = edges;
+            normalize_indexed_edges(&nodes, &index_by_node, &mut actual);
+            prop_assert_eq!(actual, expected);
+        }
+
+        /// Adjacency, edge count and node identity match a set-of-pairs
+        /// reference, through both constructors.
+        #[test]
+        fn directed_graph_matches_edge_set_reference((count, edges) in graph_input()) {
+            let nodes = node_names(count);
+            let reference: BTreeSet<(u32, u32)> = edges.iter().copied().collect();
+
+            let from_new = CompactDirectedGraph::new(nodes.clone(), edges.clone());
+            let index_by_node: HashMap<String, u32> = nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.clone(), index as u32))
+                .collect();
+            let from_indexed =
+                CompactDirectedGraph::from_indexed_nodes(nodes.clone(), index_by_node, edges);
+
+            for graph in [&from_new, &from_indexed] {
+                prop_assert_eq!(graph.nodes(), nodes.as_slice());
+                prop_assert_eq!(graph.edge_count(), reference.len());
+                for (index, node) in nodes.iter().enumerate() {
+                    prop_assert_eq!(graph.node_id(node), Some(index as u32));
+                }
+                prop_assert_eq!(graph.node_id(&"absent".to_string()), None);
+
+                for node in 0..count as u32 {
+                    let outgoing: Vec<u32> = reference
+                        .iter()
+                        .filter(|(source, _)| *source == node)
+                        .map(|(_, target)| *target)
+                        .collect();
+                    let mut incoming: Vec<u32> = reference
+                        .iter()
+                        .filter(|(_, target)| *target == node)
+                        .map(|(source, _)| *source)
+                        .collect();
+                    incoming.sort_unstable();
+                    prop_assert_eq!(graph.outgoing(node), outgoing.as_slice());
+                    prop_assert_eq!(graph.incoming(node), incoming.as_slice());
+                }
+            }
+        }
+
+        /// Rows built with `push_row` and with `values_mut` plus `finish_row`
+        /// read back as the source rows, and the flat accessors agree with
+        /// their concatenation and running lengths.
+        #[test]
+        fn rows_builder_round_trips_nested_vectors(
+            source in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..6), 0..8),
+            use_push_row in prop::collection::vec(any::<bool>(), 8),
+        ) {
+            let flat: Vec<u8> = source.iter().flatten().copied().collect();
+            let mut offsets = vec![0u32];
+            for row in &source {
+                offsets.push(offsets.last().unwrap() + row.len() as u32);
+            }
+
+            let mut builder = CompactRowsBuilder::with_capacity(source.len(), flat.len());
+            for (row, push) in source.iter().zip(use_push_row.iter().cycle()) {
+                if *push {
+                    builder.push_row(row.iter().copied());
+                } else {
+                    builder.values_mut().extend_from_slice(row);
+                    builder.finish_row();
+                }
+            }
+            prop_assert_eq!(builder.rows(), source.len());
+            let rows = builder.finish();
+
+            prop_assert_eq!(rows.rows(), source.len());
+            prop_assert_eq!(rows.len(), flat.len());
+            prop_assert_eq!(rows.is_empty(), flat.is_empty());
+            prop_assert_eq!(rows.offsets(), offsets.as_slice());
+            prop_assert_eq!(rows.values(), flat.as_slice());
+            for (index, row) in source.iter().enumerate() {
+                prop_assert_eq!(rows.row(index), row.as_slice());
+            }
+            prop_assert_eq!(
+                CompactRows::try_from_parts(offsets, flat).expect("builder parts are valid"),
+                rows
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "compact graph nodes must be unique")]
+    fn new_rejects_duplicate_nodes() {
+        CompactDirectedGraph::new(vec!["a", "b", "a"], Vec::new());
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_rejects_out_of_range_edge() {
+        CompactDirectedGraph::new(vec!["a", "b"], vec![(0, 2)]);
+    }
+}

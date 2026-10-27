@@ -557,8 +557,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )));
         }
 
-        let left_integer = kotlin_decimal_integer_value(left, source).is_some();
-        let right_integer = kotlin_decimal_integer_value(right, source).is_some();
+        let left_integer = kotlin_integer_literal_value(left, source)
+            .is_some_and(|(_, suffix)| !suffix.is_unsigned());
+        let right_integer = kotlin_integer_literal_value(right, source)
+            .is_some_and(|(_, suffix)| !suffix.is_unsigned());
         let left_boolean = boolean_literal_value(source, left).is_some();
         let right_boolean = boolean_literal_value(source, right).is_some();
         let (subject, constant, reversed) = match (left_integer, right_integer) {
@@ -580,14 +582,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 negated: (operator == "!=") != negated,
                 constant: value,
             }
-        } else if kotlin_decimal_integer_value(constant, source).is_some() {
-            if !matches!(
-                subject_type,
-                KotlinScalarType::Int
-                    | KotlinScalarType::Long
-                    | KotlinScalarType::Short
-                    | KotlinScalarType::Byte
-            ) {
+        } else if kotlin_integer_literal_value(constant, source).is_some() {
+            if !is_supported_integer_literal_comparison(constant, source, subject_type, operator) {
                 return Ok(None);
             }
             if matches!(operator, "==" | "!=") {
@@ -720,7 +716,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.integer_update(builder, node, entry, next, scope, stack)
             }
             "prefix_expression"
-                if kotlin_decimal_integer_value(node, self.prepared.source()).is_some() =>
+                if kotlin_integer_literal_value(node, self.prepared.source()).is_some() =>
             {
                 let Some(operand) = unary_operand(node) else {
                     return self.edge(builder, entry, next);
@@ -1040,9 +1036,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return true;
         }
         let source = self.prepared.source();
-        let left_literal = kotlin_decimal_integer_value(left, source).is_some()
+        let left_literal = kotlin_integer_literal_value(left, source)
+            .is_some_and(|(_, suffix)| !suffix.is_unsigned())
             || boolean_literal_value(source, left).is_some();
-        let right_literal = kotlin_decimal_integer_value(right, source).is_some()
+        let right_literal = kotlin_integer_literal_value(right, source)
+            .is_some_and(|(_, suffix)| !suffix.is_unsigned())
             || boolean_literal_value(source, right).is_some();
         let subject = match (left_literal, right_literal) {
             (false, true) => left,
@@ -1055,9 +1053,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         (boolean_literal_value(source, if left_literal { left } else { right }).is_some()
             && scalar == KotlinScalarType::Boolean
             && matches!(operator, "==" | "!="))
-            || (kotlin_decimal_integer_value(if left_literal { left } else { right }, source)
-                .is_some()
-                && is_kotlin_integral_type(scalar))
+            || is_supported_integer_literal_comparison(
+                if left_literal { left } else { right },
+                source,
+                scalar,
+                operator,
+            )
     }
 
     fn compound_integer_offset(
@@ -1075,7 +1076,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             return None;
         }
-        let value = kotlin_decimal_integer_value(value_node, self.prepared.source())?;
+        let (value, suffix) = kotlin_integer_literal_value(value_node, self.prepared.source())?;
+        // UInt/ULong operations do not share the signed scalar offset contract.
+        if suffix.is_unsigned()
+            || (suffix == KotlinIntegerSuffix::Long
+                && self.scalar_type(name) != Some(KotlinScalarType::Long))
+        {
+            return None;
+        }
         let magnitude = value.unsigned_abs();
         let negative = match first_token(assignment) {
             Some("+=") => value < 0,
@@ -3072,10 +3080,6 @@ fn boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
     )?)
 }
 
-#[doc = " The value of an `integer_literal`, or `None` when it is not a plain decimal"]
-#[doc = " the adapter can read exactly."]
-use brokk_bifrost_analysis::analyzer::common::integer_literal_value;
-
 /// Whether an integer-literal-bounded Kotlin range provably yields at least one
 /// element, so the loop body runs before the header's exit test is ever taken.
 ///
@@ -3094,12 +3098,15 @@ pub(in crate::analyzer::kotlin::semantic) fn kotlin_range_has_first_iteration(
             let (Some(start), Some(end)) = (operands.first(), operands.get(1)) else {
                 return false;
             };
-            let (Some(start), Some(end)) = (
-                integer_literal_value(source, *start),
-                integer_literal_value(source, *end),
+            let (Some((start, start_suffix)), Some((end, end_suffix))) = (
+                kotlin_integer_literal_value(*start, source),
+                kotlin_integer_literal_value(*end, source),
             ) else {
                 return false;
             };
+            if start_suffix.is_unsigned() || end_suffix.is_unsigned() {
+                return false;
+            }
             // `..` is inclusive of its end, `..<` is not.
             if has_token(iterable, "..<") {
                 start < end
@@ -3114,12 +3121,15 @@ pub(in crate::analyzer::kotlin::semantic) fn kotlin_range_has_first_iteration(
             if operator.kind() != "simple_identifier" {
                 return false;
             }
-            let (Some(start), Some(end)) = (
-                integer_literal_value(source, *start),
-                integer_literal_value(source, *end),
+            let (Some((start, start_suffix)), Some((end, end_suffix))) = (
+                kotlin_integer_literal_value(*start, source),
+                kotlin_integer_literal_value(*end, source),
             ) else {
                 return false;
             };
+            if start_suffix.is_unsigned() || end_suffix.is_unsigned() {
+                return false;
+            }
             match node_text(source, *operator) {
                 Some("until") => start < end,
                 Some("downTo") => start >= end,
@@ -3143,7 +3153,7 @@ fn is_operator_convention(node: Node<'_>, source: &str) -> bool {
         "prefix_expression" | "postfix_expression" => {
             has_token(node, "++")
                 || has_token(node, "--")
-                || (has_token(node, "-") && kotlin_decimal_integer_value(node, source).is_none())
+                || (has_token(node, "-") && kotlin_integer_literal_value(node, source).is_none())
         }
         "check_expression" => has_token(node, "in"),
         _ => false,
@@ -3153,6 +3163,33 @@ fn is_operator_convention(node: Node<'_>, source: &str) -> bool {
 fn is_integer_update(node: Node<'_>) -> bool {
     matches!(node.kind(), "prefix_expression" | "postfix_expression")
         && (has_token(node, "++") || has_token(node, "--"))
+}
+
+// Signed primitive compareTo accepts other signed widths, while equality
+// with an explicit Long literal requires a Long subject. Unsigned inline
+// classes have a separate operator family and no signed scalar contract here.
+fn is_supported_integer_literal_comparison(
+    constant: Node<'_>,
+    source: &str,
+    subject: KotlinScalarType,
+    operator: &str,
+) -> bool {
+    if !is_kotlin_integral_type(subject) {
+        return false;
+    }
+    // The literal's own type: Int when unsuffixed and in Int range, Long
+    // otherwise, never an unsigned type.
+    let Some(literal) = kotlin_literal_scalar_type(constant, source) else {
+        return false;
+    };
+    if matches!(operator, "==" | "!=") {
+        // Kotlin compiles primitive `==` only when both sides have the same
+        // type, so `Long == 1` is rejected exactly like `Int == 1L`.
+        literal == subject
+    } else {
+        // Ordered comparisons have compareTo overloads across signed widths.
+        is_kotlin_integral_type(literal)
+    }
 }
 
 fn is_kotlin_integral_type(scalar: KotlinScalarType) -> bool {

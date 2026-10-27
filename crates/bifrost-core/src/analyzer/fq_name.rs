@@ -1692,6 +1692,228 @@ mod fq_name_properties {
         }
     }
 
+    /// The (text, kind) pairs a name was built from, as an owned reference value
+    /// that does not go through `FqName` at all.
+    fn pairs(name: &FqName) -> Vec<(String, SegmentKind)> {
+        name.resolved_segments()
+            .map(|(text, kind)| (text.to_owned(), kind))
+            .collect()
+    }
+
+    type Segments = Vec<(String, SegmentKind)>;
+
+    /// A name `a`, a cut point into it, and a tail, so that `a[..cut] ++ tail`
+    /// shares a real prefix with `a` and sometimes diverges from it. Two
+    /// independently generated names almost never share a prefix, which would
+    /// leave the "is a prefix" outcome of `starts_with` untested.
+    fn name_with_related_candidate() -> impl Strategy<Value = (Segments, Segments)> {
+        (
+            segment_list(),
+            any::<prop::sample::Index>(),
+            prop::collection::vec((segment_text(), segment_kind()), 0..3),
+        )
+            .prop_map(|(name, cut, tail)| {
+                let cut = cut.index(name.len() + 1);
+                let mut candidate = name[..cut].to_vec();
+                candidate.extend(tail);
+                (name, candidate)
+            })
+    }
+
+    proptest! {
+        /// `starts_with` is a prefix test over whole segments. The oracle is the
+        /// slice prefix relation on the (text, kind) pairs the names were built
+        /// from, computed without touching `SegmentId`s.
+        #[test]
+        fn starts_with_is_the_segment_wise_prefix_relation(
+            (name, candidate) in name_with_related_candidate(),
+        ) {
+            let name_fq = intern_all(&name);
+            let candidate_fq = if candidate.is_empty() {
+                FqName::new()
+            } else {
+                intern_all(&candidate)
+            };
+
+            prop_assert_eq!(
+                name_fq.starts_with(&candidate_fq),
+                name.starts_with(&candidate)
+            );
+            prop_assert!(name_fq.starts_with(&name_fq), "a name is its own prefix");
+            prop_assert!(name_fq.starts_with(&FqName::new()), "the empty name is a prefix of all");
+        }
+
+        /// `extend_from` appends the tail's segments after the receiver's and
+        /// leaves the tail alone. The oracle is interning the concatenated
+        /// (text, kind) pairs from scratch.
+        #[test]
+        fn extend_from_matches_interning_the_concatenation(
+            head in segment_list(),
+            tail in prop::collection::vec((segment_text(), segment_kind()), 0..4),
+        ) {
+            let mut extended = intern_all(&head);
+            let tail_fq = if tail.is_empty() { FqName::new() } else { intern_all(&tail) };
+            let tail_before = tail_fq.clone();
+            extended.extend_from(&tail_fq);
+
+            let concatenated: Vec<_> = head.iter().chain(&tail).cloned().collect();
+            prop_assert_eq!(&extended, &intern_all(&concatenated));
+            prop_assert_eq!(pairs(&extended), concatenated);
+            prop_assert_eq!(tail_fq, tail_before, "the tail must not change");
+            prop_assert!(extended.starts_with(&intern_all(&head)));
+        }
+
+        /// `resolved_segments` yields exactly the (text, kind) pairs a name was
+        /// interned from, in order. The oracle is the generating list.
+        #[test]
+        fn resolved_segments_round_trips_the_interned_pairs(segments in segment_list()) {
+            prop_assert_eq!(pairs(&intern_all(&segments)), segments);
+        }
+
+        /// A package-qualified name holds one `Package` segment per component,
+        /// and renders as the components joined by the package separator: `.`
+        /// canonically and in every language but C++, `::` in C++ native
+        /// spelling. The oracle is `join` on the input components. For
+        /// components that are plain identifiers, splitting the joined rendering
+        /// on `.` also rebuilds the same name.
+        #[test]
+        fn from_package_components_agrees_with_the_joined_rendering(
+            components in prop::collection::vec(segment_text(), 0..6),
+            language in language(),
+        ) {
+            let interner = segment_interner();
+            let name = FqName::from_package_components(&components);
+
+            prop_assert_eq!(
+                pairs(&name),
+                components
+                    .iter()
+                    .map(|c| (c.clone(), SegmentKind::Package))
+                    .collect::<Vec<_>>()
+            );
+            prop_assert_eq!(name.display(interner), components.join("."));
+            let native_separator = if language == Language::Cpp { "::" } else { "." };
+            prop_assert_eq!(
+                name.display_native(language, interner),
+                components.join(native_separator)
+            );
+        }
+
+        #[test]
+        fn from_package_components_equals_parsing_the_joined_rendering(
+            components in prop::collection::vec("[A-Za-z_][A-Za-z0-9_]{0,8}", 0..6),
+        ) {
+            let interner = segment_interner();
+            let built = FqName::from_package_components(&components);
+            let mut parsed = FqName::new();
+            for part in joined_segments(&components.join("."), ".") {
+                parsed.push(interner.intern(part, SegmentKind::Package));
+            }
+            prop_assert_eq!(built, parsed);
+        }
+
+        /// `separator_between` reports the text that sits between the two
+        /// segments in the native rendering of the two-segment name they form.
+        /// The oracle is the rendering's own segment spans.
+        #[test]
+        fn separator_between_is_the_gap_in_the_native_rendering(
+            prev in (segment_text(), segment_kind()),
+            cur in (segment_text(), segment_kind()),
+            language in language(),
+        ) {
+            let interner = segment_interner();
+            let prev_id = interner.intern(&prev.0, prev.1);
+            let cur_id = interner.intern(&cur.0, cur.1);
+            let rendered = FqName::new()
+                .with_pushed(prev_id)
+                .with_pushed(cur_id)
+                .render_native(language, interner);
+
+            prop_assert_eq!(
+                interner.separator_between(prev_id, cur_id, language),
+                &rendered.text()[rendered.segment_end(0)..rendered.segment_start(1)]
+            );
+        }
+    }
+
+    /// `com.foo` renders as a string prefix of `com.foobar`, but the segments
+    /// `foo` and `foobar` differ, so it is not a prefix. A segment also carries
+    /// its kind: the same text as a `Type` is not the `Package` it was built as.
+    #[test]
+    fn starts_with_compares_segments_not_rendered_text() {
+        let interner = segment_interner();
+        let com_foo = intern_name_segments(
+            interner,
+            [("com", SegmentKind::Package), ("foo", SegmentKind::Package)],
+        );
+        let com_foobar = intern_name_segments(
+            interner,
+            [
+                ("com", SegmentKind::Package),
+                ("foobar", SegmentKind::Package),
+            ],
+        );
+        let com_foo_dot_bar = intern_name_segments(
+            interner,
+            [
+                ("com", SegmentKind::Package),
+                ("foo", SegmentKind::Package),
+                ("bar", SegmentKind::Member),
+            ],
+        );
+        let com_foo_type = intern_name_segments(
+            interner,
+            [("com", SegmentKind::Package), ("foo", SegmentKind::Type)],
+        );
+
+        assert!(
+            com_foobar
+                .display(interner)
+                .starts_with(&com_foo.display(interner))
+        );
+        assert!(!com_foobar.starts_with(&com_foo));
+        assert!(com_foo_dot_bar.starts_with(&com_foo));
+        assert!(
+            !com_foo.starts_with(&com_foo_dot_bar),
+            "longer is never a prefix"
+        );
+        assert!(
+            !com_foo_type.starts_with(&com_foo),
+            "same text, different kind"
+        );
+    }
+
+    /// The separators each language spells between adjacent segments, pinned on
+    /// the cases that `separator_between` exists to tell apart: only a `.` may
+    /// be descended by the legacy dot-only prefix walk.
+    #[test]
+    fn separator_between_distinguishes_the_non_dot_boundaries() {
+        let interner = segment_interner();
+        let id = |text, kind| interner.intern(text, kind);
+        let package = id("ns", SegmentKind::Package);
+        let other_package = id("inner", SegmentKind::Package);
+        let ty = id("Widget", SegmentKind::Type);
+        let nested = id("Inner", SegmentKind::Nested);
+        let path = id("github.com", SegmentKind::Path);
+        let other_path = id("x", SegmentKind::Path);
+
+        assert_eq!(
+            interner.separator_between(package, other_package, Language::Cpp),
+            "::"
+        );
+        assert_eq!(
+            interner.separator_between(package, other_package, Language::Java),
+            "."
+        );
+        assert_eq!(interner.separator_between(package, ty, Language::Cpp), ".");
+        assert_eq!(interner.separator_between(ty, nested, Language::Java), "$");
+        assert_eq!(
+            interner.separator_between(path, other_path, Language::Go),
+            "/"
+        );
+        assert_eq!(interner.separator_between(path, ty, Language::Go), ".");
+    }
+
     fn rebuild_and_render(text: &str, language: Language, interner: &SegmentInterner) -> String {
         let mut fq = FqName::new();
         for component in joined_segments(text, ".") {

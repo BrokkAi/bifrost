@@ -13,8 +13,8 @@ use crate::declarations::{
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
 use crate::graph::syntax::{
-    function_macro_replacement_span, normalize_macro_continuations,
-    object_macro_replacement_type_references, qualified_name_parts,
+    SentinelInput, function_macro_replacement_span, object_macro_replacement_type_references,
+    parse_sentinel, qualified_name_parts,
 };
 use crate::graph_support::CppSource;
 use crate::imports::{
@@ -22,6 +22,10 @@ use crate::imports::{
 };
 use crate::source_context::cpp_guard_set_to_runtime;
 use crate::structural::is_cpp_preprocessor_conditional;
+use crate::template_heads::{
+    CppTemplateBinding, CppTemplateContext, CppTemplateReconciliation,
+    cpp_declaration_template_context,
+};
 pub use brokk_bifrost_core::analyzer::cpp_facts::{
     CppClassDeclarationStrength, CppEnumOwnerKind as EnumOwnerKind,
 };
@@ -41,10 +45,12 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSourceOrigin, PreparedSyntaxSource};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_range_contains;
+use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{field_name_in_parent, node_range};
 use brokk_bifrost_core::analyzer::tree_walk::{
     ParentIndex, child_by_field_or_named_child_of_kinds, children_iter, first_named_child_of_kind,
     named_children_iter, node_for_exact_range, push_named_children_reversed,
+    single_named_child_matching,
 };
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -814,10 +820,7 @@ impl MacroEnvironment {
     }
 
     fn guard_may_hold(&self, guard: &PreprocessorGuard) -> bool {
-        let Some(expression) = guard.as_boolean_expression() else {
-            return true;
-        };
-        self.boolean_guard_may_hold(&expression)
+        self.boolean_guard_may_hold(&guard.as_boolean_expression())
     }
 
     fn boolean_guard_may_hold(&self, expression: &BooleanGuardExpression) -> bool {
@@ -959,6 +962,9 @@ type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Opti
 struct ExtractedComparable {
     shapes: Vec<CppComparableSlot>,
     suffix: String,
+    /// The template levels of the same occurrence, or `None` when its syntax
+    /// is unavailable or outside what [`crate::template_heads`] models.
+    template: Option<CppTemplateContext>,
 }
 
 /// How many alias hops [`VisibilityIndex::same_logical_callable`] follows
@@ -966,27 +972,14 @@ struct ExtractedComparable {
 /// cycle; this stops an adversarially long chain from costing a lookup per hop.
 const MAX_COMPARABLE_ALIAS_HOPS: usize = 32;
 
-/// Which comparison a conditional `#include` path's guards face before the
-/// header it reaches counts as visible at a reference.
-///
-/// `Proven` is the build's rule: `compile_commands.json` covers the
-/// reference's translation unit, so the reference's active guards plus the
-/// defines the build proves must imply every guard on the path, and a
-/// platform macro the build does not prove keeps the header invisible
-/// (#2011).
-///
-/// `Compatible` is the rule for a translation unit no build describes. A
-/// complete `#if`/`#else` family is a case analysis every configuration takes
-/// one branch of, so a branch of one is admitted unless its guards contradict
-/// the reference's own -- the rule the resolver already applies to a
-/// declaration's own guards (#2988). A lone `#if` is a different claim: no
-/// configuration is obliged to take it, so its guards stay strictly required
-/// and an unprovable one still reports `missing_compile_context` (#2011).
-///
-/// Without the first half, libuv's `uv/threadpool.h`, which `uv.h` includes
-/// from both arms of `#if defined(_WIN32)`, and `uv/unix.h`, which it includes
-/// from the `#else` arm, are invisible to every unguarded reference in the
-/// project (#3088).
+/// Guard admission for a conditional include path. Exact visibility
+/// (`foreign_declaration_reachable_at_reference`) always uses `Proven`: the
+/// effective source and build context must imply the path. Candidate discovery
+/// (`foreign_declaration_may_be_reachable_from_raw_guards`) takes
+/// `include_path_admission(file)`, which is `Compatible` for completed families
+/// when no compile coverage describes the file; partial-family requirements
+/// still need proof. Discovery alone never establishes an exact definition or
+/// a proven inverse hit (#6902).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IncludePathAdmission {
     Proven,
@@ -1040,6 +1033,7 @@ pub struct VisibilityIndexData {
         RwLock<HashMap<(ProjectFile, String, LogicalSymbolKey), ParserAliasTargetMatchCell>>,
     ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
     project_using_index: OnceLock<ProjectUsingIndex>,
+    namespace_alias_sites: Mutex<HashMap<ProjectFile, super::namespace_alias::NamespaceAliasCell>>,
     callable_reference_specs:
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     structured_include_fact_cells: Mutex<HashMap<ProjectFile, StructuredIncludeFactCell>>,
@@ -1074,6 +1068,7 @@ pub struct VisibilityIndexData {
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     callable_comparables: Mutex<HashMap<CodeUnit, Option<Arc<ExtractedComparable>>>>,
+    class_definition_agreements: Mutex<HashMap<(CodeUnit, CodeUnit), bool>>,
     /// Complete callable metadata is expensive for reconciled C++ members:
     /// each read can rebuild the declaration/definition evidence. Reuse it
     /// across the member, arity, identity, and navigation phases of this
@@ -1294,13 +1289,16 @@ impl BooleanGuardExpression {
 }
 
 impl PreprocessorGuard {
-    fn as_boolean_expression(&self) -> Option<BooleanGuardExpression> {
+    fn as_boolean_expression(&self) -> BooleanGuardExpression {
         match self {
-            Self::Defined(name) => Some(BooleanGuardExpression::Defined(name.clone())),
-            Self::Undefined(name) => Some(BooleanGuardExpression::Undefined(name.clone())),
-            Self::Boolean(expression) => Some(expression.clone()),
-            Self::Constant(value) => Some(BooleanGuardExpression::Constant(*value)),
-            Self::Expression(_) | Self::NegatedExpression(_) => None,
+            Self::Defined(name) => BooleanGuardExpression::Defined(name.clone()),
+            Self::Undefined(name) => BooleanGuardExpression::Undefined(name.clone()),
+            Self::Boolean(expression) => expression.clone(),
+            Self::Constant(value) => BooleanGuardExpression::Constant(*value),
+            Self::Expression(expression) => BooleanGuardExpression::Opaque(expression.clone()),
+            Self::NegatedExpression(expression) => {
+                BooleanGuardExpression::NegatedOpaque(expression.clone())
+            }
         }
     }
 
@@ -1356,28 +1354,32 @@ enum ParsedMacroReplacement {
 }
 
 /// The sentinel that gives a function-like macro replacement a parseable
-/// statement context. The replacement text is copied in verbatim, so the only
-/// bytes ahead of it are this prefix.
+/// statement context after phase-2 splicing. The only bytes ahead of it are
+/// this prefix.
 const MACRO_BODY_SENTINEL_PREFIX: &str = "void __bifrost_macro_body() { ";
+const MACRO_BODY_SENTINEL_SUFFIX: &str = "; }";
+
+// Each parsed byte owns its physical source byte, or an empty range for
+// synthetic punctuation. Deleted splices own no parsed bytes.
+type MacroOriginMap = Box<[std::ops::Range<usize>]>;
 
 /// A function-like macro replacement parsed inside a sentinel function body.
 ///
 /// Tree-sitter keeps a `#define NAME(a) ...` replacement as one opaque
 /// `preproc_arg`. Wrapping that exact byte slice in a function body recovers
 /// its statements, declarations, and member calls as ordinary C++ structure.
-/// The slice is copied verbatim at [`Self::body_offset`], so a node range in
-/// [`Self::tree`] maps back onto the defining `preproc_arg` by subtracting
-/// that offset.
+/// The spliced text begins at [`Self::body_offset`]. [`Self::file_range`]
+/// subtracts that prefix and uses physical byte origins to recover a node
+/// range in the defining replacement.
 pub struct ParsedReplacementBody {
     pub source: String,
     pub tree: Tree,
     pub body_offset: usize,
     pub parameters: Vec<String>,
-    /// For a normal parse this is an identity map. A constrained statement
-    /// recovery may insert separators after a macro formal; each boundary in
-    /// this map points back to the corresponding byte in the original
-    /// replacement, keeping source-backed ranges exact after substitution.
-    original_offsets: Box<[usize]>,
+    /// Each parsed replacement byte maps to its original physical byte. A
+    /// deleted splice creates a gap; a synthetic statement separator maps to
+    /// an empty range, keeping source-backed ranges exact after substitution.
+    original_offsets: MacroOriginMap,
 }
 
 impl ParsedReplacementBody {
@@ -1390,7 +1392,7 @@ impl ParsedReplacementBody {
     /// The byte range `node` occupies in the file that defines the macro.
     ///
     /// `replacement_start` is the logical replacement span's start byte.
-    /// The origin map accounts for continuation whitespace and any synthetic
+    /// The origin map accounts for deleted continuations and any synthetic
     /// statement separators inserted while parsing the replacement.
     pub fn file_range(&self, node: Node<'_>, replacement_start: usize) -> std::ops::Range<usize> {
         assert!(
@@ -1404,14 +1406,19 @@ impl ParsedReplacementBody {
         let start_offset = node.start_byte() - self.body_offset;
         let end_offset = node.end_byte() - self.body_offset;
         assert!(start_offset <= end_offset);
-        let start_origin = *self
+        let start_origin = self
             .original_offsets
             .get(start_offset)
-            .expect("replacement node start must have a source mapping");
-        let end_origin = *self
-            .original_offsets
-            .get(end_offset)
-            .expect("replacement node end must have a source mapping");
+            .expect("replacement node start must have a source mapping")
+            .start;
+        let end_origin = if start_offset == end_offset {
+            start_origin
+        } else {
+            self.original_offsets
+                .get(end_offset - 1)
+                .expect("replacement node end must have a source mapping")
+                .end
+        };
         assert!(start_origin <= end_origin);
         let start = replacement_start + start_origin;
         let end = replacement_start + end_origin;
@@ -1582,6 +1589,24 @@ fn macro_replacement_type_parameter(
     (parameters.len() == 1).then(|| parameters.pop().unwrap())
 }
 
+/// The grammar retains a type-shaped macro invocation as a macro type
+/// specifier even when it stands alone in a C block. Its descriptor is one
+/// actual argument, just as the argument list of an expression-shaped call is.
+pub(crate) fn function_macro_invocation_parts(node: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
+    let (name, arguments) = match node.kind() {
+        "call_expression" => (
+            node.child_by_field_name("function")?,
+            argument_children(node.child_by_field_name("arguments")?).collect(),
+        ),
+        "macro_type_specifier" => (
+            node.child_by_field_name("name")?,
+            vec![node.child_by_field_name("type")?],
+        ),
+        _ => return None,
+    };
+    (name.kind() == "identifier").then_some((name, arguments))
+}
+
 pub(crate) fn macro_type_argument_node<'tree>(
     node: Node<'tree>,
     source: &str,
@@ -1694,7 +1719,9 @@ fn recognized_c_macro_declarator_binding<'tree>(
     }
     let assignment = match statement.kind() {
         "assignment_expression" => statement,
-        "expression_statement" if statement.named_child_count() == 1 => statement.named_child(0)?,
+        "expression_statement" => {
+            single_named_child_matching(statement, |child| !child.is_extra())?
+        }
         _ => return None,
     };
     if assignment.kind() != "assignment_expression" {
@@ -2105,6 +2132,7 @@ impl<'a> VisibilityIndex<'a> {
                 parser_alias_target_matches: RwLock::new(HashMap::default()),
                 ordinary_type_import_cells: Mutex::new(HashMap::default()),
                 project_using_index: OnceLock::new(),
+                namespace_alias_sites: Mutex::new(HashMap::default()),
                 callable_reference_specs: Mutex::new(HashMap::default()),
                 structured_include_fact_cells: Mutex::new(HashMap::default()),
                 include_activation_cells: Mutex::new(HashMap::default()),
@@ -2128,6 +2156,7 @@ impl<'a> VisibilityIndex<'a> {
                 field_type_facts: Mutex::new(HashMap::default()),
                 structured_alias_targets: Mutex::new(HashMap::default()),
                 callable_comparables: Mutex::new(HashMap::default()),
+                class_definition_agreements: Mutex::new(HashMap::default()),
                 callable_metadata: Mutex::new(HashMap::default()),
                 comparable_name_declarations: Mutex::new(HashMap::default()),
                 indexed_structural_class_scopes: Mutex::new(HashMap::default()),
@@ -2378,6 +2407,7 @@ impl<'a> VisibilityIndex<'a> {
                 parser_alias_target_matches: RwLock::new(HashMap::default()),
                 ordinary_type_import_cells: Mutex::new(HashMap::default()),
                 project_using_index: OnceLock::new(),
+                namespace_alias_sites: Mutex::new(HashMap::default()),
                 callable_reference_specs: Mutex::new(HashMap::default()),
                 structured_include_fact_cells: Mutex::new(HashMap::default()),
                 include_activation_cells: Mutex::new(HashMap::default()),
@@ -2411,6 +2441,7 @@ impl<'a> VisibilityIndex<'a> {
                 field_type_facts: Mutex::new(HashMap::default()),
                 structured_alias_targets: Mutex::new(HashMap::default()),
                 callable_comparables: Mutex::new(HashMap::default()),
+                class_definition_agreements: Mutex::new(HashMap::default()),
                 callable_metadata: Mutex::new(HashMap::default()),
                 comparable_name_declarations: Mutex::new(HashMap::default()),
                 indexed_structural_class_scopes: Mutex::new(HashMap::default()),
@@ -2698,17 +2729,19 @@ impl<'a> VisibilityIndex<'a> {
         #[cfg(any(test, feature = "test-support"))]
         self.macro_replacement_parse_count
             .fetch_add(1, Ordering::Relaxed);
-        let source =
-            format!("void __bifrost_macro_arity() {{ __bifrost_macro_call({replacement}); }}");
-        let mut parser = Parser::new();
-        let parsed = parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .ok()
-            .and_then(|()| parser.parse(&source, None))
-            .filter(|tree| !tree.root_node().has_error())
-            .map_or(ParsedMacroReplacement::Unsupported, |tree| {
-                ParsedMacroReplacement::Parsed { source, tree }
-            });
+        let parsed = parse_sentinel(
+            "void __bifrost_macro_arity() { __bifrost_macro_call(",
+            SentinelInput::replacement(replacement),
+            "); }",
+        );
+        let parsed = if parsed.tree.root_node().has_error() {
+            ParsedMacroReplacement::Unsupported
+        } else {
+            ParsedMacroReplacement::Parsed {
+                source: parsed.source,
+                tree: parsed.tree,
+            }
+        };
         let parsed = Arc::new(parsed);
         cache.insert(key, Arc::clone(&parsed));
         parsed
@@ -2736,21 +2769,12 @@ impl<'a> VisibilityIndex<'a> {
             return Some(binding);
         }
         let call = match statement.kind() {
-            "call_expression" => statement,
-            "expression_statement" if statement.named_child_count() == 1 => {
-                statement.named_child(0)?
+            "expression_statement" => {
+                single_named_child_matching(statement, |child| !child.is_extra())?
             }
-            _ => return None,
+            _ => statement,
         };
-        if call.kind() != "call_expression" {
-            return None;
-        }
-        let function = call.child_by_field_name("function")?;
-        if function.kind() != "identifier" {
-            return None;
-        }
-        let arguments = call.child_by_field_name("arguments")?;
-        let actuals = argument_children(arguments).collect::<Vec<_>>();
+        let (function, actuals) = function_macro_invocation_parts(call)?;
         let environment = self.macro_environment(file, call.start_byte());
         let function_name = node_text(function, source);
         let binding = environment.binding(function_name)?;
@@ -2771,7 +2795,11 @@ impl<'a> VisibilityIndex<'a> {
                 if !macro_expansion_shape_is_safe(actual, source, &[], &environment) {
                     return None;
                 }
-                (node_text(actual, source).trim().to_string(), Some(actual))
+                let type_node = macro_type_argument_node(actual, source).unwrap_or(actual);
+                (
+                    node_text(actual, source).trim().to_string(),
+                    Some(type_node),
+                )
             }
             MacroLocalBindingTypeTemplate::Fixed(type_name) => (type_name.clone(), None),
         };
@@ -3082,10 +3110,7 @@ impl<'a> VisibilityIndex<'a> {
             let body = self.parsed_macro_replacement_body(&key, parameters, replacement)?;
             let sentinel = body.source.as_str();
             let statements = body.statements()?;
-            if statements.named_child_count() != 1 {
-                return None;
-            }
-            let declaration = statements.named_child(0)?;
+            let declaration = single_named_child_matching(statements, |child| !child.is_extra())?;
             if declaration.kind() != "declaration" {
                 return None;
             }
@@ -3212,22 +3237,23 @@ impl<'a> VisibilityIndex<'a> {
     fn parse_macro_replacement_body(
         replacement: &str,
         parameters: &[String],
-    ) -> Option<(String, Tree, Box<[usize]>)> {
-        let normalized = normalize_macro_continuations(replacement);
-        let parse = |replacement: &str| {
-            let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(&source, None)?;
-            Some((source, tree))
-        };
-        let (source, tree) = parse(&normalized)?;
+    ) -> Option<(String, Tree, MacroOriginMap)> {
+        let parsed = parse_sentinel(
+            MACRO_BODY_SENTINEL_PREFIX,
+            SentinelInput::replacement(replacement),
+            MACRO_BODY_SENTINEL_SUFFIX,
+        );
+        let normalized_end = parsed.source.len() - MACRO_BODY_SENTINEL_SUFFIX.len() - 1;
+        let normalized = &parsed.source[MACRO_BODY_SENTINEL_PREFIX.len()..normalized_end];
+        let normalized_offsets = &parsed.original_offsets;
+        let source = parsed.source.as_str();
+        let tree = &parsed.tree;
         if !tree.root_node().has_error() {
-            let mut original_offsets = (0..=normalized.len()).collect::<Vec<_>>();
-            Self::append_sentinel_offsets(&mut original_offsets, normalized.len());
-            return Some((source, tree, original_offsets.into_boxed_slice()));
+            return Some((
+                parsed.source,
+                parsed.tree,
+                parsed.original_offsets.into_boxed_slice(),
+            ));
         }
 
         let body_offset = MACRO_BODY_SENTINEL_PREFIX.len();
@@ -3239,7 +3265,7 @@ impl<'a> VisibilityIndex<'a> {
                 "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier"
             ) && parameters
                 .iter()
-                .any(|parameter| parameter.as_str() == node_text(node, &source))
+                .any(|parameter| parameter.as_str() == node_text(node, source))
                 && Self::macro_formal_needs_statement_separator(node)
             {
                 let point = node.end_byte().saturating_sub(body_offset);
@@ -3259,29 +3285,30 @@ impl<'a> VisibilityIndex<'a> {
         let mut next_insertion = 0;
         for (index, byte) in normalized.bytes().enumerate() {
             recovered.push(byte);
-            original_offsets.push(index);
+            original_offsets.push(normalized_offsets[index].clone());
             while insertion_points.get(next_insertion).copied() == Some(index + 1) {
                 recovered.push(b';');
-                original_offsets.push(index + 1);
+                let boundary = normalized_offsets[index].end;
+                original_offsets.push(boundary..boundary);
                 next_insertion += 1;
             }
         }
-        original_offsets.push(normalized.len());
-        Self::append_sentinel_offsets(&mut original_offsets, normalized.len());
+        original_offsets.push(replacement.len()..replacement.len());
         let recovered = String::from_utf8(recovered).expect("source text remains UTF-8");
-        let (source, tree) = parse(&recovered)?;
+        let parsed = parse_sentinel(
+            MACRO_BODY_SENTINEL_PREFIX,
+            SentinelInput {
+                source: recovered,
+                original_offsets,
+            },
+            MACRO_BODY_SENTINEL_SUFFIX,
+        );
+        let (source, tree, original_offsets) =
+            (parsed.source, parsed.tree, parsed.original_offsets);
         if tree.root_node().has_error() {
             return None;
         }
         Some((source, tree, original_offsets.into_boxed_slice()))
-    }
-
-    /// Extend a replacement-origin map over the `; }` suffix appended by the
-    /// sentinel parser. Nodes such as a declaration whose source omits its
-    /// terminator include that synthetic semicolon; every suffix boundary
-    /// still maps to the replacement's real end.
-    fn append_sentinel_offsets(offsets: &mut Vec<usize>, replacement_end: usize) {
-        offsets.extend([replacement_end; 3]);
     }
 
     /// A formal is statement-shaped when the recovered tree places it directly
@@ -3312,7 +3339,7 @@ impl<'a> VisibilityIndex<'a> {
                 return false;
             }
             if parent.kind() == "expression_statement" {
-                return parent.named_child_count() == 1;
+                return single_named_child_matching(parent, |child| !child.is_extra()).is_some();
             }
             if parent.kind() == "compound_statement" && current == node {
                 return true;
@@ -3363,14 +3390,13 @@ impl<'a> VisibilityIndex<'a> {
             // Keep this parser permissive. Type-role extraction predates the
             // replacement-body model and deliberately survives unrelated
             // token-pasting or recovery elsewhere in a production macro.
-            let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(&source, None)?;
-            let mut original_offsets = (0..=replacement.len()).collect::<Vec<_>>();
-            Self::append_sentinel_offsets(&mut original_offsets, replacement.len());
+            let parsed = parse_sentinel(
+                MACRO_BODY_SENTINEL_PREFIX,
+                SentinelInput::replacement(replacement),
+                MACRO_BODY_SENTINEL_SUFFIX,
+            );
+            let (source, tree, original_offsets) =
+                (parsed.source, parsed.tree, parsed.original_offsets);
             let body = ParsedReplacementBody {
                 source,
                 tree,
@@ -3840,7 +3866,6 @@ impl<'a> VisibilityIndex<'a> {
     fn apply_macro_events(
         &self,
         file: &ProjectFile,
-        before_byte: Option<usize>,
         environment: &mut MacroEnvironment,
         include_stack: &mut HashSet<ProjectFile>,
     ) {
@@ -3848,7 +3873,7 @@ impl<'a> VisibilityIndex<'a> {
             return;
         }
         if self.cpp.prepared_syntax(self.token, file).is_none() {
-            environment.mark_unknown_names(file, before_byte.unwrap_or_default());
+            environment.mark_unknown_names(file, 0);
             include_stack.remove(file);
             return;
         }
@@ -3865,7 +3890,7 @@ impl<'a> VisibilityIndex<'a> {
                         environment,
                         &mut ambiguous_seen,
                         file,
-                        before_byte.unwrap_or_default(),
+                        0,
                     );
                     include_stack.remove(file);
                     return;
@@ -3877,7 +3902,7 @@ impl<'a> VisibilityIndex<'a> {
                         environment,
                         &mut ambiguous_seen,
                         file,
-                        before_byte.unwrap_or_default(),
+                        0,
                     );
                     include_stack.remove(file);
                     return;
@@ -3901,7 +3926,7 @@ impl<'a> VisibilityIndex<'a> {
                         environment,
                         &mut ambiguous_seen,
                         file,
-                        before_byte.unwrap_or_default(),
+                        0,
                     );
                     environment.maybe_applied_pragma_once_files.remove(file);
                     environment.applied_pragma_once_files.insert(file.clone());
@@ -3914,9 +3939,6 @@ impl<'a> VisibilityIndex<'a> {
         let cell = self.macro_event_cell(file);
         let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
         for event in events {
-            if before_byte.is_some_and(|limit| event.byte() >= limit) {
-                break;
-            }
             self.apply_macro_event(file, event, environment, include_stack);
         }
         include_stack.remove(file);
@@ -3988,7 +4010,7 @@ impl<'a> VisibilityIndex<'a> {
                         );
                     }
                 } else if let Some(target) = targets.first() {
-                    self.apply_macro_events(target, None, environment, include_stack);
+                    self.apply_macro_events(target, environment, include_stack);
                 }
             }
             MacroEvent::Invalidate { byte } => {
@@ -4388,6 +4410,35 @@ impl<'a> VisibilityIndex<'a> {
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.rel_path().cmp(right.rel_path()));
         files
+    }
+
+    /// The namespace aliases written in `root`'s visible source files, by name.
+    pub(super) fn namespace_alias_cell(
+        &self,
+        root: &ProjectFile,
+    ) -> super::namespace_alias::NamespaceAliasCell {
+        self.namespace_alias_sites
+            .lock()
+            .expect("C++ namespace alias cache poisoned")
+            .entry(root.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// `root` and every source file its include closure makes visible.
+    pub(super) fn visible_source_files(&self, root: &ProjectFile) -> Vec<ProjectFile> {
+        self.visible_source_files_by_root.get(root).map_or_else(
+            || vec![root.clone()],
+            |files| {
+                files
+                    .iter()
+                    .chain([root])
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            },
+        )
     }
 
     pub fn source_is_visible(&self, root: &ProjectFile, source: &ProjectFile) -> bool {
@@ -4811,9 +4862,42 @@ impl<'a> VisibilityIndex<'a> {
         reference_byte: usize,
     ) -> bool {
         let reference_guards = OnceCell::new();
+        // A prototype must itself be active. Another same-signature prototype
+        // cannot select its include branch or compilation dialect for it.
+        if declaration.is_callable() && !callable_target_has_definition_body(analyzer, declaration)
+        {
+            return self.physical_declaration_visible_at(
+                analyzer,
+                file,
+                declaration,
+                reference_byte,
+                &reference_guards,
+            );
+        }
         self.visible_identifier_candidates(file, declaration.identifier())
             .filter(|candidate| {
-                self.same_logical_callable(analyzer, candidate, declaration)
+                // Across dialects, a shared spelling needs the include evidence
+                // that can connect a C declaration to an extern-C definition.
+                // Within one dialect retain unresolved link-unit candidates;
+                // their uncertainty is reported by the navigation consumer.
+                (if declaration.is_callable()
+                    && reference_uses_c_semantics(self.cpp, file)
+                        != reference_uses_c_semantics(self.cpp, declaration.source())
+                {
+                    crate::identity::cpp_callable_definitions_share_identity_evidence_with_visibility(
+                        analyzer,
+                        self,
+                        candidate,
+                        declaration,
+                        |left, right| {
+                            crate::identity::cpp_header_body_files_are_related(
+                                self.cpp, self.token, left, right,
+                            )
+                        },
+                    )
+                } else {
+                    self.same_logical_callable(analyzer, candidate, declaration)
+                })
                     || flattened_macro_namespace_declaration_matches(
                         analyzer,
                         self.cpp,
@@ -4834,6 +4918,27 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
+    /// Candidate guard admission, without claiming that the guards hold.
+    /// Structured inverse paths use this when visibility proof fails, so an
+    /// unrelated guard preserves uncertainty while a contradiction is excluded.
+    pub(crate) fn declaration_guards_compatible_at_reference(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        declaration: &CodeUnit,
+        reference: Node<'_>,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return false;
+        };
+        let reference_guards = preprocessor_guard_environment(reference, prepared.source());
+        declaration_guard_requirements(analyzer, self.cpp, declaration)
+            .iter()
+            .any(|(_, required)| {
+                guards_compatible_at_reference(required, reference_guards.as_ref())
+            })
+    }
+
     /// Whether a physical declaration is visible at an exact structured
     /// reference node. Inverse C field references need the reference's own
     /// preprocessor environment before using the callable activation path:
@@ -4850,11 +4955,8 @@ impl<'a> VisibilityIndex<'a> {
         let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
-        let reference_guards = preprocessor_guard_environment(reference, prepared.source());
-        let declaration_guards = declaration_guard_requirements(analyzer, self.cpp, declaration);
-        if !declaration_guards.iter().any(|(_, required)| {
-            guards_compatible_at_reference(required, reference_guards.as_ref())
-        }) {
+        if !self.declaration_guards_compatible_at_reference(analyzer, file, declaration, reference)
+        {
             return false;
         }
         if declaration.source() == file
@@ -5009,10 +5111,21 @@ impl<'a> VisibilityIndex<'a> {
                 .is_some_and(|activation| activation < reference_byte);
         }
         if self
-            .foreign_callable_declaration_activation(analyzer, declaration, &reference)
-            .or_else(|| self.exhaustive_guard_family_activation(analyzer, declaration, &reference))
-            .is_none()
+            .exhaustive_guard_family_activation(analyzer, declaration, &reference)
+            .is_some()
         {
+            // Structured coverage proves this logical declaration exists in
+            // every arm. The include path still needs its own proof.
+            return self.foreign_declaration_reachable_at_reference(
+                file,
+                prepared.as_ref(),
+                declaration.source(),
+                &HashSet::default(),
+                reference.guards(),
+                reference_byte,
+            );
+        }
+        if !self.foreign_callable_declaration_is_active(analyzer, declaration, &reference) {
             return false;
         }
         declaration_guard_requirements(analyzer, self.cpp, declaration)
@@ -5029,26 +5142,16 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
-    /// The byte at which `declaration` activates inside the foreign file that
-    /// its canonical source occurrence describes.
-    ///
-    /// Which guard rule applies depends on what decides the reference's
-    /// configuration. When `compile_commands.json` covers the reference's
-    /// translation unit, the build is the proof source and the declaration's
-    /// guards must follow from the reference's active guards plus the proven
-    /// defines; a platform macro the build does not prove leaves the
-    /// declaration invisible (#2011). With no compile coverage nothing decides
-    /// a platform macro, so the cross-file rule stands: the donor resolves its
-    /// own conditionals and only has to stay free of contradiction with the
-    /// reference. Otherwise a libuv-shaped `#if defined(__linux__)` prototype
-    /// in a shared header is hidden from every unguarded caller in another
-    /// translation unit (#2988).
-    fn foreign_callable_declaration_activation(
+    /// Whether the donor's callable facts admit this candidate. Build coverage
+    /// selects required macro facts; without it, compatibility permits discovery.
+    /// `physical_declaration_visible_at` separately requires implication and a
+    /// proven include path before publishing an exact answer (#6902).
+    fn foreign_callable_declaration_is_active(
         &self,
         analyzer: &CppGraphSource<'_>,
         declaration: &CodeUnit,
         reference: &CallableReferenceContext<'_>,
-    ) -> Option<usize> {
+    ) -> bool {
         let build_decides = !self.compile_context_is_absent(reference.file);
         let proven = self.compile_proven_guards(reference.file);
         let augmented;
@@ -5060,12 +5163,21 @@ impl<'a> VisibilityIndex<'a> {
             other => other,
         };
         analyzer
-            .declaration_source_occurrences(declaration)?
+            .declaration_source_occurrences(declaration)
             .into_iter()
-            .filter_map(|occurrence| {
-                let activation = occurrence.fact.callable_activation?;
-                let mut required =
-                    cpp_guard_set_to_runtime(occurrence.fact.callable_guards.as_ref()?)?;
+            .flatten()
+            .any(|occurrence| {
+                if occurrence.fact.callable_activation.is_none() {
+                    return false;
+                }
+                let Some(mut required) = occurrence
+                    .fact
+                    .callable_guards
+                    .as_ref()
+                    .and_then(cpp_guard_set_to_runtime)
+                else {
+                    return false;
+                };
                 if required.iter().any(|guard| match guard {
                     PreprocessorGuard::Defined(name) if name == "__cplusplus" => reference.is_c(),
                     PreprocessorGuard::Undefined(name) if name == "__cplusplus" => {
@@ -5073,22 +5185,20 @@ impl<'a> VisibilityIndex<'a> {
                     }
                     _ => false,
                 }) {
-                    return None;
+                    return false;
                 }
                 required.retain(|guard| {
                     !matches!(guard,
                     PreprocessorGuard::Defined(name) | PreprocessorGuard::Undefined(name)
                         if name == "__cplusplus")
                 });
-                let visible = required.is_empty()
+                required.is_empty()
                     || if build_decides {
                         guard_requirements_hold_at_reference(&required, active)
                     } else {
                         guards_compatible_at_reference(&required, reference.guards())
-                    };
-                visible.then_some(activation)
+                    }
             })
-            .min()
     }
 
     pub fn external_type_candidate_visible_at(
@@ -5205,7 +5315,7 @@ impl<'a> VisibilityIndex<'a> {
     /// reference in `file`.
     ///
     /// This is the include-edge analogue of the choice
-    /// [`Self::foreign_callable_declaration_activation`] makes for a foreign
+    /// [`Self::foreign_callable_declaration_is_active`] makes for a foreign
     /// declaration's own guards (#2988), and it is decided by the same thing:
     /// what settles the reference's configuration. Memoized per file because
     /// the answer depends on nothing else, and the callers ask it once per
@@ -5302,17 +5412,36 @@ impl<'a> VisibilityIndex<'a> {
         })
     }
 
+    /// The guards that hold at a reference in `file`: its own source guards,
+    /// the defines the build proves (#2011), and the translation unit's stable
+    /// `__cplusplus` state. A reference whose own environment is unknown stays
+    /// unknown -- the facts extend an environment, they never invent one. Every
+    /// proof and contradiction check against a reference uses this set, so a C
+    /// translation unit never takes an `#ifdef __cplusplus` arm (#7072).
+    fn effective_reference_guards(
+        &self,
+        file: &ProjectFile,
+        reference_guards: Option<&HashSet<PreprocessorGuard>>,
+    ) -> Option<HashSet<PreprocessorGuard>> {
+        let mut effective = reference_guards.cloned()?;
+        effective.extend(self.compile_proven_guards(file).iter().cloned());
+        if self.include_language_guard_is_stable(file) {
+            effective.insert(if reference_uses_c_semantics(self.cpp, file) {
+                PreprocessorGuard::Undefined("__cplusplus".to_string())
+            } else {
+                PreprocessorGuard::Defined("__cplusplus".to_string())
+            });
+        }
+        Some(effective)
+    }
+
     /// Decide whether a declaration that lives in another file reaches a
     /// reference in `file`.
     ///
-    /// An external header selects its declaration branch before the reference
-    /// file is parsed. Require compatible reference guards, but do not test
-    /// the header's guard expression for stability in the reference file: a
-    /// `.c` translation unit can never satisfy the `#ifdef __cplusplus` that
-    /// wraps every declaration of a portable C header, and demanding it would
-    /// hide the whole header. Guards that the reference file imposes on its
-    /// own `#include` still have to be stable, and must satisfy the rule
-    /// [`IncludePathAdmission`] names for this reference's translation unit.
+    /// Candidate discovery admits non-contradicting guards. Proven visibility
+    /// additionally requires the declaration's guards to follow from the
+    /// effective reference context; independent opaque conditions imply nothing
+    /// about one another (#6902).
     fn foreign_declaration_reachable_at_reference(
         &self,
         file: &ProjectFile,
@@ -5322,27 +5451,15 @@ impl<'a> VisibilityIndex<'a> {
         reference_guards: Option<&HashSet<PreprocessorGuard>>,
         reference_byte: usize,
     ) -> bool {
-        // The translation unit's build-proven defines join the reference's
-        // active guard set (#2011): a conditional include like the nng
-        // `NNG_PLATFORM_POSIX` chain is provable only by the compile command.
-        // A reference whose own environment is unknown stays unknown -- the
-        // facts extend an environment, they never invent one.
-        let proven = self.compile_proven_guards(file);
-        let augmented;
-        let reference_guards = match reference_guards {
-            Some(active) if !proven.is_empty() => {
-                augmented = active.union(&proven).cloned().collect();
-                Some(&augmented)
-            }
-            other => other,
-        };
+        let effective = self.effective_reference_guards(file, reference_guards);
+        let reference_guards = effective.as_ref();
         if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some() {
             eprintln!(
                 "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=foreign_guard_compatibility declaration_source={} declaration_guards={declaration_guards:?} reference_guards={reference_guards:?}",
                 declaration_source.rel_path().display(),
             );
         }
-        if !guards_compatible_at_reference(declaration_guards, reference_guards) {
+        if !guard_requirements_hold_at_reference(declaration_guards, reference_guards) {
             return false;
         }
         if self
@@ -5358,11 +5475,11 @@ impl<'a> VisibilityIndex<'a> {
                 "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=filtered_projection source={} declaration_guards={} proven_guards={} projections={}",
                 declaration_source.rel_path().display(),
                 declaration_guards.len(),
-                proven.len(),
+                self.compile_proven_guards(file).len(),
                 projections.len(),
             );
         }
-        let admission = self.include_path_admission(file);
+        let admission = IncludePathAdmission::Proven;
         projections.iter().any(|projection| {
             projection.activation_byte <= reference_byte
                 && admission.admits(
@@ -5445,7 +5562,7 @@ impl<'a> VisibilityIndex<'a> {
     ) -> bool {
         let proven = self.compile_proven_guards(file);
         if proven.is_empty()
-            || !guards_compatible_at_reference(declaration_guards, Some(proven.as_ref()))
+            || !guard_requirements_hold_at_reference(declaration_guards, Some(proven.as_ref()))
         {
             return false;
         }
@@ -5477,6 +5594,170 @@ impl<'a> VisibilityIndex<'a> {
                         &projection.required_guards,
                     )
         })
+    }
+
+    /// Whether one declaration site of `site_source` introduces its name before
+    /// `reference_byte` of `file` without consulting the reference's own guard
+    /// environment: an unguarded site earlier in the file or reached through
+    /// an unconditional include, or a foreign site the build's proven defines
+    /// reach.
+    fn declaration_site_visible_without_reference_environment(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        site_source: &ProjectFile,
+        site_byte: usize,
+        site_guards: &HashSet<PreprocessorGuard>,
+        reference_byte: usize,
+    ) -> bool {
+        let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
+        if site_source == file {
+            let visible = site_byte < reference_byte && site_guards.is_empty();
+            if report_stats {
+                eprintln!(
+                    "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=direct_peer source={} declaration_guards={} same_file=true visible={visible}",
+                    site_source.rel_path().display(),
+                    site_guards.len(),
+                );
+            }
+            return visible;
+        }
+        let direct = site_guards.is_empty()
+            && self
+                .include_activation_for_source(self.cpp, file, prepared, site_source)
+                .is_some_and(|activation| activation <= reference_byte);
+        let compile_proven = !direct
+            && self.foreign_declaration_reachable_from_compile_proven_guards(
+                file,
+                prepared,
+                site_source,
+                site_guards,
+                reference_byte,
+            );
+        if report_stats {
+            eprintln!(
+                "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=direct_peer source={} declaration_guards={} same_file=false direct={direct} compile_proven={compile_proven}",
+                site_source.rel_path().display(),
+                site_guards.len(),
+            );
+        }
+        direct || compile_proven
+    }
+
+    /// Whether one declaration site of `site_source` is in effect at
+    /// `reference_byte` of `file` under the reference's guard environment:
+    /// `raw_reference_guards` as written, and `reference_guards_at_site` after
+    /// the macro events before the reference.
+    #[allow(clippy::too_many_arguments)]
+    fn declaration_site_visible_at_reference<'g>(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        site_source: &ProjectFile,
+        site: &DeclarationGuardSite,
+        reference_byte: usize,
+        raw_reference_guards: Option<&HashSet<PreprocessorGuard>>,
+        reference_guards_at_site: impl Fn() -> Option<&'g HashSet<PreprocessorGuard>>,
+    ) -> bool {
+        if site_source == file {
+            if site.byte >= reference_byte {
+                return false;
+            }
+            // The reference's own conditional context must either prove the
+            // declaration's requirements, or follow a completed family that
+            // encloses the declaration (#3297); either way it must not
+            // contradict them.
+            let active = |guards: Option<&HashSet<PreprocessorGuard>>| {
+                guard_requirements_hold_at_reference(&site.guards, guards)
+                    || (site.completed_family_before_reference
+                        && guards_compatible_at_reference(&site.guards, guards))
+            };
+            if !active(raw_reference_guards) {
+                return false;
+            }
+            return active(reference_guards_at_site())
+                && self.preprocessor_guards_stable_between(
+                    file,
+                    site.byte,
+                    reference_byte,
+                    &site.guards,
+                );
+        }
+        let raw_feasible = self.foreign_declaration_may_be_reachable_from_raw_guards(
+            file,
+            prepared,
+            site_source,
+            &site.guards,
+            raw_reference_guards,
+            reference_byte,
+        );
+        if std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some() {
+            eprintln!(
+                "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=raw_feasibility source={} declaration_guards={} feasible={raw_feasible}",
+                site_source.rel_path().display(),
+                site.guards.len(),
+            );
+        }
+        raw_feasible
+            && self.foreign_declaration_reachable_at_reference(
+                file,
+                prepared,
+                site_source,
+                &site.guards,
+                reference_guards_at_site(),
+                reference_byte,
+            )
+    }
+
+    /// Whether a scope-level binding written at `site_byte` of `site_source`
+    /// under `site_guards` is in effect at `reference`, by the same site rule
+    /// [`Self::external_type_candidate_visible_in_context`] applies to each
+    /// declaration range.
+    pub fn binding_site_visible_at_reference(
+        &self,
+        file: &ProjectFile,
+        site_source: &ProjectFile,
+        site_byte: usize,
+        site_guards: &HashSet<PreprocessorGuard>,
+        reference: Node<'_>,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return false;
+        };
+        if self.declaration_site_visible_without_reference_environment(
+            file,
+            prepared.as_ref(),
+            site_source,
+            site_byte,
+            site_guards,
+            reference.start_byte(),
+        ) {
+            return true;
+        }
+        let raw_reference_guards = preprocessor_guard_environment(reference, prepared.source());
+        let reference_guards = OnceCell::new();
+        self.declaration_site_visible_at_reference(
+            file,
+            prepared.as_ref(),
+            site_source,
+            &DeclarationGuardSite {
+                byte: site_byte,
+                guards: site_guards.clone(),
+                completed_family_before_reference: false,
+            },
+            reference.start_byte(),
+            raw_reference_guards.as_ref(),
+            || {
+                reference_guards
+                    .get_or_init(|| {
+                        let environment = self.macro_environment(file, reference.start_byte());
+                        raw_reference_guards
+                            .clone()
+                            .filter(|guards| environment.guard_requirements_may_hold(guards))
+                    })
+                    .as_ref()
+            },
+        )
     }
 
     pub fn external_type_candidate_visible_in_context(
@@ -5545,43 +5826,14 @@ impl<'a> VisibilityIndex<'a> {
             declaration_guard_requirements(analyzer, self.cpp, peer)
                 .into_iter()
                 .any(|(declaration_byte, declaration_guards)| {
-                    if peer.source() == file {
-                        let visible = declaration_byte < reference.start_byte()
-                            && declaration_guards.is_empty();
-                        if report_stats {
-                            eprintln!(
-                                "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=direct_peer source={} declaration_guards={} same_file=true visible={visible}",
-                                peer.source().rel_path().display(),
-                                declaration_guards.len(),
-                            );
-                        }
-                        return visible;
-                    }
-                    let direct = declaration_guards.is_empty()
-                        && self
-                            .include_activation_for_source(
-                                self.cpp,
-                                file,
-                                prepared.as_ref(),
-                                peer.source(),
-                            )
-                            .is_some_and(|activation| activation <= reference.start_byte());
-                    let compile_proven = !direct
-                        && self.foreign_declaration_reachable_from_compile_proven_guards(
-                            file,
-                            prepared.as_ref(),
-                            peer.source(),
-                            &declaration_guards,
-                            reference.start_byte(),
-                        );
-                    if report_stats {
-                        eprintln!(
-                            "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=direct_peer source={} declaration_guards={} same_file=false direct={direct} compile_proven={compile_proven}",
-                            peer.source().rel_path().display(),
-                            declaration_guards.len(),
-                        );
-                    }
-                    direct || compile_proven
+                    self.declaration_site_visible_without_reference_environment(
+                        file,
+                        prepared.as_ref(),
+                        peer.source(),
+                        declaration_byte,
+                        &declaration_guards,
+                        reference.start_byte(),
+                    )
                 })
         });
         if directly_visible_without_reference_environment {
@@ -5594,60 +5846,17 @@ impl<'a> VisibilityIndex<'a> {
             return true;
         }
         let directly_visible = peers.iter().any(|peer| {
-            declaration_guard_sites(analyzer, self.cpp, peer, Some(reference.start_byte()))
+            declaration_guard_sites(analyzer, self.cpp, peer, reference.start_byte())
                 .into_iter()
                 .any(|site| {
-                    let declaration_byte = site.byte;
-                    let declaration_guards = site.guards;
-                    if peer.source() == file {
-                        if declaration_byte >= reference.start_byte() {
-                            return false;
-                        }
-                        // The reference's own conditional context must either
-                        // prove the declaration's requirements, or follow a
-                        // completed family that encloses the declaration
-                        // (#3297); either way it must not contradict them.
-                        let active = |guards: Option<&HashSet<PreprocessorGuard>>| {
-                            guard_requirements_hold_at_reference(&declaration_guards, guards)
-                                || (site.completed_family_before_reference
-                                    && guards_compatible_at_reference(&declaration_guards, guards))
-                        };
-                        if !active(raw_reference_guards.as_ref()) {
-                            return false;
-                        }
-                        return active(reference_guards_at_site().as_ref())
-                            && self.preprocessor_guards_stable_between(
-                                file,
-                                declaration_byte,
-                                reference.start_byte(),
-                                &declaration_guards,
-                            );
-                    }
-                    let raw_feasible = self.foreign_declaration_may_be_reachable_from_raw_guards(
+                    self.declaration_site_visible_at_reference(
                         file,
                         prepared.as_ref(),
                         peer.source(),
-                        &declaration_guards,
+                        &site,
+                        reference.start_byte(),
                         raw_reference_guards.as_ref(),
-                        reference.start_byte(),
-                    );
-                    if report_stats {
-                        eprintln!(
-                            "BIFROST_CPP_TYPE_VISIBILITY_STATS phase=raw_feasibility source={} declaration_guards={} feasible={raw_feasible}",
-                            peer.source().rel_path().display(),
-                            declaration_guards.len(),
-                        );
-                    }
-                    if !raw_feasible {
-                        return false;
-                    }
-                    self.foreign_declaration_reachable_at_reference(
-                        file,
-                        prepared.as_ref(),
-                        peer.source(),
-                        &declaration_guards,
-                        reference_guards_at_site().as_ref(),
-                        reference.start_byte(),
+                        || reference_guards_at_site().as_ref(),
                     )
                 })
         });
@@ -7970,7 +8179,7 @@ impl<'a> VisibilityIndex<'a> {
             return None;
         }
         let family = self
-            .visible_identifier_candidates(candidate.source(), candidate.identifier())
+            .visible_identifier_candidates(reference.file, candidate.identifier())
             .filter(|peer| {
                 peer.kind() == candidate.kind()
                     && peer.fq_name() == candidate.fq_name()
@@ -7984,12 +8193,17 @@ impl<'a> VisibilityIndex<'a> {
         ) {
             return None;
         }
-        // A reference whose own guards pick one branch already reaches that
-        // branch through the ordinary same-guard path; the family must not
-        // resurrect the branch the reference contradicts.
+        // A reference whose effective context picks one branch already reaches
+        // that branch through the ordinary same-guard path; the family must not
+        // resurrect the branch the reference contradicts. The context includes
+        // the translation unit's stable `__cplusplus` state and build-proven
+        // defines, not only the reference's source guards: a C file below
+        // `#ifdef __cplusplus ... #else ... #endif` takes the `#else` arm
+        // however the family enumerates its branches.
+        let effective = self.effective_reference_guards(reference.file, reference.guards());
         if !declaration_guard_requirements(analyzer, self.cpp, candidate)
             .iter()
-            .any(|(_, guards)| guards_compatible_at_reference(guards, reference.guards()))
+            .any(|(_, guards)| guards_compatible_at_reference(guards, effective.as_ref()))
         {
             return None;
         }
@@ -8375,21 +8589,36 @@ impl<'a> VisibilityIndex<'a> {
         {
             return false;
         }
-        // A template declaration and its out-of-line body can also diverge
-        // outside the parameter list - `template <class T>` against
-        // `template <typename T>` - and the template head is part of the
-        // persisted signature. Deciding template-head equivalence is a
-        // separate question, so templates keep string identity.
-        if self.callable_is_template_declaration(analyzer, left)
-            || self.callable_is_template_declaration(analyzer, right)
-        {
-            return false;
-        }
         let (Some(left_comparable), Some(right_comparable)) = (
             self.callable_comparable(analyzer, left),
             self.callable_comparable(analyzer, right),
         ) else {
             return false;
+        };
+        // A template declaration and its out-of-line body can also diverge
+        // outside the parameter list - `template <class T>` against
+        // `template <typename U>` - and the template head is part of the
+        // persisted signature. The structured template levels decide whether
+        // the heads and owner arguments agree, and bind each side's parameter
+        // names for the parameter comparison below. A template whose levels
+        // cannot be read keeps string identity.
+        let binding = match (&left_comparable.template, &right_comparable.template) {
+            (Some(left_template), Some(right_template))
+                if left_template.is_templated() || right_template.is_templated() =>
+            {
+                match left_template.reconcile(right_template) {
+                    CppTemplateReconciliation::Equivalent(binding) => binding,
+                    CppTemplateReconciliation::Distinct
+                    | CppTemplateReconciliation::Unsupported => return false,
+                }
+            }
+            (Some(_), Some(_)) => CppTemplateBinding::default(),
+            _ if self.callable_is_template_declaration(analyzer, left)
+                || self.callable_is_template_declaration(analyzer, right) =>
+            {
+                return false;
+            }
+            _ => CppTemplateBinding::default(),
         };
         // The trailing member `const`, ref-qualifier, `noexcept`, trailing
         // return type and requires-clause are part of C++ callable identity and
@@ -8407,13 +8636,173 @@ impl<'a> VisibilityIndex<'a> {
             .all(|(left_slot, right_slot)| match (left_slot, right_slot) {
                 (CppComparableSlot::Ellipsis, CppComparableSlot::Ellipsis) => true,
                 (CppComparableSlot::Shape(left_shape), CppComparableSlot::Shape(right_shape)) => {
-                    self.comparable_shapes_agree(analyzer, left_shape, right_shape)
+                    self.comparable_shapes_agree(analyzer, &binding, left_shape, right_shape)
                 }
                 // An unstructured parameter records that the reduction failed,
                 // not that the two spellings mean the same type, so it agrees
                 // with nothing - including another unstructured parameter.
                 _ => false,
             })
+    }
+
+    /// Whether two complete class definitions in different files define one
+    /// class.
+    ///
+    /// The one-definition rule makes every definition of a class with linkage
+    /// the same entity, and it requires those definitions to agree token for
+    /// token ([basic.def.odr]). A shared qualified name is only the spelling of
+    /// that claim, so it is never enough. The evidence is structural: both
+    /// definitions are complete, their template levels reconcile (heads, and
+    /// the arguments that select a specialization), their base specifiers
+    /// agree, and they declare the same members -- the same kinds, names and
+    /// signatures, which embed each member's template head as written. Two
+    /// classes that share a name but differ in any of these stay two classes.
+    pub fn same_logical_class_definition(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        left: &CodeUnit,
+        right: &CodeUnit,
+    ) -> bool {
+        if same_symbol(left, right) {
+            return true;
+        }
+        if !left.is_class() || !right.is_class() || left.fq_name() != right.fq_name() {
+            return false;
+        }
+        let key = if left <= right {
+            (left.clone(), right.clone())
+        } else {
+            (right.clone(), left.clone())
+        };
+        if let Some(cached) = self
+            .class_definition_agreements
+            .lock()
+            .expect("C++ class definition agreement cache poisoned")
+            .get(&key)
+        {
+            return *cached;
+        }
+        let agree = self.class_definitions_agree(analyzer, left, right);
+        self.class_definition_agreements
+            .lock()
+            .expect("C++ class definition agreement cache poisoned")
+            .insert(key, agree);
+        agree
+    }
+
+    fn class_definitions_agree(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        left: &CodeUnit,
+        right: &CodeUnit,
+    ) -> bool {
+        let complete_definition = |class: &CodeUnit| {
+            let mut facts = analyzer
+                .declaration_source_properties(class)?
+                .into_iter()
+                .filter(|fact| fact.class_strength == CppClassDeclarationStrength::Full);
+            let fact = facts.next()?;
+            // Two complete definitions in one file are a conditional family
+            // this comparison does not choose between.
+            facts.next().is_none().then_some(fact)
+        };
+        let (Some(left_fact), Some(right_fact)) =
+            (complete_definition(left), complete_definition(right))
+        else {
+            return false;
+        };
+        if left_fact.bases != right_fact.bases {
+            return false;
+        }
+        let (Some(left_template), Some(right_template)) = (
+            self.declaration_template_context(left, left_fact.declaration),
+            self.declaration_template_context(right, right_fact.declaration),
+        ) else {
+            return false;
+        };
+        if !matches!(
+            left_template.reconcile(&right_template),
+            CppTemplateReconciliation::Equivalent(_)
+        ) {
+            return false;
+        }
+        let members = |class: &CodeUnit| {
+            let mut members = analyzer
+                .direct_children(class)
+                .into_iter()
+                .filter(|member| member.source() == class.source())
+                .map(|member| {
+                    (
+                        member.kind(),
+                        member.identifier().to_owned(),
+                        member.signature().map(str::to_owned),
+                    )
+                })
+                .collect::<Vec<_>>();
+            members.sort();
+            members
+        };
+        members(left) == members(right)
+    }
+
+    /// Whether `file` sees a definition of `class` through an identical
+    /// definition in another header.
+    ///
+    /// The include graph relates a header to the translation units that
+    /// include it. When a class is defined identically in two headers, a
+    /// translation unit that includes only one copy still defines members of
+    /// the class the other copy declares: the two definitions are one class
+    /// ([`Self::same_logical_class_definition`]). Each source declaration
+    /// keeps its own identity; only the relation crosses.
+    pub fn class_definition_bridges_to_file(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        class: &CodeUnit,
+        file: &ProjectFile,
+        header_body_related: &dyn Fn(&ProjectFile, &ProjectFile) -> bool,
+    ) -> bool {
+        class.is_class()
+            && class.source() != file
+            && crate::identity::cpp_source_path_is_header(class.source())
+            && analyzer
+                .index
+                .definitions_by_structured_name(class.fq(), Language::Cpp)
+                .into_iter()
+                .any(|copy| {
+                    // The copy's own header holds the copy's declarations,
+                    // which keep their own provenance; only files beyond it
+                    // are reached through the copy.
+                    copy.is_class()
+                        && copy.source() != class.source()
+                        && copy.source() != file
+                        && crate::identity::cpp_source_path_is_header(copy.source())
+                        && header_body_related(copy.source(), file)
+                        && self.same_logical_class_definition(analyzer, class, &copy)
+                })
+    }
+
+    /// Whether the header member declaration `declaration` reaches `body`
+    /// through an identical definition of its class
+    /// ([`Self::class_definition_bridges_to_file`]).
+    pub fn member_declaration_bridges_to_body(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        declaration: &CodeUnit,
+        body: &CodeUnit,
+        header_body_related: &dyn Fn(&ProjectFile, &ProjectFile) -> bool,
+    ) -> bool {
+        declaration.is_callable()
+            && self
+                .cpp
+                .structural_parent_of(declaration)
+                .is_some_and(|owner| {
+                    self.class_definition_bridges_to_file(
+                        analyzer,
+                        &owner,
+                        body.source(),
+                        header_body_related,
+                    )
+                })
     }
 
     /// Compare two parameter shapes node by node with an explicit paired stack.
@@ -8424,6 +8813,7 @@ impl<'a> VisibilityIndex<'a> {
     fn comparable_shapes_agree(
         &self,
         analyzer: &CppGraphSource<'_>,
+        binding: &CppTemplateBinding,
         left: &CppComparableParameter,
         right: &CppComparableParameter,
     ) -> bool {
@@ -8449,6 +8839,7 @@ impl<'a> VisibilityIndex<'a> {
                         || left_primitive != right_primitive
                         || !self.comparable_names_agree(
                             analyzer,
+                            binding,
                             left_name,
                             right_name,
                             *left_primitive,
@@ -8517,15 +8908,40 @@ impl<'a> VisibilityIndex<'a> {
     /// exact agreement of what was written, which is no weaker than the
     /// whole-signature string equality this comparison replaces. Resolution on
     /// one side only is evidence of difference, never of agreement.
+    ///
+    /// A template parameter hides every outer name it spells, so a path that
+    /// starts with one is decided by `binding` alone: both sides must start
+    /// with the parameters the reconciled heads pair, and agree on the rest
+    /// of the path (`typename T::value_type`).
     fn comparable_names_agree(
         &self,
         analyzer: &CppGraphSource<'_>,
+        binding: &CppTemplateBinding,
         left: &StructuredTypeName,
         right: &StructuredTypeName,
         primitive: bool,
     ) -> bool {
         if primitive {
             return left.path() == right.path();
+        }
+        if !binding.is_empty() {
+            let (Some(left_head), Some(right_head)) = (left.path().first(), right.path().first())
+            else {
+                return false;
+            };
+            match (
+                binding.is_left_parameter(left_head),
+                binding.is_right_parameter(right_head),
+            ) {
+                (true, true) => {
+                    return !left.is_absolute()
+                        && !right.is_absolute()
+                        && binding.binds(right_head, left_head)
+                        && left.path()[1..] == right.path()[1..];
+                }
+                (false, false) => {}
+                _ => return false,
+            }
         }
         match (
             self.comparable_name_terminal(analyzer, left),
@@ -8712,10 +9128,34 @@ impl<'a> VisibilityIndex<'a> {
             .declaration_source_properties(unit)?
             .into_iter()
             .find(|fact| fact.callable_comparable_shapes.is_some())?;
+        let template = self.declaration_template_context(unit, fact.declaration);
         Some(ExtractedComparable {
             shapes: fact.callable_comparable_shapes?,
             suffix: fact.callable_identity_suffix?,
+            template,
         })
+    }
+
+    /// The template levels of one source declaration of `unit`, read from
+    /// the file's prepared syntax at the declaration's exact occurrence.
+    pub fn declaration_template_context(
+        &self,
+        unit: &CodeUnit,
+        declaration: SourceDeclarationId,
+    ) -> Option<CppTemplateContext> {
+        let facts = self
+            .cpp
+            .declaration_source_facts(self.token, unit.source())?;
+        let occurrence = facts.source.declaration(declaration).occurrence;
+        let range = facts.source.occurrence(occurrence).range;
+        let syntax = self.cpp.prepared_syntax(self.token, unit.source())?;
+        let mut node = node_for_exact_range(syntax.tree().root_node(), &range)?;
+        // An occurrence may span the template wrapper; the context starts at
+        // the declaration it wraps.
+        while node.kind() == "template_declaration" {
+            node = node.named_child(node.named_child_count().checked_sub(1)?)?;
+        }
+        cpp_declaration_template_context(node, syntax.source())
     }
 
     pub fn canonical_type_for_reference(
@@ -9762,81 +10202,6 @@ pub fn bounded_visibility_dependency_ast_node_count_for_test() -> usize {
     BOUNDED_VISIBILITY_DEPENDENCY_AST_NODE_COUNT.with(Cell::get)
 }
 
-pub struct VisibilityData {
-    pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
-    pub visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
-}
-
-/// Build the per-root include closure and the declarations each root can see
-/// through it.
-///
-/// `declarations_for` takes the reading to answer in (issue #1970): a root
-/// compiled as C sees the C reading of every file in its closure, a root
-/// compiled as C++ sees the C++ reading, and `reading_is_c_for` decides which
-/// per root. The two readings agree for all but a handful of headers, so the
-/// C map is built only when some root actually asks for it, and only over the
-/// files that root reaches.
-pub fn build_visibility_data<F, R, D>(
-    roots: &HashSet<ProjectFile>,
-    cancellation: Option<&CancellationToken>,
-    mut targets_for: F,
-    mut reading_is_c_for: R,
-    mut declarations_for: D,
-) -> VisibilityData
-where
-    F: FnMut(&ProjectFile) -> Vec<ProjectFile>,
-    R: FnMut(&ProjectFile) -> bool,
-    D: FnMut(&ProjectFile, bool) -> BTreeSet<CodeUnit>,
-{
-    let mut include_graph = IncludeGraph::default();
-    for file in roots {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            break;
-        }
-        include_graph.extend_with(file, cancellation, &mut targets_for);
-    }
-    let cpp_declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = include_graph
-        .files()
-        .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
-        .map(|file| (file.clone(), declarations_for(file, false)))
-        .collect();
-    let mut c_declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = HashMap::default();
-    let mut visible_by_file = HashMap::default();
-    let mut visible_source_files_by_root = HashMap::default();
-    for file in roots {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            break;
-        }
-        let mut visited = HashSet::default();
-        let mut visible = HashSet::default();
-        let declarations_by_file = if reading_is_c_for(file) {
-            for reached in cpp_declarations_by_file.keys() {
-                if !c_declarations_by_file.contains_key(reached) {
-                    let declarations = declarations_for(reached, true);
-                    c_declarations_by_file.insert(reached.clone(), declarations);
-                }
-            }
-            &c_declarations_by_file
-        } else {
-            &cpp_declarations_by_file
-        };
-        collect_visible_declarations(
-            &include_graph,
-            declarations_by_file,
-            file,
-            &mut visited,
-            &mut visible,
-            cancellation,
-        );
-        visible_by_file.insert(file.clone(), visible);
-        visible_source_files_by_root.insert(file.clone(), visited);
-    }
-    VisibilityData {
-        visible_by_file,
-        visible_source_files_by_root,
-    }
-}
-
 /// Admit the class that an out-of-line definition proves is in scope.
 ///
 /// `Owner::member(...) { ... }` in a file is structured proof that `Owner`
@@ -10670,44 +11035,21 @@ pub fn collect_include_closure(
     }
 }
 
-fn collect_visible_declarations(
-    include_graph: &IncludeGraph,
-    declarations_by_file: &HashMap<ProjectFile, BTreeSet<CodeUnit>>,
-    file: &ProjectFile,
-    visited: &mut HashSet<ProjectFile>,
-    out: &mut HashSet<CodeUnit>,
-    cancellation: Option<&CancellationToken>,
-) {
-    let mut stack = vec![file.clone()];
-    while let Some(file) = stack.pop() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            break;
-        }
-        if !visited.insert(file.clone()) {
-            continue;
-        }
-        if let Some(declarations) = declarations_by_file.get(&file) {
-            out.extend(declarations.iter().cloned());
-        }
-        stack.extend(include_graph.targets(&file).iter().cloned());
-    }
-}
-
 fn parse_macro_parameter_list<T>(
     replacement: &str,
     read: impl FnOnce(Node<'_>, &str) -> T,
 ) -> Option<T> {
-    let source = format!("void __bifrost_macro_parameters({replacement});");
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&source, None)?;
+    let parsed = parse_sentinel(
+        "void __bifrost_macro_parameters(",
+        SentinelInput::replacement(replacement),
+        ");",
+    );
+    let (source, tree) = (parsed.source, parsed.tree);
     let root = tree.root_node();
     if root.has_error() {
         return None;
     }
-    let declaration = root.named_child(0)?;
+    let declaration = single_named_child_matching(root, |child| !child.is_extra())?;
     let declarator = declaration.child_by_field_name("declarator")?;
     let parameters = declarator.child_by_field_name("parameters")?;
     Some(read(parameters, &source))
@@ -10953,43 +11295,34 @@ fn find_conditional_include_projection_index(
         push_named_children_reversed(node, &mut nodes);
     }
 
-    // One reached file can have several distinct compatible guard paths. Each
-    // (file, activation byte) key keeps only the inclusion-minimal guard sets:
-    // the consumers ask existence questions whose answers are monotone in the
-    // guard set -- a path whose requirements hold, stay stable, and stay
-    // compatible under one environment does so under every subset as well --
-    // so a state subsumed by an existing subset cannot witness anything its
-    // subset does not, and inserting a smaller set evicts the supersets it
-    // subsumes. Exact-set dedup still terminated cycles, but dense `#ifdef`
-    // lattices (QMK's per-keyboard feature guards) enumerated the powerset of
-    // path-union guard sets through it: the state space, the per-key linear
-    // scans, and resident memory all grew without bound (#2365).
-    let mut expanded: HashMap<(ProjectFile, usize), Vec<HashSet<PreprocessorGuard>>> =
+    // Admission checks both the full guard set and the subset contributed by
+    // incomplete conditional families. A path subsumes another only when both
+    // sets are subsets: equal full guards can have different proof obligations
+    // when one route uses a complete #if/#else and another a lone #if.
+    // Keep the minimal pairs to avoid enumerating dense guard lattices (#2365).
+    let mut expanded: HashMap<(ProjectFile, usize), Vec<PreprocessorGuardEnvironment>> =
         HashMap::default();
     while let Some((current_file, activation_byte, path)) = pending.pop() {
         let guard_sets = expanded
             .entry((current_file.clone(), activation_byte))
             .or_default();
-        // Minimality is keyed on the full guard set alone: a path's undecided
-        // guards are the per-conditional subset of that set, so a subset path
-        // carries a subset of them too.
-        if guard_sets
-            .iter()
-            .any(|existing| existing.is_subset(&path.all))
-        {
+        if guard_sets.iter().any(|existing| existing.is_subset(&path)) {
             continue;
         }
         let (evicted, kept): (Vec<_>, Vec<_>) = guard_sets
             .drain(..)
-            .partition(|existing| path.all.is_subset(existing));
+            .partition(|existing| path.is_subset(existing));
         *guard_sets = kept;
-        guard_sets.push(path.all.clone());
+        guard_sets.push(path.clone());
         if !evicted.is_empty()
             && let Some(projections) = projections_by_source.get_mut(&current_file)
         {
             projections.retain(|projection| {
                 projection.activation_byte != activation_byte
-                    || !evicted.contains(&projection.required_guards)
+                    || !evicted.iter().any(|existing| {
+                        existing.all == projection.required_guards
+                            && existing.partial == projection.partial_guards
+                    })
             });
         }
         on_state();
@@ -11345,9 +11678,20 @@ fn declaration_guard_requirements(
     cpp: &dyn CppSource,
     candidate: &CodeUnit,
 ) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
-    declaration_guard_sites(analyzer, cpp, candidate, None)
+    if cpp
+        .prepared_syntax(analyzer.token, candidate.source())
+        .is_none()
+    {
+        return Vec::new();
+    }
+    analyzer
+        .declaration_source_occurrences(candidate)
         .into_iter()
-        .map(|site| (site.byte, site.guards))
+        .flatten()
+        .filter_map(|occurrence| {
+            let guards = cpp_guard_set_to_runtime(occurrence.fact.guard_requirements.as_ref()?)?;
+            Some((occurrence.range.start_byte, guards))
+        })
         .collect()
 }
 
@@ -11359,8 +11703,7 @@ struct DeclarationGuardSite {
     /// The preprocessor requirements the range's declaration stands under.
     guards: HashSet<PreprocessorGuard>,
     /// Whether the range is one branch of completed `#if`/`#else` families
-    /// that all close before the reference. Always false without a reference
-    /// position.
+    /// that all close before the reference.
     completed_family_before_reference: bool,
 }
 
@@ -11370,7 +11713,7 @@ fn declaration_guard_sites(
     analyzer: &CppGraphSource<'_>,
     cpp: &dyn CppSource,
     candidate: &CodeUnit,
-    reference_byte: Option<usize>,
+    reference_byte: usize,
 ) -> Vec<DeclarationGuardSite> {
     let Some(prepared) = cpp.prepared_syntax(analyzer.token, candidate.source()) else {
         return Vec::new();
@@ -11385,7 +11728,7 @@ fn declaration_guard_sites(
             Some(DeclarationGuardSite {
                 byte: occurrence.range.start_byte,
                 guards,
-                completed_family_before_reference: reference_byte.is_some_and(|reference_byte| {
+                completed_family_before_reference: {
                     root.descendant_for_byte_range(
                         occurrence.range.start_byte,
                         occurrence.range.end_byte,
@@ -11397,7 +11740,7 @@ fn declaration_guard_sites(
                             reference_byte,
                         )
                     })
-                }),
+                },
             })
         })
         .collect()
@@ -11508,43 +11851,19 @@ fn preprocessor_guard_holds_at_reference(
     if active.contains(required) {
         return true;
     }
-    let active_expression = BooleanGuardExpression::all(
-        active
-            .iter()
-            .filter_map(PreprocessorGuard::as_boolean_expression),
-    );
-    required
-        .as_boolean_expression()
-        .is_some_and(|required| active_expression.implies(&required))
+    let active_expression =
+        BooleanGuardExpression::all(active.iter().map(PreprocessorGuard::as_boolean_expression));
+    active_expression.implies(&required.as_boolean_expression())
 }
 
-/// Cross-file guard rule: two guard sets are compatible when neither one
-/// contradicts the other. Use this instead of the subset test whenever the
-/// guards come from a foreign file, which resolves its own conditionals
-/// independently of the reference.
+/// Candidate discovery rule: two guard sets are compatible when neither
+/// contradicts the other. Compatibility never establishes proven visibility;
+/// that requires `guard_requirements_hold_at_reference`.
 fn guards_compatible_at_reference(
     declaration: &HashSet<PreprocessorGuard>,
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
     reference.is_some_and(|active| merge_preprocessor_guards(declaration, active).is_some())
-}
-
-/// The byte range of the `#if`/`#elif`/`#else` chain that encloses the smallest
-/// node covering `[start_byte, end_byte)`, or `None` when nothing there is
-/// conditional.
-///
-/// Two declarations of one name that report the same chain stand in different
-/// branches of it, so at most one of them is compiled in any configuration.
-/// They are alternate spellings of a single declaration, not competing
-/// declarations, and navigation must not present them as an ambiguity.
-pub fn preprocessor_conditional_family_range(
-    root: Node<'_>,
-    start_byte: usize,
-    end_byte: usize,
-) -> Option<(usize, usize)> {
-    let node = root.descendant_for_byte_range(start_byte, end_byte)?;
-    preprocessor_conditional_family_node(node)
-        .map(|family| (family.start_byte(), family.end_byte()))
 }
 
 pub(crate) fn preprocessor_conditional_family_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -11695,6 +12014,10 @@ struct PreprocessorGuardEnvironment {
 }
 
 impl PreprocessorGuardEnvironment {
+    fn is_subset(&self, other: &Self) -> bool {
+        self.all.is_subset(&other.all) && self.partial.is_subset(&other.partial)
+    }
+
     /// The environment of a path standing under both `self` and `other`, or
     /// `None` when the two contradict. A guard a lone `#if` contributes on
     /// either side stays undecided for the whole path.
@@ -11967,16 +12290,12 @@ pub fn merge_preprocessor_guards(
 ) -> Option<HashSet<PreprocessorGuard>> {
     let mut merged = left.clone();
     for guard in right {
-        let boolean_negation = guard
-            .as_boolean_expression()
-            .map(|expression| expression.negated());
+        let boolean_negation = guard.as_boolean_expression().negated();
         if merged.contains(&guard.negated())
-            || boolean_negation.is_some_and(|negated| {
-                merged
-                    .iter()
-                    .filter_map(PreprocessorGuard::as_boolean_expression)
-                    .any(|existing| existing == negated)
-            })
+            || merged
+                .iter()
+                .map(PreprocessorGuard::as_boolean_expression)
+                .any(|existing| existing == boolean_negation)
         {
             return None;
         }
@@ -12474,8 +12793,9 @@ fn recovered_macro_namespace_name(function: Node<'_>, source: &str) -> Option<St
     let [keyword, namespace_name] = identifiers.as_slice() else {
         return None;
     };
-    if keyword != "namespace" || namespace_name.is_empty() || cpp_export_macro_token(namespace_name)
-    {
+    // The namespace keyword and the complete sentinel envelope establish the
+    // identifier's role. Capitalization does not establish a macro binding.
+    if keyword != "namespace" || namespace_name.is_empty() {
         return None;
     }
     let mut next = function.next_named_sibling();
@@ -12665,6 +12985,17 @@ pub(crate) fn direct_unmatched_closing_brace(node: Node<'_>) -> bool {
     node.kind() == "ERROR"
         && (0..node.child_count())
             .any(|index| node.child(index).is_some_and(|child| child.kind() == "}"))
+}
+
+/// The preprocessor requirements a scope-level binding (a using declaration or
+/// directive, or a namespace alias) stands under, or `None` when its guard
+/// environment cannot be represented.
+pub fn binding_site_guards(node: Node<'_>, source: &str) -> Option<HashSet<PreprocessorGuard>> {
+    if callable_preprocessor_context_is_visible(node, source) {
+        Some(HashSet::default())
+    } else {
+        preprocessor_guard_environment(node, source)
+    }
 }
 
 pub fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
@@ -13536,8 +13867,12 @@ fn decode_field_declared_type_fact(
     // A field's indexed source is stored without its surrounding class body.
     // Give tree-sitter that grammatical context before checking recovery-only
     // field shapes such as `PyObject_HEAD Imaging image;`.
-    let contextual_declaration = format!("struct __bifrost_field_context {{ {declaration} }};");
-    let contextual_tree = parser.parse(&contextual_declaration, None)?;
+    let contextual = parse_sentinel(
+        "struct __bifrost_field_context { ",
+        SentinelInput::region(&declaration),
+        " };",
+    );
+    let (contextual_declaration, contextual_tree) = (contextual.source, contextual.tree);
     let mut stack = vec![contextual_tree.root_node()];
     while let Some(node) = stack.pop() {
         if let Some(recovered) = recovered_pyobject_head_field(node, &contextual_declaration)
@@ -13657,60 +13992,6 @@ pub(crate) fn cpp_declared_field_type_fact(
         template_arguments: declared_type
             .and_then(|declared_type| cpp_template_reference_arguments(declared_type, source)),
     })
-}
-
-/// Text of the type that a C or C++ alias declaration names, read from the
-/// `type_definition` or `alias_declaration` node's `type` field.
-///
-/// The declaration text is never scanned. A function-pointer typedef
-/// interleaves its aliased type with its declarator (`typedef R (*F)(int)`),
-/// so no prefix or suffix of the spelling isolates the target.
-///
-/// An alias whose declarator is a function declarator names a function type:
-/// `typedef R F(int)`, `typedef R (*F)(int)`, `typedef R *F(int)`, and
-/// `using F = R (*)(int)`. The analyzer's type model names declared types only,
-/// so such an alias has no canonical target. Its `type` field holds the return
-/// type `R`, which is a different type from the alias, so this returns `None`
-/// rather than that return type.
-pub fn cpp_alias_declaration_target_text(declaration: &str) -> Option<String> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(declaration, None)?;
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        let type_node = match node.kind() {
-            "type_definition" => {
-                let mut cursor = node.walk();
-                if node
-                    .children_by_field_name("declarator", &mut cursor)
-                    .any(declarator_names_function_type)
-                {
-                    return None;
-                }
-                node.child_by_field_name("type")?
-            }
-            "alias_declaration" => {
-                let type_node = node.child_by_field_name("type")?;
-                if type_node
-                    .child_by_field_name("declarator")
-                    .is_some_and(declarator_names_function_type)
-                {
-                    return None;
-                }
-                type_node
-            }
-            _ => {
-                let mut cursor = node.walk();
-                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-                stack.extend(children.into_iter().rev());
-                continue;
-            }
-        };
-        return Some(node_text(type_node, declaration).to_string());
-    }
-    None
 }
 
 /// True when an alias declarator names a function type.
@@ -14258,19 +14539,20 @@ fn is_pragma_once(node: Node<'_>, source: &str) -> bool {
 }
 
 fn parse_preproc_identifier(argument: &str) -> Option<String> {
-    let sentinel = format!("void __bifrost_undef() {{ {argument}; }}");
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&sentinel, None)?;
+    let parsed = parse_sentinel(
+        "void __bifrost_undef() { ",
+        SentinelInput::replacement(argument),
+        "; }",
+    );
+    let (sentinel, tree) = (parsed.source, parsed.tree);
     if tree.root_node().has_error() {
         return None;
     }
     let statement = first_descendant_of_kind(tree.root_node(), "expression_statement")?;
-    let identifier = statement.named_child(0)?;
-    (identifier.kind() == "identifier" && statement.named_child_count() == 1)
-        .then(|| node_text(identifier, &sentinel).to_string())
+    // A line comment before the synthetic terminator is a named extra, not
+    // another expression in the directive argument.
+    let identifier = single_named_child_matching(statement, |child| !child.is_extra())?;
+    (identifier.kind() == "identifier").then(|| node_text(identifier, &sentinel).to_string())
 }
 
 pub fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -16928,44 +17210,6 @@ pub fn unique_macro_replacement_type_candidate(
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
-/// The base scopes named by member using-declarations for `member` in one
-/// class source range.
-///
-/// The grammar supplies the qualified identifier and each component. Keep
-/// this interpretation shared between forward overload lookup and inverse
-/// owner routing rather than reparsing a rendered `Base::member` string at
-/// either call site.
-pub fn cpp_member_using_declaration_scopes(source: &str, member: &str) -> Vec<String> {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-    let mut scopes = Vec::new();
-    let mut pending = vec![tree.root_node()];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "using_declaration" {
-            let Some(imported) = node.named_child(0) else {
-                continue;
-            };
-            let Some(mut components) = cpp_type_name_components(imported, source) else {
-                continue;
-            };
-            if components.pop().as_deref() == Some(member) && !components.is_empty() {
-                scopes.push(components.join("::"));
-            }
-            continue;
-        }
-        push_named_children_reversed(node, &mut pending);
-    }
-    scopes
-}
-
 /// Whether a structured using-declaration scope can name `qualified` as an
 /// ancestor class. The boundary check prevents `Base` from matching
 /// `OtherBase` while allowing a relative `Base` spelling to match `ns::Base`.
@@ -17424,7 +17668,7 @@ pub fn cpp_unify_template_term(
     true
 }
 
-fn cpp_template_terms_equal(left: &CppTemplateTerm, right: &CppTemplateTerm) -> bool {
+pub(crate) fn cpp_template_terms_equal(left: &CppTemplateTerm, right: &CppTemplateTerm) -> bool {
     let mut work = vec![(left, right)];
     while let Some((left, right)) = work.pop() {
         match (left, right) {
@@ -18872,15 +19116,424 @@ pub fn cpp_canonical_alias_target_text(
     unit: &CodeUnit,
 ) -> Option<String> {
     let facts = analyzer.declaration_source_properties(unit)?;
-    let first = facts.first()?.alias_target_text.as_ref()?;
+    let first_fact = facts.first()?;
+    let first = first_fact.alias_target_text.as_ref()?;
+    let normalized = normalize_cpp_whitespace(first);
+    // Alias signatures collapse whitespace, so repeated declarations of one
+    // unit can retain different raw spellings. Require structural agreement
+    // too: whitespace inside a literal can change a type expression's value.
     facts
         .iter()
-        .all(|fact| fact.alias_target_text.as_ref() == Some(first))
+        .all(|fact| {
+            fact.alias_target_text.as_ref().is_some_and(|target| {
+                target == first
+                    || (first_fact.alias_target.is_some()
+                        && fact.alias_target == first_fact.alias_target
+                        && normalize_cpp_whitespace(target) == normalized)
+            })
+        })
         .then(|| first.clone())
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn resolver_displaced_conditional_grammar_boundary() {
+        // With FLAG defined this is an ordinary array declaration. The
+        // unpreprocessed CST swallows the directive into its array bound and
+        // incorrectly keeps the following declaration under the conditional.
+        let source = "#ifdef FLAG\nint values[\n#endif\n1];\nint outside;\n";
+        let tree = parse_cpp(source);
+        let conditional = tree.root_node().named_child(0).unwrap();
+        assert_eq!(conditional.kind(), "preproc_ifdef");
+        assert!(conditional.has_error());
+        let boundary = cpp_displaced_preprocessor_boundary(conditional).unwrap();
+        let directive = crate::grammar_test_support::nodes(conditional)
+            .into_iter()
+            .find(|node| node.kind() == "#endif" && !node.is_missing())
+            .unwrap();
+        assert_eq!(directive.parent().unwrap().kind(), "ERROR");
+        assert_eq!(directive.end_byte(), boundary.end_byte);
+        let inside = named_node_at(&tree, source, "values");
+        let outside = named_node_at(&tree, source, "outside");
+        assert!(has_ancestor_kind(inside, "preproc_ifdef"));
+        assert!(has_ancestor_kind(outside, "preproc_ifdef"));
+        assert!(inside.end_byte() < directive.start_byte());
+        assert!(outside.start_byte() > directive.end_byte());
+        assert!(preprocessor_conditional_contains_descendant(
+            conditional,
+            inside
+        ));
+        assert!(!preprocessor_conditional_contains_descendant(
+            conditional,
+            outside
+        ));
+    }
+
+    #[test]
+    fn resolver_recovered_namespace_boundaries() {
+        let source = STOLEN_BRACE_CASCADE;
+        let tree = parse_cpp(source);
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), source);
+        assert!(!index.regions.is_empty(), "fixture must enter recovery");
+        for (needle, expected) in [
+            ("First", vec!["app", "matchers", "detail"]),
+            ("Second", vec!["app", "matchers", "detail"]),
+            ("tail_function", vec!["app", "matchers"]),
+            ("TailClass", vec!["app", "matchers"]),
+            ("AfterAll", vec![]),
+        ] {
+            let node = named_node_at(&tree, source, needle);
+            let mut parsed: Vec<_> = std::iter::successors(node.parent(), |node| node.parent())
+                .filter(|node| node.kind() == "namespace_definition")
+                .filter_map(|namespace| {
+                    let name = namespace.child_by_field_name("name")?;
+                    let mut components = Vec::new();
+                    append_cpp_name_components(name, source, &mut components)?;
+                    Some((
+                        namespace.start_byte(),
+                        components,
+                        namespace_definition_has_real_braces(namespace),
+                    ))
+                })
+                .collect();
+            parsed.reverse();
+            assert_eq!(
+                index.restore_enclosing_namespaces(parsed, node.start_byte()),
+                expected,
+                "{needle}"
+            );
+        }
+        // A range owns its bytes, not the first byte following the range.
+        for region in &index.regions {
+            assert!(region.start < region.end);
+            assert!(index.region_at(region.start).is_some());
+            assert!(
+                index
+                    .region_at(region.end)
+                    .is_none_or(|found| !std::ptr::eq(found, region)),
+                "region leaked beyond its half-open boundary: {region:?}"
+            );
+        }
+        // Real recovery ERRORs can carry a close and additional tokens. The
+        // close still terminates lexical scope; it need not be the only token.
+        let errors: Vec<_> = crate::grammar_test_support::nodes(tree.root_node())
+            .into_iter()
+            .filter(|node| node.kind() == "ERROR")
+            .filter(|node| {
+                let mut cursor = node.walk();
+                node.children(&mut cursor).any(|child| child.kind() == "}")
+            })
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "fixture must retain unmatched close tokens"
+        );
+        for error in errors {
+            assert!(direct_unmatched_closing_brace(error), "{error:?}");
+        }
+    }
+
+    // These tables pin the fields and recovery tokens supplied by the released
+    // grammar, alongside the role that the resolver reads at that boundary.
+    #[test]
+    fn resolver_declarator_grammar_boundary_table() {
+        for (source, name, kind, binder) in [
+            ("int first, values[3];", "values", "identifier", true),
+            (
+                "void f() { int first, values[3]; }",
+                "values",
+                "identifier",
+                true,
+            ),
+            (
+                "typedef unsigned Underlying; enum Named : Underlying { Value };",
+                "Underlying {",
+                "type_identifier",
+                false,
+            ),
+        ] {
+            let tree = parse_cpp(source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let spelling = name.split_whitespace().next().unwrap();
+            let start = source.find(name).unwrap();
+            let node = tree
+                .root_node()
+                .named_descendant_for_byte_range(start, start + spelling.len())
+                .unwrap();
+            assert_eq!(node.kind(), kind, "{source}");
+            if spelling == "values" {
+                let array = node.parent().unwrap();
+                assert_eq!(array.kind(), "array_declarator");
+                assert_eq!(array.child_by_field_name("declarator"), Some(node));
+                assert!(is_declarator_node(array), "{source}");
+            } else {
+                let enumeration = node.parent().unwrap();
+                assert_eq!(enumeration.kind(), "enum_specifier");
+                assert_eq!(enumeration.child_by_field_name("base"), Some(node));
+                assert_eq!(
+                    enumeration.child_by_field_name("name").is_some(),
+                    source.contains("enum Named")
+                );
+            }
+            assert_eq!(is_declaration_name(node), binder, "{source}");
+        }
+    }
+
+    #[test]
+    fn resolver_alias_scope_and_argument_grammar_table() {
+        for (source, scope) in [
+            ("template<class T> using Alias = T;", true),
+            ("namespace n { template<class T> using Alias = T; }", true),
+            (
+                "struct Owner { template<class T> using Alias = T; };",
+                false,
+            ),
+            ("void f() { using Alias = int; }", false),
+        ] {
+            let tree = parse_cpp(source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let alias = crate::grammar_test_support::nodes(tree.root_node())
+                .into_iter()
+                .find(|node| node.kind() == "alias_declaration")
+                .unwrap();
+            assert_eq!(
+                node_text(alias.child_by_field_name("name").unwrap(), source),
+                "Alias"
+            );
+            assert!(alias.child_by_field_name("type").is_some());
+            assert_eq!(alias_has_visible_file_scope(alias), scope, "{source}");
+        }
+        for (source, argument_kinds, expression) in [
+            (
+                "ns::Alias value(42, arg);",
+                vec!["number_literal", "identifier"],
+                true,
+            ),
+            (
+                "ns::Alias value(42, 7);",
+                vec!["number_literal", "number_literal"],
+                false,
+            ),
+            ("ns::Alias value();", vec![], false),
+        ] {
+            let tree = parse_cpp(source);
+            assert!(!tree.root_node().has_error(), "{source}");
+            let declaration = tree.root_node().named_child(0).unwrap();
+            let ty = declaration.child_by_field_name("type").unwrap();
+            assert_eq!(node_text(ty, source), "ns::Alias");
+            let argument_lists: Vec<_> = crate::grammar_test_support::nodes(declaration)
+                .into_iter()
+                .filter(|node| node.kind() == "argument_list")
+                .collect();
+            let kinds: Vec<_> = argument_lists
+                .iter()
+                .flat_map(|node| {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .map(|child| child.kind())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(kinds, argument_kinds, "{source}");
+            assert_eq!(
+                qualified_alias_constructor_has_expression_argument(ty),
+                expression,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_namespace_brace_grammar_table() {
+        for (source, complete, closing_missing) in [
+            ("namespace n { int item; }", true, false),
+            ("namespace n { int item;", false, true),
+        ] {
+            let tree = parse_cpp(source);
+            let namespace = tree.root_node().named_child(0).unwrap();
+            assert_eq!(namespace.kind(), "namespace_definition");
+            let body = namespace.child_by_field_name("body").unwrap();
+            assert_eq!(body.kind(), "declaration_list");
+            let open = body.child(0).unwrap();
+            let close = body.child(body.child_count() - 1).unwrap();
+            assert_eq!(open.kind(), "{");
+            assert!(!open.is_missing());
+            assert_eq!(close.kind(), "}");
+            assert_eq!(close.is_missing(), closing_missing);
+            assert_eq!(
+                namespace_definition_has_real_braces(namespace),
+                complete,
+                "{source}"
+            );
+        }
+        let source = "namespace { namespace detail { struct Derived {}; void run() {} } }";
+        let tree = parse_cpp(source);
+        assert!(!tree.root_node().has_error());
+        let anonymous = tree.root_node().named_child(0).unwrap();
+        assert_eq!(anonymous.kind(), "namespace_definition");
+        assert!(anonymous.child_by_field_name("name").is_none());
+        let run = named_node_at(&tree, source, "run");
+        assert_eq!(
+            enclosing_namespace_components(run, source),
+            Some(vec!["detail".to_owned()])
+        );
+    }
+
+    #[test]
+    fn resolver_c_block_envelope_grammar_table() {
+        for (source, name, damaged, recovered) in [
+            ("void outer(void) { nested() {} }", "nested", false, false),
+            (
+                "void outer(void) { Apply(first, ^(Bucket b) { return b.value; }); }",
+                "Apply",
+                true,
+                true,
+            ),
+        ] {
+            let tree = parse_cpp(source);
+            let node = named_node_at(&tree, source, name);
+            let declarator = node.parent().unwrap();
+            assert_eq!(
+                declarator.kind(),
+                "function_declarator",
+                "{source}: {:?}",
+                tree.root_node()
+            );
+            assert_eq!(declarator.child_by_field_name("declarator"), Some(node));
+            assert_eq!(declarator.has_error(), damaged, "{source}");
+            let definition = declarator.parent().unwrap();
+            assert_eq!(definition.kind(), "function_definition");
+            assert!(definition.child_by_field_name("type").is_none());
+            assert!(definition.child_by_field_name("body").is_some());
+            assert_eq!(
+                recovered_c_block_call_envelope(declarator).is_some(),
+                recovered,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_linkage_guard_grammar_table() {
+        for (source, recovered, visible) in [
+            (
+                "#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid target();\n#ifdef __cplusplus\n}\n#endif\n",
+                false,
+                true,
+            ),
+            (
+                "#ifdef __cplusplus\nextern \"C\" {\nvoid target();\n#ifdef __cplusplus\n}\n#endif\n",
+                true,
+                false,
+            ),
+            (
+                "#ifdef __cplusplus\nextern \"C\" {\nvoid target();\n}\n#endif\n",
+                true,
+                false,
+            ),
+        ] {
+            let tree = parse_cpp(source);
+            let name = named_node_at(&tree, source, "target");
+            let mut declaration = name;
+            while declaration.kind() != "declaration" {
+                declaration = declaration.parent().unwrap();
+            }
+            assert_eq!(
+                has_ancestor_kind(declaration, "linkage_specification"),
+                recovered,
+                "{source}"
+            );
+            assert_eq!(
+                has_ancestor_kind(declaration, "preproc_ifdef"),
+                recovered,
+                "{source}"
+            );
+            if !recovered {
+                assert!(!tree.root_node().has_error());
+                let open = tree.root_node().named_child(0).unwrap();
+                assert_eq!(open.kind(), "preproc_linkage_open");
+                assert!(open.child_by_field_name("value").is_some());
+            }
+            assert_eq!(
+                callable_preprocessor_context_is_visible(declaration, source),
+                visible,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#6902: grammar 0.24.4 parsed an unnamed enum's base as its name")]
+    fn resolver_anonymous_enum_base_grammar_boundary() {
+        let source = "typedef unsigned Underlying; enum : Underlying { Value };";
+        let tree = parse_cpp(source);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let start = source.find("Underlying {").unwrap();
+        let base = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, start + "Underlying".len())
+            .unwrap();
+        let enumeration = base.parent().unwrap();
+        assert_eq!(enumeration.kind(), "enum_specifier");
+        assert!(enumeration.child_by_field_name("name").is_none());
+        assert_eq!(enumeration.child_by_field_name("base"), Some(base));
+        assert!(!is_declaration_name(base));
+    }
+
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: spliced macro tokens need physical source coordinates"
+    )]
+    fn macro_splices_preserve_statement_origin_ranges() {
+        for newline in ["\n", "\r\n"] {
+            for (replacement, name, written) in [
+                (
+                    format!("jo\\{newline}ined\\{newline}();\\{newline}after();"),
+                    "joined",
+                    format!("jo\\{newline}ined"),
+                ),
+                (
+                    format!("do {{ if (ready) bl\\{newline}ock }} while (0)"),
+                    "block",
+                    format!("bl\\{newline}ock"),
+                ),
+            ] {
+                let parameters = vec!["block".to_owned()];
+                let (source, tree, original_offsets) =
+                    VisibilityIndex::parse_macro_replacement_body(&replacement, &parameters)
+                        .expect("joined replacement parses");
+                let body = ParsedReplacementBody {
+                    source,
+                    tree,
+                    body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
+                    parameters,
+                    original_offsets,
+                };
+                let nodes = crate::grammar_test_support::nodes(body.tree.root_node());
+                let matching: Vec<_> = nodes
+                    .iter()
+                    .filter(|node| {
+                        node.kind() == "identifier" && node_text(**node, &body.source) == name
+                    })
+                    .collect();
+                assert_eq!(matching.len(), 1, "{replacement}");
+                let range = body.file_range(*matching[0], 0);
+                assert_eq!(&replacement[range], written);
+                for node in nodes.iter().filter(|node| {
+                    node.kind() == "identifier" && node_text(**node, &body.source) == "after"
+                }) {
+                    assert_eq!(&replacement[body.file_range(*node, 0)], "after");
+                }
+            }
+        }
+    }
+
     #[test]
     #[hardwon("05fbd05c6bd7: C++ declaration recovery regressed for this structured syntax edge")]
     fn issue_3089_statement_formal_at_end_of_replacement() {
@@ -18919,6 +19572,39 @@ mod tests {
         assert_eq!(node.kind(), "identifier");
         assert!(is_c_sizeof_expression_type_candidate(&c_file, node));
         assert!(!is_c_sizeof_expression_type_candidate(&cpp_file, node));
+    }
+
+    #[test]
+    fn recovered_macro_actuals_keep_their_cst_boundaries() {
+        for (source, recovered) in [
+            ("int f() { return M(Type, value); }", false),
+            ("int f() { return M(Type, ^(int n){ return n; }); }", true),
+        ] {
+            let tree = parse_cpp(source);
+            let first = named_node_at(&tree, source, "Type");
+            let (call, index, actual) = c_function_macro_argument(first)
+                .unwrap_or_else(|| panic!("first actual {source}: {}", tree.root_node().to_sexp()));
+            assert_eq!(index, 0);
+            assert_eq!(node_text(actual, source), "Type");
+            let arguments = call.child_by_field_name("arguments").unwrap();
+            let raw = arguments.named_child(0).unwrap();
+            if recovered {
+                assert_eq!(raw.kind(), "binary_expression");
+                assert_eq!(raw.child_by_field_name("left"), Some(actual));
+                let inside = named_node_at(&tree, source, "return n;");
+                let (_, index, block) = c_function_macro_argument(inside).expect("block actual");
+                assert_eq!(index, 1);
+                assert_eq!(block.kind(), "compound_literal_expression");
+                assert_eq!(node_text(block, source), "(int n){ return n; }");
+                assert_eq!(raw.child_by_field_name("right"), Some(block));
+            } else {
+                assert_eq!(raw, actual);
+                let second = named_node_at(&tree, source, "value");
+                let (_, index, actual) = c_function_macro_argument(second).expect("second actual");
+                assert_eq!(index, 1);
+                assert_eq!(node_text(actual, source), "value");
+            }
+        }
     }
 
     fn parse_cpp(source: &str) -> Tree {
@@ -20694,6 +21380,132 @@ mod lookup_order_properties {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolver_domain_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // A missing free variable cannot be supplied by irrelevant names.
+        // The expected fully bound tree is built directly from the inputs.
+        #[test]
+        fn template_substitution_respects_free_variables(
+            first in 0u16..1000,
+            second in 1000u16..2000,
+            unrelated in prop::collection::vec(0u16..1000, 1..8),
+            rename in "[A-Z][a-z]{0,6}",
+        ) {
+            let atom = |value: u16| CppTemplateTerm::Atom {
+                kind: "number_literal".to_owned(), text: value.to_string(),
+            };
+            let term = CppTemplateTerm::Node {
+                kind: "template_argument_list".to_owned(),
+                children: vec![CppTemplateTerm::Parameter("T".to_owned()), CppTemplateTerm::Parameter(format!("U{rename}"))],
+            };
+            let mut bindings = HashMap::default();
+            bindings.insert("T".to_owned(), atom(first));
+            prop_assert_eq!(cpp_substitute_template_term(&term, &bindings), None);
+            for (index, value) in unrelated.into_iter().enumerate() {
+                bindings.insert(format!("unrelated{index}"), atom(value));
+                prop_assert_eq!(cpp_substitute_template_term(&term, &bindings), None);
+            }
+            bindings.insert(format!("U{rename}"), atom(second));
+            let expected = CppTemplateTerm::Node {
+                kind: "template_argument_list".to_owned(), children: vec![atom(first), atom(second)],
+            };
+            prop_assert_eq!(cpp_substitute_template_term(&term, &bindings), Some(expected));
+        }
+
+        // Combining redeclarations is symmetric. When their parameter lists
+        // agree, the accepted argument counts are the union of both domains.
+        #[test]
+        fn callable_arity_merge_is_a_symmetric_domain_union(
+            total in 0usize..20,
+            left_required in 0usize..20,
+            right_required in 0usize..20,
+            left_variadic in any::<bool>(),
+            right_variadic in any::<bool>(),
+        ) {
+            let left = CallableArity::new(left_required.min(total), total, left_variadic);
+            let right = CallableArity::new(right_required.min(total), total, right_variadic);
+            let merged = merge_compatible_callable_arities(left, right);
+            prop_assert_eq!(merged, merge_compatible_callable_arities(right, left));
+            if let Some(merged) = merged {
+                for count in 0..=total + 2 {
+                    prop_assert_eq!(merged.accepts(count), left.accepts(count) || right.accepts(count));
+                }
+            } else {
+                prop_assert_ne!(left_variadic, right_variadic);
+            }
+        }
+
+        // Repeating the same include-path assumptions cannot discharge an
+        // undecidable guard. This is the idempotence law of conjunction.
+        #[test]
+        fn guard_environment_conjunction_is_idempotent(names in prop::collection::vec("[A-Z]{1,5}", 1..8)) {
+            let guards: HashSet<_> = names.into_iter().map(PreprocessorGuard::Defined).collect();
+            let environment = PreprocessorGuardEnvironment { all: guards.clone(), partial: guards.clone() };
+            let twice = environment.merged(&environment).unwrap();
+            prop_assert_eq!(&twice.all, &guards);
+            prop_assert_eq!(&twice.partial, &guards);
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolver_lookup_key_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        // The declaration producer and the bounded FQN consumer must agree
+        // on at least one exact index key. Canonical-name fallback would mask
+        // this boundary mismatch in ordinary navigation.
+        #[test]
+        fn parsed_nested_types_round_trip_through_bounded_lookup_keys(
+            namespaces in 0usize..3,
+            owners in 1usize..5,
+            suffix in "[a-z]{1,6}",
+        ) {
+            let mut source = String::new();
+            let mut components = Vec::new();
+            for index in 0..namespaces {
+                let name = format!("ns{index}_{suffix}");
+                source.push_str(&format!("namespace {name} {{ "));
+                components.push(name);
+            }
+            for index in 0..owners {
+                let name = format!("Owner{index}");
+                source.push_str(&format!("struct {name} {{ "));
+                components.push(name);
+            }
+            source.push_str("struct Leaf {}; ");
+            for _ in 0..owners { source.push_str("}; "); }
+            for _ in 0..namespaces { source.push_str("} "); }
+            components.push("Leaf".to_owned());
+            source.push_str(&format!("{}* value;", components.join("::")));
+
+            let tree = crate::diagnostics::parse_cpp_tree(&source);
+            prop_assert!(!tree.root_node().has_error());
+            let file = ProjectFile::new(std::env::temp_dir(), "lookup-keys.cpp");
+            let parsed = crate::adapter::parse_cpp_file(&file, &source, &tree);
+            let leaf = parsed.declarations().iter()
+                .find(|unit| unit.is_class() && unit.identifier() == "Leaf")
+                .expect("declaration producer indexed the nested type");
+            let declaration = tree.root_node().named_child(tree.root_node().named_child_count() - 1).unwrap();
+            prop_assert_eq!(declaration.kind(), "declaration");
+            let type_node = declaration.child_by_field_name("type").unwrap();
+            let parts = cpp_type_name_components(type_node, &source).unwrap();
+            prop_assert_eq!(&parts, &components);
+            let candidates = cpp_reference_fqn_candidates_from_parts(&parts, TargetKind::Type);
+            let declaration_key = leaf.fq_name();
+            prop_assert!(candidates.contains(&declaration_key), "declaration key {:?} absent from bounded query keys {:?}", declaration_key, candidates);
         }
     }
 }

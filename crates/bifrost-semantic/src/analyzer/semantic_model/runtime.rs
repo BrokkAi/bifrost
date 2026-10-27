@@ -30,8 +30,6 @@ use crate::analyzer::semantic_model::CompiledProcedureTarget;
 
 use crate::analyzer::semantic_model::CompiledResultUseObligation;
 
-use crate::analyzer::semantic_model::CompiledShard;
-
 use crate::analyzer::semantic_model::MemberFact;
 
 use crate::analyzer::semantic_model::SemanticPackSelectorQuery;
@@ -165,10 +163,10 @@ pub enum ReviewedObligationBindFailure {
 }
 
 /// The result of binding reviewed obligations to one exact call shape.
-#[derive(Debug, Clone, Copy)]
-pub struct ReviewedObligationBinding<'a> {
+#[derive(Debug, Clone)]
+pub struct ReviewedObligationBinding {
     #[doc(hidden)]
-    pub obligations: &'a [CompiledResultUseObligation],
+    pub record: std::sync::Arc<crate::analyzer::semantic_model::CompiledProcedureSummary>,
     #[doc(hidden)]
     pub basis: ReviewedObligationBasis,
     #[doc(hidden)]
@@ -177,20 +175,20 @@ pub struct ReviewedObligationBinding<'a> {
     pub covers_overrides: bool,
 }
 
-impl<'a> ReviewedObligationBinding<'a> {
-    pub fn obligations(self) -> &'a [CompiledResultUseObligation] {
-        self.obligations
+impl ReviewedObligationBinding {
+    pub fn obligations(&self) -> &[CompiledResultUseObligation] {
+        &self.record.result_use_obligations
     }
 
-    pub const fn basis(self) -> ReviewedObligationBasis {
+    pub const fn basis(&self) -> ReviewedObligationBasis {
         self.basis
     }
 
-    pub const fn ordinary_heap_unchanged(self) -> bool {
+    pub const fn ordinary_heap_unchanged(&self) -> bool {
         self.ordinary_heap_unchanged
     }
 
-    pub const fn covers_overrides(self) -> bool {
+    pub const fn covers_overrides(&self) -> bool {
         self.covers_overrides
     }
 }
@@ -596,7 +594,7 @@ pub struct RecordAddress {
     pub record: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[doc(hidden)]
 pub struct ProcedureSummaryShapePostings {
     #[doc(hidden)]
@@ -738,7 +736,8 @@ pub fn charge_posting_entry(
     )
 }
 
-fn procedure_summary_minimum_actual_count(target: &CompiledProcedureTarget) -> u32 {
+#[doc(hidden)]
+pub fn procedure_summary_minimum_actual_count(target: &CompiledProcedureTarget) -> u32 {
     if target.formals.is_empty() {
         return target.parameter_count.saturating_sub(1);
     }
@@ -1198,7 +1197,7 @@ pub struct StrictActivationMatch {
 #[doc(hidden)]
 pub fn strict_activation_match(
     manifest: &CompiledPackManifest,
-    shard: &CompiledShard,
+    selectors: &[crate::analyzer::semantic_model::ActivationSelector],
     evidence: &[SemanticModelActivationEvidence],
     bifrost_version: &Version,
 ) -> Option<StrictActivationMatch> {
@@ -1233,8 +1232,7 @@ pub fn strict_activation_match(
             })
     };
     let mut matched_requirements = Vec::new();
-    let (evidence_rank, matched_evidence, selector) = shard
-        .activation()
+    let (evidence_rank, matched_evidence, selector) = selectors
         .iter()
         .flat_map(|selector| {
             evidence
@@ -1243,8 +1241,7 @@ pub fn strict_activation_match(
                 .map(move |row| (selector_rank(selector), row.clone(), selector))
         })
         .max_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))?;
-    let mut matching_evidence = shard
-        .activation()
+    let mut matching_evidence = selectors
         .iter()
         .filter(|selector| selector_rank(selector) == evidence_rank)
         .flat_map(|selector| {
@@ -1393,7 +1390,7 @@ fn strict_coordinate_matches(
 #[doc(hidden)]
 pub fn strict_activation_mismatch_reason(
     manifest: &CompiledPackManifest,
-    shard: &CompiledShard,
+    selectors: &[crate::analyzer::semantic_model::ActivationSelector],
     evidence: &[SemanticModelActivationEvidence],
 ) -> String {
     let scoped = || {
@@ -1435,7 +1432,7 @@ pub fn strict_activation_mismatch_reason(
         }
     }
     let mut unmet_predicates = None;
-    for selector in shard.activation() {
+    for selector in selectors {
         for row in scoped() {
             if !strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
                 || !strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
@@ -1516,7 +1513,7 @@ pub fn strict_activation_mismatch_reason(
             }
         }
     }
-    for selector in shard.activation() {
+    for selector in selectors {
         let named = scoped().any(|row| {
             strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
                 && strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
@@ -1693,6 +1690,14 @@ pub fn effective_control(
 #[doc(hidden)]
 pub fn catalog_miss_reason(miss: &CatalogMiss) -> String {
     match miss {
+        CatalogMiss::IndexReconciliationRequired {
+            manifest_digest,
+            shard_id,
+        } => crate::analyzer::semantic_model::catalog::CatalogError::IndexReconciliationRequired {
+            manifest_digest: manifest_digest.clone(),
+            shard_id: shard_id.clone(),
+        }
+        .to_string(),
         CatalogMiss::NotFound => "catalog candidate disappeared before verified load".to_owned(),
         CatalogMiss::Quarantined { reason } | CatalogMiss::Incompatible { reason } => {
             reason.clone()

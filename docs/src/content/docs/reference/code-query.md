@@ -384,7 +384,7 @@ slice, including blank lines between comments.
 | `candidate_hierarchy` | `candidate-hierarchy`, `candidate_hierarchy` | `occurrence` -> `candidate_hop` | none | The hierarchy hops through which each traced member candidate was found. |
 | `candidate_target` | `candidate-target`, `candidate_target` | `resolution_candidate` -> `declaration` | none | The workspace declaration of a unit-backed candidate. Other candidates produce no row. |
 | `member_selection` | `member-selection`, `member_selection` | `occurrence` -> `member_selection` | none | One member-selection summary row per reference occurrence, from the resolver's candidate trace. |
-| `callable_applicability` | `callable-applicability`, `callable_applicability` | `occurrence` -> `callable_applicability` | none | One row per candidate callable the resolver considered, with its applicability verdict and rejection reason. |
+| `callable_applicability` | `callable-applicability`, `callable_applicability` | `occurrence` -> `callable_applicability` | none | One row per candidate callable the resolver considered, with its applicability verdict (`applicable`, `less_specific`, `inapplicable`, or `unknown`), its rejection reason, and, where the resolver records them, the invocation phase that decided it and the first failing argument with the conversion it would need. |
 | `overload_selection` | `overload-selection`, `overload_selection` | `occurrence` -> `overload_selection` | none | One overload-selection summary per reference occurrence: `resolved_unique`, `ambiguous`, `unresolved`, or `unknown_shape`. |
 
 ### Qualified paths
@@ -953,7 +953,7 @@ in the last column is left out of the JSON when it has no value. With
 | `callable_signature` | `coverage`, `declaration`, `declaration_only`, `generic_arity`, `id`, `language`, `ordinal`, `parameter_count`, `path`, `range`, `repeated`, `role`, `site_id` | `label`, `receiver_contract`, `required_arity`, `return_type`, `special_method_expected_maximum`, `special_method_expected_minimum`, `special_method_reason`, `special_method_status`, `total_arity` |
 | `signature_parameter` | `id`, `label`, `label_end_byte`, `label_start_byte`, `parameter_index`, `path`, `range`, `signature_id` | `declared_type`, `optional`, `repeated` |
 | `decorated_parameter` | `binding_status`, `boundary`, `completion`, `coverage`, `decorator_name`, `decorator_range`, `id`, `language`, `parameter_id`, `path`, `range`, `terminal` | `annotation_status`, `annotation_type`, `decorator_id`, `imported_name`, `local_name`, `module`, `owner_id`, `parameter_ordinal`, `port_id`, `procedure_id`, `reason`, `value_id` |
-| `callable_applicability` | `candidate`, `id`, `language`, `ordinal`, `path`, `range`, `selected`, `site_ast_id`, `verdict` | `reason`, `tier` |
+| `callable_applicability` | `candidate`, `id`, `language`, `ordinal`, `path`, `range`, `selected`, `site_ast_id`, `verdict` | `failing_argument`, `failing_conversion`, `phase`, `reason`, `tier` |
 | `overload_selection` | `applicable_count`, `considered_count`, `id`, `inapplicable_count`, `language`, `path`, `range`, `resolution`, `site_ast_id`, `supported`, `unknown_count` | none |
 | `member_selection` | `candidate_count`, `coverage`, `id`, `language`, `member`, `outcome`, `path`, `range`, `role`, `selected_count`, `site_ast_id`, `trace_completeness` | none |
 | `dispatch_outcome` | `call_site_count`, `coverage`, `id`, `language`, `outcome`, `path`, `range`, `site_id`, `target_count`, `targets_truncated` | `exceeded_limit`, `semantic_unsupported`, `site_ast_id` |

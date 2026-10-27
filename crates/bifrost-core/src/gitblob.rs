@@ -13,10 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use git2::{
-    AttrCheckFlags, AttrValue, ErrorCode, IndexEntry, ObjectType, Oid, Repository, Status,
-    StatusOptions,
-};
+use git2::{AttrCheckFlags, AttrValue, ErrorCode, IndexEntry, ObjectType, Oid, Repository};
 use growable_bloom_filter::GrowableBloom;
 
 use crate::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
@@ -65,7 +62,10 @@ pub fn resolve_default_branch_ref(repo: &Repository) -> DefaultBranchRef {
     if let Ok(head_ref) = repo.find_reference("refs/remotes/origin/HEAD")
         && let Some(target) = head_ref.symbolic_target()
     {
-        let display_name = target.rsplit('/').next().unwrap_or(target).to_string();
+        let display_name = target
+            .strip_prefix("refs/remotes/origin/")
+            .unwrap_or(target)
+            .to_string();
         return DefaultBranchRef {
             ref_name: target.to_string(),
             display_name,
@@ -391,56 +391,6 @@ fn platform_path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
-/// Working-tree blob OID (hex) for each of `rel_paths`.
-pub fn working_tree_oids(
-    repo: &Repository,
-    rel_paths: &[String],
-) -> Result<HashMap<String, String>> {
-    Ok(working_tree_oid_values(repo, rel_paths)?
-        .into_iter()
-        .map(|(path, oid)| (path, oid.to_string()))
-        .collect())
-}
-
-/// Resolve many working-tree paths with one Git index and dirty-tree scan.
-///
-/// Clean tracked files use the index OID without reading their bytes when Git
-/// records byte-identical worktree content. Dirty, transformed, and untracked
-/// files use the bytes visible to the analyzer. Missing files are absent from
-/// the result. This startup path replaces repeated point resolution, which
-/// read every clean source file in large Java workspaces.
-pub fn working_tree_oid_values(
-    repo: &Repository,
-    rel_paths: &[String],
-) -> Result<HashMap<String, Oid>> {
-    let started = std::time::Instant::now();
-    let workdir = workdir(repo)?;
-    let mut index = repo.index().map_err(|e| e.to_string())?;
-    // A long-lived Bifrost process can observe an external Git command.
-    index.read(true).map_err(|e| e.to_string())?;
-    let dirty = dirty_worktree_paths(repo, None)?;
-    let index_oids: HashMap<String, Oid> = index
-        .iter()
-        .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
-        .collect::<Result<_>>()?;
-    let blob_sizes = canonical_blob_sizes(
-        repo,
-        rel_paths
-            .iter()
-            .filter(|rel| !dirty.contains(*rel))
-            .filter_map(|rel| index_oids.get(rel).copied()),
-    );
-    resolve_working_tree_oid_values(
-        repo,
-        workdir,
-        rel_paths,
-        &dirty,
-        &index_oids,
-        &blob_sizes,
-        started,
-    )
-}
-
 /// One-scan working-tree identity snapshot: index OIDs with their cached
 /// stat data for tracked paths, and the set of dirty (modified, staged, or
 /// untracked) paths.
@@ -496,6 +446,7 @@ impl WorkingTreeIdentity {
     /// size and mtime match the index entry's cached stat. Dirty, untracked,
     /// ignored, and since-edited paths return `None`; their identity is the
     /// hash of the visible working bytes.
+    #[cfg(test)]
     pub fn clean_index_oid(&self, repo: &Repository, rel: &str, abs_path: &Path) -> Option<Oid> {
         let (tracked, file_size) = self.stat_clean_entry(rel, abs_path)?;
 
@@ -534,6 +485,7 @@ impl WorkingTreeIdentity {
     /// semantic identity walk batches them through one `git check-attr` process
     /// because libgit2 answered Firefox's paths one at a time in 55.3 s of CPU
     /// (issue #1904). Every other caller wants `clean_index_oid`.
+    #[cfg(test)]
     pub fn stat_clean_index_oid(&self, rel: &str, abs_path: &Path) -> Option<Oid> {
         self.stat_clean_entry(rel, abs_path)
             .map(|(tracked, _)| tracked.oid)
@@ -758,6 +710,7 @@ fn canonical_blob_sizes(
     sizes
 }
 
+#[cfg(test)]
 fn canonical_blob_size(repo: &Repository, oid: Oid) -> Option<u64> {
     canonical_blob_sizes(repo, std::iter::once(oid))
         .get(&oid)
@@ -931,92 +884,6 @@ fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSe
     Ok(paths)
 }
 
-fn resolve_working_tree_oid_values(
-    repo: &Repository,
-    workdir: &Path,
-    rel_paths: &[String],
-    dirty: &HashSet<String>,
-    index_oids: &HashMap<String, Oid>,
-    blob_sizes: &HashMap<Oid, Option<u64>>,
-    started: std::time::Instant,
-) -> Result<HashMap<String, Oid>> {
-    let mut out = HashMap::with_capacity(rel_paths.len());
-    let mut hashed = 0usize;
-    for rel in rel_paths {
-        let path = Path::new(rel);
-        let index_oid = index_oids.get(rel).copied();
-        let use_worktree = if dirty.contains(rel) || index_oid.is_none() {
-            true
-        } else {
-            let size_differs = match index_oid.and_then(|oid| blob_sizes.get(&oid).copied()) {
-                Some(Some(blob_size)) => std::fs::metadata(workdir.join(path))
-                    .map(|metadata| metadata.len() != blob_size)
-                    .unwrap_or(true),
-                // A missing index object cannot prove byte identity. Hash the
-                // visible bytes instead of serving a potentially stale OID.
-                Some(None) | None => true,
-            };
-            if size_differs {
-                true
-            } else {
-                has_content_transform(repo, path)
-            }
-        };
-        let oid = if use_worktree {
-            match hash_working_file(workdir, rel) {
-                Ok(oid) => oid,
-                Err(_) if !workdir.join(path).is_file() => continue,
-                Err(error) => return Err(error),
-            }
-        } else {
-            index_oid.expect("clean tracked path has an index OID")
-        };
-        hashed += usize::from(use_worktree);
-        out.insert(rel.clone(), oid);
-    }
-    if crate::profiling::enabled() {
-        crate::profiling::note(format!(
-            "git_identity files={} index={} hashed={} elapsed_ms={:.1}",
-            rel_paths.len(),
-            out.len().saturating_sub(hashed),
-            hashed,
-            started.elapsed().as_secs_f64() * 1000.0,
-        ));
-    }
-    Ok(out)
-}
-
-/// Like [`working_tree_oids`] but kept as the explicit incremental-update API.
-pub fn working_tree_oids_targeted(
-    repo: &Repository,
-    rel_paths: &[String],
-) -> Result<HashMap<String, String>> {
-    working_tree_oids(repo, rel_paths)
-}
-
-/// Resolve the active working-tree paths, including materialized submodule
-/// files, to the blob OIDs of their visible bytes.
-pub fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
-    let rel_paths = all_working_tree_paths(repo)?
-        .into_iter()
-        .collect::<Vec<_>>();
-    working_tree_oids(repo, &rel_paths)
-}
-
-/// Resolve one path to the OID of its current working-tree bytes. Returns
-/// `Ok(None)` for a missing file.
-pub fn working_tree_oid_for_path(repo: &Repository, rel_path: &Path) -> Result<Option<Oid>> {
-    let workdir = workdir(repo)?;
-    let index = repo.index().map_err(|e| e.to_string())?;
-    let Some(rel) = rel_path.to_str() else {
-        return Err(format!("non-UTF-8 git path: {}", rel_path.display()));
-    };
-    if !workdir.join(rel_path).is_file() {
-        return Ok(None);
-    }
-    Ok(Some(resolve_path_oid(workdir, &index, rel)?))
-}
-
 /// Whether one working-directory path belongs to the listing
 /// [`all_working_tree_paths`] builds, decided for that path alone.
 ///
@@ -1093,16 +960,6 @@ pub fn working_tree_path_is_listed(repo: &Repository, rel_path: &Path) -> Result
             .map(|ignored| !ignored)
             .map_err(|error| error.to_string());
     }
-}
-
-/// Whether a path's working-tree content differs from the index entry.
-pub fn is_path_dirty(repo: &Repository, rel_path: &Path) -> Result<bool> {
-    let workdir = workdir(repo)?;
-    let index = repo.index().map_err(|e| e.to_string())?;
-    let Some(entry) = index.get_path(rel_path, 0) else {
-        return Ok(workdir.join(rel_path).is_file());
-    };
-    Ok(!entry_stat_matches(&workdir.join(rel_path), &entry))
 }
 
 /// Read a blob's bytes by OID.
@@ -1263,21 +1120,6 @@ fn worktree_porcelain(repo: &Repository) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Blob OIDs (hex) of dirty/untracked files in `root`'s working tree.
-pub fn uncommitted_oids(root: &Path) -> Result<HashSet<String>> {
-    let Some(repo) = discover(root) else {
-        return Ok(HashSet::new());
-    };
-    let workdir = workdir(&repo)?.to_path_buf();
-    let mut out = HashSet::new();
-    for rel in dirty_paths(&repo)? {
-        if let Ok(oid) = hash_working_file(&workdir, &rel) {
-            out.insert(oid.to_string());
-        }
-    }
-    Ok(out)
-}
-
 /// Blob OIDs (hex) for every existing tracked file and every untracked file in
 /// `root`'s working tree.
 ///
@@ -1335,14 +1177,6 @@ fn background_git(workdir: &Path) -> Command {
     command
 }
 
-fn resolve_path_oid(workdir: &Path, index: &git2::Index, rel: &str) -> Result<Oid> {
-    let path = Path::new(rel);
-    match index.get_path(path, 0) {
-        Some(entry) => resolve_index_entry_oid(workdir, &entry),
-        None => hash_working_file(workdir, rel),
-    }
-}
-
 pub fn resolve_index_entry_oid(workdir: &Path, entry: &IndexEntry) -> Result<Oid> {
     let rel = index_path_to_string(entry)?;
     hash_working_file(workdir, &rel)
@@ -1350,61 +1184,6 @@ pub fn resolve_index_entry_oid(workdir: &Path, entry: &IndexEntry) -> Result<Oid
 
 pub fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
     String::from_utf8(entry.path.clone()).map_err(|err| format!("non-UTF-8 git index path: {err}"))
-}
-
-pub(crate) fn entry_stat_matches(path: &Path, entry: &IndexEntry) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    metadata.is_file() && metadata_matches_index(&metadata, entry)
-}
-
-#[cfg(unix)]
-fn metadata_matches_index(metadata: &Metadata, entry: &IndexEntry) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    metadata.dev() as u32 == entry.dev
-        && metadata.ino() as u32 == entry.ino
-        && metadata.mode() == entry.mode
-        && metadata.uid() == entry.uid
-        && metadata.gid() == entry.gid
-        && metadata.size() as u32 == entry.file_size
-        && metadata.mtime() as i32 == entry.mtime.seconds()
-        && metadata.mtime_nsec() as u32 == entry.mtime.nanoseconds()
-}
-
-#[cfg(not(unix))]
-fn metadata_matches_index(metadata: &Metadata, entry: &IndexEntry) -> bool {
-    use std::time::UNIX_EPOCH;
-
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    metadata.len() as u32 == entry.file_size
-        && duration.as_secs() as i32 == entry.mtime.seconds()
-        && duration.subsec_nanos() == entry.mtime.nanoseconds()
-}
-
-fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_unmodified(false)
-        .exclude_submodules(true);
-    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
-    let mut dirty = HashSet::new();
-    let changed = dirty_flags();
-    for entry in statuses.iter() {
-        if entry.status().intersects(changed)
-            && let Some(path) = entry.path()
-        {
-            dirty.insert(path.to_string());
-        }
-    }
-    Ok(dirty)
 }
 
 fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
@@ -1479,17 +1258,6 @@ fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<Hash
         }
     }
     Ok(dirty)
-}
-
-fn dirty_flags() -> Status {
-    Status::WT_MODIFIED
-        | Status::WT_NEW
-        | Status::WT_TYPECHANGE
-        | Status::WT_RENAMED
-        | Status::INDEX_MODIFIED
-        | Status::INDEX_NEW
-        | Status::INDEX_TYPECHANGE
-        | Status::INDEX_RENAMED
 }
 
 fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
@@ -1568,9 +1336,7 @@ pub mod test_repo {
 
 #[cfg(test)]
 mod tests {
-    use super::test_repo::{
-        commit_all, commit_paths, init_repo, refresh_index_stat_preserving_oid,
-    };
+    use super::test_repo::{commit_all, commit_paths, init_repo};
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
 
@@ -1829,10 +1595,12 @@ mod tests {
         let oid = Oid::hash_object(ObjectType::Blob, changed)
             .unwrap()
             .to_string();
-        assert_eq!(
-            working_tree_oids_full(&parent).unwrap()["vendor/child/nested/tracked.py"],
-            oid
-        );
+        let rel = "vendor/child/nested/tracked.py".to_string();
+        let resolved = working_tree_identity(&parent)
+            .unwrap()
+            .resolve_with_metadata(&parent, std::slice::from_ref(&rel))
+            .unwrap();
+        assert_eq!(resolved[&rel].oid.to_string(), oid);
         assert!(
             existing_working_tree_oids(temp.path())
                 .unwrap()
@@ -2029,119 +1797,6 @@ mod tests {
     }
 
     #[test]
-    #[hardwon("#1742: clean CRLF checkout identity disagreed with the bytes visible to analysis")]
-    fn clean_eol_transformed_file_oid_matches_visible_bytes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        let source_path = temp.path().join("a.cs");
-        std::fs::write(&source_path, "class A {}\n").unwrap();
-        commit_all(&repo, "source");
-
-        std::fs::write(temp.path().join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
-        commit_paths(&repo, &[".gitattributes"], "attributes");
-        std::fs::write(&source_path, "class A {}\r\n").unwrap();
-
-        // Match the index stat Git records after a transformed checkout while
-        // retaining the canonical LF blob OID.
-        let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
-        let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();
-        assert_ne!(visible_oid, index_oid, "LF and CRLF OIDs must differ");
-
-        reset_hash_calls();
-        let resolved = working_tree_oids(&repo, &["a.cs".to_string()]).unwrap();
-        let visible_oid_hex = visible_oid.to_string();
-        let index_oid_hex = index_oid.to_string();
-        assert_eq!(resolved.get("a.cs"), Some(&visible_oid_hex));
-        assert_ne!(resolved.get("a.cs"), Some(&index_oid_hex));
-        assert_eq!(hash_calls(), 1);
-    }
-
-    #[test]
-    #[hardwon(
-        "#1742: same-size working-tree filters were incorrectly trusted as canonical index bytes"
-    )]
-    fn equal_size_filter_attribute_hashes_working_tree_bytes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        let source_path = temp.path().join("a.txt");
-        std::fs::write(&source_path, "hello\n").unwrap();
-        commit_all(&repo, "source");
-
-        // The explicit filter has equal-size output in this fixture. The
-        // attribute guard must still avoid trusting the index OID.
-        std::fs::write(temp.path().join(".gitattributes"), "*.txt filter=opaque\n").unwrap();
-        commit_paths(&repo, &[".gitattributes"], "attributes");
-
-        let index_oid = repo
-            .index()
-            .unwrap()
-            .get_path(Path::new("a.txt"), 0)
-            .expect("source index entry")
-            .id;
-        let visible_oid = Oid::hash_object(ObjectType::Blob, b"hello\n").unwrap();
-        assert_eq!(visible_oid, index_oid);
-
-        reset_hash_calls();
-        let resolved = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
-        assert_eq!(resolved.get("a.txt"), Some(&visible_oid.to_string()));
-        assert_eq!(hash_calls(), 1);
-    }
-
-    #[test]
-    fn dirty_file_oid_reflects_working_tree() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("a.txt"), "changed\n").unwrap();
-
-        reset_hash_calls();
-        let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
-        assert_eq!(
-            oids["a.txt"],
-            Oid::hash_object(ObjectType::Blob, b"changed\n")
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(hash_calls(), 1);
-
-        let uncommitted = uncommitted_oids(temp.path()).unwrap();
-        assert!(uncommitted.contains(&oids["a.txt"]));
-    }
-
-    #[test]
-    fn targeted_matches_bulk_for_clean_dirty_and_untracked() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo = init_repo(temp.path());
-        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
-        std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
-        commit_all(&repo, "init");
-        std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
-        std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
-
-        let paths = vec![
-            "clean.txt".to_string(),
-            "dirty.txt".to_string(),
-            "new.txt".to_string(),
-        ];
-        let bulk = working_tree_oids(&repo, &paths).unwrap();
-        let targeted = working_tree_oids_targeted(&repo, &paths).unwrap();
-        assert_eq!(bulk, targeted);
-        assert_eq!(
-            targeted["clean.txt"],
-            Oid::hash_object(ObjectType::Blob, b"clean\n")
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(
-            targeted["dirty.txt"],
-            Oid::hash_object(ObjectType::Blob, b"working\n")
-                .unwrap()
-                .to_string()
-        );
-    }
-
-    #[test]
     #[hardwon(
         "#2542: file identity batching read stale metadata and needlessly hashed clean files"
     )]
@@ -2254,6 +1909,69 @@ mod tests {
         assert!(!oids.contains(&deleted_oid));
     }
 
+    /// GC keeps an analyzer row while its blob is in `live_bloom`, which joins
+    /// `reachable_bloom` with `existing_working_tree_oids` for every
+    /// registered worktree. Each set must hold every blob a row can name.
+    #[test]
+    fn gc_liveness_covers_history_empty_files_and_removed_worktrees() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("main");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = init_repo(&root);
+        // An ordinary clone: a network remote without `remote.origin.promisor`.
+        // Git treats a remote as a promisor only when that key is true or
+        // `extensions.partialclone` names it.
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        assert!(!has_network_promisor_remote(&repo).unwrap());
+
+        std::fs::write(root.join("a.rs"), "fn first() {}\n").unwrap();
+        std::fs::write(root.join("__init__.py"), "").unwrap();
+        let first = commit_all(&repo, "first");
+        std::fs::write(root.join("a.rs"), "fn second() {}\n").unwrap();
+        commit_all(&repo, "second");
+        std::fs::write(root.join("untracked.py"), "").unwrap();
+
+        // A linked worktree whose directory was deleted without
+        // `git worktree prune` stays registered.
+        let linked = temp.path().join("linked");
+        repo.worktree("linked", &linked, None).unwrap();
+        std::fs::remove_dir_all(&linked).unwrap();
+        assert_eq!(worktree_roots(&repo).unwrap().len(), 2);
+        assert_eq!(existing_working_tree_oids(&linked).unwrap(), HashSet::new());
+
+        // A blob reachable only from history, read from the first commit's tree.
+        let history_blob = repo
+            .find_commit(first)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_name("a.rs")
+            .expect("a.rs in the first commit")
+            .id();
+        assert_eq!(
+            history_blob,
+            Oid::hash_object(ObjectType::Blob, b"fn first() {}\n").unwrap()
+        );
+        let bloom = reachable_bloom(&repo).unwrap();
+        assert!(bloom.contains(history_blob.to_string().as_str()));
+
+        // Empty files share Git's well-known empty blob OID.
+        let empty_blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        assert!(
+            existing_working_tree_oids(&root)
+                .unwrap()
+                .contains(empty_blob)
+        );
+        std::fs::remove_file(root.join("__init__.py")).unwrap();
+        assert!(
+            existing_working_tree_oids(&root)
+                .unwrap()
+                .contains(empty_blob),
+            "an untracked empty file alone keeps the empty blob live"
+        );
+    }
+
     #[test]
     fn multiroot_persistence_dir_is_order_insensitive() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2358,5 +2076,482 @@ mod tests {
             machine_cache_root_with_overrides(Some(one.as_os_str().to_owned())),
             Some(one)
         );
+    }
+}
+
+/// Cache-identity tests on real repositories. The oracles are git2's own
+/// `Oid::hash_object` over the bytes on disk, `Repository::status_file`, and
+/// the committed blob's byte length; none of them reuse the code under test.
+#[cfg(test)]
+mod working_tree_identity_tests {
+    use super::test_repo::{commit_all, init_repo};
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// A fixed time well before any index file written during a test, so no
+    /// index entry is ever racily clean.
+    fn mtime(step: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_700_000_000 + step, 123_456_789)
+    }
+
+    fn set_mtime(path: &Path, step: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime(step))
+            .unwrap();
+    }
+
+    /// Write `bytes` with mode 0644 (independent of the umask) and a chosen
+    /// mtime. Equal file system timestamps are otherwise common for writes
+    /// made within one kernel tick.
+    pub(super) fn write_file(path: &Path, bytes: &[u8], step: u64) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        set_mtime(path, step);
+    }
+
+    pub(super) fn blob_oid(bytes: &[u8]) -> Oid {
+        Oid::hash_object(ObjectType::Blob, bytes).unwrap()
+    }
+
+    fn index_oid(repo: &Repository, rel: &str) -> Oid {
+        repo.index()
+            .unwrap()
+            .get_path(Path::new(rel), 0)
+            .expect("tracked path")
+            .id
+    }
+
+    #[test]
+    fn stat_clean_identity_serves_the_index_oid_until_the_stat_changes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let file = temp.path().join("a.rs");
+        let committed: &[u8] = b"fn a() {}\n";
+        write_file(&file, committed, 0);
+        write_file(&temp.path().join("other.rs"), b"fn o() {}\n", 0);
+        commit_all(&repo, "init");
+        let identity = working_tree_identity(&repo).unwrap();
+        let both = |rel: &str| {
+            let abs = temp.path().join(rel);
+            (
+                identity.clean_index_oid(&repo, rel, &abs),
+                identity.stat_clean_index_oid(rel, &abs),
+            )
+        };
+        // The production path, `resolve_with_metadata`, answers from the same
+        // snapshot and the same verified-clean memo.
+        let resolve = |rel: &str| {
+            identity
+                .resolve_with_metadata(&repo, &[rel.to_string()])
+                .unwrap()[rel]
+                .oid
+        };
+        let modified = |rel: &str| {
+            repo.status_file(Path::new(rel))
+                .unwrap()
+                .contains(git2::Status::WT_MODIFIED)
+        };
+        let committed_oid = blob_oid(committed);
+
+        assert_eq!(both("a.rs"), (Some(committed_oid), Some(committed_oid)));
+        // Served again from the verified-clean memo.
+        assert_eq!(both("a.rs"), (Some(committed_oid), Some(committed_oid)));
+
+        // A different size alone stops the fast path, even with the recorded
+        // mtime and a path already in the verified-clean memo.
+        let longer: &[u8] = b"fn a() { 1; }\n";
+        write_file(&file, longer, 0);
+        assert!(modified("a.rs"));
+        assert_eq!(both("a.rs"), (None, None));
+        assert_eq!(resolve("a.rs"), blob_oid(longer));
+
+        // A different size or a different mtime stops the fast path.
+        write_file(&file, b"fn a() { 1; }\n", 1);
+        assert_eq!(both("a.rs"), (None, None));
+        write_file(&file, b"fn z() {}\n", 2);
+        assert_eq!(both("a.rs"), (None, None));
+
+        // Restoring the bytes and mtime restores the identity.
+        write_file(&file, committed, 0);
+        assert_eq!(both("a.rs"), (Some(committed_oid), Some(committed_oid)));
+        assert_eq!(resolve("a.rs"), committed_oid);
+
+        // A same-size edit that keeps the whole-second mtime but changes the
+        // recorded nanoseconds stops the fast path too. The nanosecond value
+        // is a multiple of 100 ns so that NTFS can store it. Skip this step
+        // where the file system or the index dropped the nanoseconds, because
+        // then no stat difference exists.
+        let same_size: &[u8] = b"fn y() {}\n";
+        assert_eq!(same_size.len(), committed.len());
+        std::fs::write(&file, same_size).unwrap();
+        let nanos_mtime = UNIX_EPOCH + Duration::new(1_700_000_000, 987_654_300);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(nanos_mtime)
+            .unwrap();
+        let stored = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let index_nanos = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("a.rs"), 0)
+            .expect("tracked path")
+            .mtime
+            .nanoseconds();
+        if stored == nanos_mtime && index_nanos != 0 && index_nanos != 987_654_300 {
+            assert!(modified("a.rs"));
+            assert_eq!(both("a.rs"), (None, None));
+            assert_eq!(resolve("a.rs"), blob_oid(same_size));
+        } else {
+            eprintln!(
+                "skipping the nanosecond step: stored mtime {stored:?}, index nanoseconds {index_nanos}"
+            );
+        }
+
+        // Racy case: a same-size edit that restores the mtime is invisible to
+        // the stat check, so the snapshot still serves the old OID. The
+        // caller-supplied invalidation is the remedy and applies per path.
+        write_file(&file, b"fn z() {}\n", 0);
+        assert_eq!(both("a.rs"), (Some(committed_oid), Some(committed_oid)));
+        identity.invalidate_paths(["a.rs".to_string()]);
+        assert_eq!(both("a.rs"), (None, None));
+        assert_eq!(
+            both("other.rs"),
+            (
+                Some(blob_oid(b"fn o() {}\n")),
+                Some(blob_oid(b"fn o() {}\n"))
+            )
+        );
+
+        // Missing and untracked paths have no index identity.
+        write_file(&temp.path().join("new.rs"), b"fn n() {}\n", 0);
+        assert_eq!(both("new.rs"), (None, None));
+        assert_eq!(both("ghost.rs"), (None, None));
+    }
+
+    #[test]
+    fn paths_dirty_at_scan_time_have_no_index_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let file = temp.path().join("a.rs");
+        write_file(&file, b"fn a() {}\n", 0);
+        commit_all(&repo, "init");
+
+        write_file(&file, b"fn z() {}\n", 1);
+        let identity = working_tree_identity(&repo).unwrap();
+        // The edit is reverted after the scan, so the stat matches the index
+        // again; the scan still saw the path dirty and refuses its OID.
+        write_file(&file, b"fn a() {}\n", 0);
+        assert_eq!(identity.clean_index_oid(&repo, "a.rs", &file), None);
+        assert_eq!(identity.stat_clean_index_oid("a.rs", &file), None);
+    }
+
+    #[test]
+    fn transformed_or_unverifiable_clean_entries_only_serve_the_stat_form() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        write_file(&temp.path().join("eol.cs"), b"class A {}\n", 0);
+        write_file(&temp.path().join("filtered.txt"), b"hello\n", 0);
+        write_file(&temp.path().join("plain.txt"), b"plain\n", 0);
+        write_file(&temp.path().join("missing.rs"), b"fn m() {}\n", 0);
+        commit_all(&repo, "init");
+        write_file(
+            &temp.path().join(".gitattributes"),
+            b"*.cs text eol=crlf\nfiltered.txt filter=opaque\n",
+            0,
+        );
+        commit_all(&repo, "attributes");
+
+        // The CRLF checkout keeps the canonical LF blob in the index but a
+        // longer file on disk. Git records that file's stat in the index.
+        write_file(&temp.path().join("eol.cs"), b"class A {}\r\n", 1);
+        let eol_oid = super::test_repo::refresh_index_stat_preserving_oid(&repo, "eol.cs");
+        assert_eq!(eol_oid, blob_oid(b"class A {}\n"));
+
+        // Delete the loose object behind missing.rs, so the index names an
+        // object the database no longer holds while the stat still matches.
+        let absent = index_oid(&repo, "missing.rs");
+        let hex = absent.to_string();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+
+        let identity = working_tree_identity(&repo).unwrap();
+        let abs = |rel: &str| temp.path().join(rel);
+
+        // Transformed or unverifiable: the checked form declines (the caller
+        // must hash the visible bytes), the stat form still names the index OID.
+        for (rel, index) in [
+            ("eol.cs", eol_oid),
+            ("filtered.txt", blob_oid(b"hello\n")),
+            ("missing.rs", absent),
+        ] {
+            assert_eq!(
+                identity.clean_index_oid(&repo, rel, &abs(rel)),
+                None,
+                "{rel}"
+            );
+            assert_eq!(
+                identity.stat_clean_index_oid(rel, &abs(rel)),
+                Some(index),
+                "{rel}"
+            );
+        }
+        assert_eq!(
+            identity.clean_index_oid(&repo, "plain.txt", &abs("plain.txt")),
+            Some(blob_oid(b"plain\n"))
+        );
+    }
+
+    /// Each attribute lets a clean checkout show bytes that differ from the
+    /// canonical blob the index names. Git keeps the path clean because the
+    /// index stat matches, so only the attribute (or, for eol, the size)
+    /// tells the production path to hash the visible bytes.
+    #[test]
+    #[hardwon(
+        "#1742: CRLF and same-size filtered checkouts got the index OID, not the visible bytes"
+    )]
+    fn transformed_clean_entries_resolve_to_the_visible_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        // The fixture rewrites each file in place and then records its size
+        // and mtime in the index, as a transforming checkout would. It cannot
+        // record the real ctime, so tell `git status` not to compare it; a
+        // ctime mismatch would make Git rehash and report the path dirty.
+        repo.config()
+            .unwrap()
+            .set_bool("core.trustctime", false)
+            .unwrap();
+        let ident_committed = format!("$Id: {} $\n", "0".repeat(40)).into_bytes();
+        // Checkout replaces any expanded `$Id: ... $` with the blob's own OID.
+        let ident_visible = format!("$Id: {} $\n", blob_oid(&ident_committed)).into_bytes();
+        // (path, committed bytes, bytes a transforming checkout writes)
+        let cases: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+            (
+                "eol.cs",
+                b"class A {}\n".to_vec(),
+                b"class A {}\r\n".to_vec(),
+            ),
+            // A filter driver whose smudge output keeps the length.
+            ("filtered.txt", b"hello\n".to_vec(), b"HELLO\n".to_vec()),
+            ("ident.txt", ident_committed, ident_visible),
+            // "text\n" in EBCDIC code page 037: one byte per character.
+            (
+                "encoded.txt",
+                b"text\n".to_vec(),
+                vec![0xA3, 0x85, 0xA7, 0xA3, 0x25],
+            ),
+        ];
+        for (rel, committed, _) in &cases {
+            write_file(&temp.path().join(rel), committed, 0);
+        }
+        commit_all(&repo, "init");
+        write_file(
+            &temp.path().join(".gitattributes"),
+            b"*.cs text eol=crlf\nfiltered.txt filter=opaque\nident.txt ident\n\
+              encoded.txt working-tree-encoding=IBM037\n",
+            0,
+        );
+        super::test_repo::commit_paths(&repo, &[".gitattributes"], "attributes");
+        for (rel, committed, visible) in &cases {
+            assert_ne!(blob_oid(visible), blob_oid(committed), "{rel}");
+            write_file(&temp.path().join(rel), visible, 1);
+            let index = super::test_repo::refresh_index_stat_preserving_oid(&repo, rel);
+            assert_eq!(index, blob_oid(committed), "{rel}");
+        }
+
+        let identity = working_tree_identity(&repo).unwrap();
+        let rels: Vec<String> = cases.iter().map(|(rel, _, _)| rel.to_string()).collect();
+        let resolved = identity.resolve_with_metadata(&repo, &rels).unwrap();
+        for (rel, committed, visible) in &cases {
+            let abs = temp.path().join(rel);
+            // The scan saw the path clean with a matching stat, so the index
+            // fast path was available to every resolver below.
+            assert_eq!(
+                identity.stat_clean_index_oid(rel, &abs),
+                Some(blob_oid(committed)),
+                "{rel}"
+            );
+            assert_eq!(resolved[*rel].oid, blob_oid(visible), "{rel}");
+            assert_eq!(identity.clean_index_oid(&repo, rel, &abs), None, "{rel}");
+        }
+    }
+
+    #[test]
+    fn canonical_blob_size_is_the_stored_byte_length_of_blobs_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let bytes = b"line one\nline two\r\n\0binary tail";
+        let blob = repo.blob(bytes).unwrap();
+        let empty = repo.blob(b"").unwrap();
+        write_file(&temp.path().join("a.rs"), b"fn a() {}\n", 0);
+        let commit = commit_all(&repo, "init");
+        let tree = repo.find_commit(commit).unwrap().tree_id();
+
+        assert_eq!(canonical_blob_size(&repo, blob), Some(bytes.len() as u64));
+        assert_eq!(canonical_blob_size(&repo, empty), Some(0));
+        // Present, but not a blob.
+        assert_eq!(canonical_blob_size(&repo, tree), None);
+        assert_eq!(canonical_blob_size(&repo, commit), None);
+        // Absent from the object database.
+        assert_eq!(canonical_blob_size(&repo, blob_oid(b"never stored")), None);
+    }
+
+    #[test]
+    fn index_entry_oid_is_the_hash_of_the_visible_bytes_not_the_recorded_id() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let file = temp.path().join("a.rs");
+        write_file(&file, b"fn a() {}\n", 0);
+        commit_all(&repo, "init");
+        let entry = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("a.rs"), 0)
+            .unwrap();
+        assert_eq!(
+            resolve_index_entry_oid(temp.path(), &entry).unwrap(),
+            entry.id
+        );
+
+        write_file(&file, b"fn changed() {}\n", 1);
+        let resolved = resolve_index_entry_oid(temp.path(), &entry).unwrap();
+        assert_eq!(resolved, blob_oid(b"fn changed() {}\n"));
+        assert_ne!(resolved, entry.id);
+
+        // A deleted file is an error, not a stale OID.
+        std::fs::remove_file(&file).unwrap();
+        assert!(resolve_index_entry_oid(temp.path(), &entry).is_err());
+
+        // An index path that is not UTF-8 cannot name a file for the caller.
+        let mut bad = entry;
+        bad.path = vec![0xff, 0xfe];
+        assert!(
+            resolve_index_entry_oid(temp.path(), &bad)
+                .unwrap_err()
+                .contains("non-UTF-8")
+        );
+    }
+
+    #[test]
+    fn read_blob_returns_stored_bytes_and_rejects_non_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        write_file(&temp.path().join("a.rs"), b"fn a() {}\n", 0);
+        let commit = commit_all(&repo, "init");
+        let tree = repo.find_commit(commit).unwrap().tree_id();
+        let stored = repo.blob(b"\xff\0not utf8\r\n").unwrap();
+
+        assert_eq!(
+            read_blob(&repo, &stored.to_string()).unwrap(),
+            b"\xff\0not utf8\r\n"
+        );
+        assert!(read_blob(&repo, "not a hex oid").is_err());
+        assert!(read_blob(&repo, &blob_oid(b"never stored").to_string()).is_err());
+        assert!(read_blob(&repo, &tree.to_string()).is_err());
+    }
+
+    #[test]
+    fn default_branch_ref_follows_origin_head_and_otherwise_falls_back_to_head() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        write_file(&temp.path().join("a.rs"), b"fn a() {}\n", 0);
+        let commit = commit_all(&repo, "init");
+
+        assert_eq!(
+            resolve_default_branch_ref(&repo),
+            DefaultBranchRef {
+                ref_name: "HEAD".to_string(),
+                display_name: "HEAD (default branch unavailable)".to_string(),
+                fallback: true,
+            }
+        );
+
+        repo.reference("refs/remotes/origin/main", commit, true, "main")
+            .unwrap();
+        // A non-symbolic origin/HEAD does not identify a branch.
+        repo.reference("refs/remotes/origin/HEAD", commit, true, "detached")
+            .unwrap();
+        assert!(resolve_default_branch_ref(&repo).fallback);
+
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            true,
+            "origin/HEAD",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_default_branch_ref(&repo),
+            DefaultBranchRef {
+                ref_name: "refs/remotes/origin/main".to_string(),
+                display_name: "main".to_string(),
+                fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    #[hardwon("f288e4d7d2e6: a default branch with slashes showed only its last segment")]
+    fn default_branch_display_name_keeps_slashes_in_branch_names() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        write_file(&temp.path().join("a.rs"), b"fn a() {}\n", 0);
+        let commit = commit_all(&repo, "init");
+        repo.reference("refs/remotes/origin/release/1.0", commit, true, "branch")
+            .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/release/1.0",
+            true,
+            "origin/HEAD",
+        )
+        .unwrap();
+        let resolved = resolve_default_branch_ref(&repo);
+        assert_eq!(resolved.ref_name, "refs/remotes/origin/release/1.0");
+        assert_eq!(resolved.display_name, "release/1.0");
+    }
+
+    #[test]
+    fn object_database_exists_for_checkouts_and_bare_repositories_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Discovery searches parent directories, so a plain directory has an
+        // object database exactly when git finds one above it (a TMPDIR inside
+        // a checkout). Ask git rather than assume the temp root is outside one.
+        let plain = temp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let git_finds_one = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&plain)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert_eq!(has_object_database(&plain), git_finds_one);
+
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        init_repo(&checkout);
+        std::fs::create_dir(checkout.join("sub")).unwrap();
+        assert!(has_object_database(&checkout));
+        assert!(has_object_database(&checkout.join("sub")));
+        assert!(discover(&checkout).is_some());
+
+        // A bare repository has objects but no checkout, so `discover`
+        // filters it out while `has_object_database` accepts it.
+        let bare = temp.path().join("bare.git");
+        Repository::init_bare(&bare).unwrap();
+        assert!(has_object_database(&bare));
+        assert!(discover(&bare).is_none());
     }
 }

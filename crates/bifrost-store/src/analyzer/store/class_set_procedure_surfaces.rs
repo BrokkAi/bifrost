@@ -533,7 +533,7 @@ pub(crate) const SURFACE_LEXICAL_CHILDREN_SQL: &str =
      WHERE surface_id=?1 ORDER BY child_ordinal LIMIT ?2";
 pub(crate) const SURFACE_READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,blob_oid,subject,
-            start_byte,end_byte,digest,read_ordinal
+            start_byte,end_byte,digest,site_ordinal,read_ordinal
      FROM class_set_procedure_surface_reads WHERE surface_id=?1 ORDER BY read_ordinal LIMIT ?2";
 
 impl AnalyzerStore {
@@ -1220,7 +1220,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64, expected: usize) -> Result<V
     let mut rows = statement.query(params![id, sql_limit(expected)?])?;
     let mut reads = Vec::new();
     while let Some(row) = rows.next()? {
-        let ordinal = row.get::<_, u32>(12)?;
+        let ordinal = row.get::<_, u32>(13)?;
         if ordinal as usize != reads.len() {
             return Err(StoreError::new(
                 "class-set procedure surface read ordinals are not dense",
@@ -1353,8 +1353,10 @@ fn insert_surface(
         ensure_not_cancelled(cancellation)?;
         let columns = ReadKeyColumns::of(read);
         conn.execute(
-            "INSERT INTO class_set_procedure_surface_reads VALUES(
-               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO class_set_procedure_surface_reads(
+               surface_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
+               index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 id,
                 ordinal,
@@ -1369,7 +1371,8 @@ fn insert_surface(
                 columns.subject,
                 columns.start_byte,
                 columns.end_byte,
-                columns.digest
+                columns.digest,
+                columns.site_ordinal
             ],
         )?;
     }
@@ -1661,6 +1664,7 @@ mod tests {
                     site: ProcedureCallSiteLocator {
                         start_byte: 12,
                         end_byte: 18,
+                        ordinal: 1,
                     },
                 },
                 digest: StableDigest::sha256(b"dispatch"),

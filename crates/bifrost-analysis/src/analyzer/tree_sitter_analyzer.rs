@@ -66,7 +66,8 @@ use crate::analyzer::store::{
     PreparedParsedBlob, PreparedParsedBlobPreparation, RelationalStoreOutcome,
     RenderedDefinitionCandidateOutcome, RenderedDefinitionRequest, StoreError, WorkspaceAnchorRow,
     WorkspaceContentPackageFact, WorkspaceFileRow, WorkspacePackageEdgeRow,
-    WorkspacePackageFileRow, WorkspaceSnapshots, require_complete_file_state,
+    WorkspacePackageFileRow, WorkspaceSnapshots, WorkspaceSourceRefusalRow,
+    require_complete_file_state,
 };
 
 use crate::analyzer::structural::materialization::MaterializationRecord;
@@ -1107,30 +1108,32 @@ pub fn single_connection_store_context_for_test(
 pub fn ephemeral_store_context(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = AnalyzerStore::open_ephemeral()
-        .map_err(|error| error.context("opening the ephemeral analyzer store"))?;
-    Ok(store_context_from_store(project, store, true))
+    ephemeral_store_context_with_config(project, &Default::default())
 }
 
-pub(crate) fn persistent_store_context(
+pub(crate) fn ephemeral_store_context_with_config(
     project: &dyn Project,
+    config: &AnalyzerConfig,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    persistent_store_context_with_automatic_gc(project, true)
+    let store = AnalyzerStore::open_ephemeral_with_config(config)
+        .map_err(|error| error.context("opening the ephemeral analyzer store"))?;
+    Ok(store_context_from_store(project, store, true))
 }
 
 #[doc(hidden)]
 pub fn persistent_store_context_without_automatic_gc(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    persistent_store_context_with_automatic_gc(project, false)
+    persistent_store_context_with_config(project, &Default::default(), false)
 }
 
-fn persistent_store_context_with_automatic_gc(
+pub(crate) fn persistent_store_context_with_config(
     project: &dyn Project,
+    config: &AnalyzerConfig,
     automatic_gc: bool,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => open_persistent_store(root)?,
+        Some(root) => open_persistent_store_with_config(root, config)?,
         None => {
             return Err(StoreError::new(rootless_persistence_message(
                 project.root(),
@@ -1140,9 +1143,12 @@ fn persistent_store_context_with_automatic_gc(
     Ok(store_context_from_store(project, store, automatic_gc))
 }
 
-fn open_persistent_store(root: &std::path::Path) -> std::result::Result<AnalyzerStore, StoreError> {
+fn open_persistent_store_with_config(
+    root: &std::path::Path,
+    config: &AnalyzerConfig,
+) -> std::result::Result<AnalyzerStore, StoreError> {
     let db_path = crate::analyzer::store::analyzer_db_path(root);
-    AnalyzerStore::open_persistent(&db_path).map_err(|error| {
+    AnalyzerStore::open_persistent_with_config(&db_path, config).map_err(|error| {
         error.context(format!(
             "opening the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
             db_path.display(),
@@ -1155,7 +1161,14 @@ fn open_persistent_store(root: &std::path::Path) -> std::result::Result<Analyzer
 pub fn scoped_store_context(
     project: &dyn Project,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = open_persistent_store(project.root())?;
+    scoped_store_context_with_config(project, &Default::default())
+}
+
+pub(crate) fn scoped_store_context_with_config(
+    project: &dyn Project,
+    config: &AnalyzerConfig,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let store = open_persistent_store_with_config(project.root(), config)?;
     // The root selects reusable content, not the identity of this partial
     // listing. Do not use the subset to schedule repository-wide collection.
     let mut context = store_context_from_store(project, store, false);
@@ -1926,9 +1939,9 @@ pub struct AnalyzerRuntimeState {
     #[doc(hidden)]
     pub dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
     /// Whether this generation accounts for every workspace package file.
-    /// Positive package rows remain usable when false; only absence loses
+    /// Positive package rows remain usable when incomplete; only absence loses
     /// authority. Incremental generations may clear but never restore it.
-    workspace_package_inventory_complete: bool,
+    workspace_inventory: WorkspaceInventoryCompleteness,
     /// Digests of the non-source inputs that qualified this generation's
     /// workspace declarations.
     #[doc(hidden)]
@@ -1969,6 +1982,68 @@ pub struct AnalyzerRuntimeState {
     claim_import_reads: AtomicUsize,
 }
 
+/// What a reconcile or workspace-input pass proves about the source inventory.
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkspaceInventoryCompleteness {
+    /// Every workspace source is indexed, so a missing package or declaration
+    /// is proof of absence.
+    indexed: bool,
+    /// Every workspace source is indexed or is a source-admission refusal the
+    /// selected revision records with its reason. Graph construction can name
+    /// those exclusions instead of refusing the whole inventory.
+    accounted: bool,
+}
+
+impl WorkspaceInventoryCompleteness {
+    const COMPLETE: Self = Self {
+        indexed: true,
+        accounted: true,
+    };
+
+    fn mark_incomplete(&mut self) {
+        *self = Self {
+            indexed: false,
+            accounted: false,
+        };
+    }
+
+    fn require(&mut self, condition: bool) {
+        if !condition {
+            self.mark_incomplete();
+        }
+    }
+
+    /// A source without published facts whose cause the workspace-input sync
+    /// classifies: a refusal it records, or an incomplete inventory.
+    fn mark_unindexed(&mut self) {
+        self.indexed = false;
+    }
+
+    /// A refusal is a deterministic function of the source bytes, the adapter
+    /// and the admission policy, so it is a recorded exclusion and not
+    /// missing inventory. Cancellation and timeouts are never refusals: they
+    /// are `AdmissionStop` values that `classify_unpublished_source` reports
+    /// as `Unavailable`. That includes `ProofRejected`, which
+    /// `BoundedParse::Rejected` yields only after the cancellation and
+    /// deadline checks, and which an adapter reaches only through included
+    /// ranges derived from the bytes. Every variant is listed, so a new refusal
+    /// kind has to be classified here.
+    fn record_refusal(&mut self, reason: &SourceAdmissionRefusal) {
+        self.indexed = false;
+        match reason {
+            SourceAdmissionRefusal::Binary
+            | SourceAdmissionRefusal::ProofRejected
+            | SourceAdmissionRefusal::StructuralLine { .. }
+            | SourceAdmissionRefusal::Budget { .. } => {}
+        }
+    }
+
+    fn meet(&mut self, other: Self) {
+        self.indexed &= other.indexed;
+        self.accounted &= other.accounted;
+    }
+}
+
 /// The previous generation's include-claim relation, handed to the next
 /// derivation by `TreeSitterAnalyzer::reconcile_claimed_files`.
 ///
@@ -1997,13 +2072,14 @@ impl AnalyzerRuntimeState {
         dirty_path_symbol_rows: HashMap<ProjectFile, (String, PathSymbolRow)>,
         seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     ) -> Self {
-        let workspace_package_inventory_complete =
-            dirty_file_states.is_empty() && dirty_path_symbol_rows.is_empty();
+        let mut workspace_inventory = WorkspaceInventoryCompleteness::COMPLETE;
+        workspace_inventory
+            .require(dirty_file_states.is_empty() && dirty_path_symbol_rows.is_empty());
         Self {
             fresh_parse_errors,
             dirty_file_states: Mutex::new(dirty_file_states),
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
-            workspace_package_inventory_complete,
+            workspace_inventory,
             workspace_package_identity_input_digests: HashMap::default(),
             workspace_configuration_digest: None,
             workspace_package_inventory_error: None,
@@ -2023,7 +2099,7 @@ impl AnalyzerRuntimeState {
             fresh_parse_errors,
             dirty_file_states,
             dirty_path_symbol_rows,
-            workspace_package_inventory_complete,
+            workspace_inventory,
             workspace_package_identity_input_digests,
             workspace_configuration_digest: _,
             workspace_package_inventory_error,
@@ -2048,7 +2124,7 @@ impl AnalyzerRuntimeState {
             .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows
             .into_inner()
             .expect("dirty path-symbol mutex poisoned");
-        self.workspace_package_inventory_complete &= workspace_package_inventory_complete;
+        self.workspace_inventory.meet(workspace_inventory);
         self.workspace_package_identity_input_digests
             .extend(workspace_package_identity_input_digests);
         if self.workspace_package_inventory_error.is_none() {
@@ -2065,7 +2141,7 @@ impl AnalyzerRuntimeState {
     }
 
     fn mark_workspace_package_inventory_incomplete(&mut self) {
-        self.workspace_package_inventory_complete = false;
+        self.workspace_inventory.mark_incomplete();
     }
 
     fn record_workspace_package_inventory_error(&mut self, error: StoreError) {
@@ -2265,6 +2341,33 @@ fn source_admission_for_oid<A: LanguageAdapter>(
                 ))),
             }
         }
+    }
+}
+
+/// How the workspace-input sync publishes a live source whose blob has no
+/// published facts at the captured generation. Full and incremental syncs
+/// share this, so a refused source is never a selected source row.
+enum UnpublishedSource {
+    /// Admitted source whose facts are missing: selected, inventory incomplete.
+    Admitted,
+    /// Recorded with its reason instead of a source row.
+    Refused(SourceAdmissionRefusal),
+    /// Admission did not finish: omitted, inventory incomplete.
+    Unavailable,
+}
+
+fn classify_unpublished_source<A: LanguageAdapter>(
+    project: &dyn Project,
+    adapter: &A,
+    file: &ProjectFile,
+    oid: Oid,
+) -> UnpublishedSource {
+    match source_admission_for_oid(project, adapter, file, oid, None) {
+        Some(Err(AdmissionStop::Refused(reason))) => UnpublishedSource::Refused(reason),
+        Some(Err(AdmissionStop::Cancelled | AdmissionStop::TimedOut)) => {
+            UnpublishedSource::Unavailable
+        }
+        Some(Ok(())) | None => UnpublishedSource::Admitted,
     }
 }
 
@@ -4175,7 +4278,7 @@ where
             .is_none_or(|context| context.workspace_snapshot.is_none());
         let mut store_context = match store_context {
             Some(store_context) => store_context,
-            None => ephemeral_store_context(project.as_ref())?,
+            None => ephemeral_store_context_with_config(project.as_ref(), &config)?,
         };
         let epochs = adapter
             .storage_language_keys()
@@ -4893,7 +4996,7 @@ where
 
     #[doc(hidden)]
     pub fn workspace_package_inventory_complete(&self) -> bool {
-        if !self.state.workspace_package_inventory_complete {
+        if !self.state.workspace_inventory.indexed {
             return false;
         }
         let Some(overlays) = self.project.overlay_content() else {
@@ -4919,11 +5022,13 @@ where
     }
 
     /// Whether every source overlay belongs to the parsed inventory. Unlike
-    /// package-absence proof, graph construction may consume an indexed overlay.
+    /// package-absence proof, graph construction may consume an indexed overlay,
+    /// and a source that admission refused is an explained exclusion the
+    /// selected revision records ([`Self::selected_source_admission_refusals`]).
     /// Package-identity configuration readiness is a separate caller obligation.
     #[doc(hidden)]
     pub fn indexed_source_inventory_complete(&self) -> bool {
-        if !self.state.workspace_package_inventory_complete {
+        if !self.state.workspace_inventory.accounted {
             return false;
         }
         let Some(overlays) = self.project.overlay_content() else {
@@ -4943,6 +5048,47 @@ where
                         })
                 })
         })
+    }
+
+    /// Sources of this analyzer's storage languages that source admission
+    /// refused at the selected revision, with the recorded reason object as
+    /// JSON text, ordered by path. They are explained exclusions: never
+    /// selected source rows, never parsed. The result lives for one query.
+    #[doc(hidden)]
+    pub fn selected_source_admission_refusals(
+        &self,
+    ) -> Result<Vec<(ProjectFile, String)>, StoreError> {
+        let snapshots = self.selected_workspace_snapshots();
+        let conn = self.store_context.store.read_conn()?;
+        let mut statement = conn.prepare_cached(
+            "SELECT rel_path, json(reason) FROM workspace_source_refusals
+             WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+               AND valid_from <= ?4 AND (valid_until IS NULL OR ?4 < valid_until)
+             ORDER BY rel_path",
+        )?;
+        let mut refusals = Vec::new();
+        for (lang, _) in self.adapter.storage_language_keys() {
+            let Some(snapshot) = snapshots.get(&lang) else {
+                continue;
+            };
+            let rows = statement.query_map(
+                rusqlite::params![
+                    snapshot.workspace_id.as_str(),
+                    lang,
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            for row in rows {
+                let (path, reason) = row?;
+                refusals.push((
+                    ProjectFile::new(self.project.root(), std::path::PathBuf::from(path)),
+                    reason,
+                ));
+            }
+        }
+        Ok(refusals)
     }
 
     /// Whether the package-qualified identities stored for this analyzer can be
@@ -6452,7 +6598,7 @@ where
                 "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
                 adapter.language()
             ));
-            let (dirty, package_inventory_complete) = Self::sync_path_symbol_units(
+            let (dirty, inventory) = Self::sync_path_symbol_units(
                 project,
                 adapter,
                 &indexed_files,
@@ -6464,9 +6610,7 @@ where
                 .lock()
                 .expect("dirty path-symbol mutex poisoned")
                 .extend(dirty);
-            if !package_inventory_complete {
-                state.mark_workspace_package_inventory_incomplete();
-            }
+            state.workspace_inventory.meet(inventory);
         }
 
         if let Some(progress) = progress.as_ref() {
@@ -7078,7 +7222,10 @@ where
         files: &[ProjectFile],
         configuration: &[WorkspaceConfigurationInput],
         store_context: &AnalyzerStoreContext,
-    ) -> (HashMap<ProjectFile, (String, PathSymbolRow)>, bool) {
+    ) -> (
+        HashMap<ProjectFile, (String, PathSymbolRow)>,
+        WorkspaceInventoryCompleteness,
+    ) {
         let snapshot = store_context.live_paths.snapshot();
         let mut rows_by_language: HashMap<
             String,
@@ -7088,6 +7235,11 @@ where
             .into_iter()
             .map(|(lang, _)| (lang, Vec::new()))
             .collect();
+        let mut refusals_by_language: HashMap<String, Vec<WorkspaceSourceRefusalRow>> =
+            rows_by_language
+                .keys()
+                .map(|lang| (lang.clone(), Vec::new()))
+                .collect();
         let mut publication_keys = Vec::new();
         let mut live_files = Vec::new();
         for file in files {
@@ -7098,29 +7250,37 @@ where
             publication_keys.push((blob_oid, storage_language.clone()));
             live_files.push((file, blob_oid, storage_language));
         }
-        let mut package_inventory_complete = true;
+        let mut inventory = WorkspaceInventoryCompleteness::COMPLETE;
         let published = match store_context
             .store
             .parsed_blob_keys_at_generations(&publication_keys, &store_context.generations)
         {
             Ok(published) => published,
             Err(_) => {
-                package_inventory_complete = false;
+                inventory.mark_incomplete();
                 HashSet::default()
             }
         };
         for (file, blob_oid, storage_language) in live_files {
             if !published.contains(&(blob_oid, storage_language.clone())) {
-                match source_admission_for_oid(project, adapter, file, blob_oid, None) {
-                    Some(Err(AdmissionStop::Refused(_))) => {
-                        package_inventory_complete = false;
+                match classify_unpublished_source(project, adapter, file, blob_oid) {
+                    UnpublishedSource::Admitted => inventory.mark_incomplete(),
+                    UnpublishedSource::Refused(reason) => {
+                        inventory.record_refusal(&reason);
+                        refusals_by_language
+                            .entry(storage_language)
+                            .or_default()
+                            .push(WorkspaceSourceRefusalRow {
+                                rel_path: crate::path_utils::rel_path_string(file),
+                                blob_oid,
+                                reason,
+                            });
                         continue;
                     }
-                    Some(Err(AdmissionStop::Cancelled | AdmissionStop::TimedOut)) => {
-                        package_inventory_complete = false;
+                    UnpublishedSource::Unavailable => {
+                        inventory.mark_incomplete();
                         continue;
                     }
-                    _ => {}
                 }
             }
             let workspace_file = WorkspaceFileRow {
@@ -7168,7 +7328,7 @@ where
                 adapter.workspace_file_package_anchor(),
             );
             let relations = relations.and_then(|facts| {
-                package_inventory_complete &= facts.complete;
+                inventory.require(facts.complete);
                 Self::workspace_snapshot_relations(adapter, &entries, &facts.facts)
             });
             let mut persisted = false;
@@ -7188,6 +7348,7 @@ where
                             &anchors,
                             configuration,
                             &foreign_source_paths[&lang],
+                            &refusals_by_language[&lang],
                         )
                         .is_ok()
                     {
@@ -7200,7 +7361,7 @@ where
                 }
             }
             if !persisted {
-                package_inventory_complete = false;
+                inventory.mark_incomplete();
                 dirty.extend(
                     entries
                         .into_iter()
@@ -7208,7 +7369,7 @@ where
                 );
             }
         }
-        (dirty, package_inventory_complete)
+        (dirty, inventory)
     }
 
     /// Publish the content readings in one storage language's workspace
@@ -7290,6 +7451,7 @@ where
                     &[],
                     &[],
                     &natural_paths,
+                    &[],
                 ) {
                 Ok(snapshot) => {
                     let mut snapshots = self.selected_workspace_snapshots().as_ref().clone();
@@ -7312,12 +7474,13 @@ where
     }
 
     fn refresh_path_symbol_units(
+        project: &dyn Project,
         adapter: &A,
         files: &BTreeSet<ProjectFile>,
         store_context: &AnalyzerStoreContext,
         workspace_snapshots: &mut WorkspaceSnapshots,
         dirty: &mut HashMap<ProjectFile, (String, PathSymbolRow)>,
-        package_inventory_complete: &mut bool,
+        inventory: &mut WorkspaceInventoryCompleteness,
     ) {
         let storage_languages = adapter
             .storage_language_keys()
@@ -7329,15 +7492,60 @@ where
             .map(|lang| (lang.clone(), store_context.generations[lang]))
             .collect();
         let snapshot = store_context.live_paths.snapshot();
+        let publication_keys = files
+            .iter()
+            .filter_map(|file| {
+                snapshot
+                    .validated_oid_for_path(file)
+                    .map(|oid| (oid, adapter.storage_language_key_for_file(file).to_string()))
+            })
+            .collect::<Vec<_>>();
+        let published = match store_context
+            .store
+            .parsed_blob_keys_at_generations(&publication_keys, &store_context.generations)
+        {
+            Ok(published) => published,
+            Err(_) => {
+                inventory.mark_incomplete();
+                HashSet::default()
+            }
+        };
         for file in files {
             dirty.remove(file);
             let rel_path = crate::path_utils::rel_path_string(file);
-            let live_oid = snapshot.validated_oid_for_path(file);
-            let file_replacement =
-                live_oid.map(|oid| (adapter.storage_language_key_for_file(file), oid));
+            let storage_language = adapter.storage_language_key_for_file(file);
+            let mut refusal = None;
+            // The same classification as the full workspace sync: a refused
+            // source is recorded, never selected, and the omission of a source
+            // whose admission did not finish leaves the inventory incomplete.
+            let live_oid = snapshot.validated_oid_for_path(file).filter(|&oid| {
+                if published.contains(&(oid, storage_language.to_string())) {
+                    return true;
+                }
+                match classify_unpublished_source(project, adapter, file, oid) {
+                    UnpublishedSource::Admitted => {
+                        inventory.mark_incomplete();
+                        true
+                    }
+                    UnpublishedSource::Refused(reason) => {
+                        inventory.record_refusal(&reason);
+                        refusal = Some(WorkspaceSourceRefusalRow {
+                            rel_path: rel_path.clone(),
+                            blob_oid: oid,
+                            reason,
+                        });
+                        false
+                    }
+                    UnpublishedSource::Unavailable => {
+                        inventory.mark_incomplete();
+                        false
+                    }
+                }
+            });
+            let file_replacement = live_oid.map(|oid| (storage_language, oid));
             let replacement = live_oid
                 .and_then(|blob_oid| Self::path_symbol_row(adapter, file, blob_oid))
-                .map(|row| (adapter.storage_language_key_for_file(file), row));
+                .map(|row| (storage_language, row));
             let replacement_ref = replacement.as_ref().map(|&(lang, ref row)| (lang, row));
             let relations = if let Some((lang, blob_oid)) = file_replacement {
                 let entry = (
@@ -7357,7 +7565,7 @@ where
                         adapter.workspace_file_package_anchor(),
                     )
                     .and_then(|facts| {
-                        *package_inventory_complete &= facts.complete;
+                        inventory.require(facts.complete);
                         Self::workspace_snapshot_relations(adapter, &[entry], &facts.facts)
                     })
             } else {
@@ -7378,6 +7586,7 @@ where
                         &package_files,
                         &package_edges,
                         &anchors,
+                        refusal.as_ref().map(|row| (storage_language, row)),
                     ) {
                         workspace_snapshots.extend(next);
                         persisted = true;
@@ -7391,7 +7600,7 @@ where
             if !persisted && let Some((lang, row)) = replacement {
                 dirty.insert(file.clone(), (lang.to_string(), row));
             }
-            *package_inventory_complete &= persisted;
+            inventory.require(persisted);
         }
     }
 
@@ -7429,14 +7638,14 @@ where
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
-        let mut workspace_package_inventory_complete = true;
+        let mut workspace_inventory = WorkspaceInventoryCompleteness::COMPLETE;
         let oid_plan = {
             let _scope = profiling::scope("reconcile.resolve_live_oids");
             Self::resolve_live_oids(project, &files, store_context, replace_live_paths)
         };
         match oid_plan {
             Ok(file_oids) => {
-                workspace_package_inventory_complete &= file_oids.len() == files.len();
+                workspace_inventory.require(file_oids.len() == files.len());
                 let mut candidate_order = Vec::new();
                 let mut candidates_by_blob_key = HashMap::default();
                 for file in &files {
@@ -7611,8 +7820,8 @@ where
                                 required_existing_additional_storage_languages,
                                 error,
                             )) => {
-                                workspace_package_inventory_complete &=
-                                    error.is_none() && state.parse_complete;
+                                workspace_inventory
+                                    .require(error.is_none() && state.parse_complete);
                                 let blob_outcome = if error.is_some() {
                                     RepresentativeBlobOutcome::Dirty
                                 } else {
@@ -7651,7 +7860,9 @@ where
                                 parsed_files.insert(file);
                             }
                             None => {
-                                workspace_package_inventory_complete = false;
+                                // The workspace-input sync classifies the cause:
+                                // a recorded refusal, or an incomplete inventory.
+                                workspace_inventory.mark_unindexed();
                                 representative_blob_outcomes.insert(
                                     (oid, storage_key.to_string()),
                                     RepresentativeBlobOutcome::Unparseable,
@@ -7710,10 +7921,10 @@ where
                     store_context,
                 ) {
                     let Some(analyzed) = state else {
-                        workspace_package_inventory_complete = false;
+                        workspace_inventory.mark_unindexed();
                         continue;
                     };
-                    workspace_package_inventory_complete &= analyzed.state.parse_complete;
+                    workspace_inventory.require(analyzed.state.parse_complete);
                     let mut seed_key = None;
                     if let Some(oid) = file_oids.get(&file).copied() {
                         let storage_key = adapter.storage_language_key_for_file(&file);
@@ -7741,7 +7952,7 @@ where
                 }
             }
             Err(error) => {
-                workspace_package_inventory_complete = false;
+                workspace_inventory.mark_incomplete();
                 profiling::note(format!(
                     "resolve_live_oids failed; reconciling {:?} without live identities: {error}",
                     adapter.language()
@@ -7789,9 +8000,7 @@ where
             dirty_path_symbol_rows,
             seeded_file_states,
         );
-        if !workspace_package_inventory_complete {
-            state.mark_workspace_package_inventory_incomplete();
-        }
+        state.workspace_inventory.meet(workspace_inventory);
         state.persistence_stats = persistence_stats;
         state
     }
@@ -9982,7 +10191,7 @@ where
     /// their absence cannot be established from the indexed snapshot alone.
     #[doc(hidden)]
     pub fn definition_sources_may_exist(&self) -> bool {
-        !self.state.workspace_package_inventory_complete
+        !self.state.workspace_inventory.indexed
             || self.indexed_live_snapshot.all_paths().next().is_some()
             || self.live_snapshot().all_paths().next().is_some()
             || self
@@ -17199,8 +17408,9 @@ where
                 dirty_path_symbol_rows,
             },
         );
-        state.workspace_package_inventory_complete &=
-            self.state.workspace_package_inventory_complete;
+        state
+            .workspace_inventory
+            .meet(self.state.workspace_inventory);
         state.workspace_package_inventory_error =
             self.state.workspace_package_inventory_error.clone();
         state.workspace_package_identity_input_digests =
@@ -17237,12 +17447,13 @@ where
         workspace_paths_to_refresh.extend(claim_delta.dropped);
         dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
         Self::refresh_path_symbol_units(
+            self.project.as_ref(),
             self.adapter.as_ref(),
             &workspace_paths_to_refresh,
             &store_context,
             &mut relational_workspace_snapshots,
             &mut dirty_path_symbol_rows,
-            &mut state.workspace_package_inventory_complete,
+            &mut state.workspace_inventory,
         );
         *state
             .dirty_path_symbol_rows
@@ -17930,6 +18141,44 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
 #[path = "tree_sitter_resolution_producer_tests.rs"]
 #[doc(hidden)]
 pub mod resolution_producer_tests;
+
+#[cfg(test)]
+mod inventory_completeness_tests {
+    use super::WorkspaceInventoryCompleteness;
+    use crate::analyzer::semantic::source_admission::{AdmissionDimension, SourceAdmissionRefusal};
+
+    /// Every refusal kind is deterministic in the source bytes, the adapter and
+    /// the admission policy, so each one leaves the inventory accounted for
+    /// while the refused file stays unindexed. Cancellation and timeouts are
+    /// not refusals and clear both facts through `mark_incomplete`.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6650: a refusal cleared graph readiness, and ProofRejected was not treated as deterministic"
+    )]
+    #[test]
+    fn every_refusal_kind_is_accounted_for_and_unindexed() {
+        for reason in [
+            SourceAdmissionRefusal::Binary,
+            SourceAdmissionRefusal::ProofRejected,
+            SourceAdmissionRefusal::StructuralLine {
+                limit: 16_000,
+                observed: 20_000,
+            },
+            SourceAdmissionRefusal::Budget {
+                dimension: AdmissionDimension::Nodes,
+                limit: 1,
+                observed: 2,
+            },
+        ] {
+            let mut inventory = WorkspaceInventoryCompleteness::COMPLETE;
+            inventory.record_refusal(&reason);
+            assert!(!inventory.indexed, "{reason:?} leaves the file unindexed");
+            assert!(inventory.accounted, "{reason:?} is a recorded exclusion");
+        }
+        let mut transient = WorkspaceInventoryCompleteness::COMPLETE;
+        transient.mark_incomplete();
+        assert!(!transient.indexed && !transient.accounted);
+    }
+}
 
 #[cfg(test)]
 mod sigil_anchor_tests {

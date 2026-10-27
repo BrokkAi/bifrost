@@ -778,7 +778,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// proof and so cannot recurse.
     fn actual_evidence(&self, actual: Node<'tree>) -> KotlinActualEvidence<'tree> {
         let actual = kotlin_unwrap_receiver(actual);
-        if !literal_type_names(actual.kind()).is_empty() || actual.kind() == "null_literal" {
+        if !literal_type_names(actual, self.prepared.source()).is_empty()
+            || actual.kind() == "null_literal"
+        {
             return KotlinActualEvidence::Literal(actual);
         }
         match actual.kind() {

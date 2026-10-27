@@ -1296,7 +1296,7 @@ fn dynamic_call_write_for_field(
         let arguments = node.child_by_field_name("arguments")?;
         let actuals = named_children(arguments);
         if name == "setattr" {
-            let Some(attribute) = actuals.get(1).copied() else {
+            let Some(attribute) = actuals.get(1).cloned() else {
                 return Some(DynamicMemberName::Any);
             };
             return Some(dynamic_member_name(workspace, file, attribute, prepared));
@@ -1345,7 +1345,7 @@ fn dynamic_call_write_for_field(
         return Some(
             named_children(arguments)
                 .first()
-                .copied()
+                .cloned()
                 .map(|name| dynamic_member_name(workspace, file, name, prepared))
                 .unwrap_or(DynamicMemberName::Any),
         );
@@ -1376,7 +1376,7 @@ fn dynamic_call_write_for_field(
         "__setitem__" => Some(
             actuals
                 .first()
-                .copied()
+                .cloned()
                 .map(|name| dynamic_member_name(workspace, file, name, prepared))
                 .unwrap_or(DynamicMemberName::Any),
         ),
@@ -1387,7 +1387,7 @@ fn dynamic_call_write_for_field(
         "setdefault" => Some(
             actuals
                 .first()
-                .copied()
+                .cloned()
                 .map(|name| dynamic_member_name(workspace, file, name, prepared))
                 .unwrap_or(DynamicMemberName::Any),
         ),
@@ -2628,6 +2628,70 @@ fn import_bound_external_symbol(
     )
 }
 
+/// The module, member and class seed of the module value an import binds
+/// `reference` to: `os.environ` after `import os`, or `environ` after
+/// `from os import environ`.
+///
+/// The import binder proves the module and member by identity, so a shadowed or
+/// rebound module name never reaches the declared field.
+fn imported_external_module_value(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> Option<(String, String, ClassSeed)> {
+    let (module, member) =
+        import_bound_external_symbol(python_analyzer(workspace), file, prepared, reference)?;
+    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let seed = external_module_value_seed(&overlay, &module, &member)?;
+    Some((module, member, seed))
+}
+
+/// The exact external classes a module value seed names, as an access-chain origin.
+fn exact_external_module_value(seed: ClassSeed) -> Option<PythonExactResultValue> {
+    match seed {
+        ClassSeed::Class(class @ ClassIdentity::External { .. }) => Some(
+            PythonExactResultValue::Classes(vec![class].into_boxed_slice()),
+        ),
+        ClassSeed::Classes(classes)
+            if classes
+                .iter()
+                .all(|class| matches!(class, ClassIdentity::External { .. })) =>
+        {
+            Some(PythonExactResultValue::Classes(classes))
+        }
+        _ => None,
+    }
+}
+
+/// The exact external classes of an attribute-form module value such as
+/// `os.environ`, while the field still holds the module's own value.
+///
+/// A declared field type describes the module's own value, so a workspace write
+/// to that member (`os.environ = fake`), or a module object that escapes to an
+/// unseen writer, withholds the class instead of publishing it.
+fn unreplaced_external_module_value(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> Option<PythonExactResultValue> {
+    let (module, member, seed) =
+        imported_external_module_value(workspace, file, prepared, reference)?;
+    let value = exact_external_module_value(seed)?;
+    python_analyzer(workspace)
+        .cached_module_member_mutation_free(&module, &member, || {
+            brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::python_workspace_module_member_mutation_free(
+                workspace.analyzer(),
+                &module,
+                &member,
+                200_000,
+                &|| true,
+            )
+        })
+        .then_some(value)
+}
+
 fn imported_external_callable_binding(
     python: &PythonAnalyzer,
     file: &ProjectFile,
@@ -3468,7 +3532,7 @@ impl PythonBuiltinShadowRequestMemo {
             .lock()
             .expect("builtin shadow memo lock poisoned")
             .get(&key)
-            .copied()
+            .cloned()
         {
             return session.scope_step().then_some(answer);
         }
@@ -3813,7 +3877,7 @@ impl PythonModuleBindingRequestMemo {
             .expect("module binding memo lock poisoned")
             .get(&source)
             .and_then(|bindings| bindings.get(name))
-            .copied()
+            .cloned()
         {
             return Some(binding);
         }
@@ -5315,7 +5379,7 @@ pub(crate) fn python_external_value_member_on_workspace_class(
     receiver_class: &CodeUnit,
     member: &str,
     overlay: &SemanticModelOverlay,
-) -> Option<SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let mut cache = ExternalClassCache::default();
     let ancestors = python.get_ancestors(receiver_class);
     for owner in std::iter::once(receiver_class).chain(ancestors.iter()) {
@@ -5482,6 +5546,13 @@ pub(crate) fn python_external_field_read_discharges_gap(
     {
         return false;
     }
+    // A declared module value such as `os.environ` is read from the module's
+    // own namespace, which runs no descriptor, so the declaration retires the
+    // claim for as long as the import binder proves the module and no
+    // workspace source can replace the field.
+    if unreplaced_external_module_value(workspace, &file, &prepared, access).is_some() {
+        return true;
+    }
     let Some(method) = node_at_span(&prepared, procedure.semantics().locator().anchor().span())
     else {
         return false;
@@ -5575,7 +5646,7 @@ fn external_class_member_mutation_free(
         };
         class_ids.insert(owner_id.to_owned());
     }
-    let mut identity_groups = Vec::with_capacity(class_ids.len());
+    let mut class_records = Vec::with_capacity(class_ids.len());
     for class_id in class_ids {
         let matched = overlay.symbols_with_id(&class_id);
         let [class_record] = matched.records.as_slice() else {
@@ -5589,11 +5660,16 @@ fn external_class_member_mutation_free(
         {
             return false;
         }
-        let mut identities = Vec::with_capacity(class_record.aliases.len() + 1);
-        identities.push(class_record.qualified_name.as_str());
-        identities.extend(class_record.aliases.iter().map(String::as_str));
-        identity_groups.push(identities);
+        class_records.push(Arc::clone(class_record));
     }
+    let identity_groups = class_records
+        .iter()
+        .map(|class| {
+            std::iter::once(class.qualified_name.as_str())
+                .chain(class.aliases.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     python_analyzer(workspace).cached_class_member_mutation_free(&identity_groups, member, || {
         let Ok(files) = workspace.analyzer().project().all_files_shared() else {
             return false;
@@ -5657,11 +5733,11 @@ pub(crate) fn python_external_class_call_identity(
 /// callable-shape evidence only. Inherited members use unique, unambiguous
 /// class and base declarations from a complete C3 order.
 #[doc(hidden)]
-pub fn python_external_member_declaration<'a>(
-    overlay: &'a SemanticModelOverlay,
+pub fn python_external_member_declaration(
+    overlay: &SemanticModelOverlay,
     owner_id: &str,
     member: &str,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let owner = exact_python_model_class(overlay, owner_id)?;
     if python_external_declares_member(overlay, owner_id, member) {
         if overlay
@@ -5892,10 +5968,10 @@ fn python_external_declares_member(
         })
 }
 
-fn python_external_class_records<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn python_external_class_records(
+    overlay: &SemanticModelOverlay,
     id: &str,
-) -> Vec<&'a SemanticModelSymbol> {
+) -> Vec<Arc<SemanticModelSymbol>> {
     let Some(class) = exact_python_model_class(overlay, id) else {
         return Vec::new();
     };
@@ -5913,10 +5989,10 @@ fn python_external_class_records<'a>(
         .collect()
 }
 
-fn exact_python_model_class<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn exact_python_model_class(
+    overlay: &SemanticModelOverlay,
     id: &str,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let matched = overlay.symbols_with_id(id);
     let [symbol] = matched.records.as_slice() else {
         return None;
@@ -5925,14 +6001,14 @@ fn exact_python_model_class<'a>(
         && symbol.language == Language::Python.config_label()
         && symbol.kind == SemanticModelSymbolKind::Class
         && !symbol.provenance.ambiguous)
-        .then_some(*symbol)
+        .then_some(symbol.clone())
 }
 
-fn exact_python_method_declaration<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn exact_python_method_declaration(
+    overlay: &SemanticModelOverlay,
     owner_id: &str,
     member: &str,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<Arc<SemanticModelSymbol>> {
     let mut records = python_external_class_records(overlay, owner_id)
         .into_iter()
         .flat_map(|owner| {
@@ -5973,7 +6049,7 @@ fn exact_python_method_declaration<'a>(
         .then_with(|| left.id.cmp(&right.id))
     });
     records.dedup_by(|left, right| left.id == right.id);
-    let symbol = records.first().copied()?;
+    let symbol = records.first().cloned()?;
     Some(symbol)
 }
 
@@ -6003,7 +6079,7 @@ fn python_external_class_mro(overlay: &SemanticModelOverlay, root_id: &str) -> O
         if stack[top].bases.is_none() {
             let class_id = stack[top].class_id.clone();
             let class = exact_python_model_class(overlay, &class_id)?;
-            stack[top].bases = Some(python_external_direct_bases(overlay, class)?);
+            stack[top].bases = Some(python_external_direct_bases(overlay, &class)?);
         }
         let bases = stack[top].bases.as_ref().expect("bases were initialized");
         if stack[top].next_base < bases.len() {
@@ -6053,7 +6129,7 @@ fn python_external_direct_bases(
             .iter()
             .any(|relation| relation.kind == "extends")
         {
-            declared.push(python_external_direct_bases_for_record(overlay, record)?);
+            declared.push(python_external_direct_bases_for_record(overlay, &record)?);
         }
     }
     if declared.is_empty() {
@@ -6735,7 +6811,7 @@ fn python_unique_reaching_binding_assignment_at(
     let mut facts = GenKillFacts::new(point_count, definition_count);
     for (point_index, point) in semantics.points().iter().enumerate() {
         let local = &assignments_by_point[point_index];
-        if let Some(generated) = local.last().copied() {
+        if let Some(generated) = local.last().cloned() {
             for killed in 0..definition_count {
                 facts.record_killed(point_index, killed);
             }
@@ -6754,10 +6830,10 @@ fn python_unique_reaching_binding_assignment_at(
     let same_point = assignments_by_point.get(use_point_index)?;
     let before_call = same_point
         .iter()
-        .copied()
+        .cloned()
         .filter(|definition| assignments[*definition - 1].0 < use_event_index)
         .collect::<Vec<_>>();
-    let reaching_here = if let Some(last) = before_call.last().copied() {
+    let reaching_here = if let Some(last) = before_call.last().cloned() {
         vec![last]
     } else {
         reaching.reaching_in(use_point_index).collect::<Vec<_>>()
@@ -8283,6 +8359,20 @@ fn python_exact_value_class_at_in_query(
             let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
             let node = node_at_span(&prepared, mapping.locator.anchor().span())?;
             let location_row = semantics.memory_location(*location)?;
+            // A module attribute such as `os.environ` is itself the declared
+            // module value. Reading it as an access on the bare module object
+            // would descend to a base that has no class.
+            if node.kind() == "attribute"
+                && matches!(
+                    location_row.kind,
+                    MemoryLocationKind::Field { .. } | MemoryLocationKind::Property { .. }
+                )
+                && let Some(value) =
+                    unreplaced_external_module_value(workspace, &file, &prepared, node)
+            {
+                origin_value = Some(value);
+                break;
+            }
             let (base, access, base_node) = match &location_row.kind {
                 MemoryLocationKind::Field { base, .. }
                 | MemoryLocationKind::Property { base, .. }
@@ -8358,27 +8448,10 @@ fn python_exact_value_class_at_in_query(
         let value_file = file_for_locator(workspace, &value_mapping.locator)?;
         let value_prepared = prepared_for_procedure(workspace, procedure, &value_file).ok()?;
         let value_node = node_at_span(&value_prepared, value_mapping.locator.anchor().span())?;
-        if let Some((module, member)) = import_bound_external_symbol(
-            python_analyzer(workspace),
-            &value_file,
-            &value_prepared,
-            value_node,
-        ) && let Some(overlay) = workspace.analyzer().semantic_model_overlay()
-            && let Some(seed) = external_module_value_seed(&overlay, &module, &member)
+        if let Some((_, _, seed)) =
+            imported_external_module_value(workspace, &value_file, &value_prepared, value_node)
         {
-            origin_value = match seed {
-                ClassSeed::Class(class @ ClassIdentity::External { .. }) => Some(
-                    PythonExactResultValue::Classes(vec![class].into_boxed_slice()),
-                ),
-                ClassSeed::Classes(classes)
-                    if classes
-                        .iter()
-                        .all(|class| matches!(class, ClassIdentity::External { .. })) =>
-                {
-                    Some(PythonExactResultValue::Classes(classes))
-                }
-                _ => None,
-            };
+            origin_value = exact_external_module_value(seed);
             break;
         }
         let binding = bindings.unique_binding_origin(value)?;
@@ -8473,7 +8546,7 @@ fn python_exact_call_result_value(
         }
         python_exact_result_value_from_type_ref(&overlay, returns)
     } else {
-        PythonExactResultValue::Classes(python_exact_return_classes(&overlay, declaration)?)
+        PythonExactResultValue::Classes(python_exact_return_classes(&overlay, &declaration)?)
     };
     Some(PythonExactCallResult {
         value,
@@ -8571,7 +8644,7 @@ fn python_exact_access_return_classes(
     if declaration.exact_return_classes.is_empty() || !mutation_free {
         return None;
     }
-    python_exact_return_classes(&overlay, declaration)
+    python_exact_return_classes(&overlay, &declaration)
 }
 
 fn python_external_declared_property_return_classes(
@@ -8736,9 +8809,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // also change class-set/field-slot summaries keyed by this token.
         // #5738: Intrinsic roots cannot hide unadmitted runtime-base claims.
         // #5751: Runtime hierarchy follows positively bound module class-object RHS aliases.
+        // #3488: A declared attribute-form module field value (`os.environ`)
+        // seeds the exact receiver of a member call, and a workspace write to
+        // that field withholds the declared class.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v82-same-name-external-class-records-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds-exact-partial-field-values-workspace-receiver-and-proxy-access-calls-trivia-covered-reference-sites-exact-method-result-origins-shared-direct-receiver-proof-5511-lexical-class-object-bindings-5721-bounded-local-import-bases-5738-intrinsic-root-evidence-5745-runtime-class-binding-mutation-5751-module-class-object-aliases",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-dict-read-methods-bounded-receiver-scopes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-arm-proven-classes-reach-joins-class-body-member-binding-import-bound-bases-importing-source-root-established-source-root-modules-declared-project-root-authority-package-path-extension-executed-typed-numeric-literals-partial-modeled-surface-hook-safety-variadic-container-classes-dynamic-write-name-sets-structured-dynamic-receiver-type-parameter-bounds-dynamic-type-write-bounds-nonescaping-nested-write-bounds-runtime-created-class-exclusion-loop-name-list-bounds-postponed-and-type-checking-annotation-bounds-field-slot-class-value-bounds-quoted-receiver-annotation-name-resolution-field-content-deletion-receivers-declared-parameter-conditional-closed-world-property-descriptor-field-slots-v82-same-name-external-class-records-external-module-value-types-exact-constructor-instance-dispatch-python-c3-class-member-replacement-scan-rql-inherited-external-member-exact-factory-and-access-return-class-sets-stable-local-multi-target-flow-dynamic-any-is-not-a-runtime-class-uncertain-constructor-call-shapes-once-bound-module-global-initializer-class-seeds-exact-partial-field-values-workspace-receiver-and-proxy-access-calls-trivia-covered-reference-sites-exact-method-result-origins-shared-direct-receiver-proof-5511-lexical-class-object-bindings-5721-bounded-local-import-bases-5738-intrinsic-root-evidence-5745-runtime-class-binding-mutation-5751-module-class-object-aliases-3488-module-field-value-receivers",
         )
         .expect("adapter name is non-empty")
     }
@@ -8841,10 +8917,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
             return ClassSeed::NotApplicable;
         };
-        if let Some((module, member)) =
-            import_bound_external_symbol(python_analyzer(workspace), &file, &prepared, node)
-            && let Some(overlay) = workspace.analyzer().semantic_model_overlay()
-            && let Some(seed) = external_module_value_seed(&overlay, &module, &member)
+        if let Some((_, _, seed)) =
+            imported_external_module_value(workspace, &file, &prepared, node)
         {
             return seed;
         }

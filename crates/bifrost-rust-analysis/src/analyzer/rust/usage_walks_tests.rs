@@ -96,6 +96,44 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "3dc93c95f31f: quicksilver round 3 on brokk-bifrost-rust: include host imports escaped their local scopes"
+    )]
+    fn include_routes_respect_host_import_extents() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                r#"mod api { pub struct Thing; }
+mod other { pub struct Thing; }
+use crate::api::Thing;
+fn decoy() { use crate::other::Thing; include!("local.rs"); }
+mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
+            )
+            .file("src/generated.rs", "fn generated(_: Thing) {}")
+            .file("src/local.rs", "fn local(_: Thing) {}")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert_eq!(analyzer.get_analyzed_files().len(), 3);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let includes = RustIncludeRoutes::new(&analyzer, scope.token()).unwrap();
+        for (path, expected) in [
+            ("src/generated.rs", "crate::api"),
+            ("src/local.rs", "crate::other"),
+        ] {
+            let routes = includes.include_routes_for(&fixture.file(path)).unwrap();
+            assert_eq!(routes.len(), 1, "{path}: {routes:#?}");
+            let bindings = &routes[0].host_bindings;
+            assert_eq!(bindings.len(), 1, "{path}: {routes:#?}");
+            assert_eq!(bindings[0].local_name, "Thing");
+            assert_eq!(
+                bindings[0].module_specifier, expected,
+                "{path}: {routes:#?}"
+            );
+            assert_eq!(bindings[0].imported_name.as_deref(), Some("Thing"));
+        }
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "bd33e1b59a9f: a failed inverse fact read must not cache a complete empty walk"
     )]

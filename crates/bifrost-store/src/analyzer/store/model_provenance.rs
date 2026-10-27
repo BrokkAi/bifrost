@@ -9,6 +9,19 @@ use crate::analyzer::store::model_catalog::CatalogPackSourceKind;
 
 use url::Url;
 
+/// Extract the addressed record from a virtual model URI. Generated callers
+/// also retain their rule-qualified addresses beside the generated facts.
+#[doc(hidden)]
+pub fn model_uri_record_id(uri: &str) -> Option<String> {
+    let uri = Url::parse(uri).ok()?;
+    if uri.scheme() != "bifrost-model" || uri.host_str() != Some("v1") {
+        return None;
+    }
+    uri.path_segments()?
+        .next_back()
+        .map(brokk_bifrost_core::path_utils::percent_decode)
+}
+
 pub fn model_location(
     shard: &ActiveSemanticModelShard,
     record_kind: &str,
@@ -76,7 +89,7 @@ pub fn provenance_with_visits<E>(
         visit()?;
         if explanation.status == SemanticModelActivationStatus::Active
             && explanation.manifest_digest == shard.manifest.content_sha256
-            && explanation.shard_id == shard.shard.shard_id()
+            && explanation.shard_id == shard.descriptor.shard_id.as_str()
             && explanation.source_kind == shard.source_kind
             && explanation.source_id == shard.source_id
         {
@@ -85,6 +98,7 @@ pub fn provenance_with_visits<E>(
         }
     }
     Ok(SemanticModelProvenance {
+        extraction: shard.manifest.extraction.clone(),
         active_model_set_hash: active.active_model_set_hash().to_string(),
         pack_digest: shard.manifest.semantic_sha256.clone(),
         pack_id: shard.manifest.pack_id.clone(),

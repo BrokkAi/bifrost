@@ -35,7 +35,6 @@ use brokk_bifrost_cpp::declarations::node_text;
 use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::resolver::*;
 use std::borrow::Cow;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tree_sitter::{Node, Parser};
@@ -1228,6 +1227,96 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[test]
+    #[hardwon(
+        "db00de0653f1: quicksilver round 4 on brokk-bifrost-cpp: include antichain lost the admissible complete-family path"
+    )]
+    fn conditional_include_projection_is_invariant_under_include_order() {
+        for reverse in [false, true] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let root = temp.path().canonicalize().expect("canonical root");
+            let complete =
+                "#if defined(F)\n#include \"good.h\"\n#else\n#include \"empty.h\"\n#endif\n";
+            let partial = "#if defined(F)\n#include \"bad.h\"\n#endif\n";
+            let router = if reverse {
+                format!("{partial}{complete}")
+            } else {
+                format!("{complete}{partial}")
+            };
+            for (path, source) in [
+                ("consumer.cpp", "#include \"router.h\"\nTarget value;\n"),
+                ("router.h", router.as_str()),
+                ("good.h", "#include \"leaf.h\"\n"),
+                ("bad.h", "#include \"leaf.h\"\n"),
+                ("empty.h", ""),
+                ("leaf.h", "#pragma once\nstruct Target {};\n"),
+            ] {
+                ProjectFile::new(root.clone(), path)
+                    .write(source)
+                    .expect("write fixture");
+            }
+            let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+            let leaf = ProjectFile::new(root.clone(), "leaf.h");
+            let analyzer =
+                CppAnalyzer::from_project(brokk_bifrost_core::analyzer::project::TestProject::new(
+                    root,
+                    brokk_bifrost_core::analyzer::model::Language::Cpp,
+                ));
+            let scope =
+                brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
+            let token = scope.token();
+            let visibility = VisibilityIndex::build(
+                &analyzer,
+                token,
+                &CppGraphSource::from_source(&analyzer, token),
+                &HashSet::from_iter([consumer.clone()]),
+            );
+            let prepared = analyzer
+                .prepared_syntax(token, &consumer)
+                .expect("consumer tree");
+            let target = analyzer
+                .declarations(&leaf)
+                .into_iter()
+                .find(|unit| unit.identifier() == "Target")
+                .expect("target declaration");
+            let start = prepared
+                .source()
+                .find("Target value")
+                .expect("type reference");
+            let reference = prepared
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(start, start + "Target".len())
+                .expect("type node");
+            assert!(
+                !visibility.external_type_candidate_visible_in_context(
+                    &CppGraphSource::from_source(&analyzer, token),
+                    &consumer,
+                    &target,
+                    reference
+                ),
+                "an unproved F must not establish visibility in either include order: reverse={reverse}"
+            );
+            let projections = visibility.conditional_include_projections_for_source(
+                &consumer,
+                prepared.as_ref(),
+                &leaf,
+            );
+            // Both routes require F for proof. Candidate discovery still keeps
+            // the complete-family route, which dominates the lone #if route.
+            assert_eq!(projections.len(), 1, "reverse={reverse}");
+            assert!(
+                projections[0].partial_guards.is_empty(),
+                "complete-family path lost: reverse={reverse}, partial={:?}",
+                projections[0].partial_guards
+            );
+            assert_eq!(
+                projections[0].required_guards,
+                HashSet::from_iter([PreprocessorGuard::Defined("F".to_string())])
+            );
+        }
+    }
+
     /// #2365: one guarded root include that fans out through a header diamond
     /// reaches `target.h` with both `{A}` and `{A, B}` guard sets at the same
     /// activation byte. Consumers only ask existence questions that are
@@ -1561,131 +1650,6 @@ ABSL_NAMESPACE_END
             analyzer.full_hydration_count_for_test(),
             0,
             "persisted field linkage must avoid preparing source syntax during global-field resolution"
-        );
-    }
-
-    #[test]
-    fn visibility_build_hydrates_overlapping_closures_once_and_preserves_root_visibility() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let shared = ProjectFile::new(root.clone(), "shared.h");
-        let leaf = ProjectFile::new(root.clone(), "leaf.h");
-        let right_only = ProjectFile::new(root, "right_only.h");
-
-        let adjacency = HashMap::from_iter([
-            (left.clone(), vec![shared.clone()]),
-            (right.clone(), vec![shared.clone(), right_only.clone()]),
-            (shared.clone(), vec![leaf.clone()]),
-            (leaf.clone(), Vec::new()),
-            (right_only.clone(), Vec::new()),
-        ]);
-        let declarations_by_file: HashMap<_, _> = [
-            (left.clone(), "Left"),
-            (right.clone(), "Right"),
-            (shared.clone(), "Shared"),
-            (leaf.clone(), "Leaf"),
-            (right_only.clone(), "RightOnly"),
-        ]
-        .into_iter()
-        .map(|(file, name)| {
-            let declaration = CodeUnit::new(file.clone(), CodeUnitType::Class, "", name);
-            (file, BTreeSet::from([declaration]))
-        })
-        .collect();
-
-        let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let mut include_discovery_counts = HashMap::<ProjectFile, usize>::default();
-        let VisibilityData {
-            visible_by_file, ..
-        } = build_visibility_data(
-            &roots,
-            None,
-            |file| {
-                *include_discovery_counts.entry(file.clone()).or_default() += 1;
-                adjacency.get(file).cloned().unwrap_or_default()
-            },
-            |_root| false,
-            |file, _c_semantics| declarations_by_file.get(file).cloned().unwrap_or_default(),
-        );
-
-        assert_eq!(include_discovery_counts.len(), adjacency.len());
-        assert!(
-            include_discovery_counts.values().all(|count| *count == 1),
-            "the complete visibility build must discover each union-closure file exactly once: \
-             {include_discovery_counts:#?}"
-        );
-        assert_eq!(include_discovery_counts.get(&shared), Some(&1));
-        assert_eq!(include_discovery_counts.get(&leaf), Some(&1));
-
-        let visible_names = |root: &ProjectFile| {
-            visible_by_file
-                .get(root)
-                .into_iter()
-                .flatten()
-                .map(|unit| unit.identifier().to_string())
-                .collect::<HashSet<_>>()
-        };
-
-        assert_eq!(
-            visible_names(&left),
-            HashSet::from_iter(["Left", "Shared", "Leaf"].map(str::to_string))
-        );
-        assert_eq!(
-            visible_names(&right),
-            HashSet::from_iter(["Right", "Shared", "Leaf", "RightOnly"].map(str::to_string))
-        );
-    }
-
-    #[test]
-    fn union_visibility_keeps_colliding_declarations_root_local() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let left_header = ProjectFile::new(root.clone(), "left/collision.h");
-        let right_header = ProjectFile::new(root, "right/collision.h");
-        let left_collision =
-            CodeUnit::new(left_header.clone(), CodeUnitType::Class, "", "Collision");
-        let right_collision =
-            CodeUnit::new(right_header.clone(), CodeUnitType::Class, "", "Collision");
-        let adjacency = HashMap::from_iter([
-            (left.clone(), vec![left_header.clone()]),
-            (right.clone(), vec![right_header.clone()]),
-            (left_header.clone(), Vec::new()),
-            (right_header.clone(), Vec::new()),
-        ]);
-        let declarations = HashMap::from_iter([
-            (left_header.clone(), BTreeSet::from([left_collision])),
-            (right_header.clone(), BTreeSet::from([right_collision])),
-        ]);
-        let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let VisibilityData {
-            visible_by_file, ..
-        } = build_visibility_data(
-            &roots,
-            None,
-            |file| adjacency.get(file).cloned().unwrap_or_default(),
-            |_root| false,
-            |file, _c_semantics| declarations.get(file).cloned().unwrap_or_default(),
-        );
-        let cpp = visibility_analyzer(&visible_by_file);
-        let query_scope =
-            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&cpp);
-        let query_token = query_scope.token();
-        let visibility = visibility_index(&cpp, query_token, visible_by_file);
-        let candidate_sources = |file: &ProjectFile| {
-            visibility
-                .visible_identifier_candidates(file, "Collision")
-                .map(|candidate| candidate.source().clone())
-                .collect::<HashSet<_>>()
-        };
-
-        assert_eq!(candidate_sources(&left), HashSet::from_iter([left_header]));
-        assert_eq!(
-            candidate_sources(&right),
-            HashSet::from_iter([right_header])
         );
     }
 

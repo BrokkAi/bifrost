@@ -232,8 +232,8 @@ pub(crate) fn resolve_python_defining_class_binding(
 
 type ProfileResolver = fn(
     &PortableProfileEvidence,
-    &[TypeFact],
-    &[MemberFact],
+    &[std::sync::Arc<TypeFact>],
+    &[std::sync::Arc<MemberFact>],
     &SemanticModelActivationEvidence,
     &[String],
     &str,
@@ -252,7 +252,7 @@ fn resolve_python_defining_binding_using(
     // Do not inspect any payload or carrier until the complete evidence row matches.
     let shards = active
         .shards()
-        .iter()
+        .into_iter()
         .filter(|shard| {
             shard
                 .matching_evidence
@@ -280,7 +280,7 @@ fn resolve_python_defining_binding_using(
     let mut not_class_or_module_value = false;
     let mut answers = Vec::new();
     for shard in shards {
-        let Some((types, members, _)) = shard.shard.payload().declaration_facts() else {
+        let Some((types, members, _)) = shard.decoded().payload().declaration_facts() else {
             continue;
         };
         let mut profile: Option<&PortableProfileEvidence> = None;
@@ -325,7 +325,7 @@ fn resolve_python_defining_binding_using(
                     &answer.target,
                     PythonDefiningTarget::Class(_) | PythonDefiningTarget::Value(_)
                 ) && let Err(message) =
-                    require_class_declaration_records_coverage(shard, profile, &answer.artifact)
+                    require_class_declaration_records_coverage(&shard, profile, &answer.artifact)
                 {
                     incomplete.push(diagnostic(
                         "python.runtime_binding.class_declarations_incomplete",
@@ -448,8 +448,8 @@ impl ResolvedProfileBinding {
 
 fn resolve_profile(
     profile: &PortableProfileEvidence,
-    types: &[TypeFact],
-    members: &[MemberFact],
+    types: &[std::sync::Arc<TypeFact>],
+    members: &[std::sync::Arc<MemberFact>],
     selected: &SemanticModelActivationEvidence,
     requested_module: &[String],
     requested_member: &str,
@@ -518,8 +518,8 @@ fn resolve_profile(
 
 fn resolve_profile_class_or_module_value(
     profile: &PortableProfileEvidence,
-    types: &[TypeFact],
-    members: &[MemberFact],
+    types: &[std::sync::Arc<TypeFact>],
+    members: &[std::sync::Arc<MemberFact>],
     selected: &SemanticModelActivationEvidence,
     requested_module: &[String],
     requested_class: &str,
@@ -613,8 +613,8 @@ struct ProfileBindingGraph {
 
 fn resolve_profile_graph(
     profile: &PortableProfileEvidence,
-    types: &[TypeFact],
-    members: &[MemberFact],
+    types: &[std::sync::Arc<TypeFact>],
+    members: &[std::sync::Arc<MemberFact>],
     selected: &SemanticModelActivationEvidence,
     requested_module: &[String],
     requested_member: &str,
@@ -1534,7 +1534,7 @@ fn require_class_declaration_records_coverage(
 ) -> Result<(), String> {
     require_class_declaration_records_evidence(
         shard.manifest.completeness,
-        shard.shard.python_correspondence.as_ref(),
+        shard.manifest.python_correspondence.as_ref(),
         profile,
         artifact,
     )
@@ -1966,9 +1966,13 @@ mod tests {
 
     fn profile_parts(
         active: &ResolvedActiveSemanticModels,
-    ) -> (PortableProfileEvidence, Vec<TypeFact>, Vec<MemberFact>) {
+    ) -> (
+        PortableProfileEvidence,
+        Vec<std::sync::Arc<TypeFact>>,
+        Vec<std::sync::Arc<MemberFact>>,
+    ) {
         for shard in active.shards() {
-            let Some((types, members, _)) = shard.shard.payload().declaration_facts() else {
+            let Some((types, members, _)) = shard.decoded().payload().declaration_facts() else {
                 continue;
             };
             let profile = types
@@ -2201,7 +2205,7 @@ mod tests {
         let (profile, types, _) = profile_parts(&active);
         let shard = active
             .shards()
-            .iter()
+            .into_iter()
             .find(|shard| !shard.matching_evidence.is_empty())
             .expect("selected shard exists");
         let artifact =
@@ -2321,7 +2325,7 @@ mod tests {
             lookup(&active, &evidence, "Text"),
             Err(PythonRuntimeBindingError::Incomplete(_))
         ));
-        let resolve = |types: &[TypeFact]| {
+        let resolve = |types: &[std::sync::Arc<TypeFact>]| {
             resolve_profile_class_or_module_value(
                 &profile,
                 types,
@@ -2333,11 +2337,13 @@ mod tests {
             )
         };
         let mut wrong_id = types.clone();
-        wrong_id
-            .iter_mut()
-            .find(|fact| fact.name == "bs4.Text")
-            .unwrap()
-            .id = "not-the-csmi-derived-native-id".to_owned();
+        std::sync::Arc::make_mut(
+            wrong_id
+                .iter_mut()
+                .find(|fact| fact.name == "bs4.Text")
+                .unwrap(),
+        )
+        .id = "not-the-csmi-derived-native-id".to_owned();
         assert!(matches!(
             profile_resolution_error(resolve(&wrong_id).unwrap_err()),
             PythonRuntimeBindingError::Incomplete(_)
@@ -2348,6 +2354,7 @@ mod tests {
             .iter_mut()
             .find(|fact| fact.name == "bs4.Text")
             .unwrap();
+        let class = std::sync::Arc::make_mut(class);
         let Locator::Interchange { identity, .. } = &mut class.locator else {
             panic!("fixture class has a CSMI identity");
         };
@@ -2583,7 +2590,7 @@ mod tests {
             .into_iter()
             .find(|member| member.name == "parse")
             .expect("fixture has one callable member");
-        member
+        std::sync::Arc::make_mut(&mut member)
             .signature
             .as_mut()
             .expect("fixture callable has a signature")
@@ -2678,7 +2685,7 @@ mod tests {
     fn callable_shape_coverage_and_provenance_are_required_for_definition() {
         let (active, evidence) = activate_fixture(|_| {});
         let (profile, types, members) = profile_parts(&active);
-        let fails_incomplete = |members: &[MemberFact]| {
+        let fails_incomplete = |members: &[std::sync::Arc<MemberFact>]| {
             let failure = resolve_profile(
                 &profile,
                 &types,
@@ -2703,7 +2710,7 @@ mod tests {
         let Locator::Interchange {
             callable_shape_evidence,
             ..
-        } = &mut callable.locator
+        } = &mut std::sync::Arc::make_mut(callable).locator
         else {
             panic!("fixture callable has an interchange locator");
         };
@@ -2718,7 +2725,7 @@ mod tests {
         let Locator::Interchange {
             callable_shape_evidence: Some(shape),
             ..
-        } = &mut callable.locator
+        } = &mut std::sync::Arc::make_mut(callable).locator
         else {
             panic!("fixture callable has validated shape evidence");
         };
@@ -2752,7 +2759,7 @@ mod tests {
         let Locator::Interchange {
             callable_shape_evidence: Some(shape),
             ..
-        } = &mut callable.locator
+        } = &mut std::sync::Arc::make_mut(callable).locator
         else {
             panic!("fixture callable has validated shape evidence");
         };
@@ -2770,7 +2777,7 @@ mod tests {
         let Locator::Interchange {
             callable_shape_evidence: Some(shape),
             ..
-        } = &mut callable.locator
+        } = &mut std::sync::Arc::make_mut(callable).locator
         else {
             panic!("fixture callable has validated shape evidence");
         };
@@ -2789,7 +2796,7 @@ mod tests {
         let Locator::Interchange {
             callable_shape_evidence: Some(shape),
             ..
-        } = &mut callable.locator
+        } = &mut std::sync::Arc::make_mut(callable).locator
         else {
             panic!("fixture callable has validated shape evidence");
         };
@@ -2810,7 +2817,7 @@ mod tests {
         let Locator::Interchange {
             callable_shape_evidence: Some(shape),
             ..
-        } = &mut callable.locator
+        } = &mut std::sync::Arc::make_mut(callable).locator
         else {
             panic!("fixture callable has validated shape evidence");
         };

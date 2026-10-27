@@ -20,7 +20,7 @@
 use crate::analyzer::code_unit_index::CodeUnitIndex;
 use crate::analyzer::model::Range;
 use crate::analyzer::symbol_path::rendered_terminal_segment;
-use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
+use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
@@ -28,16 +28,25 @@ use std::collections::BTreeMap;
 use std::hash::Hash;
 use tree_sitter::{Node, Tree};
 
-/// The single precise binding for `name`, if the engine resolved it to exactly
-/// one (or a first-of) target. Shared by the per-language receiver typing.
+/// The precise binding for `name`. Shared by the per-language receiver typing.
+///
+/// Every caller reads an engine that seeds one target per symbol
+/// (`seed_symbol`, `seed_or_shadow`, aliases of those): C++, C#'s declared-type
+/// bindings, Java and Ruby. A multi-target set comes only from
+/// `seed_symbol_many`, and taking one member of it would depend on hash
+/// iteration order, so such a set is a caller error. Use [`unique_precise`]
+/// or read every target instead.
 pub fn first_precise<T: Clone + Eq + Hash>(
     bindings: &LocalInferenceEngine<T>,
     name: &str,
 ) -> Option<T> {
-    bindings
-        .resolve_symbol_ref(name)
-        .and_then(SymbolResolution::as_precise)
-        .and_then(|targets| targets.iter().next().cloned())
+    let targets = bindings.resolve_symbol_ref(name)?.as_precise()?;
+    debug_assert_eq!(
+        targets.len(),
+        1,
+        "first_precise needs a single-target binding for {name}"
+    );
+    targets.iter().next().cloned()
 }
 
 /// The only target for `name`, when the engine resolved it precisely and
@@ -989,5 +998,299 @@ mod tests {
             "mod.Widget.render".to_string(),
         );
         assert_eq!(key.terminal(Language::TypeScript), "render");
+    }
+}
+
+/// Properties of the per-file class span index and the small shared helpers
+/// next to it. Each oracle is a brute-force reference written independently of
+/// the production iterator chains.
+#[cfg(test)]
+mod class_range_index_properties {
+    use super::*;
+    use crate::analyzer::model::CodeUnitType;
+    use crate::analyzer::project::TestProject;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    fn file() -> ProjectFile {
+        ProjectFile::new(std::env::temp_dir(), "Spans.java")
+    }
+
+    fn unit(kind: CodeUnitType, name: &str) -> CodeUnit {
+        CodeUnit::new(file(), kind, "", name)
+    }
+
+    fn range(start: usize, end: usize) -> Range {
+        Range {
+            start_byte: start,
+            end_byte: end,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    /// A span list with nesting, partial overlap, equal spans and empty spans.
+    fn spans() -> impl Strategy<Value = Vec<(usize, usize)>> {
+        proptest::collection::vec((0usize..30, 0usize..20), 0..12).prop_map(|raw| {
+            raw.into_iter()
+                .map(|(start, length)| (start, start + length))
+                .collect()
+        })
+    }
+
+    /// Reference for the smallest enclosing span. A span `[start, end)` encloses
+    /// `byte` when it holds that byte, so an empty span never encloses
+    /// anything. Among enclosing spans the shortest wins; equal lengths go to
+    /// the span that appears first in the input.
+    fn reference_enclosing(spans: &[(usize, usize)], byte: usize) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (index, (start, end)) in spans.iter().enumerate() {
+            if !(*start <= byte && byte < *end) {
+                continue;
+            }
+            best = match best {
+                Some(current) if spans[current].1 - spans[current].0 <= end - start => {
+                    Some(current)
+                }
+                _ => Some(index),
+            };
+        }
+        best
+    }
+
+    struct FakeIndex {
+        project: TestProject,
+        file: ProjectFile,
+        units: Vec<(CodeUnit, Vec<Range>)>,
+    }
+
+    impl CodeUnitIndex for FakeIndex {
+        fn project(&self) -> &dyn crate::analyzer::project::Project {
+            &self.project
+        }
+        fn languages(&self) -> BTreeSet<Language> {
+            unimplemented!()
+        }
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            unimplemented!()
+        }
+        fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _: &ProjectFile,
+            _: usize,
+            _: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+        fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+        fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+        fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+            assert_eq!(file, &self.file);
+            self.units.iter().map(|(unit, _)| unit.clone()).collect()
+        }
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+            self.units
+                .iter()
+                .find(|(unit, _)| unit == code_unit)
+                .map(|(_, ranges)| ranges.clone())
+                .expect("only declared units are asked for ranges")
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Lookups on a span list equal a linear scan that picks the shortest
+        /// enclosing span, first in input order on equal length; the exact-span
+        /// lookup returns the first span with equal bounds; and the resolving
+        /// lookup applies the same rule among only the units `resolve` accepts.
+        #[test]
+        fn lookups_equal_a_linear_scan(
+            spans in spans(),
+            accepted in proptest::collection::vec(any::<bool>(), 12),
+            probe in 0usize..55,
+            exact in (0usize..30, 0usize..20),
+        ) {
+            let units: Vec<CodeUnit> = (0..spans.len())
+                .map(|i| unit(CodeUnitType::Class, &format!("C{i}")))
+                .collect();
+            let index = ClassRangeIndex::from_class_spans(
+                units.iter().cloned().zip(spans.iter().map(|&(s, e)| range(s, e))),
+            );
+
+            for byte in 0..=probe {
+                let expected = reference_enclosing(&spans, byte);
+                prop_assert_eq!(index.enclosing_unit(byte), expected.map(|i| &units[i]));
+                let expected_fqn = expected.map(|i| units[i].fq_name());
+                prop_assert_eq!(index.enclosing(byte), expected_fqn.as_deref());
+
+                let mut visited = Vec::new();
+                let resolved = index.find_in_enclosing_units(byte, |candidate| {
+                    visited.push(candidate.fq_name());
+                    let i = units.iter().position(|u| u == candidate).unwrap();
+                    accepted[i].then_some(i)
+                });
+                let enclosing: Vec<usize> = (0..spans.len())
+                    .filter(|&i| spans[i].0 <= byte && byte < spans[i].1)
+                    .collect();
+                // A rejected unit becomes an empty span, which can never be chosen.
+                let accepted_spans: Vec<(usize, usize)> = enclosing
+                    .iter()
+                    .map(|&i| if accepted[i] { spans[i] } else { (0, 0) })
+                    .collect();
+                let expected_resolved =
+                    reference_enclosing(&accepted_spans, byte).map(|k| enclosing[k]);
+                prop_assert_eq!(resolved, expected_resolved);
+                let expected_visits: Vec<String> =
+                    enclosing.iter().map(|&i| units[i].fq_name()).collect();
+                prop_assert_eq!(visited, expected_visits, "resolve sees exactly the enclosing units");
+            }
+
+            let (start, length) = exact;
+            let end = start + length;
+            let expected_exact = spans.iter().position(|&s| s == (start, end));
+            prop_assert_eq!(
+                index.unit_for_exact_span(start, end),
+                expected_exact.map(|i| &units[i])
+            );
+            if let Some(&(s, e)) = spans.first() {
+                prop_assert_eq!(index.unit_for_exact_span(s, e), units.first());
+            }
+        }
+
+        /// `build` indexes every range of every class-like declaration and no
+        /// other declaration kind. Which of two equally short enclosing classes
+        /// wins follows the declaration set's order, which is not part of the
+        /// contract, so the oracle accepts any shortest enclosing class.
+        #[test]
+        fn build_indexes_each_class_range_and_only_classes(
+            decls in proptest::collection::vec(
+                (
+                    any::<bool>(),
+                    proptest::collection::vec((0usize..30, 0usize..20), 1..4),
+                ),
+                0..8,
+            ),
+        ) {
+            let mut units = Vec::new();
+            for (i, (is_class, raw)) in decls.iter().enumerate() {
+                let kind = if *is_class { CodeUnitType::Class } else { CodeUnitType::Function };
+                let ranges = raw.iter().map(|&(s, l)| range(s, s + l)).collect();
+                units.push((unit(kind, &format!("D{i}")), ranges));
+            }
+            let index = FakeIndex {
+                project: TestProject::new(std::env::temp_dir(), Language::Java),
+                file: file(),
+                units: units.clone(),
+            };
+            let built = ClassRangeIndex::build(&index, &file());
+
+            let class_spans: Vec<(&CodeUnit, &Range)> = units
+                .iter()
+                .filter(|(unit, _)| unit.is_class())
+                .flat_map(|(unit, ranges)| ranges.iter().map(move |r| (unit, r)))
+                .collect();
+            for byte in 0..50usize {
+                let shortest = class_spans
+                    .iter()
+                    .filter(|(_, r)| r.start_byte <= byte && byte < r.end_byte)
+                    .map(|(_, r)| r.end_byte - r.start_byte)
+                    .min();
+                match (built.enclosing_unit(byte), shortest) {
+                    (None, None) => {}
+                    (Some(found), Some(length)) => {
+                        prop_assert!(
+                            class_spans.iter().any(|(u, r)| {
+                                *u == found
+                                    && r.start_byte <= byte
+                                    && byte < r.end_byte
+                                    && r.end_byte - r.start_byte == length
+                            }),
+                            "{} is not a shortest enclosing class of byte {}", found.fq_name(), byte
+                        );
+                    }
+                    (found, shortest) => prop_assert!(
+                        false, "byte {byte}: found {found:?}, shortest enclosing length {shortest:?}"
+                    ),
+                }
+            }
+            for (unit, range) in &class_spans {
+                prop_assert!(
+                    built.unit_for_exact_span(range.start_byte, range.end_byte).is_some(),
+                    "{} span {:?} is missing", unit.fq_name(), range
+                );
+            }
+            for (unit, ranges) in units.iter().filter(|(u, _)| !u.is_class()) {
+                for r in ranges {
+                    let exact = built.unit_for_exact_span(r.start_byte, r.end_byte);
+                    prop_assert!(
+                        exact.is_none_or(|found| found.is_class()),
+                        "{} is not class-like but was indexed", unit.fq_name()
+                    );
+                }
+            }
+        }
+
+        /// Deduplication equals "keep an item iff no equal item precedes it".
+        #[test]
+        fn dedup_preserving_order_keeps_first_occurrences(
+            items in proptest::collection::vec(0u8..6, 0..24),
+        ) {
+            let expected: Vec<u8> = items
+                .iter()
+                .enumerate()
+                .filter(|(i, item)| !items[..*i].contains(item))
+                .map(|(_, item)| *item)
+                .collect();
+            let deduped = dedup_preserving_order(items.iter().copied());
+            prop_assert_eq!(&deduped, &expected);
+            prop_assert_eq!(dedup_preserving_order(deduped.iter().copied()), deduped);
+        }
+
+        /// A name seeded with `k` distinct targets resolves precisely for
+        /// `1..=4` targets (the default cap), becomes ambiguous above the cap,
+        /// and is unknown at zero. Only a precise single target is "unique" or
+        /// "first"; `first_precise` asserts that it never sees several.
+        #[test]
+        fn precise_target_helpers_follow_the_resolution_state(
+            targets in proptest::collection::btree_set(any::<i32>(), 0..8),
+            shadow_afterwards in any::<bool>(),
+        ) {
+            let mut engine = LocalInferenceEngine::<i32>::default();
+            engine.seed_symbol_many("name", targets.iter().copied());
+            if shadow_afterwards {
+                engine.declare_shadow("name");
+            }
+            let precise = !shadow_afterwards && (1..=4).contains(&targets.len());
+
+            let single = precise && targets.len() == 1;
+            if single || !precise {
+                prop_assert_eq!(
+                    first_precise(&engine, "name"),
+                    single.then(|| *targets.iter().next().expect("one target"))
+                );
+            }
+            let unique = unique_precise(&engine, "name");
+            if single {
+                prop_assert_eq!(unique, targets.iter().next().copied());
+            } else {
+                prop_assert_eq!(unique, None);
+            }
+            prop_assert_eq!(first_precise(&engine, "never seeded"), None);
+            prop_assert_eq!(unique_precise(&engine, "never seeded"), None);
+        }
     }
 }

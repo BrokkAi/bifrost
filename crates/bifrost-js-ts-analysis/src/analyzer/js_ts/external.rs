@@ -716,6 +716,7 @@ impl TypeScriptDeclarationPackProducer {
             suppressed_diagnostics,
             shards,
         )
+        .with_extraction(request.artifact_kind, artifact)
     }
 
     /// Produce one shard per canonical TypeScript built-in library from the
@@ -1052,7 +1053,8 @@ impl TypeScriptDeclarationPackProducer {
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: (!shards.is_empty()).then(|| AuthoredSemanticModelPack {
-                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
+schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),
                 producer: Producer {
@@ -2027,6 +2029,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.type_index_by_name
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),

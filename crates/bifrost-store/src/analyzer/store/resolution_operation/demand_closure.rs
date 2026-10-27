@@ -522,12 +522,12 @@ pub(super) struct LexicalRouteStarts<R = (u32, u32), P = ()> {
 pub(super) fn select_lexical_route_starts<R, P, I>(
     start: ResolutionScopeId,
     mut parent: impl FnMut(ResolutionScopeId) -> Result<Option<ResolutionScopeId>>,
-    mut read: impl FnMut(ResolutionScopeId, u32) -> Result<I>,
+    mut read: impl FnMut(ResolutionScopeId, u32) -> Result<Read<I>>,
     mut outer_can_compete: impl FnMut(Option<&R>, u32) -> bool,
     mut prunes_provider: impl FnMut(&R, &R) -> bool,
     completion: &mut ResolutionCompletion,
     cancellation: &CancellationToken,
-) -> Result<LexicalRouteStarts<R, P>>
+) -> Result<Read<LexicalRouteStarts<R, P>>>
 where
     R: Clone + Ord,
     I: IntoIterator<Item = Result<RankedLexicalTier<R, P>>>,
@@ -545,7 +545,7 @@ where
     let mut binding = None::<R>;
     while let Some(level) = scope {
         if cancellation.is_cancelled() {
-            break;
+            return Ok(Read::Cancelled(completion.combine(&cancelled_completion())));
         }
         assert!(
             seen.insert(level),
@@ -553,7 +553,28 @@ where
             result.scopes
         );
         result.scopes.push(level.get());
-        for read in read(level, depth)? {
+        let tiers = match read(level, depth)? {
+            Read::Ready {
+                value,
+                completion: read_completion,
+            } => {
+                *completion = completion.combine(&read_completion);
+                value
+            }
+            Read::Cancelled(read_completion) => {
+                return Ok(Read::Cancelled(completion.combine(&read_completion)));
+            }
+            Read::Unavailable {
+                reason,
+                completion: read_completion,
+            } => {
+                return Ok(Read::Unavailable {
+                    reason,
+                    completion: completion.combine(&read_completion),
+                });
+            }
+        };
+        for read in tiers {
             let RankedLexicalTier {
                 rank,
                 tier,
@@ -607,7 +628,7 @@ where
             observed.pruned = prunes_provider(binding, provider);
         }
     }
-    Ok(result)
+    Ok(Read::ready(result))
 }
 
 /// A declaration already proven by the language's selected-member reader.
@@ -1110,6 +1131,16 @@ pub trait HalfRules {
     fn placements(&mut self) -> Vec<Self::Placement> {
         unreachable!()
     }
+    /// Gap-only source endpoint evidence, published through the same channel as
+    /// provider endpoint evidence. The closer retains ownership of publication.
+    fn source_endpoint_completion(
+        &self,
+        _: &SourceHalf,
+        _: &EndpointSignature,
+        _: &ReadySelectedResolution<'_, '_>,
+    ) -> Option<ResolutionCompletion> {
+        None
+    }
     fn initial_completion(&self) -> ResolutionCompletion {
         ResolutionCompletion::Complete
     }
@@ -1200,7 +1231,7 @@ pub trait HalfRules {
         _: ResolutionScopeId,
         _: u32,
         _: &ResolutionLookupSemanticRecipe,
-    ) -> Result<Self::LexicalTiers> {
+    ) -> Result<Read<Self::LexicalTiers>> {
         unreachable!("lexical starts require binding tiers")
     }
     fn outer_can_compete(&self, _: &Self::Placement, _: Option<&Self::Rank>, _: u32) -> bool {
@@ -1385,7 +1416,7 @@ pub enum ProviderPreparation<K> {
         endpoint_completion: Option<ResolutionCompletion>,
     },
     /// Retain a root's base without publication, including the JVM caller
-    /// route with whole_file_import_gaps (java_reverse_rows.rs).
+    /// route with whole_file_import_gaps (jvm_reverse_rows.rs).
     RetainBase {
         completion: ResolutionCompletion,
         /// Gap-only endpoint coverage. None records no entry and never falls
@@ -1584,6 +1615,8 @@ pub struct BridgeMaterial {
     pub candidate_origin_rank: Option<u32>,
     pub target_definition: Option<BindingNodeId>,
     pub cross_language_evidence: Option<SelectedJvmBridgeEvidence>,
+    /// Authored binder whose traversal grants the external callable channel.
+    pub callable_import: Option<SemanticId>,
 }
 impl BridgeMaterial {
     pub fn same_language(language: Language) -> Self {
@@ -1594,6 +1627,7 @@ impl BridgeMaterial {
             candidate_origin_rank: None,
             target_definition: None,
             cross_language_evidence: None,
+            callable_import: None,
         }
     }
 }
@@ -1808,16 +1842,6 @@ pub trait DemandRules {
     ) -> Result<Option<ResolutionCompletion>> {
         Ok(Some(prefix.raw.clone()))
     }
-    fn compile_publication(
-        &mut self,
-        _frame: &RootFrame,
-        ready: &ReadySelectedResolution<'_, '_>,
-        contexts: crate::analyzer::resolution::SelectedResolutionContextInputs,
-        session: &ResolutionSession,
-        cancellation: &CancellationToken,
-    ) -> Result<SelectedFactOperationBlueprintConstruction> {
-        ready.collect_blueprint_in_session(contexts, cancellation, session)
-    }
     fn register_publication(
         &mut self,
         _frame: &RootFrame,
@@ -1826,16 +1850,7 @@ pub trait DemandRules {
         session: &ResolutionSession,
         cancellation: &CancellationToken,
     ) -> Result<ContextRegistrationOutcome> {
-        ready.register_context_cells_in_session(
-            registration,
-            SelectedContextRegistrationCells {
-                shared: registration.shared_semantic_identities(),
-                boundaries: registration.boundary_nodes(),
-                gaps: registration.context_owned_gap_identities(),
-            },
-            cancellation,
-            session,
-        )
+        ready.register_context_in_session(registration, cancellation, session)
     }
     fn publication_context(
         &self,
@@ -2035,11 +2050,70 @@ pub struct SharedDemand<'a, 'store, 'input, R: DemandRules> {
     pub arena: &'a RefCell<ClosedRelations>,
     pub paths: &'a dyn SelectedContextPathSource,
     pub ready: &'a ReadySelectedResolution<'store, 'input>,
+    pub projection_memo: Option<&'a super::file_context::ContextBlueprintMemo>,
     pub base: &'a dyn BatchResolutionFragmentSource,
     pub session: &'a ResolutionSession,
     pub cancellation: &'a CancellationToken,
     pub completion: &'a ResolutionCompletion,
 }
+// Shared forward scheduling over a language's rules and already assembled
+// source. Callers retain their source extras and blueprint-session policy.
+impl SelectedResolutionOperation<'_, '_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn with_shared_forward_operation<R: DemandRules, T>(
+        &self,
+        rules: R,
+        arena: &RefCell<ClosedRelations>,
+        paths: &dyn SelectedContextPathSource,
+        source: &dyn BatchResolutionFragmentSource,
+        blueprint: &SelectedFactOperationBlueprint,
+        lexical: &dyn BatchResolutionFragmentSource,
+        typed: &dyn SelectedTypedFactSource,
+        projection_memo: Option<&super::file_context::ContextBlueprintMemo>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+        artifacts: Option<&mut crate::analyzer::resolution::ForwardCandidateArtifactCache>,
+        run: impl FnOnce(&mut crate::analyzer::resolution::FactResolutionOperation<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let provider = super::demand::DemandProvider::new(SharedDemand {
+            source_closures: HashMap::default(),
+            rules,
+            arena,
+            paths,
+            ready: &self.ready,
+            projection_memo,
+            base: lexical,
+            session,
+            cancellation,
+            completion: &ResolutionCompletion::Complete,
+        });
+        if let Some(artifacts) = artifacts {
+            blueprint.with_demand_operation_using_artifacts(
+                source,
+                paths,
+                lexical,
+                typed,
+                provider,
+                cancellation,
+                session,
+                artifacts,
+                run,
+            )
+        } else {
+            blueprint.with_demand_operation(
+                source,
+                paths,
+                lexical,
+                typed,
+                provider,
+                cancellation,
+                session,
+                run,
+            )
+        }
+    }
+}
+
 impl<R> DemandLanguage for SharedDemand<'_, '_, '_, R>
 where
     R: DemandRules,
@@ -3423,6 +3497,7 @@ fn bridge_from_material(
     descriptor
         .with_precedence(material.precedence)
         .with_candidate_origin_rank(material.candidate_origin_rank)
+        .with_callable_import_token(material.callable_import)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3783,7 +3858,7 @@ fn close_start_selection<H: HalfRules>(
     facts: &mut PlacementFacts<H::Target>,
     mut selection: StartSelection<H::Rank, H::Provider>,
     cancellation: &CancellationToken,
-) -> Result<StartSelection<H::Rank, H::Provider>> {
+) -> Result<Read<StartSelection<H::Rank, H::Provider>>> {
     if let Some(request) = selection.lexical.take() {
         let tag = facts.tag;
         let lookup = &request.lookup;
@@ -3791,10 +3866,16 @@ fn close_start_selection<H: HalfRules>(
             request.scope,
             |scope| rules.lexical_parent(owner, scope),
             |scope, depth| {
-                Ok(rules
-                    .lexical_tier(owner, scope, depth, lookup)?
-                    .into_iter()
-                    .map(move |mut read| {
+                let (tiers, completion) = match rules.lexical_tier(owner, scope, depth, lookup)? {
+                    Read::Ready { value, completion } => (value, completion),
+                    Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                    Read::Unavailable { reason, completion } => {
+                        return Ok(Read::Unavailable { reason, completion });
+                    }
+                };
+                Ok(Read::Ready {
+                    completion,
+                    value: tiers.into_iter().map(move |mut read| {
                         if let Some((location, head)) = read.head {
                             let route = [head];
                             let cursor = WalkCursor {
@@ -3824,14 +3905,24 @@ fn close_start_selection<H: HalfRules>(
                                 read.ranked.tier.coverage.combine(&coverage);
                         }
                         Ok(read.ranked)
-                    }))
+                    }),
+                })
             },
             |best, depth| rules.outer_can_compete(owner, best, depth),
             |binding, provider| rules.prunes_provider(binding, provider),
             &mut facts.completion,
             cancellation,
         )?;
-        selection = selected.into();
+        selection = match selected {
+            Read::Ready { value, completion } => {
+                facts.completion = facts.completion.combine(&completion);
+                value.into()
+            }
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+            Read::Unavailable { reason, completion } => {
+                return Ok(Read::Unavailable { reason, completion });
+            }
+        };
     }
     if let Some(head) = selection.head.take() {
         let route = [head];
@@ -3862,7 +3953,7 @@ fn close_start_selection<H: HalfRules>(
         }
         selection.locations = locations;
     }
-    Ok(selection)
+    Ok(Read::ready(selection))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3912,6 +4003,7 @@ pub(super) fn deadend_bridge(
 }
 
 struct SourceAccumulator {
+    endpoint_completion: Option<ResolutionCompletion>,
     descriptors: Vec<SelectedRootBridgeDescriptor>,
     associations: Vec<ContextAssociation>,
     half_facts: Vec<HalfClosureFacts>,
@@ -3924,6 +4016,7 @@ struct SourceAccumulator {
 impl Default for SourceAccumulator {
     fn default() -> Self {
         Self {
+            endpoint_completion: None,
             descriptors: Vec::new(),
             associations: Vec::new(),
             half_facts: Vec::new(),
@@ -4485,6 +4578,14 @@ fn resume_source_members<R: DemandRules>(
     Ok(Read::ready(None))
 }
 
+#[track_caller]
+fn assert_half_hook_completion(completion: &ResolutionCompletion) {
+    assert!(
+        !completion.contains_reason(ResolutionIncompleteReason::Cancelled),
+        "a half hook returned Ready with operation cancellation; cancellation must be Read::Cancelled"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_source_placement<'a, R: DemandRules + 'a>(
     shared: &SharedDemand<'_, '_, '_, R>,
@@ -4582,6 +4683,7 @@ fn finish_source_placement<'a, R: DemandRules + 'a>(
                 return Ok(Read::Cancelled(hook_completion.combine(&completion)));
             }
         };
+        assert_half_hook_completion(&completion);
         observation.completion = observation.completion.combine(&completion);
         for ProvenTarget {
             target: member,
@@ -4638,6 +4740,7 @@ fn finish_source_placement<'a, R: DemandRules + 'a>(
                     hook_completion.combine(&cancelled_completion()),
                 ));
             }
+            assert_half_hook_completion(&branch);
             observation.completion = observation.completion.combine(&branch);
             proofs.push(
                 EvidenceOwner::ExportBranch(half_id, placement, definition),
@@ -4657,11 +4760,14 @@ fn finish_source_placement<'a, R: DemandRules + 'a>(
             }
             retain_export_proof(blockers, half, lookup, completion);
         }
+        assert_half_hook_completion(&unstaged);
         observation.completion = observation.completion.combine(&unstaged);
         if exports.is_empty() {
+            let completion = rules.empty_target(owner, &target)?;
+            assert_half_hook_completion(&completion);
             observation.completion = observation
                 .completion
-                .combine(&rules.empty_target(owner, &target)?)
+                .combine(&completion)
                 .combine(&unstaged);
         }
         for (export, target_demand, evidence) in exports {
@@ -4782,6 +4888,7 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
                 hook_completion.combine(&cancelled_completion()),
             ));
         };
+        assert_half_hook_completion(&boundary.completion);
         observation.completion = boundary.completion;
         associations.extend(boundary.associations);
         if observation.completion != ResolutionCompletion::Complete {
@@ -4943,7 +5050,9 @@ fn poll_source_rows<R: DemandRules>(
             ));
         };
         if !current.initialized {
-            current.accum.observation.completion = rules.initial_completion();
+            let completion = rules.initial_completion();
+            assert_half_hook_completion(&completion);
+            current.accum.observation.completion = completion;
             current.accum.prefix_has_targets = rules.prefix_has_targets();
             current.placements = rules.placements().into_iter().enumerate();
             current.initialized = true;
@@ -5073,6 +5182,27 @@ fn poll_source_rows<R: DemandRules>(
                                 selected,
                                 shared.cancellation,
                             )?;
+                            let selected = match selected {
+                                Read::Ready { value, completion } => {
+                                    state.accum.hook_completion =
+                                        state.accum.hook_completion.combine(&completion);
+                                    value
+                                }
+                                Read::Cancelled(completion) => {
+                                    return Ok(Read::Cancelled(
+                                        state.accum.hook_completion.combine(&completion),
+                                    ));
+                                }
+                                Read::Unavailable { reason, completion } => {
+                                    return Ok(Read::Unavailable {
+                                        reason,
+                                        completion: state
+                                            .accum
+                                            .hook_completion
+                                            .combine(&completion),
+                                    });
+                                }
+                            };
                             active.starts = rules
                                 .prefix_starts(&active.owner, selected, &mut active.facts)?
                                 .into();
@@ -5108,6 +5238,27 @@ fn poll_source_rows<R: DemandRules>(
                                 selected,
                                 shared.cancellation,
                             )?;
+                            let selected = match selected {
+                                Read::Ready { value, completion } => {
+                                    state.accum.hook_completion =
+                                        state.accum.hook_completion.combine(&completion);
+                                    value
+                                }
+                                Read::Cancelled(completion) => {
+                                    return Ok(Read::Cancelled(
+                                        state.accum.hook_completion.combine(&completion),
+                                    ));
+                                }
+                                Read::Unavailable { reason, completion } => {
+                                    return Ok(Read::Unavailable {
+                                        reason,
+                                        completion: state
+                                            .accum
+                                            .hook_completion
+                                            .combine(&completion),
+                                    });
+                                }
+                            };
                             active.starts = rules.lexical_starts(selected, &active.facts).into();
                         }
                         active.phase = PlacementPhase::Finish;
@@ -5158,9 +5309,18 @@ fn poll_source_rows<R: DemandRules>(
                 return Ok(Read::Unavailable { reason, completion });
             }
         }
+        if let Some(completion) =
+            rules.source_endpoint_completion(&current.source, &plan.endpoint, shared.ready)
+        {
+            state.accum.endpoint_completion = Some(match state.accum.endpoint_completion.take() {
+                Some(previous) => previous.combine(&completion),
+                None => completion,
+            });
+        }
         state.half_index += 1;
     }
     let SourceAccumulator {
+        endpoint_completion,
         descriptors,
         associations,
         half_facts,
@@ -5172,7 +5332,7 @@ fn poll_source_rows<R: DemandRules>(
     } = std::mem::take(&mut state.accum);
     Ok(Read::Ready {
         value: SourceRowsProgress::Continue(RouteClosure {
-            endpoint_completion: None,
+            endpoint_completion,
             disposition: RouteDisposition::Publish,
             preparation: None,
             bridges: descriptors,
@@ -5957,14 +6117,21 @@ pub(super) fn publish_closure<R: DemandRules>(
                 discharges: None,
             });
         };
-        let SelectedFactOperationBlueprintConstruction::Ready(registration) =
-            shared.rules.compile_publication(
-                plan,
-                shared.ready,
-                contexts,
-                shared.session,
-                shared.cancellation,
-            )?
+        let Some(registration) = shared.ready.publish_prepared_context(
+            contexts,
+            shared.cancellation,
+            shared.session,
+            shared.projection_memo,
+            |registration| {
+                shared.rules.register_publication(
+                    plan,
+                    shared.ready,
+                    registration,
+                    shared.session,
+                    shared.cancellation,
+                )
+            },
+        )?
         else {
             return Ok(LanguageClosure {
                 completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
@@ -5972,22 +6139,6 @@ pub(super) fn publish_closure<R: DemandRules>(
                 discharges: None,
             });
         };
-        if matches!(
-            shared.rules.register_publication(
-                plan,
-                shared.ready,
-                &registration,
-                shared.session,
-                shared.cancellation
-            )?,
-            ContextRegistrationOutcome::Cancelled
-        ) {
-            return Ok(LanguageClosure {
-                completion: evidence.combine(&crate::analyzer::resolution::cancelled_completion()),
-                closed: false,
-                discharges: None,
-            });
-        }
         registration
     };
     shared

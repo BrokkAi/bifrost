@@ -7,7 +7,6 @@
 //! later binds.
 
 use crate::constructor_site::ConstructorSite;
-use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::model::{DeclarationKind, JavaTypeConstructorShape};
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
@@ -44,14 +43,17 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, HoistingClass};
 use brokk_bifrost_core::analyzer::tree_walk::{
-    TreeWalkAction, first_named_child_of_kind, named_children,
+    TreeWalkAction, WalkControl, first_named_child_of_kind, named_children, walk_tree_preorder,
 };
+use brokk_bifrost_core::analyzer::{CodeUnit, Language};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use super::declarations::{
-    JavaCallableShape, JavaDeclarationModifiers, JavaFieldShape, JavaTypeShape, is_declared_name,
-    looks_like_pascal_identifier, node_text,
+    JavaCallableShape, JavaDeclarationModifiers, JavaFieldShape, JavaTypeShape,
+    canonical_parameter_type_texts, is_declared_name, java_record_components,
+    java_record_declares_accessor, looks_like_pascal_identifier, node_text, spread_parameter_name,
+    spread_parameter_type_node,
 };
 use super::graph_support::{
     java_declared_type_parameters, java_method_reference_parts, java_switch_selector_expression,
@@ -843,6 +845,15 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
 
         if node.kind() == "explicit_constructor_invocation" {
+            // JLS 8.8.7.1 uses the constructor's parameters in a static
+            // context. Preserve ordinary argument lookup: javac separately
+            // rejects own-instance access here, a restriction we do not yet
+            // model for invalid source.
+            if let Some(arguments) = node.child_by_field_name("arguments") {
+                for argument in named_children(arguments) {
+                    self.lower_expression(argument);
+                }
+            }
             return self.suppress_with_gap(
                 node,
                 ResolutionSiteKind::UnsupportedExpression,
@@ -914,21 +925,14 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
 
         if node.kind() == "formal_parameters"
-            && node.named_child_count() > 0
             && node.parent().is_some_and(|record| {
                 record.kind() == "record_declaration"
                     && record.child_by_field_name("parameters") == Some(node)
             })
         {
-            // Record components are declarations on the record, not callable
-            // parameters. A local record can appear inside a method, so the
-            // outer callable context remains on the stack while this exact
-            // record parameter list is visited.
-            return self.suppress_with_gap(
-                node,
-                ResolutionSiteKind::UnsupportedDeclaration,
-                ResolutionGapKind::UnsupportedScopeOrBinder,
-            );
+            // The record owner already published component fields, accessors
+            // and canonical formals, or named the malformed header gap.
+            return self.suppress_semantics();
         }
 
         if let Some(lambda) = self.lambda_context_for_parameter(node) {
@@ -2121,20 +2125,39 @@ impl<'source> JavaResolutionBuilder<'source> {
             Some(context.declaration),
             "type declaration containment must balance"
         );
-        let implicit_hierarchy = match context.flavor {
-            TypeFlavor::Class => !context.has_explicit_superclass,
-            TypeFlavor::Interface => !context.has_explicit_superinterface,
-            TypeFlavor::Enum | TypeFlavor::Record | TypeFlavor::Annotation => true,
-        };
-        if context.flavor == TypeFlavor::Class && !context.has_explicit_superclass {
-            if !context.is_java_lang_object {
-                self.add_implicit_object_supertype(context.declaration);
+        match context.flavor {
+            TypeFlavor::Class
+                if !context.has_explicit_superclass && !context.is_java_lang_object =>
+            {
+                self.add_implicit_supertype(
+                    context.declaration,
+                    "Object",
+                    ResolutionSupertypeKind::ImplicitSuperclass,
+                );
             }
-        } else if implicit_hierarchy {
-            self.add_gap(
-                context.declaration,
-                ResolutionGapKind::UnsupportedHierarchyTraversal,
-            );
+            TypeFlavor::Enum => {
+                self.add_implicit_supertype(
+                    context.declaration,
+                    "Enum",
+                    ResolutionSupertypeKind::Superclass,
+                );
+            }
+            TypeFlavor::Interface if !context.has_explicit_superinterface => {
+                let rules = crate::intrinsics::implicit_interface_members(Language::Java)
+                    .expect("Java defines its parentless-interface member root");
+                self.add_implicit_supertype(
+                    context.declaration,
+                    rules.simple_name,
+                    ResolutionSupertypeKind::ImplicitInterfaceMembers,
+                );
+            }
+            TypeFlavor::Interface | TypeFlavor::Class => {}
+            TypeFlavor::Record | TypeFlavor::Annotation => {
+                self.add_gap(
+                    context.declaration,
+                    ResolutionGapKind::UnsupportedHierarchyTraversal,
+                );
+            }
         }
     }
 
@@ -2373,7 +2396,9 @@ impl<'source> JavaResolutionBuilder<'source> {
             | ResolutionTypeTransferKind::ComponentIndex
             | ResolutionTypeTransferKind::ComponentIndexOk
             | ResolutionTypeTransferKind::ComponentCommaOkValue
-            | ResolutionTypeTransferKind::ComponentSlice => {
+            | ResolutionTypeTransferKind::ComponentSlice
+            | ResolutionTypeTransferKind::IndexOperand
+            | ResolutionTypeTransferKind::ElementOperand => {
                 ResolutionTypeTransferValueTransform::Preserve
             }
             ResolutionTypeTransferKind::NumericPromotion
@@ -2660,7 +2685,14 @@ impl<'source> JavaResolutionBuilder<'source> {
                 self.current_scope(),
                 Some(declaration),
                 ResolutionScopeKind::TypeBody,
-                body.start_byte(),
+                // Record component types and canonical constructor formals
+                // belong to the record's scope even though their syntax is
+                // in its header, before the written body.
+                if flavor == TypeFlavor::Record {
+                    node.start_byte()
+                } else {
+                    body.start_byte()
+                },
                 body.end_byte(),
             );
             self.body_scopes.insert(body.id(), body_scope);
@@ -2678,6 +2710,53 @@ impl<'source> JavaResolutionBuilder<'source> {
                     body_scope,
                     source_declaration,
                 );
+            }
+            if flavor == TypeFlavor::Record {
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    if self.lower_record_components(node, parameters, declaration, body_scope) {
+                        let component_types =
+                            canonical_parameter_type_texts(parameters, self.source);
+                        let has_canonical_constructor =
+                            named_children(body).into_iter().any(|child| {
+                                child.kind() == "compact_constructor_declaration"
+                                    || (child.kind() == "constructor_declaration"
+                                        && child.child_by_field_name("parameters").is_some_and(
+                                            |written| {
+                                                canonical_parameter_type_texts(written, self.source)
+                                                    == component_types
+                                            },
+                                        ))
+                            });
+                        if !has_canonical_constructor {
+                            let constructor = self.lower_default_constructor(
+                                body,
+                                declaration,
+                                type_name,
+                                body_scope,
+                                source_declaration,
+                            );
+                            let parameter_scope = self.allocate_scope(
+                                body_scope,
+                                Some(constructor),
+                                ResolutionScopeKind::Executable,
+                                parameters.start_byte(),
+                                parameters.end_byte(),
+                            );
+                            self.lower_record_constructor_parameters(
+                                parameters,
+                                constructor,
+                                parameter_scope,
+                                parameters.end_byte()..parameters.end_byte(),
+                            );
+                        }
+                    }
+                } else {
+                    self.add_gap(declaration, ResolutionGapKind::UnsupportedScopeOrBinder);
+                    self.add_reference_enumeration_gap(
+                        declaration,
+                        ResolutionGapKind::UnsupportedScopeOrBinder,
+                    );
+                }
             }
             Some(body_scope)
         } else {
@@ -2983,7 +3062,10 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     fn switch_selector_has_constant_variable_type(&self, selector: Node<'_>) -> bool {
-        if matches!(selector.kind(), "binary_expression" | "unary_expression") {
+        if matches!(
+            selector.kind(),
+            "binary_expression" | "unary_expression" | "string_literal"
+        ) {
             return true;
         }
         if selector.kind() == "cast_expression" {
@@ -2991,6 +3073,19 @@ impl<'source> JavaResolutionBuilder<'source> {
                 .child_by_field_name("type")
                 .is_some_and(|type_node| {
                     matches!(type_node.kind(), "integral_type" | "floating_point_type")
+                        || super::graph::return_type::java_type_name_components(
+                            type_node,
+                            self.source,
+                        )
+                        .is_some_and(|path| {
+                            matches!(
+                                path.iter()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .as_slice(),
+                                ["String"] | ["java", "lang", "String"]
+                            )
+                        })
                 });
         }
         let binding = if selector.kind() == "assignment_expression" {
@@ -3018,7 +3113,27 @@ impl<'source> JavaResolutionBuilder<'source> {
         };
         self.facts.intrinsic_type_seeds.iter().any(|seed| {
             seed.output == source_type_slot && seed.kind == IntrinsicTypeKind::Primitive
-        })
+        }) || self.slot_names_string_type(source_type_slot)
+    }
+
+    // JLS 4.12.4 includes String as well as primitive constant variables.
+    // Follow the structured type-reference qualifiers, never the rendered type.
+    fn slot_names_string_type(&self, mut slot: ResolutionTypeSlotId) -> bool {
+        let mut path = Vec::new();
+        loop {
+            let site = self.slot(slot).site;
+            let Some(identifier) = self.facts.identifiers.iter().find(|identifier| {
+                identifier.site == site && identifier.namespace == ResolutionNamespace::Type
+            }) else {
+                return false;
+            };
+            path.push(self.facts.names[identifier.name.index()].spelling.as_str());
+            match identifier.qualifier {
+                Some(qualifier) => slot = qualifier,
+                None => break,
+            }
+        }
+        matches!(path.as_slice(), ["String"] | ["String", "lang", "java"])
     }
 
     fn visible_value_type_slot(&self, reference: Node<'_>) -> Option<ResolutionTypeSlotId> {
@@ -3118,12 +3233,6 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ),
                 result_types: Vec::new(),
             });
-        if node.kind() == "compact_constructor_declaration" {
-            // A compact record constructor implicitly has one value parameter
-            // per record component. Until those parameters have exact rows,
-            // its otherwise empty signature header cannot prove arity.
-            self.add_gap(declaration, ResolutionGapKind::UnsupportedCallApplicability);
-        }
         if is_constructor {
             let owner = self
                 .type_contexts
@@ -3190,8 +3299,13 @@ impl<'source> JavaResolutionBuilder<'source> {
         let (body_start, body_end) = body
             .map(|body| (body.start_byte(), body.end_byte()))
             .unwrap_or((node.end_byte(), node.end_byte()));
-        let executable_start = node
-            .child_by_field_name("parameters")
+        let compact_parameters = (node.kind() == "compact_constructor_declaration")
+            .then(|| node.parent().and_then(|body| body.parent()))
+            .flatten()
+            .filter(|record| record.kind() == "record_declaration")
+            .and_then(|record| record.child_by_field_name("parameters"));
+        let executable_start = compact_parameters
+            .or_else(|| node.child_by_field_name("parameters"))
             .map_or(body_start, |parameters| parameters.start_byte());
         let callable_scope = self.allocate_scope(
             self.current_scope(),
@@ -3229,6 +3343,43 @@ impl<'source> JavaResolutionBuilder<'source> {
                 "callable return-type owner override must balance"
             );
         }
+        if node.kind() == "compact_constructor_declaration" {
+            if let Some(parameters) = compact_parameters
+                && java_record_components(parameters).is_ok()
+            {
+                self.lower_record_constructor_parameters(
+                    parameters,
+                    declaration,
+                    callable_scope,
+                    body_start..body_end,
+                );
+            } else {
+                self.add_gap(declaration, ResolutionGapKind::UnsupportedCallApplicability);
+            }
+        }
+        // Applicability without inference is safe only when none of the
+        // formal types mention this method's type parameters, including nested
+        // type arguments. Inspect grammar nodes, never source syntax strings.
+        let method_type_parameters = java_declared_type_parameters(node);
+        if !method_type_parameters.is_empty()
+            && let Some(parameters) = node.child_by_field_name("parameters")
+        {
+            let mut pending = named_children(parameters);
+            while let Some(part) = pending.pop() {
+                if part.kind() == "type_identifier"
+                    && super::graph_support::java_type_parameter_in_scope(
+                        part,
+                        self.source,
+                        node_text(part, self.source),
+                    )
+                    .is_some_and(|formal| method_type_parameters.contains(&formal))
+                {
+                    self.add_gap(declaration, ResolutionGapKind::UnsupportedCallApplicability);
+                    break;
+                }
+                pending.extend(named_children(part));
+            }
+        }
         Some(CallableContext {
             declaration,
             scope: callable_scope,
@@ -3239,7 +3390,9 @@ impl<'source> JavaResolutionBuilder<'source> {
     }
 
     /// The constructor Java supplies for a class that writes none (JLS 8.8.9):
-    /// it takes no arguments and has the class's own access. The class itself
+    /// it takes no arguments and has the class's own access. Records reuse
+    /// this publication for their implicit canonical constructor (JLS 8.10.4),
+    /// then attach their component parameters. The class itself
     /// declares it, so its source declaration is the class declaration and a
     /// call that selects it navigates to the class. The class body anchors the
     /// site, since a site must lie within its scope and the body scope does not
@@ -3251,7 +3404,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         owner_name: ResolutionNameId,
         scope: ResolutionScopeId,
         class_source: SourceDeclarationId,
-    ) {
+    ) -> ResolutionSiteId {
         let site = self.add_site_in_scope(body, ResolutionSiteKind::ConstructorDeclaration, scope);
         self.declaration_sources.push((site, class_source));
         let visibility = self
@@ -3280,6 +3433,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                 type_parameter_count: 0,
                 result_types: Vec::new(),
             });
+        site
     }
 
     fn lower_initializer(&mut self, node: Node<'_>) {
@@ -3318,6 +3472,241 @@ impl<'source> JavaResolutionBuilder<'source> {
             activation_start,
             activation_end,
         });
+    }
+
+    /// JLS 8.10.3: a component supplies a private final field and, unless
+    /// explicitly declared, a public accessor. Source metadata records finality;
+    /// native rows record each member's identity, visibility and declared type.
+    fn lower_record_components(
+        &mut self,
+        record: Node<'_>,
+        parameters: Node<'_>,
+        owner: ResolutionSiteId,
+        scope: ResolutionScopeId,
+    ) -> bool {
+        let components = match java_record_components(parameters) {
+            Ok(components) => components,
+            Err(malformed) => {
+                for component in malformed {
+                    let site = self.add_site_in_scope(
+                        component,
+                        ResolutionSiteKind::UnsupportedDeclaration,
+                        scope,
+                    );
+                    let name = component
+                        .child_by_field_name("name")
+                        .or_else(|| spread_parameter_name(component))
+                        .filter(|name| !name.is_missing());
+                    let spelling = name
+                        .map(|name| node_text(name, self.source).to_owned())
+                        .unwrap_or_else(|| {
+                            let ordinal = named_children(parameters)
+                                .into_iter()
+                                .filter(|node| !node.is_extra())
+                                .take_while(|node| node.start_byte() < component.start_byte())
+                                .count();
+                            format!("<record component {}>", ordinal + 1)
+                        });
+                    let name = self.intern_name(&spelling);
+                    self.facts.identifiers.push(PositionedIdentifierFact {
+                        site,
+                        name,
+                        role: ResolutionIdentifierRole::Declaration,
+                        namespace: ResolutionNamespace::Value,
+                        qualifier: None,
+                    });
+                    self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+                    self.add_reference_enumeration_gap(
+                        site,
+                        ResolutionGapKind::UnsupportedScopeOrBinder,
+                    );
+                }
+                return false;
+            }
+        };
+        let bounds = *self.scope(scope);
+        self.scope_stack.push(scope);
+        self.declaration_contexts.push(owner);
+        for component in components {
+            let field = self.add_identifier_site(
+                component.name,
+                ResolutionSiteKind::ValueDeclaration,
+                scope,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Value,
+                None,
+            );
+            let source = self.record_declaration_source_with_name(
+                component.node,
+                Some(component.name),
+                field,
+            );
+            self.add_declaration_visibility(field, component.node, source);
+            self.facts.binders.push(ResolutionBinderFact {
+                declaration: field,
+                scope,
+                kind: ResolutionBinderKind::Field,
+                hoisting: HoistingClass::ScopeWide,
+                activation_start: bounds.start_byte,
+                activation_end: bounds.end_byte,
+            });
+            self.facts.member_owners.push(ResolutionMemberOwnerFact {
+                member: field,
+                owner,
+                kind: ResolutionMemberKind::Field,
+                access: ResolutionMemberAccess::Instance,
+                qualifier_compatibility: ResolutionMemberQualifierCompatibility::RuntimeOnly,
+            });
+            self.reference_enclosing_declaration_overrides.push(field);
+            // Header traversal is suppressed below. Keep annotation type and
+            // value references through the existing structured annotation walk.
+            walk_tree_preorder(component.node, false, |node| {
+                if matches!(node.kind(), "annotation" | "marker_annotation") {
+                    self.lower_annotation(node);
+                    WalkControl::SkipChildren
+                } else {
+                    WalkControl::Continue
+                }
+            });
+            let mut ty = self.lower_type(component.ty);
+            if component.repeated {
+                ty = self.lower_array_type(component.node, ty, 1);
+            }
+            self.attach_lowered_declaration_type(
+                field,
+                ty,
+                component.ty,
+                DeclarationTypeRole::Value,
+            );
+            assert_eq!(
+                self.reference_enclosing_declaration_overrides.pop(),
+                Some(field)
+            );
+            if java_record_declares_accessor(
+                record,
+                node_text(component.name, self.source),
+                self.source,
+            ) {
+                continue;
+            }
+            let accessor = self.add_identifier_site(
+                component.name,
+                ResolutionSiteKind::CallableDeclaration,
+                scope,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Callable,
+                None,
+            );
+            let source = self
+                .source_collector
+                .declare_node(parameters, Some(component.name));
+            self.declaration_sources.push((accessor, source));
+            self.add_declaration_visibility(accessor, component.name, source);
+            self.facts.binders.push(ResolutionBinderFact {
+                declaration: accessor,
+                scope,
+                kind: ResolutionBinderKind::Callable,
+                hoisting: HoistingClass::ScopeWide,
+                activation_start: bounds.start_byte,
+                activation_end: bounds.end_byte,
+            });
+            self.facts.member_owners.push(ResolutionMemberOwnerFact {
+                member: accessor,
+                owner,
+                kind: ResolutionMemberKind::Method,
+                access: ResolutionMemberAccess::Instance,
+                qualifier_compatibility: ResolutionMemberQualifierCompatibility::RuntimeOnly,
+            });
+            let result = self.attach_lowered_declaration_type(
+                accessor,
+                ty,
+                component.ty,
+                DeclarationTypeRole::Return,
+            );
+            self.facts
+                .callable_signatures
+                .push(ResolutionCallableSignatureFact {
+                    callable: accessor,
+                    type_parameter_count: 0,
+                    result_types: vec![ResolutionCallableResultTypeFact {
+                        ordinal: 0,
+                        value_type: result,
+                    }],
+                });
+        }
+        assert_eq!(self.declaration_contexts.pop(), Some(owner));
+        assert_eq!(self.scope_stack.pop(), Some(scope));
+        true
+    }
+
+    /// JLS 8.10.4: canonical formals follow the header's component order.
+    fn lower_record_constructor_parameters(
+        &mut self,
+        parameters: Node<'_>,
+        constructor: ResolutionSiteId,
+        scope: ResolutionScopeId,
+        activation: std::ops::Range<usize>,
+    ) {
+        self.scope_stack.push(scope);
+        self.declaration_contexts.push(constructor);
+        for parameter in named_children(parameters) {
+            let repeated = parameter.kind() == "spread_parameter";
+            let (name, ty) = if repeated {
+                (
+                    spread_parameter_name(parameter),
+                    spread_parameter_type_node(parameter),
+                )
+            } else if parameter.kind() == "formal_parameter" {
+                (
+                    parameter.child_by_field_name("name"),
+                    parameter.child_by_field_name("type"),
+                )
+            } else {
+                continue;
+            };
+            let (Some(name), Some(ty)) = (name, ty) else {
+                self.add_gap(constructor, ResolutionGapKind::UnsupportedCallApplicability);
+                continue;
+            };
+            let declaration = self.add_identifier_site(
+                name,
+                ResolutionSiteKind::ValueDeclaration,
+                scope,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Value,
+                None,
+            );
+            // The component node identifies its field and the header identifies
+            // its accessor. A name-node pair identifies the canonical parameter.
+            let source = self.record_declaration_source_with_name(name, Some(name), declaration);
+            self.source_collector
+                .mark_lexical(source, DeclarationKind::Parameter);
+            // Implicit constructors have an empty activation range. Compact
+            // constructors bind these implicit parameters throughout their body.
+            self.add_parameter_binder_fact(declaration, scope, activation.start, activation.end);
+            let value_type = if let Some(dimensions) = parameter.child_by_field_name("dimensions") {
+                self.attach_declaration_gap_type(
+                    declaration,
+                    dimensions,
+                    DeclarationTypeRole::Parameter,
+                    ResolutionGapKind::PostfixArrayDimensions,
+                )
+            } else {
+                self.attach_declaration_type(declaration, ty, DeclarationTypeRole::Parameter)
+            };
+            let ordinal = self.next_callable_parameter_ordinal(constructor);
+            self.record_callable_parameter_fact(
+                constructor,
+                ordinal,
+                declaration,
+                value_type,
+                repeated,
+            );
+        }
+        assert_eq!(self.declaration_contexts.pop(), Some(constructor));
+        self.scope_stack
+            .pop()
+            .expect("record constructor parameter scope");
     }
 
     fn next_callable_parameter_ordinal(&mut self, callable: ResolutionSiteId) -> u32 {
@@ -3823,6 +4212,10 @@ impl<'source> JavaResolutionBuilder<'source> {
             return;
         }
 
+        self.type_contexts
+            .last_mut()
+            .expect("inheritance clause retains its owning context")
+            .has_explicit_superinterface = true;
         let Some(type_list) = first_named_child_of_kind(node, "type_list") else {
             return;
         };
@@ -3830,25 +4223,26 @@ impl<'source> JavaResolutionBuilder<'source> {
         if type_nodes.is_empty() {
             return;
         }
-        self.type_contexts
-            .last_mut()
-            .expect("superinterfaces retain their type context")
-            .has_explicit_superinterface = true;
         for type_node in type_nodes {
             self.add_supertype(subtype, type_node, ResolutionSupertypeKind::Interface);
         }
     }
 
     // The language-defined superclass route is absolute: a source declaration
-    // named java or Object cannot shadow it. It has no authored point range.
-    fn add_implicit_object_supertype(&mut self, subtype: ResolutionSiteId) {
+    // named java, Object or Enum cannot shadow it. It has no authored point range.
+    fn add_implicit_supertype(
+        &mut self,
+        subtype: ResolutionSiteId,
+        parent_name: &str,
+        kind: ResolutionSupertypeKind,
+    ) {
         let occurrence = self.site_occurrences[subtype.index()];
         let reference = self.add_site_from_occurrence(
             occurrence,
             ResolutionSiteKind::SyntheticReference,
             self.site(subtype).scope,
         );
-        let name = self.intern_name("Object");
+        let name = self.intern_name(parent_name);
         let prefix = [self.intern_name("java"), self.intern_name("lang")];
         crate::implicit_supertype::publish_implicit_supertype(
             &mut self.facts,
@@ -3856,7 +4250,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             reference,
             name,
             &prefix,
-            ResolutionSupertypeKind::ImplicitSuperclass,
+            kind,
         );
         let next = self.next_parent_ordinal.entry(subtype).or_default();
         *next = next
@@ -4144,9 +4538,6 @@ impl<'source> JavaResolutionBuilder<'source> {
         node: Node<'_>,
         element: ResolutionTypeSlotId,
     ) -> ResolutionTypeSlotId {
-        let site = self.add_site(node, ResolutionSiteKind::TypeReference);
-        let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
-        let name = self.intern_name("structural-type");
         let source_type = self.capture_source_type(node);
         let JavaTypeSyntaxShape::Array { dimensions, .. } = self
             .source_types
@@ -4155,7 +4546,20 @@ impl<'source> JavaResolutionBuilder<'source> {
         else {
             panic!("array_type has a structured array type shape")
         };
-        assert!(*dimensions > 0, "Java arrays have at least one dimension");
+        let dimensions = *dimensions;
+        self.lower_array_type(node, element, dimensions)
+    }
+
+    fn lower_array_type(
+        &mut self,
+        node: Node<'_>,
+        element: ResolutionTypeSlotId,
+        dimensions: u32,
+    ) -> ResolutionTypeSlotId {
+        assert!(dimensions > 0, "Java arrays have at least one dimension");
+        let site = self.add_site(node, ResolutionSiteKind::TypeReference);
+        let container = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
+        let name = self.intern_name("structural-type");
         self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
             output: container,
             name,
@@ -4163,7 +4567,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             indirection: 0,
         });
         let mut containers = vec![container];
-        for _ in 1..*dimensions {
+        for _ in 1..dimensions {
             let nested = self.add_slot(site, ResolutionTypeSlotRole::TargetTypeIdentity);
             self.facts.intrinsic_type_seeds.push(IntrinsicTypeSeedFact {
                 output: nested,
@@ -4427,6 +4831,62 @@ impl<'source> JavaResolutionBuilder<'source> {
                         }
                     }
                 }
+                "array_creation_expression" => {
+                    let Some(ty) = node.child_by_field_name("type") else {
+                        self.lower_unsupported_expression_as(
+                            node,
+                            ResolutionGapKind::MalformedSyntax,
+                        );
+                        continue;
+                    };
+                    let mut dimensions = 0;
+                    let mut dependencies = Vec::new();
+                    for child in named_children(node) {
+                        match child.kind() {
+                            "dimensions_expr" => {
+                                dimensions += 1;
+                                dependencies.extend(named_children(child).into_iter().filter(
+                                    |child| {
+                                        !matches!(child.kind(), "annotation" | "marker_annotation")
+                                    },
+                                ));
+                            }
+                            "dimensions" => {
+                                let mut cursor = child.walk();
+                                dimensions += u32::try_from(
+                                    child
+                                        .children(&mut cursor)
+                                        .filter(|child| child.kind() == "[")
+                                        .count(),
+                                )
+                                .expect("Java array dimensions fit u32");
+                            }
+                            "array_initializer" => dependencies.push(child),
+                            _ => {}
+                        }
+                    }
+                    if dimensions == 0 {
+                        self.lower_unsupported_expression_as(
+                            node,
+                            ResolutionGapKind::MalformedSyntax,
+                        );
+                        continue;
+                    }
+                    let element = self.lower_type(ty);
+                    let array = self.lower_array_type(node, element, dimensions);
+                    self.type_slots_by_node.insert(node.id(), array);
+                    stack.push((node, true));
+                    stack.extend(dependencies.into_iter().map(|child| (child, false)));
+                }
+                "array_initializer" => {
+                    let Some(array) = self.contextual_array_initializer_type(node) else {
+                        self.lower_unsupported_expression(node);
+                        continue;
+                    };
+                    self.type_slots_by_node.insert(node.id(), array);
+                    stack.push((node, true));
+                    stack.extend(named_children(node).into_iter().map(|child| (child, false)));
+                }
                 "object_creation_expression" => {
                     stack.push((node, true));
                     self.push_argument_dependencies(node, &mut stack);
@@ -4537,6 +4997,33 @@ impl<'source> JavaResolutionBuilder<'source> {
             .expect("expression postorder always publishes its root slot")
     }
 
+    fn contextual_array_initializer_type(
+        &mut self,
+        node: Node<'_>,
+    ) -> Option<ResolutionTypeSlotId> {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "array_creation_expression" => self.type_slots_by_node.get(&parent.id()).copied(),
+            "array_initializer" => {
+                let container = *self.type_slots_by_node.get(&parent.id())?;
+                self.facts
+                    .type_components
+                    .iter()
+                    .find(|component| {
+                        component.container == container
+                            && component.constructor == ResolutionTypeConstructorKind::Sequence
+                            && component.kind == ResolutionTypeComponentKind::Element
+                    })
+                    .map(|component| component.component)
+            }
+            "variable_declarator" if parent.child_by_field_name("dimensions").is_none() => {
+                let ty = parent.parent()?.child_by_field_name("type")?;
+                (ty.kind() == "array_type").then(|| self.lower_type(ty))
+            }
+            _ => None,
+        }
+    }
+
     fn finish_expression(&mut self, node: Node<'_>) {
         if self.expression_slots_by_node.contains_key(&node.id()) {
             return;
@@ -4553,6 +5040,46 @@ impl<'source> JavaResolutionBuilder<'source> {
             "method_invocation" => self.finish_method_invocation(node),
             "method_reference" => self.finish_method_reference(node),
             "field_access" => self.finish_field_access(node),
+            "array_creation_expression" | "array_initializer" => {
+                if node.kind() == "array_creation_expression"
+                    && let Some(initializer) = node.child_by_field_name("value")
+                {
+                    self.finish_expression_with_value(node, initializer);
+                    return;
+                }
+                let input = self.type_slots_by_node[&node.id()];
+                let site = self.add_site(node, ResolutionSiteKind::Initializer);
+                let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+                crate::call_arguments::publish_jvm_expression_type(&mut self.facts, input, output);
+                let operands = if node.kind() == "array_initializer" {
+                    named_children(node)
+                } else {
+                    named_children(node)
+                        .into_iter()
+                        .filter(|child| child.kind() == "dimensions_expr")
+                        .flat_map(named_children)
+                        .filter(|child| !matches!(child.kind(), "annotation" | "marker_annotation"))
+                        .collect()
+                };
+                let kind = if node.kind() == "array_initializer" {
+                    ResolutionTypeTransferKind::ElementOperand
+                } else {
+                    ResolutionTypeTransferKind::IndexOperand
+                };
+                for operand in operands {
+                    self.facts
+                        .type_transfers
+                        .push(ResolutionTypeTransferFact::new(
+                            self.expression_slot(operand),
+                            output,
+                            kind,
+                            0,
+                            0,
+                            ResolutionTypeTransferValueTransform::Preserve,
+                        ));
+                }
+                self.expression_slots_by_node.insert(node.id(), output);
+            }
             "object_creation_expression" => self.finish_object_creation(node),
             "switch_expression" => self.lower_unsupported_expression_preserving_children(node),
             "class_literal" => self.finish_class_literal_expression(node),
@@ -5752,6 +6279,7 @@ mod tests {
     use brokk_bifrost_core::analyzer::ProjectFile;
     use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionCallableReceiverOrigin;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse_file(source: &str) -> ParsedFile {
         let tree = super::super::declarations::parse_tree(source).expect("java tree");
@@ -5770,6 +6298,62 @@ mod tests {
         let facts = parse_once(source);
         assert_eq!(facts, parse_once(source), "fact rows must be deterministic");
         facts
+    }
+
+    #[test]
+    #[hardwon("#6291: census C05 lost structured types for Java arrays and nested initializers")]
+    fn array_expression_grammar_publishes_structured_dimensions() {
+        let facts = parse(
+            r#"class App { void run() {
+            int[][] values = {{1}, {2, 3}};
+            byte[][] bytes = new byte[2][];
+            String[] names = new String[1];
+            Object[] objects = new Object[]{};
+        } }"#,
+        );
+        let mut dimensions = Vec::new();
+        for site in facts
+            .sites
+            .iter()
+            .filter(|site| site.kind == ResolutionSiteKind::Initializer)
+        {
+            for output in facts.type_slots.iter().filter(|slot| {
+                slot.site == site.id && slot.role == ResolutionTypeSlotRole::ExpressionValue
+            }) {
+                let input = facts
+                    .type_transfers
+                    .iter()
+                    .find(|transfer| {
+                        transfer.output == output.id && !transfer.kind.is_operand_gate()
+                    })
+                    .expect("array expression has declared runtime transfer")
+                    .input;
+                let mut component = facts
+                    .type_transfers
+                    .iter()
+                    .find(|transfer| transfer.output == input)
+                    .expect("runtime declared value has an identity input")
+                    .input;
+                let mut depth = 0;
+                while let Some(row) = facts.type_components.iter().find(|row| {
+                    row.container == component
+                        && row.constructor == ResolutionTypeConstructorKind::Sequence
+                }) {
+                    depth += 1;
+                    component = row.component;
+                }
+                assert!(depth > 0, "array initializer retains a structured sequence");
+                dimensions.push(depth);
+            }
+        }
+        dimensions.sort_unstable();
+        assert_eq!(dimensions, [1, 1, 1, 1, 2, 2]);
+        assert!(
+            !facts
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == ResolutionGapKind::UnsupportedExpression)
+        );
     }
 
     #[test]
@@ -6149,10 +6733,10 @@ mod tests {
         "#;
         let facts = parse(source);
 
-        // Thirty-two declarations and the six default constructors of the
-        // classes that write none, which take their class's access.
-        assert_eq!(facts.declaration_visibilities.len(), 38);
-        assert_eq!(facts.visibility_eligibilities.len(), 38);
+        // Thirty-two declarations, six default constructors, and the record
+        // component's private field and public accessor.
+        assert_eq!(facts.declaration_visibilities.len(), 40);
+        assert_eq!(facts.visibility_eligibilities.len(), 40);
         assert!(facts.declaration_visibilities.iter().all(|visibility| {
             facts
                 .visibility_eligibilities
@@ -6207,6 +6791,7 @@ mod tests {
             ("privateField", DeclaredVisibility::Private),
             ("implicitInterfaceField", DeclaredVisibility::Public),
             ("implicitAnnotationField", DeclaredVisibility::Public),
+            ("recordComponentOnly", DeclaredVisibility::Private),
         ] {
             assert_eq!(
                 declaration_visibilities(&facts, spelling, ResolutionSiteKind::ValueDeclaration),
@@ -6226,6 +6811,7 @@ mod tests {
             ),
             ("value", DeclaredVisibility::Public),
             ("locals", DeclaredVisibility::PackagePrivate),
+            ("recordComponentOnly", DeclaredVisibility::Public),
         ] {
             assert_eq!(
                 declaration_visibilities(&facts, spelling, ResolutionSiteKind::CallableDeclaration),
@@ -6284,10 +6870,6 @@ mod tests {
             ),
             vec![DeclaredVisibility::Public]
         );
-        assert!(facts.declaration_visibilities.iter().all(|fact| {
-            name(&facts, identifier_for_site(&facts, fact.declaration).name)
-                != "recordComponentOnly"
-        }));
     }
 
     #[test]
@@ -6411,7 +6993,9 @@ mod tests {
             projection.reference == foo_reference.site
                 && projection.kind == BindingProjectionKind::TargetTypeIdentity
         }));
-        assert_eq!(facts.supertypes.len(), 3);
+        // #6291 / ebbe6c1af3: parentless B adds a lookup-only Object root;
+        // its missing-provider gap belongs to that reference, not the owner.
+        assert_eq!(facts.supertypes.len(), 4);
         let superclass = facts
             .supertypes
             .iter()
@@ -6460,7 +7044,10 @@ mod tests {
                     implicit_superclass_reference(&facts, foo),
                     ResolutionGapKind::UnsupportedHierarchyTraversal
                 ),
-                ResolutionGapFact::new(b, ResolutionGapKind::UnsupportedHierarchyTraversal),
+                ResolutionGapFact::new(
+                    implicit_superclass_reference(&facts, b),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
                 ResolutionGapFact::new(
                     facts.gaps.last().expect("placement gap").site,
                     ResolutionGapKind::UnsupportedPlacementBoundary
@@ -7575,7 +8162,8 @@ mod tests {
             ("package java.lang; class Outer { class Object {} }", 2),
             (
                 "interface I {} enum E { A } record R() {} @interface A {}",
-                0,
+                // #6291: I gets an Object member root and E an Enum parent.
+                2,
             ),
         ] {
             let facts = parse(source);
@@ -7643,6 +8231,243 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#6291: implicit record canonical constructors lost their callable target and formals"
+    )]
+    fn implicit_record_canonical_constructor_has_ordered_component_parameters() {
+        for (source, expected) in [
+            ("record Product() {}", vec![]),
+            (
+                "record Product(int count, String name) {}",
+                vec!["count", "name"],
+            ),
+            (
+                "record Product(int count) { Product() { this(0); } }",
+                vec!["count"],
+            ),
+            ("record Product(String... names) {}", vec!["names"]),
+        ] {
+            let facts = parse(source);
+            let owner = identifier(
+                &facts,
+                "Product",
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Type,
+            )
+            .site;
+            let implicit = facts
+                .member_owners
+                .iter()
+                .find(|member| {
+                    member.owner == owner
+                        && member.kind == ResolutionMemberKind::Constructor
+                        && !facts
+                            .definition_units
+                            .iter()
+                            .any(|unit| unit.declaration == member.member)
+                })
+                .expect("record without a written canonical constructor has an implicit callable")
+                .member;
+            let parameters = facts
+                .callable_parameters
+                .iter()
+                .filter(|parameter| parameter.callable == implicit)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parameters
+                    .iter()
+                    .map(|parameter| name(
+                        &facts,
+                        identifier_for_site(&facts, parameter.parameter).name
+                    ))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            if source == "record Product(int count, String name) {}" {
+                let types = parameters
+                    .iter()
+                    .map(|parameter| {
+                        let input = facts
+                            .type_transfers
+                            .iter()
+                            .find(|transfer| {
+                                transfer.output == parameter.value_type
+                                    && transfer.kind == ResolutionTypeTransferKind::DeclaredType
+                            })
+                            .unwrap()
+                            .input;
+                        if let Some(seed) = facts
+                            .intrinsic_type_seeds
+                            .iter()
+                            .find(|seed| seed.output == input)
+                        {
+                            name(&facts, seed.name)
+                        } else {
+                            name(
+                                &facts,
+                                identifier_for_site(&facts, slot(&facts, input).site).name,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(types, ["int", "String"]);
+                let string_reference = identifier(
+                    &facts,
+                    "String",
+                    ResolutionIdentifierRole::Reference,
+                    ResolutionNamespace::Type,
+                )
+                .site;
+                let component_field = facts
+                    .member_owners
+                    .iter()
+                    .find(|member| {
+                        member.owner == owner
+                            && member.kind == ResolutionMemberKind::Field
+                            && name(&facts, identifier_for_site(&facts, member.member).name)
+                                == "name"
+                    })
+                    .expect("record component field")
+                    .member;
+                // One written component type is shared by its field, accessor
+                // and canonical formal; its source owner is the field.
+                assert!(
+                    facts
+                        .reference_owners
+                        .contains(&ResolutionReferenceOwnerFact {
+                            reference: string_reference,
+                            owner: Some(component_field)
+                        })
+                );
+            }
+            for (ordinal, parameter) in parameters.iter().enumerate() {
+                assert_eq!(parameter.ordinal as usize, ordinal);
+                let parameter_scope = facts.scope(site(&facts, parameter.parameter).scope);
+                let record_scope = facts.scope(parameter_scope.parent.unwrap());
+                assert!(
+                    record_scope.start_byte <= parameter_scope.start_byte
+                        && parameter_scope.end_byte <= record_scope.end_byte
+                );
+            }
+            if source == "record Product(String... names) {}" {
+                assert!(parameters[0].repeated);
+            }
+        }
+        for source in [
+            "record Product(int count) { Product(int count) { this.count = count; } }",
+            "record Product(int count) { Product {} }",
+        ] {
+            let facts = parse(source);
+            let constructors = facts
+                .member_owners
+                .iter()
+                .filter(|member| member.kind == ResolutionMemberKind::Constructor)
+                .collect::<Vec<_>>();
+            assert_eq!(constructors.len(), 1);
+            let constructor = site(&facts, constructors[0].member);
+            assert_eq!(
+                &source[constructor.start_byte..constructor.end_byte],
+                "Product"
+            );
+        }
+        let malformed = parse("record Broken(int value, int other { Broken {} }");
+        let component_gaps = malformed
+            .gaps
+            .iter()
+            .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder)
+            .collect::<Vec<_>>();
+        assert!(
+            !component_gaps.is_empty(),
+            "missing header token stays open"
+        );
+        assert!(
+            component_gaps.iter().any(|gap| {
+                name(&malformed, identifier_for_site(&malformed, gap.site).name) == "other"
+            }),
+            "the missing closing token names its preceding component"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#6291: parentless interfaces stayed open and enum implicit parents could not be selected"
+    )]
+    fn implicit_parent_edges_follow_java_type_flavor() {
+        let facts = parse(
+            "interface Parent {} interface Child extends Parent {} class C {} enum E implements Child { VALUE }",
+        );
+        for (spelling, parent, kind) in [
+            ("C", "Object", ResolutionSupertypeKind::ImplicitSuperclass),
+            (
+                "Parent",
+                "Object",
+                ResolutionSupertypeKind::ImplicitInterfaceMembers,
+            ),
+            ("E", "Enum", ResolutionSupertypeKind::Superclass),
+        ] {
+            let owner = identifier(
+                &facts,
+                spelling,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Type,
+            )
+            .site;
+            let implicit = facts
+                .supertypes
+                .iter()
+                .find(|edge| {
+                    edge.subtype == owner
+                        && site(&facts, edge.supertype_reference).kind
+                            == ResolutionSiteKind::SyntheticReference
+                })
+                .expect("implicit superclass has an ordinary selectable edge");
+            assert_eq!(
+                name(
+                    &facts,
+                    identifier_for_site(&facts, implicit.supertype_reference).name
+                ),
+                parent
+            );
+            assert_eq!(implicit.kind, kind);
+            assert_eq!(implicit.parent_ordinal, 0);
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+                owner,
+                ResolutionGapKind::UnsupportedHierarchyTraversal
+            )));
+        }
+        let interface = identifier(
+            &facts,
+            "Parent",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        )
+        .site;
+        assert!(
+            facts
+                .supertypes
+                .iter()
+                .filter(|edge| edge.subtype == interface)
+                .all(|edge| edge.kind == ResolutionSupertypeKind::ImplicitInterfaceMembers)
+        );
+        assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+            interface,
+            ResolutionGapKind::UnsupportedHierarchyTraversal
+        )));
+        let child = identifier(
+            &facts,
+            "Child",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        )
+        .site;
+        assert!(
+            facts.supertypes.iter().any(
+                |edge| edge.subtype == child && edge.kind == ResolutionSupertypeKind::Interface
+            )
+        );
+    }
+
+    #[test]
     fn only_directly_instantiable_classes_publish_a_default_constructor_site() {
         let overloaded = parse("record R(int x) { R() { this(0); } }");
         let r = identifier(
@@ -7665,6 +8490,8 @@ mod tests {
             ResolutionNamespace::Type,
         )
         .site;
+        // #6291 / 51c51699dd: compact formals come from the record header,
+        // closing the prior unsupported-signature applicability obligation.
         assert!(!compact.gaps.contains(&ResolutionGapFact::new(
             c,
             ResolutionGapKind::ImplicitConstructor
@@ -7676,7 +8503,7 @@ mod tests {
             ResolutionNamespace::Constructor,
         )
         .site;
-        assert!(compact.gaps.contains(&ResolutionGapFact::new(
+        assert!(!compact.gaps.contains(&ResolutionGapFact::new(
             compact_constructor,
             ResolutionGapKind::UnsupportedCallApplicability
         )));
@@ -7684,8 +8511,8 @@ mod tests {
             compact
                 .callable_parameters
                 .iter()
-                .all(|parameter| parameter.callable != compact_constructor),
-            "implicit record-component parameters are not fabricated"
+                .any(|parameter| parameter.callable == compact_constructor),
+            "compact constructor formals come from the record header"
         );
 
         let constructors = |facts: &FileResolutionFacts| {
@@ -7799,7 +8626,9 @@ mod tests {
         )
         .site;
 
-        assert_eq!(facts.supertypes.len(), 5);
+        // #6291 / ebbe6c1af3: two parentless interfaces add Object member
+        // roots; their hierarchy gaps move from owners to provider references.
+        assert_eq!(facts.supertypes.len(), 7);
         let edge_names = facts
             .supertypes
             .iter()
@@ -7842,9 +8671,9 @@ mod tests {
                 .count(),
             7
         );
-        for implicit_root in [base, other] {
-            assert!(facts.gaps.contains(&ResolutionGapFact::new(
-                implicit_root,
+        for parentless_interface in [base, other] {
+            assert!(!facts.gaps.contains(&ResolutionGapFact::new(
+                parentless_interface,
                 ResolutionGapKind::UnsupportedHierarchyTraversal
             )));
         }
@@ -8375,12 +9204,34 @@ mod tests {
         let enumeration = nested_type("E");
         let record = nested_type("R");
         let annotation = nested_type("N");
+        // #6291: records gain canonical constructor visibility; interfaces
+        // and enums now name missing parent providers through synthetic roots.
+        let record_constructor = facts
+            .member_owners
+            .iter()
+            .find(|member| {
+                member.owner == record && member.kind == ResolutionMemberKind::Constructor
+            })
+            .expect("implicit record constructor")
+            .member;
+        let visibility = |declaration| {
+            facts
+                .declaration_visibilities
+                .iter()
+                .find(|fact| fact.declaration == declaration)
+                .unwrap()
+                .visibility
+        };
+        assert_eq!(visibility(record_constructor), visibility(record));
         assert_eq!(
             non_visibility_gaps(&facts),
             vec![
-                ResolutionGapFact::new(interface, ResolutionGapKind::UnsupportedHierarchyTraversal),
                 ResolutionGapFact::new(
-                    enumeration,
+                    implicit_superclass_reference(&facts, interface),
+                    ResolutionGapKind::UnsupportedHierarchyTraversal
+                ),
+                ResolutionGapFact::new(
+                    implicit_superclass_reference(&facts, enumeration),
                     ResolutionGapKind::UnsupportedHierarchyTraversal
                 ),
                 ResolutionGapFact::new(record, ResolutionGapKind::UnsupportedHierarchyTraversal),
@@ -8407,6 +9258,7 @@ mod tests {
                 interface,
                 enumeration,
                 record,
+                record_constructor,
                 annotation,
             ]
         );
@@ -8533,14 +9385,86 @@ mod tests {
         "#2771: loop and resource suppression hid local bindings and body references"
     )]
     fn unsupported_binders_cannot_leak_affirmative_rows() {
-        let source = "class A<T> { enum E { ONE } record R(int component) {} Object f() { try (A resourceValue = open(); var laterResource = resourceValue; resourceValue) { resourceValue.helper(); } catch (Exception caught) { caught.toString(); } for (String item : items) { item.toString(); } class Local {} Object a = () -> { return hidden; }; Object b = new Object() { Object m() { return hidden2; } }; return a; } }";
+        let source = "class A<T> { enum E { ONE } record R(int component) { int read() { return component; } } Object f() { try (A resourceValue = open(); var laterResource = resourceValue; resourceValue) { resourceValue.helper(); } catch (Exception caught) { caught.toString(); } for (String item : items) { item.toString(); } class Local {} Object a = () -> { return hidden; }; Object b = new Object() { Object m() { return hidden2; } }; return a; } }";
         let facts = parse(source);
         let spellings = identifier_spellings(&facts);
 
-        let unsupported = "component";
+        let component_declarations = facts
+            .identifiers
+            .iter()
+            .filter(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Declaration
+                    && name(&facts, identifier.name) == "component"
+            })
+            .collect::<Vec<_>>();
+        // JLS 8.10.3/8.10.4: field, accessor and canonical formal have
+        // distinct declarations even though the header spells one name.
+        assert_eq!(component_declarations.len(), 3);
+        let component = facts
+            .callable_parameters
+            .iter()
+            .find(|parameter| {
+                name(
+                    &facts,
+                    identifier_for_site(&facts, parameter.parameter).name,
+                ) == "component"
+            })
+            .expect("record component formal")
+            .parameter;
+        let record = identifier(
+            &facts,
+            "R",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        )
+        .site;
+        let constructor = facts
+            .member_owners
+            .iter()
+            .find(|member| {
+                member.owner == record && member.kind == ResolutionMemberKind::Constructor
+            })
+            .unwrap()
+            .member;
         assert!(
-            !spellings.contains(&unsupported),
-            "unsupported subtree leaked {unsupported:?}: {spellings:?}"
+            facts
+                .callable_parameters
+                .iter()
+                .any(|parameter| parameter.callable == constructor
+                    && parameter.parameter == component)
+        );
+        let binder = facts
+            .binders
+            .iter()
+            .find(|binder| binder.declaration == component)
+            .expect("component formal has a binder");
+        assert_eq!(binder.kind, ResolutionBinderKind::Parameter);
+        assert_eq!(binder.activation_start, binder.activation_end);
+        assert_eq!(&source[binder.activation_start..binder.activation_end], "");
+        assert_eq!(facts.scope(binder.scope).owner, Some(constructor));
+        let read = identifier(
+            &facts,
+            "component",
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Value,
+        )
+        .site;
+        let read_site = site(&facts, read);
+        assert!(read_site.start_byte > binder.activation_end);
+        let mut scope = Some(read_site.scope);
+        while let Some(current) = scope {
+            assert_ne!(
+                current, binder.scope,
+                "a record method cannot see its constructor's parameters"
+            );
+            scope = facts.scope(current).parent;
+        }
+        assert!(
+            !facts
+                .member_owners
+                .iter()
+                .any(|member| member.member == component),
+            "the canonical parameter is distinct from the component field and accessor"
         );
         for supported in [
             "ONE",
@@ -8661,8 +9585,8 @@ mod tests {
                 .iter()
                 .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::Return)
                 .count(),
-            2,
-            "the outer and anonymous methods retain their return edges"
+            3,
+            "the outer, anonymous and added record methods retain their return edges"
         );
         assert_eq!(
             facts
@@ -8670,7 +9594,7 @@ mod tests {
                 .iter()
                 .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedScopeOrBinder)
                 .count(),
-            1,
+            0, // The complete record header now publishes every component member.
             "all resolution gaps: {:?}",
             facts.gaps
         );
@@ -8698,7 +9622,9 @@ mod tests {
                 .iter()
                 .filter(|gap| gap.kind == ResolutionGapKind::UnsupportedVisibility)
                 .count(),
-            6,
+            // The implicit constructor and read method have package-private
+            // access; the new component field has private access (JLS 8.10.3).
+            9,
             "all resolution gaps: {:?}",
             facts.gaps
         );
@@ -8793,6 +9719,20 @@ mod tests {
                 facts.reference_enumeration_gaps
             );
         }
+
+        let annotated_record = parse("record R(@Component(Values.FLAG) int value) {}");
+        let component_spellings = identifier_spellings(&annotated_record);
+        for spelling in ["Component", "Values", "FLAG"] {
+            assert!(
+                component_spellings.contains(&spelling),
+                "record header annotation reference omitted {spelling:?}: {component_spellings:?}"
+            );
+        }
+        assert!(
+            annotated_record.reference_enumeration_gaps.is_empty(),
+            "record component annotations stay structurally enumerated: {:?}",
+            annotated_record.reference_enumeration_gaps
+        );
 
         let module = parse_file(
             "module sample.app { requires other.mod; exports sample.pkg to friend.mod; opens sample.internal; uses Service; provides Service with Implementation, other.Implementation; }",

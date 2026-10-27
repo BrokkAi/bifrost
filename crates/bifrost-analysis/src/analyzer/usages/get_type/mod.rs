@@ -152,7 +152,7 @@ pub fn exact_semantic_model_type_outcome(
             == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete;
     let types = records
         .into_iter()
-        .map(|symbol| semantic_model_lookup_type(file, symbol))
+        .map(|symbol| semantic_model_lookup_type(file, &symbol))
         .collect();
     Some(TypeLookupOutcome {
         status: if complete {

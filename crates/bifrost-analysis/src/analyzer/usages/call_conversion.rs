@@ -104,10 +104,10 @@ impl ExternalConversionIdentity {
     }
 
     #[doc(hidden)]
-    pub fn model_declaration<'a>(
+    pub fn model_declaration(
         &self,
-        overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
-    ) -> Option<&'a crate::analyzer::semantic_model::SemanticModelSymbol> {
+        overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>> {
         let ExternalConversionProvenance::SemanticPack {
             pack_id,
             declaration_id,
@@ -129,7 +129,7 @@ impl ExternalConversionIdentity {
         (symbol.provenance.pack_id == *pack_id
             && symbol.qualified_name == self.fqn
             && !symbol.provenance.ambiguous)
-            .then_some(*symbol)
+            .then(|| Arc::clone(symbol))
     }
 
     pub fn fqn(&self) -> &str {

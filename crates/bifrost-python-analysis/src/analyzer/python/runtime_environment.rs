@@ -1452,6 +1452,90 @@ mod tests {
         )
     }
 
+    fn production_profile(
+        fixture: &Fixture,
+        runtime: Option<&PythonRuntimeEnvironmentConfig>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryProfile,
+        PythonDeclaredEnvironmentError,
+    > {
+        let project = brokk_bifrost_core::analyzer::project::TestProject::new(
+            fixture.workspace.path().to_path_buf(),
+            brokk_bifrost_core::analyzer::Language::Python,
+        );
+        crate::analyzer::python::runtime_artifact::python_production_summary_profile(
+            &project,
+            runtime,
+            &DependencyPackLimits::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn production_profile_uses_workspace_packaging_without_runtime() {
+        use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
+            PythonSummaryAuthority, PythonSummaryObservation,
+        };
+        let fixture = fixture();
+        let mut undeclared = fixture.runtime.clone();
+        undeclared.declared_environment = None;
+        for runtime in [None, Some(&undeclared)] {
+            let profile = production_profile(&fixture, runtime).unwrap();
+            assert!(matches!(
+                profile.authority,
+                PythonSummaryAuthority::Workspace
+            ));
+            assert!(matches!(
+                profile.observation,
+                PythonSummaryObservation::Runtime
+            ));
+            assert!(!profile.ordered);
+            assert!(profile.roots.is_empty(), "{:?}", profile.roots);
+        }
+    }
+
+    #[test]
+    fn production_profile_checks_declared_runtime_inputs() {
+        use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryAuthority;
+        let fixture = fixture();
+        let profile = production_profile(&fixture, Some(&fixture.runtime)).unwrap();
+        let roots = root_inventories(fixture.workspace.path(), &fixture.runtime);
+        let proof = produce(
+            &fixture,
+            &fixture.runtime,
+            &roots,
+            &DependencyPackLimits::default(),
+            None,
+        )
+        .unwrap();
+        let PythonSummaryAuthority::CheckedRuntime {
+            project_config_digest,
+        } = profile.authority
+        else {
+            panic!("verified runtime must supply authority");
+        };
+        assert_eq!(
+            lower_hex_string(&project_config_digest),
+            proof.project_config().value
+        );
+        assert!(profile.ordered);
+        assert_eq!(profile.roots, vec![PathBuf::from("src")]);
+    }
+
+    #[test]
+    fn production_profile_reports_invalid_runtime_without_workspace_fallback() {
+        let fixture = fixture();
+        fs::write(
+            fixture.workspace.path().join("bin/python"),
+            b"changed interpreter",
+        )
+        .unwrap();
+        assert!(matches!(
+            production_profile(&fixture, Some(&fixture.runtime)),
+            Err(PythonDeclaredEnvironmentError::InputDigestMismatch { .. })
+        ));
+    }
+
     #[test]
     fn project_config_tracks_root_order_and_exact_content_inputs() {
         let fixture = fixture();

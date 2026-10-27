@@ -179,6 +179,11 @@ pub(super) struct ScanCtx<'a> {
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
     nearest_member_target_cache: HashMap<NearestMemberTargetKey, (TargetMemberResolution, bool)>,
+    /// The type each call-argument target parameter declares, by callee and
+    /// parameter index, with whether deriving it admitted doubt. A derivation
+    /// parses the callee's file, so a scan with many sites that pass the same
+    /// callee a target-typed `new()` reads that file once.
+    callable_parameter_type_cache: HashMap<(CodeUnit, usize), (Option<String>, bool)>,
     extension_target_cache: HashMap<ExtensionTargetCacheKey, (TargetMemberResolution, bool)>,
     pub(super) class_ranges: ClassRangeIndex,
     using_aliases: &'a HashMap<String, String>,
@@ -215,6 +220,7 @@ impl<'a> ScanCtx<'a> {
             limit_exceeded,
             enclosing_cache: HashMap::default(),
             nearest_member_target_cache: HashMap::default(),
+            callable_parameter_type_cache: HashMap::default(),
             extension_target_cache: HashMap::default(),
             target_visibility: None,
             class_ranges: prepared.class_ranges.clone(),
@@ -1319,6 +1325,32 @@ fn identifier_is_member_access_name(node: Node<'_>) -> bool {
         })
 }
 
+/// The class that parameter `parameter_index` of `method` declares, which a
+/// target-typed `new()` passed to it constructs.
+fn call_argument_parameter_owner(
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+    method: &CodeUnit,
+    parameter_index: usize,
+) -> Option<CodeUnit> {
+    let key = (method.clone(), parameter_index);
+    let fqn = match ctx.callable_parameter_type_cache.get(&key) {
+        Some((fqn, doubted)) => {
+            ctx.membership.replay(*doubted);
+            fqn.clone()
+        }
+        None => {
+            let (fqn, doubted) = ctx.membership.measured(|| {
+                callable_parameter_type_fq_name(ctx.csharp, token, method, parameter_index)
+            });
+            ctx.callable_parameter_type_cache
+                .insert(key, (fqn.clone(), doubted));
+            fqn
+        }
+    };
+    class_unit_for_fq_name(ctx.csharp, token, &fqn?)
+}
+
 enum LabelOwnerResolution {
     NotLabel,
     MatchesTarget,
@@ -1420,22 +1452,18 @@ impl CSharpInitializerOwnerLookups for InverseInitializerOwnerLookups<'_, '_> {
 
     fn call_argument_owners(&mut self, call: Node<'_>, index: usize) -> CSharpCallArgumentOwners {
         let candidates = inverse_call_argument_method_candidates(call, self.token, self.ctx);
+        let token = self.token;
+        let (csharp, source) = (self.ctx.csharp, self.ctx.source);
         resolve_call_argument_owners(
             call,
             index,
-            self.ctx.source,
+            source,
             candidates,
-            |method| self.ctx.csharp.signature_metadata(method),
+            |method| csharp.signature_metadata(method),
             |method, parameter_index| {
-                callable_parameter_type_fq_name(
-                    self.ctx.csharp,
-                    self.token,
-                    method,
-                    parameter_index,
-                )
-                .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
-                .into_iter()
-                .collect()
+                call_argument_parameter_owner(token, self.ctx, method, parameter_index)
+                    .into_iter()
+                    .collect()
             },
         )
     }

@@ -174,6 +174,18 @@ impl SelectedGoImportBindingDescriptor {
     }
 }
 
+impl SelectedGoImportBindingDescriptor {
+    pub(super) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        self.completion.charge_retained(heap);
+        if let Some(provider) = &self.presumed_provider {
+            provider.charge_retained(heap);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::engine::PreloadedFragmentSource;

@@ -161,6 +161,7 @@ pub(super) fn authored_pack(
     shards: Vec<AuthoredShard>,
 ) -> AuthoredSemanticModelPack {
     AuthoredSemanticModelPack {
+        extraction: None,
         schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id,
         version,
@@ -683,6 +684,7 @@ fn round_trip(
         Completeness::Partial
     };
     let pack = AuthoredSemanticModelPack {
+        extraction: None,
         schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: format!("bifrost.summary-foundry.{}", corpus.as_str()),
         version: "0.0.0".to_owned(),

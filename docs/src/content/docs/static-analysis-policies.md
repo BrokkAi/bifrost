@@ -3977,8 +3977,9 @@ over its own files for each `run_policy` call instead of evaluating on the
 analyzer that serves its other tools, so its policy findings match the CLI's.
 Units are published to the repository's analyzer cache under keys that every
 entry point computes identically, so a unit one entry point publishes is a unit
-another can reuse. An ordinary scan computes every unit afresh and publishes
-what completes; a later `--diff-base` run whose base is that same revision
+another can reuse. An ordinary scan reuses the units whose recorded inputs it
+verifies against its own workspace, recomputes the rest, and publishes what
+completes; a later `--diff-base` run whose base is that same revision
 reuses those units for its base evaluation, and its head reuses the ones whose
 inputs it verifies. Reuse is on by default everywhere; the full-evaluation
 override is `--no-incremental` on the CLI, `incremental: false` for MCP

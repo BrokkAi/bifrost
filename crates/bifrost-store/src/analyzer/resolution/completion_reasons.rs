@@ -1231,6 +1231,26 @@ impl Hash for CompletionReasons {
     }
 }
 
+impl CompletionReasons {
+    pub(crate) fn charge_retained(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        match &self.0 {
+            CompletionReasonsRepr::Raw(reasons) => heap.slice(reasons),
+            CompletionReasonsRepr::Factored {
+                base,
+                excluded,
+                additions,
+            } => {
+                heap.arc(base, |base, heap| heap.slice(&base.reasons));
+                heap.slice(excluded);
+                heap.slice(additions);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

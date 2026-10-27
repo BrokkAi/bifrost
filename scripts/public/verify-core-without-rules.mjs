@@ -14,8 +14,13 @@ const execute = promisify(execFile);
 export async function verifyCoreWithoutRules(binary, expectedIdentity, { exec = execute } = {}) {
   assert.match(expectedIdentity, /^[a-f0-9]{40}$/u);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "bifrost-core-without-rules-"));
-  const env = { ...process.env };
-  delete env.BIFROST_OPEN_POLICY_PACK_ROOT;
+  // Qualify only what the binary delivers. Host rule content reaches the engine
+  // through BIFROST_* variables (pack and bundle roots) and through runtime
+  // acquisition of public rule releases, which installs the absent rule below
+  // whenever anonymous discovery succeeds. None of the commands here needs a
+  // BIFROST_* variable, so drop them all rather than track the engine's list.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("BIFROST_")));
+  env.BIFROST_OPEN_PACKS_DISABLE = "1";
   try {
     const options = { env, cwd: root, encoding: "utf8", timeout: 60_000, maxBuffer: 4 * 1024 * 1024 };
     const identity = (await exec(binary, ["--build-identity"], options)).stdout.trim();
@@ -35,7 +40,7 @@ export async function verifyCoreWithoutRules(binary, expectedIdentity, { exec = 
       await exec(binary, ["--root", root, "--policy", "--policy-id", "bifrost.correctness.dynamic-evaluation"], options);
     } catch (error) {
       assert.ok(error.code !== "ENOENT" && !error.killed, "selection check failed to execute");
-      assert.match(String(error.stderr), /unknown|not found|no.*polic/iu);
+      assert.match(String(error.stderr), /unknown built-in policy id `bifrost\.correctness\.dynamic-evaluation`/u);
       rejected = true;
     }
     assert.ok(rejected, "core engine silently restored an absent product rule");

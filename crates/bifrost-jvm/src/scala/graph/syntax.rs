@@ -1516,10 +1516,6 @@ pub fn scala_method_value_site_with_parents<'tree>(
     })
 }
 
-pub fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
-    is_type_like_reference_with_parents(node, source, &ParentIndex::unindexed())
-}
-
 /// In `A TypeOperator B`, the grammar exposes `TypeOperator` as the exact
 /// `operator` field of `infix_type`, even when it is an ordinary `identifier`.
 pub fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
@@ -2279,10 +2275,6 @@ pub fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
     is_constructor_like_reference_with_parents(node, source, &ParentIndex::unindexed())
 }
 
-pub fn parent_kind(node: Node<'_>) -> Option<&str> {
-    parent_kind_with_parents(node, &ParentIndex::unindexed())
-}
-
 pub use brokk_bifrost_core::analyzer::tree_walk::has_ancestor_kind;
 
 pub fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
@@ -2299,21 +2291,6 @@ pub fn field_expression_for_member_with_parents<'tree>(
     } else {
         None
     }
-}
-
-pub fn member_qualifier_node(node: Node<'_>) -> Option<Node<'_>> {
-    field_expression_for_member(node)?.child_by_field_name("value")
-}
-
-pub fn member_qualifier(node: Node<'_>, source: &str) -> Option<String> {
-    member_qualifier_node(node)
-        .map(|value| {
-            node_text(value, source)
-                .trim()
-                .trim_end_matches('$')
-                .to_string()
-        })
-        .filter(|qualifier| !qualifier.is_empty())
 }
 
 pub fn is_owner_qualified_this(qualifier: Node<'_>, source: &str) -> bool {
@@ -3239,6 +3216,27 @@ object Roleful { def apply(using String): Roleful = new Roleful(0) }
 "#;
         let prototype = Arc::new(scala_source_facts(source).expect("Scala source facts"));
         assert!(!prototype.callable_alternatives_by_range.is_empty());
+        let mut expected_roles = prototype
+            .callable_alternatives_by_range
+            .values()
+            .map(|alternative| alternative.role)
+            .collect::<Vec<_>>();
+        expected_roles.sort_by_key(|role| match role {
+            ScalaCallableRole::Ordinary => 0,
+            ScalaCallableRole::PrimaryConstructor => 1,
+            ScalaCallableRole::SecondaryConstructor => 2,
+        });
+        assert_eq!(
+            expected_roles,
+            vec![
+                ScalaCallableRole::Ordinary,
+                ScalaCallableRole::PrimaryConstructor,
+                ScalaCallableRole::SecondaryConstructor,
+                ScalaCallableRole::SecondaryConstructor,
+            ],
+            "the fixture declares apply, a primary constructor, and two secondary constructors"
+        );
+        assert!(prototype.abstract_callable_ranges.is_empty());
 
         let root = std::env::temp_dir().join("bifrost-3393-scala-facts-cache");
         let files = (0..8)
@@ -3349,8 +3347,33 @@ object Outer {
             tree.root_node().to_sexp()
         );
         let parents = ParentIndex::new(tree.root_node());
+        let binder_start = source
+            .find("case Outer.Item(value)")
+            .expect("extractor pattern")
+            + "case Outer.Item(".len();
+        let qualified_type_start = source
+            .find("selected: Outer.Item")
+            .expect("qualified type annotation")
+            + "selected: Outer.".len();
+        let mut saw_expected_binder = false;
+        let mut saw_expected_qualified_type = false;
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
+            if node.start_byte() == binder_start && node.kind() == "identifier" {
+                assert_eq!(node_text(node, source), "value");
+                assert!(is_scala_case_pattern_binder_with_parents(
+                    node, source, &parents
+                ));
+                saw_expected_binder = true;
+            }
+            if node.start_byte() == qualified_type_start {
+                let reference =
+                    qualified_stable_type_reference_with_parents(node, source, &parents)
+                        .expect("Outer.Item type reference");
+                assert_eq!(reference.segments, vec!["Outer", "Item"]);
+                assert_eq!(reference.role, ScalaQualifiedStableTypeRole::Type);
+                saw_expected_qualified_type = true;
+            }
             assert_eq!(
                 is_scala_case_pattern_binder_with_parents(node, source, &parents),
                 is_scala_case_pattern_binder(node, source),
@@ -3435,6 +3458,14 @@ object Outer {
             let mut cursor = node.walk();
             stack.extend(node.children(&mut cursor));
         }
+        assert!(
+            saw_expected_binder,
+            "the expected case binder node was visited"
+        );
+        assert!(
+            saw_expected_qualified_type,
+            "the expected qualified type node was visited"
+        );
     }
 
     fn explicit(arity: usize) -> ScalaCallableParameterList {

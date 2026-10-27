@@ -72,12 +72,78 @@ fn cpp_is_ignorable_clone_logging_node(node: Node<'_>, source: &str) -> bool {
     if node.kind() != "expression_statement" {
         return false;
     }
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    text.contains("std::cout")
-        || text.contains("std::cerr")
-        || text.contains("std::clog")
-        || text.starts_with("printf(")
+    let Some(mut expression) = node.named_child(0) else {
+        return false;
+    };
+    if expression.kind() == "call_expression" {
+        return expression
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                function.kind() == "identifier"
+                    && function.utf8_text(source.as_bytes()).expect("source node") == "printf"
+            });
+    }
+    if expression.kind() != "binary_expression" {
+        return false;
+    }
+    // Stream insertion is left associative. Only a chain rooted at a logging
+    // stream is ignorable; a sink mentioned in an argument is ordinary work.
+    while expression.kind() == "binary_expression" {
+        if expression
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "<<")
+        {
+            return false;
+        }
+        expression = expression
+            .child_by_field_name("left")
+            .expect("binary expression has a left operand");
+    }
+    expression.kind() == "qualified_identifier"
+        && expression
+            .child_by_field_name("scope")
+            .is_some_and(|scope| {
+                scope.kind() == "namespace_identifier"
+                    && scope.utf8_text(source.as_bytes()).expect("source node") == "std"
+            })
+        && expression.child_by_field_name("name").is_some_and(|name| {
+            name.kind() == "identifier"
+                && matches!(
+                    name.utf8_text(source.as_bytes()).expect("source node"),
+                    "cout" | "cerr" | "clog"
+                )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    mod clone_properties {
+        use brokk_bifrost_test_macros::hardwon;
+        use proptest::prelude::*;
+
+        // Oracle: consistent identifier/literal renaming and inserting standalone
+        // printf/std::{cout,cerr,clog} statements preserve the clone class. Adding
+        // a branch or a non-logging call changes it, even when a string argument
+        // spells a sink or a sink call is nested inside the new call.
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(32))]
+            #[test]
+            #[hardwon("d4f00f8567e4: ordinary calls containing stream names disappeared from clone profiles")]
+            fn clone_edits_obey_declared_equivalence_classes(value in 1u16..1000) {
+                let mut parser = crate::clones::cpp_clone_parser();
+                let original = "int sum(int n) { int total = 1; for (int i = 0; i < n; ++i) { total += i; } return total; }";
+                let renamed = format!("int count(int limit) {{ int result = {value}; for (int index = 0; index < limit; ++index) {{ result += index; }} return result; }}");
+                let profile = crate::clones::cpp_clone_profile(&mut parser, original);
+                prop_assert_eq!(&profile, &crate::clones::cpp_clone_profile(&mut parser, &renamed));
+                for log in ["printf(\"progress\");", "std::cout << total;", "std::cerr << total;", "std::clog << total;"] {
+                    let edited = original.replace("return total;", &format!("{log} return total;"));
+                    prop_assert_eq!(&profile, &crate::clones::cpp_clone_profile(&mut parser, &edited), "log: {}", log);
+                }
+                for work in ["if (n) { ++total; }", "consume(total);", "consume(\"std::cout\");", "consume(\"std::cerr\");", "consume(\"std::clog\");", "consume(\"printf(\");", "consume(printf(\"progress\"));", "consume(std::cout);"] {
+                    let edited = original.replace("return total;", &format!("{work} return total;"));
+                    prop_assert_ne!(&profile, &crate::clones::cpp_clone_profile(&mut parser, &edited), "work: {}", work);
+                }
+            }
+        }
+    }
 }

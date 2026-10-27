@@ -72,13 +72,6 @@ mod rust_departing_wave2_root_tests {
         let fixture = RustRootResolutionOperationFixture::new();
         let cancellation = CancellationToken::new();
         let operation = fixture.open_ready(&cancellation);
-        assert!(
-            operation
-                .ready
-                .inventory
-                .replace_resolution_requests_1(std::iter::empty(), &cancellation)
-                .unwrap()
-        );
         let conn = operation.ready.inventory.connection();
         let registry = registry();
         for sql in [

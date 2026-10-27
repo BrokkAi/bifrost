@@ -185,6 +185,7 @@ mod tests {
             payload,
             coverage: Some(Completeness::Complete),
             provenance: SemanticModelProvenance {
+                extraction: None,
                 active_model_set_hash: "active".into(),
                 pack_digest: "digest".into(),
                 pack_id: "test.deferred".into(),

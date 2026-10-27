@@ -207,13 +207,16 @@ pub fn read_maven_configuration(path: &Path, source: &str) -> Option<MavenConfig
                     let optional_literal = dependency
                         .child_text("optional")
                         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+                    // An absent scope is Maven's compile default; a scope whose
+                    // property does not resolve is not known to be compile.
                     let topology_kind = if optional_literal {
                         DependencyScope::Optional
                     } else {
-                        maven_scope_edge_kind(match &scope {
-                            MavenValue::Resolved(value) => Some(value),
-                            _ => None,
-                        })
+                        match &scope {
+                            MavenValue::Resolved(value) => maven_scope_edge_kind(Some(value)),
+                            MavenValue::Missing => maven_scope_edge_kind(None),
+                            MavenValue::Unresolved => DependencyScope::Unknown,
+                        }
                     };
                     MavenDependencyFacts {
                         ordinal: u32::try_from(ordinal)
@@ -275,5 +278,351 @@ pub fn maven_scope_edge_kind(scope: Option<&str>) -> DependencyScope {
         Some("test") => DependencyScope::Test,
         Some("provided") => DependencyScope::Provided,
         Some(_) => DependencyScope::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn pom(path: &str, source: &str) -> Option<MavenConfigurationFacts> {
+        maven_configuration_from_bytes(Path::new(path), source.as_bytes())
+    }
+
+    fn resolved(value: &str) -> MavenValue {
+        MavenValue::Resolved(value.to_owned())
+    }
+
+    /// A child module pom in the shape Maven's CI-friendly versions produce:
+    /// groupId and version come from `<parent>`, the version is `${revision}`,
+    /// and properties refer to other properties and to `project.*` values.
+    #[test]
+    fn child_pom_inherits_parent_coordinates_and_expands_nested_properties() {
+        let source = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.acme</groupId>
+    <artifactId>acme-parent</artifactId>
+    <version>${revision}</version>
+  </parent>
+  <artifactId>billing</artifactId>
+  <properties>
+    <revision>2.4.0</revision>
+    <slf4j.version>2.0.13</slf4j.version>
+    <logging.version>${slf4j.version}</logging.version>
+    <sibling.version>${project.version}</sibling.version>
+  </properties>
+  <modules>
+    <module>${project.artifactId}-api</module>
+    <module> core </module>
+    <module>${undefined.module}</module>
+  </modules>
+  <dependencies>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${logging.version}</version>
+    </dependency>
+    <!-- a sibling module of the same reactor -->
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>billing-model</artifactId>
+      <version>${sibling.version}</version>
+      <classifier>${undefined.classifier}</classifier>
+    </dependency>
+  </dependencies>
+</project>
+"#;
+        let facts = pom("services/billing/pom.xml", source).expect("a named Maven project");
+        assert_eq!(facts.directory, PathBuf::from("services/billing"));
+        assert_eq!(facts.group_id, "com.acme");
+        assert_eq!(facts.artifact_id, "billing");
+        assert_eq!(facts.version, resolved("2.4.0"));
+        assert_eq!(
+            facts.modules,
+            vec![
+                resolved("billing-api"),
+                resolved("core"),
+                MavenValue::Unresolved
+            ]
+        );
+        assert_eq!(facts.limitations, vec![MavenModelLimitation::ParentModel]);
+        assert_eq!(
+            facts.default_source_roots(),
+            [
+                ("main", PathBuf::from("services/billing/src/main")),
+                ("test", PathBuf::from("services/billing/src/test")),
+            ]
+        );
+
+        let [logging, sibling] = facts.dependencies.as_slice() else {
+            panic!("two dependencies: {:?}", facts.dependencies);
+        };
+        assert_eq!(logging.ordinal, 0);
+        assert_eq!(logging.group_id, resolved("org.slf4j"));
+        assert_eq!(logging.version, resolved("2.0.13"));
+        assert_eq!(logging.scope, MavenValue::Missing);
+        assert_eq!(logging.artifact_type, MavenValue::Missing);
+        assert_eq!(logging.optional, MavenValue::Missing);
+        assert_eq!(logging.topology_kind, DependencyScope::Compile);
+        assert_eq!(sibling.ordinal, 1);
+        assert_eq!(sibling.group_id, resolved("com.acme"));
+        assert_eq!(sibling.artifact_id, resolved("billing-model"));
+        assert_eq!(sibling.version, resolved("2.4.0"));
+        assert_eq!(sibling.classifier, MavenValue::Unresolved);
+
+        // A pom's own groupId and version override the parent's; artifactId
+        // is never inherited.
+        let own = pom(
+            "pom.xml",
+            "<project><parent><groupId>parent.group</groupId><artifactId>base</artifactId>\
+             <version>1.0</version></parent><groupId>own.group</groupId>\
+             <artifactId>app</artifactId><version>9.1</version></project>",
+        )
+        .expect("a named Maven project");
+        assert_eq!(own.group_id, "own.group");
+        assert_eq!(own.artifact_id, "app");
+        assert_eq!(own.version, resolved("9.1"));
+        assert_eq!(own.directory, PathBuf::new());
+    }
+
+    #[test]
+    fn pom_without_a_resolvable_named_project_yields_no_facts() {
+        let accepted = "<project><groupId>g</groupId><artifactId>a</artifactId></project>";
+        let control = pom("pom.xml", accepted).expect("the control pom names a project");
+        assert_eq!(control.version, MavenValue::Missing);
+        assert!(control.limitations.is_empty());
+
+        for (label, source) in [
+            (
+                "root is not <project>",
+                "<settings><groupId>g</groupId><artifactId>a</artifactId></settings>",
+            ),
+            (
+                "artifactId is not inherited from the parent",
+                "<project><parent><groupId>g</groupId><artifactId>p</artifactId>\
+                 <version>1</version></parent></project>",
+            ),
+            (
+                "no groupId and no parent",
+                "<project><artifactId>a</artifactId></project>",
+            ),
+            (
+                "whitespace-only groupId and no parent",
+                "<project><groupId>  </groupId><artifactId>a</artifactId></project>",
+            ),
+            (
+                "groupId names an undefined property",
+                "<project><groupId>${undefined}</groupId><artifactId>a</artifactId></project>",
+            ),
+            (
+                "artifactId refers to itself",
+                "<project><groupId>g</groupId><artifactId>${project.artifactId}</artifactId>\
+                 </project>",
+            ),
+            (
+                "mismatched end tag",
+                "<project><groupId>g</artifactId><artifactId>a</artifactId></project>",
+            ),
+            (
+                "unclosed root",
+                "<project><groupId>g</groupId><artifactId>a</artifactId>",
+            ),
+        ] {
+            let facts = pom("pom.xml", source);
+            assert!(facts.is_none(), "{label}: {facts:?}");
+        }
+
+        // Invalid UTF-8 inside a comment would still parse after lossy
+        // decoding; the exact bytes are not a readable configuration.
+        let mut invalid_utf8 =
+            b"<project><groupId>g</groupId><artifactId>a</artifactId><!-- ".to_vec();
+        invalid_utf8.extend_from_slice(&[0xff, 0xfe]);
+        invalid_utf8.extend_from_slice(b" --></project>");
+        assert!(pom("pom.xml", &String::from_utf8_lossy(&invalid_utf8)).is_some());
+        assert!(maven_configuration_from_bytes(Path::new("pom.xml"), &invalid_utf8).is_none());
+
+        // The byte cap is inclusive: a pom of exactly the cap is read.
+        let at_cap = format!(
+            "{accepted}{}",
+            " ".repeat(MAX_BUILD_METADATA_BYTES - accepted.len())
+        );
+        assert_eq!(at_cap.len(), MAX_BUILD_METADATA_BYTES);
+        assert!(pom("pom.xml", &at_cap).is_some());
+        let over_cap = format!("{at_cap} ");
+        assert!(pom("pom.xml", &over_cap).is_none());
+    }
+
+    /// Maven's scope vocabulary: an absent scope is `compile`; `system` and
+    /// `import` are real Maven scopes this reader does not model.
+    #[test]
+    fn dependency_scopes_become_topology_edge_kinds() {
+        let dependency = |scope: &str, optional: &str| {
+            format!(
+                "<dependency><groupId>g</groupId><artifactId>d</artifactId>{scope}{optional}</dependency>"
+            )
+        };
+        let cases = [
+            ("", "", DependencyScope::Compile),
+            ("<scope>compile</scope>", "", DependencyScope::Compile),
+            ("<scope> runtime </scope>", "", DependencyScope::Runtime),
+            ("<scope>test</scope>", "", DependencyScope::Test),
+            ("<scope>provided</scope>", "", DependencyScope::Provided),
+            ("<scope>system</scope>", "", DependencyScope::Unknown),
+            ("<scope>import</scope>", "", DependencyScope::Unknown),
+            ("<scope>${test.scope}</scope>", "", DependencyScope::Test),
+            (
+                "<scope>test</scope>",
+                "<optional>TRUE</optional>",
+                DependencyScope::Optional,
+            ),
+            (
+                "<scope>provided</scope>",
+                "<optional>false</optional>",
+                DependencyScope::Provided,
+            ),
+        ];
+        let dependencies: String = cases
+            .iter()
+            .map(|(scope, optional, _)| dependency(scope, optional))
+            .collect();
+        let source = format!(
+            "<project><groupId>g</groupId><artifactId>a</artifactId>\
+             <properties><test.scope>test</test.scope></properties>\
+             <dependencies>{dependencies}</dependencies></project>"
+        );
+        let facts = pom("pom.xml", &source).expect("a named Maven project");
+        let actual: Vec<_> = facts
+            .dependencies
+            .iter()
+            .map(|dependency| (dependency.ordinal, dependency.topology_kind))
+            .collect();
+        let expected: Vec<_> = (0u32..)
+            .zip(cases.iter().map(|(_, _, kind)| *kind))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// `DependencyScope::Unknown` documents that a resolver which cannot
+    /// attribute a dependency to a scope must write Unknown, not guess.
+    #[test]
+    #[hardwon("4961f92aee92: an unresolved ${...} dependency scope was read as compile")]
+    fn unresolved_dependency_scope_is_unknown_not_compile() {
+        let facts = pom(
+            "pom.xml",
+            "<project><groupId>g</groupId><artifactId>a</artifactId><dependencies>\
+             <dependency><groupId>g</groupId><artifactId>d</artifactId>\
+             <scope>${undefined.scope}</scope></dependency></dependencies></project>",
+        )
+        .expect("a named Maven project");
+        assert_eq!(facts.dependencies[0].scope, MavenValue::Unresolved);
+        assert_eq!(
+            facts.dependencies[0].topology_kind,
+            DependencyScope::Unknown
+        );
+    }
+
+    fn domain(path: &str, package: &str, requires_directory: bool) -> Option<PathBuf> {
+        JvmSourceDomain::discover(Path::new(path), package, requires_directory)
+            .map(|domain| domain.root)
+    }
+
+    /// Source domains follow the Maven and Gradle `src/<set>/<language>`
+    /// layout first and the package-mirrors-directory rule otherwise.
+    #[test]
+    fn source_domains_follow_jvm_layout_and_package_directories() {
+        for (path, package, requires_directory, expected) in [
+            (
+                "w/app/src/main/java/com/acme/Order.java",
+                "com.acme",
+                true,
+                Some("w/app/src/main/java"),
+            ),
+            // Kotlin does not require the directory to mirror the package.
+            (
+                "w/app/src/test/kotlin/OrderTest.kt",
+                "com.acme",
+                false,
+                Some("w/app/src/test/kotlin"),
+            ),
+            // A package segment named like a source set is not a source root.
+            (
+                "w/app/src/main/java/org/test/Fixture.java",
+                "org.test",
+                true,
+                Some("w/app/src/main/java"),
+            ),
+            (
+                "w/app/src/main/java/org/java/Util.java",
+                "org.java",
+                true,
+                Some("w/app/src/main/java"),
+            ),
+            (
+                "w/kmp/src/commonMain/kotlin/a/Shared.kt",
+                "a",
+                false,
+                Some("w/kmp/src/commonMain/kotlin"),
+            ),
+            // Without a layout, the package directories locate the root.
+            ("w/lib/com/acme/Order.java", "com.acme", true, Some("w/lib")),
+            ("w/lib/Order.java", "", true, Some("w/lib")),
+            ("w/lib/com/other/Order.java", "com.acme", true, None),
+            (
+                "w/lib/com/other/Order.kt",
+                "com.acme",
+                false,
+                Some("w/lib/com/other"),
+            ),
+        ] {
+            assert_eq!(
+                domain(path, package, requires_directory),
+                expected.map(PathBuf::from),
+                "{path} in package {package:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_sets_see_their_conventional_dependencies() {
+        let root = |path: &str| JvmSourceDomain {
+            root: PathBuf::from(path),
+        };
+        let main = root("w/app/src/main/java");
+        let main_kotlin = root("w/app/src/main/kotlin");
+        let test = root("w/app/src/test/java");
+        let other_main = root("w/lib/src/main/java");
+        let common_main = root("w/kmp/src/commonMain/kotlin");
+        let jvm_main = root("w/kmp/src/jvmMain/kotlin");
+        let jvm_test = root("w/kmp/src/jvmTest/kotlin");
+        let ios_main = root("w/kmp/src/iosMain/kotlin");
+        let plain = root("w/plain");
+        for (caller, target, expected) in [
+            (&test, &main, true),
+            (&main, &test, false),
+            // Java and Kotlin directories of one source set are one set.
+            (&main, &main_kotlin, true),
+            (&test, &other_main, false),
+            (&jvm_test, &jvm_main, true),
+            (&jvm_test, &common_main, true),
+            (&ios_main, &common_main, true),
+            (&common_main, &jvm_main, false),
+            (&jvm_main, &ios_main, false),
+            (&plain, &plain, true),
+            (&plain, &main, false),
+            (&main, &plain, false),
+        ] {
+            assert_eq!(
+                caller.can_access(target),
+                expected,
+                "{:?} -> {:?}",
+                caller.root,
+                target.root
+            );
+        }
     }
 }

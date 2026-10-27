@@ -2390,30 +2390,14 @@ impl EffectTraversalCache {
         if self.result_contract_names.is_none() {
             let mut inventory = ResultContractNameInventory::default();
             if let Some(models) = self.models(analyzer) {
-                for shard in models.shards() {
-                    let Some(summaries) = shard.shard.payload().procedure_summaries() else {
-                        continue;
-                    };
-                    for summary in summaries {
-                        if summary.result_contracts.is_empty() {
-                            continue;
-                        }
-                        let Some((_, member)) =
-                            crate::analyzer::semantic::authored_procedure_target_identity(
-                                &summary.target.path,
-                                &summary.target.symbol,
-                            )
-                        else {
-                            continue;
-                        };
-                        let language = shard.manifest.language.clone();
-                        let arity = summary.target.callable_arity();
-                        inventory
-                            .members
-                            .entry((language, member.to_owned(), summary.target.has_receiver))
-                            .or_default()
-                            .insert(arity);
-                    }
+                for (language, member, has_receiver, arity) in
+                    models.result_contract_name_inventory()
+                {
+                    inventory
+                        .members
+                        .entry((language, member, has_receiver))
+                        .or_default()
+                        .insert(arity);
                 }
             }
             self.result_contract_names = Some(inventory);

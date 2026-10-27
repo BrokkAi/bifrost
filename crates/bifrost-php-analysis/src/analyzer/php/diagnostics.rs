@@ -92,7 +92,7 @@ fn php_members_in_owner_closure<'a>(
     overlay: &'a SemanticModelOverlay,
     owners: impl IntoIterator<Item = &'a str>,
     member: &str,
-) -> Vec<&'a SemanticModelSymbol> {
+) -> Vec<Arc<SemanticModelSymbol>> {
     owners
         .into_iter()
         .flat_map(|owner| overlay.members_of(owner).records)
@@ -111,10 +111,10 @@ pub(crate) const PHP_GLOBAL_NAMESPACE_OWNER: &str =
 /// Matching on the qualified name keeps a terminal-name posting for an
 /// unrelated symbol from answering a fully qualified question, and filtering
 /// to PHP keeps another ecosystem's posting from answering at all.
-fn php_overlay_symbols_named<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn php_overlay_symbols_named(
+    overlay: &SemanticModelOverlay,
     fqn: &str,
-) -> Vec<&'a SemanticModelSymbol> {
+) -> Vec<Arc<SemanticModelSymbol>> {
     overlay
         .symbols_named(fqn)
         .records
@@ -212,7 +212,7 @@ struct AnalyzerPhpExternalSurface {
 }
 
 impl AnalyzerPhpExternalSurface {
-    fn classify(records: &[&SemanticModelSymbol]) -> PhpExternalSymbol {
+    fn classify(records: &[Arc<SemanticModelSymbol>]) -> PhpExternalSymbol {
         match records {
             [] => PhpExternalSymbol::Absent,
             [symbol] if !symbol.provenance.ambiguous => PhpExternalSymbol::Indexed {
@@ -247,12 +247,12 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
             .symbols_with_id(owner_id)
             .records
             .first()
-            .copied()
+            .cloned()
             .expect("the owner identity came from a lookup_type match on this overlay");
         // A member can be inherited, so the owner's whole ancestry is part of
         // the surface the lookup must check, and only a closure with no gap can
         // report the member absent.
-        let surface = overlay.owner_surface(owner);
+        let surface = overlay.owner_surface(&owner);
         let found = php_members_in_owner_closure(
             overlay,
             surface.closure.iter().map(|ancestor| ancestor.id.as_ref()),

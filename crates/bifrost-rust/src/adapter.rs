@@ -5,11 +5,8 @@
 //! -- it names `ParsedFile` and `Language`-registry types this crate cannot see
 //! -- and forwards to these free functions and constants.
 
-use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use std::sync::LazyLock;
-
-use crate::declarations::rust_package_name;
 
 /// Cognitive-complexity node vocabulary for Rust.
 pub static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
@@ -58,10 +55,4 @@ pub const RUST_CLONE_COMMENT_KINDS: &[&str] = &["line_comment", "block_comment"]
 pub fn rust_extract_call_receiver(reference: &str) -> Option<String> {
     brokk_bifrost_core::analyzer::common::extract_call_reference_parts(reference, &["::"])
         .map(|(receiver, _)| receiver.to_string())
-}
-
-/// Whether a declaration's stored package qualifier differs from the one its
-/// path alone implies, i.e. whether it has to be persisted at all.
-pub fn rust_unit_has_explicit_qualifier(code_unit: &CodeUnit) -> bool {
-    code_unit.package_name() != rust_package_name(code_unit.source())
 }

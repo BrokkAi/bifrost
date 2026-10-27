@@ -366,6 +366,8 @@ pub(crate) mod tests {
 
     fn go_test_type(id: &str, name: &str, kind: TypeKind, symbol: &str) -> TypeFact {
         TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             id: id.to_owned(),
             name: name.to_owned(),
             type_kind: kind,
@@ -930,7 +932,10 @@ pub(crate) mod tests {
         normalized_carrier.envelope.as_mut().unwrap(),
     )
     .unwrap();
-        assert_eq!(decoded.runtime_contracts(), Some(&normalized_carrier));
+        assert_eq!(
+            decoded.runtime_contracts().map(AsRef::as_ref),
+            Some(&normalized_carrier)
+        );
 
         let exported = export_runtime_contracts_csmi_pack(&compiled, &CsmiExportOptions::default())
             .expect("portable runtime-contract fixture exports without artifact evidence");
@@ -1055,7 +1060,7 @@ pub(crate) mod tests {
             &DecodeLimits::default(),
         )
         .expect("compiled runtime-values shard decodes");
-        assert_eq!(decoded.runtime_values(), Some(runtime));
+        assert_eq!(decoded.runtime_values().map(AsRef::as_ref), Some(runtime));
 
         let artifact = CsmiArtifactEvidence::new(
             "pkg:generic/nodejs.org/node@22.11.0",
@@ -1871,6 +1876,8 @@ pub(crate) mod tests {
         };
         relations.clear();
         types.push(TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),
@@ -3939,7 +3946,14 @@ pub(crate) mod tests {
         let CompiledPayload::DeclarationFacts { types, members, .. } = &mut decoded.payload else {
             unreachable!();
         };
-        change(types, members);
+        let mut plain_types = types.iter().map(|record| record.as_ref().clone()).collect();
+        let mut plain_members = members
+            .iter()
+            .map(|record| record.as_ref().clone())
+            .collect();
+        change(&mut plain_types, &mut plain_members);
+        *types = plain_types.into_iter().map(std::sync::Arc::new).collect();
+        *members = plain_members.into_iter().map(std::sync::Arc::new).collect();
         let raw = canonical_json(&decoded).unwrap();
         shard.descriptor.raw_size = raw.len() as u64;
         shard.descriptor.stored_size = raw.len() as u64;
@@ -4672,7 +4686,7 @@ pub(crate) mod tests {
             let mut selected = active
                 .shards()
                 .iter()
-                .map(|shard| shard.shard.shard_id())
+                .map(|shard| shard.descriptor.shard_id.as_str().to_owned())
                 .collect::<Vec<_>>();
             selected.sort_unstable();
             assert_eq!(selected, expected_shards);

@@ -436,7 +436,7 @@ impl TypeFlowQueryState {
             cancellation,
             active_semantic_model_snapshot,
         } = query;
-        let Some(cached) = self.solve(
+        let Some(cached) = self.solve_live(
             workspace,
             procedure,
             semantic_budget,
@@ -447,7 +447,7 @@ impl TypeFlowQueryState {
             return ReceiverDispatchAssessment::NotApplicable;
         };
         let CachedTypeFlowAnalysis::Live { result, .. } = cached else {
-            return ReceiverDispatchAssessment::NotApplicable;
+            unreachable!("solve_live returns only live results")
         };
         if !result.complete || result.semantic_budget_exhausted {
             return ReceiverDispatchAssessment::NotApplicable;
@@ -567,7 +567,7 @@ impl TypeFlowQueryState {
         if !is_python_iterator_method(procedure) {
             return Vec::new();
         }
-        let Some(result) = self.solve(
+        let Some(result) = self.solve_live(
             workspace,
             procedure,
             semantic_budget,
@@ -578,7 +578,7 @@ impl TypeFlowQueryState {
             return Vec::new();
         };
         let CachedTypeFlowAnalysis::Live { result, .. } = result else {
-            unreachable!("Python __iter__ roots bypass finding-free row hydration")
+            unreachable!("solve_live returns only live results")
         };
         result
             .class_sets
@@ -807,6 +807,13 @@ impl TypeFlowQueryState {
         );
     }
 
+    /// This root's type-flow result: this query's cached result, the persisted
+    /// finding-free projection of an earlier solve, or a new solve.
+    ///
+    /// The projection answers class-set rows exactly as a live result does,
+    /// and nothing else. A consumer that reads the live receiver sets calls
+    /// [`Self::solve_live`] instead, so that its answer cannot depend on
+    /// whether an earlier query happened to publish this root.
     fn solve(
         &mut self,
         workspace: &WorkspaceAnalyzer,
@@ -816,6 +823,197 @@ impl TypeFlowQueryState {
         cancellation: &CancellationToken,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Option<CachedTypeFlowAnalysis> {
+        if is_python_iterator_method(procedure) {
+            return self.solve_live(
+                workspace,
+                procedure,
+                semantic_budget,
+                limits,
+                cancellation,
+                active_semantic_model_snapshot,
+            );
+        }
+        let (adapter, provider_behavior, field_slots) = self.query_field_slots(
+            workspace,
+            procedure,
+            semantic_budget,
+            cancellation,
+            active_semantic_model_snapshot.clone(),
+        )?;
+        let cache_key = TypeFlowCacheKey {
+            root: procedure.handle.clone(),
+            provider_behavior,
+            field_slots: field_slots.digest(),
+        };
+        match self.cache.get(&cache_key).cloned() {
+            Some(CachedTypeFlowAnalysis::Failed) => {
+                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
+                return None;
+            }
+            Some(result) => {
+                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
+                return Some(result);
+            }
+            None => {}
+        }
+        let persistent_key = if field_slots.semantic_budget_exhausted() {
+            None
+        } else {
+            root_result_persistence_key(
+                workspace,
+                adapter,
+                provider_behavior,
+                &field_slots,
+                &procedure.handle,
+                active_semantic_model_snapshot.as_deref(),
+                limits,
+                semantic_budget.limits(),
+            )
+        };
+        let mut persistent_store_failed = false;
+        if let (Some(store), Some(persistent_key)) = (workspace.store(), persistent_key.as_ref()) {
+            match store.finding_free_class_set_root_result(
+                persistent_key,
+                limits.max_retained_relations,
+                limits.max_retained_bytes,
+                cancellation,
+            ) {
+                Ok(ClassSetRootResultLookup::Hit(persisted))
+                    if persisted.rows.len() <= limits.max_retained_relations
+                        && persisted.retained_bytes() <= limits.max_retained_bytes =>
+                {
+                    let rows: Arc<[ClassSetRowValue]> =
+                        persisted_class_set_rows(procedure.file(), *persisted).into();
+                    self.work.root_result_persistence_hits =
+                        self.work.root_result_persistence_hits.saturating_add(1);
+                    let cached = CachedTypeFlowAnalysis::FindingFreeRows(rows);
+                    self.cache.insert(cache_key, cached.clone());
+                    return Some(cached);
+                }
+                Ok(ClassSetRootResultLookup::Hit(_) | ClassSetRootResultLookup::Rejected(_)) => {
+                    self.work.root_result_persistence_rejections = self
+                        .work
+                        .root_result_persistence_rejections
+                        .saturating_add(1);
+                }
+                Ok(ClassSetRootResultLookup::Miss) => {
+                    self.work.root_result_persistence_misses =
+                        self.work.root_result_persistence_misses.saturating_add(1);
+                }
+                Err(_) if cancellation.is_cancelled() => {
+                    push_deduplicated_diagnostic(
+                        &mut self.diagnostics,
+                        CodeQueryDiagnosticCode::Cancelled,
+                        "class-set root-result hydration was cancelled".to_string(),
+                    );
+                    self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
+                    return None;
+                }
+                Err(_) => {
+                    self.work.root_result_store_failures =
+                        self.work.root_result_store_failures.saturating_add(1);
+                    persistent_store_failed = true;
+                }
+            }
+        }
+        self.solve_root(
+            workspace,
+            adapter,
+            field_slots,
+            cache_key,
+            procedure,
+            persistent_key,
+            persistent_store_failed,
+            semantic_budget,
+            limits,
+            cancellation,
+            active_semantic_model_snapshot,
+        )
+    }
+
+    /// This root's live type-flow result, never the finding-free projection.
+    ///
+    /// Receiver dispatch reads per-site class sets, constructor origins and
+    /// member declarations that the projection does not carry. Answering it
+    /// from a projection hit made one call's dispatch outcome depend on
+    /// whether an earlier query in the process or cache had published the
+    /// root (#6638).
+    fn solve_live(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &SemanticProcedureValue,
+        semantic_budget: &mut SemanticBudget,
+        limits: CodeQueryValueFlowLimits,
+        cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Option<CachedTypeFlowAnalysis> {
+        let (adapter, provider_behavior, field_slots) = self.query_field_slots(
+            workspace,
+            procedure,
+            semantic_budget,
+            cancellation,
+            active_semantic_model_snapshot.clone(),
+        )?;
+        let cache_key = TypeFlowCacheKey {
+            root: procedure.handle.clone(),
+            provider_behavior,
+            field_slots: field_slots.digest(),
+        };
+        match self.cache.get(&cache_key).cloned() {
+            Some(result @ CachedTypeFlowAnalysis::Live { .. }) => {
+                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
+                return Some(result);
+            }
+            Some(CachedTypeFlowAnalysis::Failed) => {
+                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
+                return None;
+            }
+            Some(CachedTypeFlowAnalysis::FindingFreeRows(_)) | None => {}
+        }
+        // A live solve still publishes its projection for row consumers.
+        let persistent_key =
+            if field_slots.semantic_budget_exhausted() || is_python_iterator_method(procedure) {
+                None
+            } else {
+                root_result_persistence_key(
+                    workspace,
+                    adapter,
+                    provider_behavior,
+                    &field_slots,
+                    &procedure.handle,
+                    active_semantic_model_snapshot.as_deref(),
+                    limits,
+                    semantic_budget.limits(),
+                )
+            };
+        self.solve_root(
+            workspace,
+            adapter,
+            field_slots,
+            cache_key,
+            procedure,
+            persistent_key,
+            false,
+            semantic_budget,
+            limits,
+            cancellation,
+            active_semantic_model_snapshot,
+        )
+    }
+
+    /// This query's field-slot index for the root's language, acquired once.
+    fn query_field_slots(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &SemanticProcedureValue,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Option<(
+        &'static dyn TypeFlowAdapter,
+        IcfgProviderBehaviorIdentity,
+        Arc<FieldSlotIndex>,
+    )> {
         let language = language_for_file(procedure.file());
         let Some(adapter) = type_flow_adapter(language) else {
             push_deduplicated_diagnostic(
@@ -959,232 +1157,150 @@ impl TypeFlowQueryState {
                 }
             }
         };
-        let field_slots = Arc::clone(&query_field_slots.index);
-        let cache_key = TypeFlowCacheKey {
-            root: procedure.handle.clone(),
+        Some((
+            adapter,
             provider_behavior,
-            field_slots: field_slots.digest(),
-        };
-        let python_iterator_root = is_python_iterator_method(procedure);
-        match self.cache.get(&cache_key).cloned() {
-            Some(result @ CachedTypeFlowAnalysis::Live { .. }) => {
-                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
-                Some(result)
-            }
-            Some(result @ CachedTypeFlowAnalysis::FindingFreeRows(_)) if !python_iterator_root => {
-                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
-                Some(result)
-            }
-            Some(CachedTypeFlowAnalysis::Failed) => {
-                self.work.cache_hits = self.work.cache_hits.saturating_add(1);
-                None
-            }
-            Some(CachedTypeFlowAnalysis::FindingFreeRows(_)) | None => {
-                let persistent_key =
-                    if field_slots.semantic_budget_exhausted() || python_iterator_root {
-                        None
-                    } else {
-                        root_result_persistence_key(
-                            workspace,
-                            adapter,
-                            provider_behavior,
-                            &field_slots,
-                            &procedure.handle,
-                            active_semantic_model_snapshot.as_deref(),
-                            limits,
-                            semantic_budget.limits(),
-                        )
-                    };
-                let mut persistent_store_failed = false;
-                if let (Some(store), Some(persistent_key)) =
-                    (workspace.store(), persistent_key.as_ref())
-                {
-                    match store.finding_free_class_set_root_result(
-                        persistent_key,
-                        limits.max_retained_relations,
-                        limits.max_retained_bytes,
-                        cancellation,
-                    ) {
-                        Ok(ClassSetRootResultLookup::Hit(persisted))
-                            if persisted.rows.len() <= limits.max_retained_relations
-                                && persisted.retained_bytes() <= limits.max_retained_bytes =>
-                        {
-                            let rows: Arc<[ClassSetRowValue]> =
-                                persisted_class_set_rows(procedure.file(), *persisted).into();
-                            self.work.root_result_persistence_hits =
-                                self.work.root_result_persistence_hits.saturating_add(1);
-                            let cached = CachedTypeFlowAnalysis::FindingFreeRows(rows);
-                            self.cache.insert(cache_key, cached.clone());
-                            return Some(cached);
-                        }
-                        Ok(
-                            ClassSetRootResultLookup::Hit(_)
-                            | ClassSetRootResultLookup::Rejected(_),
-                        ) => {
-                            self.work.root_result_persistence_rejections = self
-                                .work
-                                .root_result_persistence_rejections
-                                .saturating_add(1);
-                        }
-                        Ok(ClassSetRootResultLookup::Miss) => {
-                            self.work.root_result_persistence_misses =
-                                self.work.root_result_persistence_misses.saturating_add(1);
-                        }
-                        Err(_) if cancellation.is_cancelled() => {
-                            push_deduplicated_diagnostic(
-                                &mut self.diagnostics,
-                                CodeQueryDiagnosticCode::Cancelled,
-                                "class-set root-result hydration was cancelled".to_string(),
-                            );
-                            self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
-                            return None;
-                        }
-                        Err(_) => {
-                            self.work.root_result_store_failures =
-                                self.work.root_result_store_failures.saturating_add(1);
-                            persistent_store_failed = true;
-                        }
-                    }
+            Arc::clone(&query_field_slots.index),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn solve_root(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &'static dyn TypeFlowAdapter,
+        field_slots: Arc<FieldSlotIndex>,
+        cache_key: TypeFlowCacheKey,
+        procedure: &SemanticProcedureValue,
+        persistent_key: Option<FindingFreeClassSetRootKey>,
+        persistent_store_failed: bool,
+        semantic_budget: &mut SemanticBudget,
+        limits: CodeQueryValueFlowLimits,
+        cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Option<CachedTypeFlowAnalysis> {
+        self.work.solves = self.work.solves.saturating_add(1);
+        let mut solver_budget = SolverBudget::new(limits.solver_work);
+        let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
+        // Root work starts at zero, while its resident bound includes
+        // the parent's current file, which coexists with its callees.
+        // Historical admissions from the prepass or earlier roots do
+        // not make these new callee admissions free.
+        let mut child_budget = SemanticBudget::new_root_child(semantic_budget);
+        let outcome = solve_type_flow_for_root_with_refinements(
+            workspace,
+            adapter,
+            &field_slots,
+            &procedure.handle,
+            active_semantic_model_snapshot,
+            CLOSURE_LIMITS,
+            FeedbackLimits::default(),
+            self.value_flow_cache.clone(),
+            self.summary_state.clone(),
+            &mut child_budget,
+            &mut request,
+            &mut self.refinements,
+        );
+        // Callee handles are local to the completed root solve.
+        // Fold performed work and its peak into the parent without
+        // importing those now-released resident admissions.
+        semantic_budget.absorb_root_work(child_budget);
+        match outcome {
+            Ok(result) => {
+                self.work.summary_cache_hits = self
+                    .work
+                    .summary_cache_hits
+                    .saturating_add(result.reusable_summary_hits as u64);
+                self.work.summary_cache_misses = self
+                    .work
+                    .summary_cache_misses
+                    .saturating_add(result.reusable_summary_misses as u64);
+                self.work.root_summary_cache_hits = self
+                    .work
+                    .root_summary_cache_hits
+                    .saturating_add(result.reusable_root_summary_hits as u64);
+                self.work.root_summary_observation_rejections = self
+                    .work
+                    .root_summary_observation_rejections
+                    .saturating_add(result.reusable_root_summary_observation_rejections as u64);
+                self.work.published_summaries = self
+                    .work
+                    .published_summaries
+                    .saturating_add(result.published_summaries as u64);
+                self.work.summary_profile = self
+                    .work
+                    .summary_profile
+                    .saturating_add(result.summary_profile);
+                self.work.solver_attempts = self
+                    .work
+                    .solver_attempts
+                    .saturating_add(result.solver_attempts.len() as u64);
+                if result.semantic_budget_exhausted {
+                    self.semantic_budget_exhausted = true;
+                    self.record_semantic_exhausted_root(procedure, &result.incomplete_evidence);
                 }
-                self.work.solves = self.work.solves.saturating_add(1);
-                let mut solver_budget = SolverBudget::new(limits.solver_work);
-                let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-                // Root work starts at zero, while its resident bound includes
-                // the parent's current file, which coexists with its callees.
-                // Historical admissions from the prepass or earlier roots do
-                // not make these new callee admissions free.
-                let mut child_budget = SemanticBudget::new_root_child(semantic_budget);
-                let outcome = solve_type_flow_for_root_with_refinements(
-                    workspace,
-                    adapter,
-                    &field_slots,
-                    &procedure.handle,
-                    active_semantic_model_snapshot,
-                    CLOSURE_LIMITS,
-                    FeedbackLimits::default(),
-                    self.value_flow_cache.clone(),
-                    self.summary_state.clone(),
-                    &mut child_budget,
-                    &mut request,
-                    &mut self.refinements,
-                );
-                // Callee handles are local to the completed root solve.
-                // Fold performed work and its peak into the parent without
-                // importing those now-released resident admissions.
-                semantic_budget.absorb_root_work(child_budget);
-                self.field_slots.insert(
-                    field_slot_key,
-                    Some(QueryFieldSlots {
-                        index: Arc::clone(&field_slots),
-                    }),
-                );
-                match outcome {
-                    Ok(result) => {
-                        self.work.summary_cache_hits = self
-                            .work
-                            .summary_cache_hits
-                            .saturating_add(result.reusable_summary_hits as u64);
-                        self.work.summary_cache_misses = self
-                            .work
-                            .summary_cache_misses
-                            .saturating_add(result.reusable_summary_misses as u64);
-                        self.work.root_summary_cache_hits = self
-                            .work
-                            .root_summary_cache_hits
-                            .saturating_add(result.reusable_root_summary_hits as u64);
-                        self.work.root_summary_observation_rejections = self
-                            .work
-                            .root_summary_observation_rejections
-                            .saturating_add(
-                                result.reusable_root_summary_observation_rejections as u64,
-                            );
-                        self.work.published_summaries = self
-                            .work
-                            .published_summaries
-                            .saturating_add(result.published_summaries as u64);
-                        self.work.summary_profile = self
-                            .work
-                            .summary_profile
-                            .saturating_add(result.summary_profile);
-                        self.work.solver_attempts = self
-                            .work
-                            .solver_attempts
-                            .saturating_add(result.solver_attempts.len() as u64);
-                        if result.semantic_budget_exhausted {
-                            self.semantic_budget_exhausted = true;
-                            self.record_semantic_exhausted_root(
-                                procedure,
-                                &result.incomplete_evidence,
-                            );
-                        }
-                        if !result.complete {
-                            self.work.incomplete_roots =
-                                self.work.incomplete_roots.saturating_add(1);
-                            self.record_incomplete_root(procedure, &result.incomplete_evidence);
-                        }
-                        let projected_rows = if !persistent_store_failed
-                            && result.persistence_status == TypeFlowRootPersistenceStatus::Eligible
-                            && result.findings.is_empty()
-                            // Constructor-origin evidence is request-local:
-                            // the durable class-set projection does not carry
-                            // the binding, escape, and member-closure proof
-                            // that makes it usable by call_bindings.
-                            && !(adapter.language() == crate::analyzer::Language::Python
-                                && result
-                                    .class_sets
-                                    .iter()
-                                    .any(|set| set.constructor_origin.is_some()))
-                            && let Some(persistent_key) = persistent_key.as_ref()
-                        {
-                            let projected: Arc<[ClassSetRowValue]> =
-                                project_class_sets(&result).into();
-                            let publication = self.publish_finding_free_root_result(
-                                workspace,
-                                persistent_key,
-                                &result,
-                                &projected,
-                                limits,
-                                cancellation,
-                            );
-                            if publication == RootResultPublicationOutcome::Cancelled {
-                                push_deduplicated_diagnostic(
-                                    &mut self.diagnostics,
-                                    CodeQueryDiagnosticCode::Cancelled,
-                                    "class-set root-result publication was cancelled".to_string(),
-                                );
-                                self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
-                                return None;
-                            }
-                            Some(projected)
-                        } else {
-                            None
-                        };
-                        let cached = CachedTypeFlowAnalysis::Live {
-                            result: Arc::new(result),
-                            projected_rows,
-                        };
-                        self.cache.insert(cache_key, cached.clone());
-                        Some(cached)
-                    }
-                    Err(error) => {
-                        self.work.failed_solves = self.work.failed_solves.saturating_add(1);
-                        let code = match &error {
-                            TypeFlowError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
-                            TypeFlowError::Plan(_)
-                            | TypeFlowError::Solve(_)
-                            | TypeFlowError::Io(_) => {
-                                CodeQueryDiagnosticCode::SemanticProviderFailed
-                            }
-                        };
+                if !result.complete {
+                    self.work.incomplete_roots = self.work.incomplete_roots.saturating_add(1);
+                    self.record_incomplete_root(procedure, &result.incomplete_evidence);
+                }
+                let projected_rows = if !persistent_store_failed
+                    && result.persistence_status == TypeFlowRootPersistenceStatus::Eligible
+                    && result.findings.is_empty()
+                    // Constructor-origin evidence is request-local:
+                    // the durable class-set projection does not carry
+                    // the binding, escape, and member-closure proof
+                    // that makes it usable by call_bindings.
+                    && !(adapter.language() == crate::analyzer::Language::Python
+                        && result
+                            .class_sets
+                            .iter()
+                            .any(|set| set.constructor_origin.is_some()))
+                    && let Some(persistent_key) = persistent_key.as_ref()
+                {
+                    let projected: Arc<[ClassSetRowValue]> = project_class_sets(&result).into();
+                    let publication = self.publish_finding_free_root_result(
+                        workspace,
+                        persistent_key,
+                        &result,
+                        &projected,
+                        limits,
+                        cancellation,
+                    );
+                    if publication == RootResultPublicationOutcome::Cancelled {
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
-                            code,
-                            format!("class-set analysis failed: {error}"),
+                            CodeQueryDiagnosticCode::Cancelled,
+                            "class-set root-result publication was cancelled".to_string(),
                         );
                         self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
-                        None
+                        return None;
                     }
-                }
+                    Some(projected)
+                } else {
+                    None
+                };
+                let cached = CachedTypeFlowAnalysis::Live {
+                    result: Arc::new(result),
+                    projected_rows,
+                };
+                self.cache.insert(cache_key, cached.clone());
+                Some(cached)
+            }
+            Err(error) => {
+                self.work.failed_solves = self.work.failed_solves.saturating_add(1);
+                let code = match &error {
+                    TypeFlowError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+                    TypeFlowError::Plan(_) | TypeFlowError::Solve(_) | TypeFlowError::Io(_) => {
+                        CodeQueryDiagnosticCode::SemanticProviderFailed
+                    }
+                };
+                push_deduplicated_diagnostic(
+                    &mut self.diagnostics,
+                    code,
+                    format!("class-set analysis failed: {error}"),
+                );
+                self.cache.insert(cache_key, CachedTypeFlowAnalysis::Failed);
+                None
             }
         }
     }

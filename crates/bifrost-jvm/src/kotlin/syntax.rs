@@ -38,12 +38,10 @@
 //! `type_identifier` child per segment, not a nested or scoped node. Nothing here
 //! splits source text on `.` or `::` to recover that structure.
 
-use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind, is_comment_kind, named_children,
 };
 use brokk_bifrost_core::analyzer::usages::common::node_text;
-use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
 use tree_sitter::Node;
 
 /// Whether a `this@Label` label names an owner's simple name.
@@ -642,84 +640,107 @@ fn kotlin_scalar_type_name(name: &str) -> Option<KotlinScalarType> {
     }
 }
 
-/// Read a supported decimal integer literal, including a directly signed
-/// decimal literal. Hexadecimal, binary, unsigned, real, and arbitrary unary
-/// expressions remain unclassified.
-pub fn kotlin_decimal_integer_value(node: Node<'_>, source: &str) -> Option<i128> {
-    match node.kind() {
-        "integer_literal" => node
-            .utf8_text(source.as_bytes())
-            .ok()?
-            .replace('_', "")
-            .parse()
-            .ok(),
-        "long_literal" => first_named_child_of_kind(node, "integer_literal").and_then(|child| {
-            child
-                .utf8_text(source.as_bytes())
-                .ok()?
-                .replace('_', "")
-                .parse()
-                .ok()
-        }),
-        "prefix_expression" if node.named_child_count() == 1 => {
-            let operand = node.named_child(0)?;
-            let value = kotlin_decimal_integer_value(operand, source)?;
-            let operator = node
-                .children(&mut node.walk())
-                .find(|child| !child.is_named())
-                .map(|child| child.kind())?;
-            match operator {
-                "+" => Some(value),
-                "-" => value.checked_neg(),
-                _ => None,
-            }
-        }
-        _ => None,
+/// The suffix written on a Kotlin integer literal, independent of its value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KotlinIntegerSuffix {
+    None,
+    Long,
+    Unsigned,
+    UnsignedLong,
+}
+
+impl KotlinIntegerSuffix {
+    pub fn is_unsigned(self) -> bool {
+        matches!(self, Self::Unsigned | Self::UnsignedLong)
     }
+}
+
+/// Decode an AST-selected decimal, hexadecimal or binary integer literal.
+/// Unary signs are folded iteratively; range and suffix applicability belong
+/// to the caller, since a numeric value alone does not establish a Kotlin type.
+pub fn kotlin_integer_literal_value(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(i128, KotlinIntegerSuffix)> {
+    let prefixed = node.kind() == "prefix_expression";
+    let mut node = node;
+    let mut negative = false;
+    while node.kind() == "prefix_expression" && node.named_child_count() == 1 {
+        let operator = node
+            .children(&mut node.walk())
+            .find(|child| !child.is_named())
+            .map(|child| child.kind())?;
+        match operator {
+            "+" => {}
+            "-" => negative = !negative,
+            _ => return None,
+        }
+        node = node.named_child(0).expect("one prefix operand");
+    }
+    let (literal, suffix) = match node.kind() {
+        "integer_literal" | "hex_literal" | "bin_literal" => (node, KotlinIntegerSuffix::None),
+        "long_literal" => (node.named_child(0)?, KotlinIntegerSuffix::Long),
+        "unsigned_literal" => {
+            let suffix = if node.utf8_text(source.as_bytes()).ok()?.ends_with('L') {
+                KotlinIntegerSuffix::UnsignedLong
+            } else {
+                KotlinIntegerSuffix::Unsigned
+            };
+            (node.named_child(0)?, suffix)
+        }
+        _ => return None,
+    };
+    // UInt/ULong do not define unaryPlus or unaryMinus. An extension could,
+    // but its result is not a literal constant this syntax reader can prove.
+    if prefixed && suffix.is_unsigned() {
+        return None;
+    }
+    let digits = literal.utf8_text(source.as_bytes()).ok()?.replace('_', "");
+    let (radix, digits) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if let Some(digits) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else {
+        (10, digits.as_str())
+    };
+    let value = i128::from_str_radix(digits, radix).ok()?;
+    let value = if negative {
+        value.checked_neg()?
+    } else {
+        value
+    };
+    Some((value, suffix))
 }
 
 /// Classify a literal whose default Kotlin type is one of the supported scalar
 /// types. The value itself is read separately so the semantic producer can
 /// publish an exact constant.
 pub fn kotlin_literal_scalar_type(node: Node<'_>, source: &str) -> Option<KotlinScalarType> {
-    match node.kind() {
-        "integer_literal" => kotlin_decimal_integer_value(node, source).and_then(|value| {
-            if i32::MIN as i128 <= value && value <= i32::MAX as i128 {
-                Some(KotlinScalarType::Int)
-            } else if i64::MIN as i128 <= value && value <= i64::MAX as i128 {
-                Some(KotlinScalarType::Long)
-            } else {
-                None
-            }
-        }),
-        "long_literal" => Some(KotlinScalarType::Long),
-        "boolean_literal"
-            if matches!(node.utf8_text(source.as_bytes()).ok()?, "true" | "false") =>
-        {
-            Some(KotlinScalarType::Boolean)
-        }
-        "prefix_expression" if node.named_child_count() == 1 => {
-            let operator = node
-                .children(&mut node.walk())
-                .find(|child| !child.is_named())
-                .map(|child| child.kind())?;
-            if !matches!(operator, "+" | "-") {
-                return None;
-            }
-            let operand = node.named_child(0)?;
-            if operand.kind() == "long_literal" {
-                return Some(KotlinScalarType::Long);
-            }
-            let value = kotlin_decimal_integer_value(node, source)?;
-            if i32::MIN as i128 <= value && value <= i32::MAX as i128 {
-                Some(KotlinScalarType::Int)
-            } else if i64::MIN as i128 <= value && value <= i64::MAX as i128 {
-                Some(KotlinScalarType::Long)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    if node.kind() == "boolean_literal"
+        && matches!(node.utf8_text(source.as_bytes()).ok()?, "true" | "false")
+    {
+        return Some(KotlinScalarType::Boolean);
+    }
+    let (value, suffix) = kotlin_integer_literal_value(node, source)?;
+    // Unsigned inline classes are distinct from the supported signed scalars.
+    if suffix.is_unsigned() {
+        return None;
+    }
+    if suffix == KotlinIntegerSuffix::Long {
+        return i64::try_from(value).ok().map(|_| KotlinScalarType::Long);
+    }
+    if i32::try_from(value).is_ok() {
+        Some(KotlinScalarType::Int)
+    } else if i64::try_from(value).is_ok() {
+        Some(KotlinScalarType::Long)
+    } else {
+        None
     }
 }
 
@@ -763,24 +784,6 @@ pub fn kotlin_extension_receiver_text(declaration: Node<'_>, source: &str) -> Op
     kotlin_extension_receiver_components(declaration, source).map(|components| components.join("."))
 }
 
-/// The declaration node covering `range`.
-///
-/// The smallest covering node is not always the declaration: an `enum_entry`
-/// spans exactly its own name, so its `simple_identifier` child covers the same
-/// bytes and would win the smallest-covering walk. Climbing back out to the
-/// outermost node with the same span picks the declaration rather than the name
-/// inside it.
-pub fn kotlin_declaration_node<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
-    let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
-    while let Some(parent) = node.parent() {
-        if parent.start_byte() != node.start_byte() || parent.end_byte() != node.end_byte() {
-            break;
-        }
-        node = parent;
-    }
-    Some(node)
-}
-
 /// The default expression attached to a Kotlin function or constructor parameter.
 /// Function defaults are siblings of the hidden parameter rule; constructor
 /// defaults are children of the visible class_parameter rule.
@@ -794,4 +797,203 @@ pub fn kotlin_parameter_default(parameter: Node<'_>) -> Option<Node<'_>> {
             .find(|node| node.kind() == "=")
     }?;
     equals.next_named_sibling()
+}
+
+#[cfg(test)]
+mod quicksilver_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "d5886539d3ef: quicksilver round 5 on brokk-bifrost-jvm: nested Kotlin unary prefixes exhausted the stack"
+    )]
+    fn decimal_integer_deep_prefixes_are_stack_safe() {
+        let source = format!("val value = {}1\n", "+ ".repeat(30_000));
+        let tree = crate::kotlin::language::parse_tree(&source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut expression = None;
+        brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "prefix_expression" {
+                    expression = Some(node);
+                    brokk_bifrost_core::analyzer::tree_walk::WalkControl::Break
+                } else {
+                    brokk_bifrost_core::analyzer::tree_walk::WalkControl::Continue
+                }
+            },
+        );
+        let expression = expression.expect("prefix expression");
+        let mut current = expression;
+        let mut depth = 0;
+        while current.kind() == "prefix_expression" {
+            depth += 1;
+            current = current.named_child(0).unwrap();
+        }
+        assert_eq!(depth, 30_000, "pinned grammar nests each prefix");
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(128 * 1024)
+                .spawn_scoped(scope, || {
+                    assert_eq!(
+                        kotlin_integer_literal_value(expression, &source),
+                        Some((1, KotlinIntegerSuffix::None))
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+
+    #[test]
+    fn grammar_selected_argument_delegate_name_and_signature_nodes() {
+        // The pinned grammar has two argument-list parents and no single name
+        // for a destructuring property. Spans below are authored source tokens.
+        let source = "@Anno(1) class Child : Base(2)\nval count: Int = 3\nval delegated by /*comment*/ lazy { 4 }\nval (a, b) = pair\nfun library.Receiver.result(): library.Result = f(5)\n";
+        let tree = crate::kotlin::language::parse_tree(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut arguments = Vec::new();
+        let mut properties = Vec::new();
+        let mut signatures = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            match node.kind() {
+                "constructor_invocation" | "call_expression" => {
+                    if let Some(args) = kotlin_value_arguments(node) {
+                        arguments.push((
+                            args.utf8_text(source.as_bytes()).unwrap(),
+                            args.parent().unwrap().kind(),
+                        ));
+                        assert_eq!(args.kind(), "value_arguments");
+                        let start = source
+                            .find(args.utf8_text(source.as_bytes()).unwrap())
+                            .unwrap();
+                        assert_eq!(args.byte_range(), start..start + args.byte_range().len());
+                    }
+                }
+                "property_declaration" => {
+                    properties.push(kotlin_declaration_name(node).map(|name| {
+                        assert_eq!(name.kind(), "simple_identifier");
+                        assert_eq!(name.parent().unwrap().kind(), "variable_declaration");
+                        (
+                            name.utf8_text(source.as_bytes()).unwrap(),
+                            name.byte_range(),
+                        )
+                    }));
+                    if let Some(delegate) = kotlin_property_delegate_expression(node) {
+                        assert_eq!(delegate.kind(), "call_expression");
+                        assert_eq!(delegate.utf8_text(source.as_bytes()).unwrap(), "lazy { 4 }");
+                        assert_eq!(delegate.parent().unwrap().kind(), "property_delegate");
+                    } else {
+                        assert!(
+                            !node
+                                .utf8_text(source.as_bytes())
+                                .unwrap()
+                                .contains("delegated")
+                        );
+                    }
+                }
+                "function_declaration" => signatures.push((
+                    kotlin_extension_receiver_text(node, source),
+                    kotlin_declared_return_type_text(node, source),
+                )),
+                _ => {}
+            }
+            WalkControl::Continue
+        });
+        assert_eq!(
+            arguments,
+            [
+                // In an annotation, the pinned grammar consumes the opening
+                // parenthesis outside the value_arguments node.
+                ("1)", "constructor_invocation"),
+                ("(2)", "constructor_invocation"),
+                ("(5)", "call_suffix")
+            ]
+        );
+        assert_eq!(
+            properties,
+            [
+                Some((
+                    "count",
+                    source.find("count").unwrap()..source.find("count").unwrap() + 5
+                )),
+                Some((
+                    "delegated",
+                    source.find("delegated").unwrap()..source.find("delegated").unwrap() + 9
+                )),
+                None
+            ]
+        );
+        assert_eq!(
+            signatures,
+            [(
+                Some("library.Receiver".into()),
+                Some("library.Result".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn decimal_literal_boundaries_follow_kotlin_integer_ranges() {
+        // Kotlin signed decimal constants: the L suffix fixes Long; an
+        // unsuffixed value fitting 32 signed bits defaults to Int.
+        for (spelling, value, scalar) in [
+            ("-1", -1_i128, KotlinScalarType::Int),
+            ("+1", 1, KotlinScalarType::Int),
+            ("2147483646", 2147483646, KotlinScalarType::Int),
+            ("2147483647", 2147483647, KotlinScalarType::Int),
+            ("2147483648", 2147483648, KotlinScalarType::Long),
+            ("-2147483648", -2147483648, KotlinScalarType::Int),
+            ("-2147483649", -2147483649, KotlinScalarType::Long),
+            ("1L", 1, KotlinScalarType::Long),
+        ] {
+            let source = format!("val n = {spelling}\n");
+            let tree = crate::kotlin::language::parse_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let property = tree.root_node().named_child(0).unwrap();
+            let expression = property
+                .named_child(property.named_child_count() - 1)
+                .unwrap();
+            assert_eq!(expression.utf8_text(source.as_bytes()).unwrap(), spelling);
+            assert_eq!(
+                kotlin_integer_literal_value(expression, &source).map(|(value, _)| value),
+                Some(value),
+                "{spelling}"
+            );
+            assert_eq!(
+                kotlin_literal_scalar_type(expression, &source),
+                Some(scalar),
+                "{spelling}"
+            );
+        }
+        let source = "fun widths(i: Int, l: Long) {}";
+        let tree = crate::kotlin::language::parse_tree(source).unwrap();
+        let mut widths = Vec::new();
+        walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if node.kind() == "parameter" {
+                widths.push(kotlin_declared_scalar_type(
+                    kotlin_binding_type_node(node).unwrap(),
+                    source,
+                ));
+            }
+            WalkControl::Continue
+        });
+        assert_eq!(
+            widths,
+            [Some(KotlinScalarType::Int), Some(KotlinScalarType::Long)]
+        );
+    }
 }

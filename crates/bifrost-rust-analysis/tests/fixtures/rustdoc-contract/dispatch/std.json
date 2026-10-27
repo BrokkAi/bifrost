@@ -1,0 +1,220 @@
+{
+  "root": 0,
+  "crate_version": "1.0.0",
+  "includes_private": true,
+  "index": {
+    "0": {
+      "id": 0,
+      "crate_id": 0,
+      "name": "std",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "module": {
+          "is_crate": true,
+          "items": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "is_stripped": false
+        }
+      }
+    },
+    "1": {
+      "id": 1,
+      "crate_id": 0,
+      "name": "option",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "core::option",
+          "name": "option",
+          "id": 101,
+          "is_glob": false
+        }
+      }
+    },
+    "2": {
+      "id": 2,
+      "crate_id": 0,
+      "name": "iter",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "core::iter",
+          "name": "iter",
+          "id": 102,
+          "is_glob": false
+        }
+      }
+    },
+    "3": {
+      "id": 3,
+      "crate_id": 0,
+      "name": "ops",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "core::ops",
+          "name": "ops",
+          "id": 103,
+          "is_glob": false
+        }
+      }
+    },
+    "4": {
+      "id": 4,
+      "crate_id": 0,
+      "name": "convert",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "core::convert",
+          "name": "convert",
+          "id": 104,
+          "is_glob": false
+        }
+      }
+    },
+    "5": {
+      "id": 5,
+      "crate_id": 0,
+      "name": "vec",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "alloc::vec",
+          "name": "vec",
+          "id": 105,
+          "is_glob": false
+        }
+      }
+    },
+    "6": {
+      "id": 6,
+      "crate_id": 0,
+      "name": "boxed",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "use": {
+          "source": "alloc::boxed",
+          "name": "boxed",
+          "id": 106,
+          "is_glob": false
+        }
+      }
+    }
+  },
+  "paths": {
+    "0": {
+      "crate_id": 0,
+      "path": [
+        "std"
+      ],
+      "kind": "module"
+    },
+    "101": {
+      "crate_id": 1,
+      "path": [
+        "core",
+        "option"
+      ],
+      "kind": "module"
+    },
+    "102": {
+      "crate_id": 1,
+      "path": [
+        "core",
+        "iter"
+      ],
+      "kind": "module"
+    },
+    "103": {
+      "crate_id": 1,
+      "path": [
+        "core",
+        "ops"
+      ],
+      "kind": "module"
+    },
+    "104": {
+      "crate_id": 1,
+      "path": [
+        "core",
+        "convert"
+      ],
+      "kind": "module"
+    },
+    "105": {
+      "crate_id": 2,
+      "path": [
+        "alloc",
+        "vec"
+      ],
+      "kind": "module"
+    },
+    "106": {
+      "crate_id": 2,
+      "path": [
+        "alloc",
+        "boxed"
+      ],
+      "kind": "module"
+    }
+  },
+  "external_crates": {
+    "1": {
+      "name": "core",
+      "html_root_url": null,
+      "path": "core.rlib"
+    },
+    "2": {
+      "name": "alloc",
+      "html_root_url": null,
+      "path": "alloc.rlib"
+    }
+  },
+  "format_version": 61,
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "target_features": []
+  }
+}

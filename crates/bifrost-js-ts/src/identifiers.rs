@@ -114,3 +114,41 @@ pub(crate) fn collect_js_ts_export_clause_roots(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_js_ts_identifiers, extract_js_ts_type_identifiers};
+    use crate::javascript::extract_js_type_identifiers;
+    use brokk_bifrost_core::hash::HashSet;
+    use std::collections::BTreeSet;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn identifier_projection_matches_named_grammar_nodes() {
+        let ts = "interface Holder<T> { value: T; } type Result = Holder<string>; const holder: Holder<number> = make(); holder.value;";
+        let expected: BTreeSet<String> = ["Holder", "T", "value", "Result", "holder", "make"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            extract_js_ts_type_identifiers(ts, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            expected
+        );
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(ts, None).unwrap();
+        let mut collected = HashSet::default();
+        collect_js_ts_identifiers(tree.root_node(), ts, &mut collected);
+        assert_eq!(collected.into_iter().collect::<BTreeSet<_>>(), expected);
+
+        let js = "const π = source.value; function render(item) { return item.name; }";
+        let expected_js: BTreeSet<String> = ["π", "source", "value", "render", "item", "name"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(extract_js_type_identifiers(js), expected_js);
+    }
+}

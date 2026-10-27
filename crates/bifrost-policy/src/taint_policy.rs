@@ -3041,9 +3041,9 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
 }
 
 struct SelectedSummaryFamily {
-    payload_identity: usize,
+    order: usize,
+    shard: Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelShard>,
     language: String,
-    payload: Vec<CompiledProcedureSummary>,
     root_ids: HashSet<String>,
 }
 
@@ -6492,13 +6492,13 @@ impl<'a> TaintPolicyCompiler<'a> {
                     "unique procedure-summary lookup returned a non-unique record set".to_owned(),
                 ));
             };
-            let family_key = selected.payload.as_ptr() as usize;
+            let family_key = Arc::as_ptr(&selected.shard) as usize;
             let family = families
                 .entry(family_key)
                 .or_insert_with(|| SelectedSummaryFamily {
-                    payload_identity: selected.payload.as_ptr() as usize,
+                    order: active.procedure_summary_shard_order(&selected.shard),
+                    shard: Arc::clone(&selected.shard),
                     language: selected.shard.manifest.language.clone(),
-                    payload: selected.payload.to_vec(),
                     root_ids: HashSet::new(),
                 });
             family.root_ids.insert(selected.record.id.clone());
@@ -6508,24 +6508,15 @@ impl<'a> TaintPolicyCompiler<'a> {
         }
 
         let mut families = families.into_values().collect::<Vec<_>>();
-        families.sort_unstable_by(|left, right| {
-            left.language.cmp(&right.language).then_with(|| {
-                left.payload
-                    .iter()
-                    .map(|summary| (&summary.model_id, &summary.id))
-                    .cmp(
-                        right
-                            .payload
-                            .iter()
-                            .map(|summary| (&summary.model_id, &summary.id)),
-                    )
-            })
-        });
+        families.sort_unstable_by_key(|family| family.order);
         let mut lowered = Vec::new();
         let mut unmaterialized_bindings = Vec::new();
         for family in families {
-            let by_id = family
-                .payload
+            let payload = active.procedure_summary_family(
+                &family.shard,
+                family.root_ids.iter().map(String::as_str),
+            );
+            let by_id = payload
                 .iter()
                 .map(|summary| (summary.id.as_str(), summary))
                 .collect::<HashMap<_, _>>();
@@ -6555,8 +6546,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     }
                 }
             }
-            let summaries = family
-                .payload
+            let summaries = payload
                 .iter()
                 .filter(|summary| selected_ids.contains(&summary.id))
                 .cloned()
@@ -6618,34 +6608,25 @@ impl<'a> TaintPolicyCompiler<'a> {
             let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                 continue;
             };
-            let family_key = selected.payload.as_ptr() as usize;
+            let family_key = Arc::as_ptr(&selected.shard) as usize;
             let family = unmaterialized_families
                 .entry(family_key)
                 .or_insert_with(|| SelectedSummaryFamily {
-                    payload_identity: selected.payload.as_ptr() as usize,
+                    order: active.procedure_summary_shard_order(&selected.shard),
+                    shard: Arc::clone(&selected.shard),
                     language: selected.shard.manifest.language.clone(),
-                    payload: selected.payload.to_vec(),
                     root_ids: HashSet::new(),
                 });
             family.root_ids.insert(selected.record.id.clone());
         }
         let mut unmaterialized_families = unmaterialized_families.into_values().collect::<Vec<_>>();
-        unmaterialized_families.sort_unstable_by(|left, right| {
-            left.language.cmp(&right.language).then_with(|| {
-                left.payload
-                    .iter()
-                    .map(|summary| (&summary.model_id, &summary.id))
-                    .cmp(
-                        right
-                            .payload
-                            .iter()
-                            .map(|summary| (&summary.model_id, &summary.id)),
-                    )
-            })
-        });
+        unmaterialized_families.sort_unstable_by_key(|family| family.order);
         for family in unmaterialized_families {
-            let by_id = family
-                .payload
+            let payload = active.procedure_summary_family(
+                &family.shard,
+                family.root_ids.iter().map(String::as_str),
+            );
+            let by_id = payload
                 .iter()
                 .map(|summary| (summary.id.as_str(), summary))
                 .collect::<HashMap<_, _>>();
@@ -6675,8 +6656,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     }
                 }
             }
-            let summaries = family
-                .payload
+            let summaries = payload
                 .iter()
                 .filter(|summary| selected_ids.contains(&summary.id))
                 .cloned()
@@ -6716,7 +6696,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                         continue;
                     };
-                    if selected.payload.as_ptr() as usize == family.payload_identity
+                    if Arc::ptr_eq(&selected.shard, &family.shard)
                         && selected.record.model_id == summary.model_id
                         && selected.record.id == summary.id
                     {
@@ -7000,9 +6980,9 @@ fn is_exact_python_constructor_boundary(boundary: &DispatchBoundary) -> bool {
         && matches!(&boundary.completeness, EvidenceCompleteness::Complete)
 }
 
-fn select_unmaterialized_flow_summary<'matched, 'model>(
-    matched: &'matched ProcedureSummaryMatch<'model>,
-) -> Result<Option<&'matched ActivatedProcedureSummary<'model>>, TaintPolicyCompileError> {
+fn select_unmaterialized_flow_summary(
+    matched: &ProcedureSummaryMatch,
+) -> Result<Option<&ActivatedProcedureSummary>, TaintPolicyCompileError> {
     if matched.applicability
         == brokk_bifrost_analysis::analyzer::semantic_model::ProcedureSummaryApplicability::Incomplete
     {
@@ -7046,7 +7026,7 @@ fn select_unmaterialized_flow_summary<'matched, 'model>(
             }
             let identical = rest
                 .iter()
-                .all(|other| unmaterialized_flow_claims_agree(other.record, first.record));
+                .all(|other| unmaterialized_flow_claims_agree(&other.record, &first.record));
             Ok(identical.then_some(first))
         }
     }

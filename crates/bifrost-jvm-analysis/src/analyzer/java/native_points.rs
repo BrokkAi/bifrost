@@ -125,6 +125,11 @@ pub(crate) fn resolve_java_definition_with_evidence_bounded(
             work: ReceiverAnalysisWork::default(),
         };
     };
+    let anchored = java_creation_keyword_anchor(query);
+    let query = match &anchored {
+        Some(site) => BoundedReceiverQuery { site, ..query },
+        None => query,
+    };
     let site_text = query.site.text.clone();
     let reference_namespace = java_constructor_reference_namespace(&query);
     let mut external_static_imports = Vec::new();
@@ -541,6 +546,8 @@ fn java_native_call_evidence(
         creation,
         type_node,
     } = call_site
+        && outcome.definitions.is_empty()
+        && outcome.lexical_definition.is_none()
     {
         let type_name = java_native_constructor_type_name(query, creation, type_node);
         if type_name.is_none()
@@ -1459,14 +1466,20 @@ fn java_native_argument_type(
     {
         return Some(intrinsic);
     }
-    if expression.kind() == "method_invocation" {
+    if matches!(
+        expression.kind(),
+        "method_invocation" | "object_creation_expression"
+    ) {
         // Each nested query descends to a strict argument/receiver child.
         // Bound the remaining resolver call stack by the existing Java
         // expression budget; deeper expressions retain an unknown type.
         let mut nesting = 0;
         let mut ancestor = expression.parent();
         while let Some(node) = ancestor {
-            if node.kind() == "method_invocation" {
+            if matches!(
+                node.kind(),
+                "method_invocation" | "object_creation_expression"
+            ) {
                 nesting += 1;
             }
             if nesting >= crate::analyzer::java::call_conversion::JAVA_EXPRESSION_DEPTH_LIMIT {
@@ -1474,7 +1487,17 @@ fn java_native_argument_type(
             }
             ancestor = node.parent();
         }
-        let member = expression.child_by_field_name("name")?;
+        let member = if expression.kind() == "object_creation_expression" {
+            let type_node = expression.child_by_field_name("type")?;
+            // The existing proof transports a nominal owner, not substituted
+            // type arguments. Keep parameterized construction conservative.
+            if type_node.kind() == "generic_type" {
+                return None;
+            }
+            java_constructor_type_terminal(type_node)?
+        } else {
+            expression.child_by_field_name("name")?
+        };
         let site = java_native_reference_site_at_node(query, member)?;
         let call_query = BoundedReceiverQuery {
             analyzer: query.analyzer,
@@ -1488,6 +1511,17 @@ fn java_native_argument_type(
         match resolve_java_definition_with_evidence_bounded(call_query, || {}) {
             BoundedResolution::Complete { value, .. } => {
                 if let Some(proof) = value.evidence.exact_external_call() {
+                    if expression.kind() == "object_creation_expression" {
+                        // Nominal identity alone cannot validate a nested call.
+                        // The existing constructor proof has independently
+                        // selected an applicable declaration using its actuals.
+                        let (owner, _) = proof.canonical_callee().rsplit_once('.')?;
+                        return Some(TypeRef::Named {
+                            name: owner.to_owned(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        });
+                    }
                     let identity = proof.external_member_identity()?;
                     return match _java
                         .inner
@@ -1776,6 +1810,26 @@ fn java_selected_jdk_artifact(
         .active_semantic_model_snapshot()?
         .jdk_artifact_for_home(home)
         .cloned()
+}
+
+// The creation keyword has no producer reference. Navigate through the same
+// constructor type reference used when the cursor is on the written type.
+fn java_creation_keyword_anchor(query: BoundedReceiverQuery<'_>) -> Option<ResolvedReferenceSite> {
+    crate::analyzer::jvm::native_points::jvm_reference_anchor(query, |creation| {
+        if creation.kind() != "object_creation_expression" {
+            return None;
+        }
+        let mut cursor = creation.walk();
+        let keyword = creation
+            .children(&mut cursor)
+            .find(|child| child.kind() == "new")?;
+        if keyword.start_byte() != query.site.focus_start_byte
+            || keyword.end_byte() != query.site.focus_end_byte
+        {
+            return None;
+        }
+        java_constructor_type_terminal(creation.child_by_field_name("type")?)
+    })
 }
 
 fn java_constructor_reference_namespace(

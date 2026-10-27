@@ -177,7 +177,7 @@ fn java_native_selected_inverse_candidate_mount_reader_seeks_shared_indexes() {
     );
     let answer = inverse(&analyzer, &class);
     assert!(!answer.edges.is_empty(), "{answer:#?}");
-    let plan = brokk_bifrost_analysis::analyzer::store::resolution_operation::java_reverse_rows::last_jvm_reverse_candidate_plan_for_test();
+    let plan = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::last_jvm_reverse_candidate_plan_for_test();
     eprintln!("selected Java reverse candidate EXPLAIN QUERY PLAN: {plan:#?}");
     for required in [
         "resolution_reference_lookup_identities_identity",

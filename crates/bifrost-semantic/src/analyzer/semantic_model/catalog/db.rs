@@ -12,7 +12,7 @@ use crate::analyzer::semantic_model::catalog::CatalogOpenMode;
 use brokk_bifrost_core::sqlite_template;
 
 pub(in crate::analyzer::semantic_model::catalog) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 22;
+pub(in crate::analyzer::semantic_model::catalog) const CURRENT_CATALOG_VERSION: i64 = 26;
 const PRE_NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 10;
 const NATIVE_COMPATIBILITY_CATALOG_VERSION: i64 = 11;
 const UNKNOWN_TYPES_CATALOG_VERSION: i64 = 12;
@@ -77,6 +77,19 @@ const SEMANTIC_MODEL_SCHEMA_V17_SQL: &str =
 const SEMANTIC_MODEL_SCHEMA_V18_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0022-semantic-model-schema-v18.sql");
 
+const SEMANTIC_MODEL_SCHEMA_V19_SQL: &str = include_str!(
+    "../../../../migrations/semantic-pack-catalog/0023-artifact-extraction-schema-v19.sql"
+);
+
+pub(in crate::analyzer::semantic_model::catalog) const SEMANTIC_ROWS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0024-semantic-record-rows.sql");
+
+pub(in crate::analyzer::semantic_model::catalog) const SEMANTIC_ROW_QUESTIONS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0025-semantic-row-questions.sql");
+
+pub(in crate::analyzer::semantic_model::catalog) const SEMANTIC_PAYLOAD_FAMILIES_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0026-semantic-payload-families.sql");
+
 /// This build's empty-catalog template. The migrations are the schema inputs:
 /// on an empty catalog their Rust steps have no rows to change, so the SQL
 /// alone decides the bytes.
@@ -107,6 +120,10 @@ static CATALOG_TEMPLATE: LazyLock<sqlite_template::Template> = LazyLock::new(|| 
             SEMANTIC_MODEL_SCHEMA_V16_SQL.as_bytes(),
             SEMANTIC_MODEL_SCHEMA_V17_SQL.as_bytes(),
             SEMANTIC_MODEL_SCHEMA_V18_SQL.as_bytes(),
+            SEMANTIC_MODEL_SCHEMA_V19_SQL.as_bytes(),
+            SEMANTIC_ROWS_SQL.as_bytes(),
+            SEMANTIC_ROW_QUESTIONS_SQL.as_bytes(),
+            SEMANTIC_PAYLOAD_FAMILIES_SQL.as_bytes(),
         ],
     )
 });
@@ -128,7 +145,7 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
         }
     };
     if mode == CatalogOpenMode::ReadWrite {
-        // A new catalog runs twenty-two migrations. Copy a template instead; see
+        // A new catalog runs twenty-three migrations. Copy a template instead; see
         // `sqlite_template`. The caller holds the catalog's initialization
         // lock, so no other opener is creating this file.
         let _scope =
@@ -146,6 +163,7 @@ pub fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogErr
         Connection::open_with_flags(&path, flags)
             .map_err(|error| CatalogError::sqlite("open catalog", error))?
     };
+    brokk_bifrost_core::cache_db::sql_profile::install_catalog_durable(&connection);
     if mode == CatalogOpenMode::ReadWrite {
         connection.set_transaction_behavior(TransactionBehavior::Immediate);
     }
@@ -182,6 +200,7 @@ fn build_fresh_catalog(path: &Path) -> Result<(), CatalogError> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|error| CatalogError::sqlite("open catalog template", error))?;
+    brokk_bifrost_core::cache_db::sql_profile::install_catalog_durable(&connection);
     connection.set_transaction_behavior(TransactionBehavior::Immediate);
     connection
         .busy_timeout(BUSY_TIMEOUT)
@@ -308,7 +327,11 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
     migrate_semantic_model_schema_v15(connection)?;
     migrate_semantic_model_schema_v16(connection)?;
     migrate_semantic_model_schema_v17(connection)?;
-    migrate_semantic_model_schema_v18(connection)
+    migrate_semantic_model_schema_v18(connection)?;
+    migrate_manifest_schema(connection, 23, SEMANTIC_MODEL_SCHEMA_V19_SQL)?;
+    migrate_manifest_schema(connection, 24, SEMANTIC_ROWS_SQL)?;
+    migrate_manifest_schema(connection, 25, SEMANTIC_ROW_QUESTIONS_SQL)?;
+    migrate_manifest_schema(connection, 26, SEMANTIC_PAYLOAD_FAMILIES_SQL)
 }
 
 fn migrate_legacy_catalog_versions(connection: &mut Connection) -> Result<(), CatalogError> {
@@ -1914,7 +1937,10 @@ mod tests {
         let mut migrated = Connection::open_in_memory().unwrap();
         create_schema_10(&mut migrated);
         insert_legacy_pack(&migrated);
-        let expected_full_pack_row = table_rows(&migrated, "catalog_packs");
+        let mut expected_full_pack_row = table_rows(&migrated, "catalog_packs");
+        for row in &mut expected_full_pack_row {
+            row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, 3));
+        }
         let expected_child_rows: Vec<(&str, Vec<Vec<rusqlite::types::Value>>)> = [
             "catalog_sources",
             "catalog_pins",
@@ -2197,7 +2223,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let pack_rows = table_rows(&connection, "catalog_packs");
+        let mut pack_rows = table_rows(&connection, "catalog_packs");
+        for row in &mut pack_rows {
+            row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, 3));
+        }
         let source_rows = table_rows(&connection, "catalog_sources");
         let pin_rows = table_rows(&connection, "catalog_pins");
         let generated_rows = table_rows(&connection, "catalog_generated_productions");
@@ -2213,7 +2242,7 @@ mod tests {
         .into_iter()
         .map(|table| (table, table_rows(&connection, table)))
         .collect();
-        let pack_indexes_and_triggers = {
+        let mut pack_indexes_and_triggers = {
             let mut statement = connection
                 .prepare(
                     "SELECT type, name, sql FROM sqlite_schema
@@ -2233,6 +2262,12 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
         };
+        for (_, name, sql) in &mut pack_indexes_and_triggers {
+            if name == "catalog_semantic_epoch_packs_update" {
+                *sql = sql.as_ref().map(|sql| sql.replace("installed_at, verified_at ON catalog_packs",
+                    "installed_at, verified_at, extraction_kind, extraction_input_kind, extraction_digest ON catalog_packs"));
+            }
+        }
         let generated_view_sql: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_schema
@@ -2345,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_13_through_22_preserve_catalog_rows_and_defer_old_shards_to_demand() {
+    fn migrations_13_through_26_preserve_catalog_rows_and_defer_old_shards_to_demand() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_schema_10(&mut connection);
         insert_legacy_pack(&connection);
@@ -2418,7 +2453,10 @@ mod tests {
             "schema migration leaves old shards unindexed until an exact demand reconciles them"
         );
 
-        let rows_after_callable_values = table_rows(&connection, "catalog_packs");
+        let mut rows_after_callable_values = table_rows(&connection, "catalog_packs");
+        for row in &mut rows_after_callable_values {
+            row.extend(std::iter::repeat_n(rusqlite::types::Value::Null, 3));
+        }
         let epoch_after_callable_values = table_rows(&connection, "catalog_semantic_state");
         migrate_semantic_model_schema(&mut connection).unwrap();
         assert_eq!(
@@ -2433,6 +2471,18 @@ mod tests {
         migrate_semantic_model_schema_v16(&mut connection).unwrap();
         migrate_semantic_model_schema_v17(&mut connection).unwrap();
         migrate_semantic_model_schema_v18(&mut connection).unwrap();
+        migrate_manifest_schema(&mut connection, 23, SEMANTIC_MODEL_SCHEMA_V19_SQL).unwrap();
+        migrate_manifest_schema(&mut connection, 24, SEMANTIC_ROWS_SQL).unwrap();
+        migrate_manifest_schema(&mut connection, 25, SEMANTIC_ROW_QUESTIONS_SQL).unwrap();
+        migrate_manifest_schema(&mut connection, 26, SEMANTIC_PAYLOAD_FAMILIES_SQL).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))

@@ -118,7 +118,6 @@ use brokk_bifrost_cpp::identity::CppOccurrenceRole;
 use brokk_bifrost_cpp::identity::cpp_is_range_for_binding_name;
 use brokk_bifrost_cpp::identity::cpp_range_is_pure_virtual_declaration;
 use brokk_bifrost_cpp::identity::cpp_same_node;
-use brokk_bifrost_cpp::imports::include_paths as cpp_include_paths;
 use brokk_bifrost_cpp::imports::resolve_include_targets;
 use brokk_bifrost_cpp::imports::resolve_include_targets_with_index;
 use std::sync::Arc;
@@ -4053,23 +4052,18 @@ fn cpp_macro_candidates(
     let scope = AnalyzerQueryScope::new(analyzer);
     let dispatch = CppDispatch::new(analyzer, scope.token());
     let source = dispatch.source();
+    let includes = source.canonical_include_paths(file).unwrap_or_default();
     analyzer
         .definitions(name)
         .filter(CodeUnit::is_macro)
         .filter(|unit| {
             unit.source() == file
-                || analyzer.import_statements(file).iter().any(|import| {
-                    cpp_include_paths(std::slice::from_ref(import))
-                        .iter()
-                        .any(|include| {
-                            let targets = match include_targets {
-                                Some(index) => {
-                                    resolve_include_targets_with_index(file, include, index)
-                                }
-                                None => resolve_include_targets(analyzer.project(), file, include),
-                            };
-                            targets.iter().any(|target| target == unit.source())
-                        })
+                || includes.iter().any(|include| {
+                    let targets = match include_targets {
+                        Some(index) => resolve_include_targets_with_index(file, include, index),
+                        None => resolve_include_targets(analyzer.project(), file, include),
+                    };
+                    targets.iter().any(|target| target == unit.source())
                 })
         })
         .filter(|unit| {
@@ -4127,6 +4121,56 @@ fn resolve_cpp_type_without_focused_qualifier(
     );
     read_scope.read_completion()?;
     Ok(candidates)
+}
+
+/// The owner a qualified name's scope components select under C++ lookup
+/// from the reference site. A leading `::` anchors lookup at global scope.
+enum CppLexicalQualifiedOwner {
+    Resolved(CodeUnit),
+    // no candidates: the lexical resolver reports the fail-closed verdict
+    // without the units, so only the reason survives.
+    Ambiguous(String),
+    Missing,
+}
+
+fn cpp_lexical_qualified_owner(
+    dispatch: &CppDispatch<'_>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    owner_components: &[String],
+    globally_qualified: bool,
+) -> CppLexicalQualifiedOwner {
+    let owner_reference = owner_components.join("::");
+    let lexical_scope = match cpp_enclosing_lexical_scope_components(
+        node,
+        &dispatch.source(),
+        visibility,
+        file,
+        source,
+    ) {
+        CppLexicalScopeResolution::Resolved(lexical_scope) => lexical_scope,
+        CppLexicalScopeResolution::Ambiguous => {
+            return CppLexicalQualifiedOwner::Ambiguous(format!(
+                "enclosing C++ scope for `{owner_reference}` is ambiguous"
+            ));
+        }
+        CppLexicalScopeResolution::Missing => return CppLexicalQualifiedOwner::Missing,
+    };
+    match visibility.resolve_type_components_lexically_for_forward(
+        &dispatch.source(),
+        file,
+        owner_components,
+        globally_qualified,
+        &lexical_scope,
+    ) {
+        CppLexicalTypeResolution::Resolved { unit, .. } => CppLexicalQualifiedOwner::Resolved(unit),
+        CppLexicalTypeResolution::Ambiguous => CppLexicalQualifiedOwner::Ambiguous(format!(
+            "`{owner_reference}` resolves ambiguously in its enclosing C++ class or namespace"
+        )),
+        CppLexicalTypeResolution::Missing => CppLexicalQualifiedOwner::Missing,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4258,36 +4302,20 @@ fn cpp_type_candidates_without_focused_qualifier(
                 cpp_lexical_namespace(node, source).as_deref(),
             )
         };
-        let owner = match cpp_enclosing_lexical_scope_components(
-            node, &dispatch.source(), visibility, file, source,
+        let owner = match cpp_lexical_qualified_owner(
+            &dispatch,
+            visibility,
+            file,
+            source,
+            node,
+            &components,
+            globally_qualified,
         ) {
-            CppLexicalScopeResolution::Resolved(lexical_scope) => {
-                match visibility.resolve_type_components_lexically_for_forward(
-                    &dispatch.source(),
-                    file,
-                    &components,
-                    globally_qualified,
-                    &lexical_scope,
-                ) {
-                    CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
-                    CppLexicalTypeResolution::Ambiguous => {
-                        // no candidates: `LexicalTypeResolution::Ambiguous`
-                        // reports the fail-closed verdict without the units.
-                        return CppTypeCandidates::outcome(ambiguous_without_candidates(format!(
-                            "`{owner_reference}` resolves ambiguously in its enclosing C++ class or namespace"
-                        )));
-                    }
-                    CppLexicalTypeResolution::Missing => fallback_owner(),
-                }
+            CppLexicalQualifiedOwner::Resolved(unit) => Some(unit),
+            CppLexicalQualifiedOwner::Ambiguous(reason) => {
+                return CppTypeCandidates::outcome(ambiguous_without_candidates(reason));
             }
-            CppLexicalScopeResolution::Ambiguous => {
-                // no candidates: the ambiguity is in the enclosing scope, so no
-                // member candidate was ever collected.
-                return CppTypeCandidates::outcome(ambiguous_without_candidates(format!(
-                    "enclosing C++ scope for `{owner_reference}` is ambiguous"
-                )));
-            }
-            CppLexicalScopeResolution::Missing => fallback_owner(),
+            CppLexicalQualifiedOwner::Missing => fallback_owner(),
         }
         .filter(|owner| {
             visibility.external_type_candidate_visible_at(file, owner, node.start_byte())
@@ -5006,12 +5034,10 @@ fn cpp_active_block_tag_type_node<'tree>(
             .child_by_field_name("name")
             .is_some_and(|name_node| cpp_node_text(name_node, source).trim() == name);
         if matching_tag {
-            let mut scope = candidate.parent();
-            while let Some(parent) = scope {
+            for parent in cpp_tag_specifier_ancestors_before_type_reference_context(candidate) {
                 if parent.kind() == "compound_statement" {
                     return Some(candidate);
                 }
-                scope = parent.parent();
             }
         }
         ancestor = candidate.parent();
@@ -6004,24 +6030,61 @@ fn resolve_cpp_call(
                 && let Some((member, owner_components)) = components.split_last()
                 && !owner_components.is_empty()
             {
-                let owner_text = owner_components.join("::");
-                let mut owners = ctx
-                    .visibility
-                    .resolve_type(ctx.file, &owner_text)
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                owners.extend(cpp_visible_name_candidates(
-                    ctx.analyzer,
-                    token,
+                // C++ lookup selects one owner: `Base::f()` inside `ns` names
+                // `ns::Base`, and `::Base::f()` names the global `Base`. Pool
+                // same-spelled owners only when lexical lookup finds none.
+                let lexical_owner = match cpp_lexical_qualified_owner(
+                    &ctx_dispatch,
                     ctx.visibility,
                     ctx.file,
-                    ctx.support,
-                    &owner_text,
-                    Some(CppTargetKind::Type),
-                    cpp_lexical_namespace(function, ctx.source).as_deref(),
-                ));
-                sort_units(&mut owners);
-                owners.dedup();
+                    ctx.source,
+                    function,
+                    owner_components,
+                    is_globally_qualified_cpp_name(function),
+                ) {
+                    CppLexicalQualifiedOwner::Resolved(owner) => Some(owner),
+                    CppLexicalQualifiedOwner::Ambiguous(reason) => {
+                        return ambiguous_without_candidates(reason);
+                    }
+                    CppLexicalQualifiedOwner::Missing => None,
+                }
+                .filter(|owner| {
+                    ctx.visibility.external_type_candidate_visible_at(
+                        ctx.file,
+                        owner,
+                        call.start_byte(),
+                    )
+                })
+                .and_then(|owner| {
+                    ctx.visibility.canonical_visible_full_type_unit(
+                        &ctx_dispatch.source(),
+                        ctx.file,
+                        &owner,
+                    )
+                });
+                let owners = if let Some(owner) = lexical_owner {
+                    vec![owner]
+                } else {
+                    let owner_text = owner_components.join("::");
+                    let mut owners = ctx
+                        .visibility
+                        .resolve_type(ctx.file, &owner_text)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    owners.extend(cpp_visible_name_candidates(
+                        ctx.analyzer,
+                        token,
+                        ctx.visibility,
+                        ctx.file,
+                        ctx.support,
+                        &owner_text,
+                        Some(CppTargetKind::Type),
+                        cpp_lexical_namespace(function, ctx.source).as_deref(),
+                    ));
+                    sort_units(&mut owners);
+                    owners.dedup();
+                    owners
+                };
                 candidates =
                     cpp_member_candidates_lazy(ctx, token, owners, member, call_arity, || {
                         cpp_call_argument_types(
@@ -8526,6 +8589,11 @@ fn cpp_direct_member_candidates_traced(
     depth: usize,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
+    let dispatch = CppDispatch::new(analyzer, token);
+    let graph = dispatch.source();
+    let related = |left: &ProjectFile, right: &ProjectFile| {
+        cpp_header_body_files_are_related(analyzer, token, left, right)
+    };
     for owner in owners {
         let found: Vec<CodeUnit> =
             crate::analyzer::usages::cpp_graph::relational_structural_members(
@@ -8541,12 +8609,13 @@ fn cpp_direct_member_candidates_traced(
                 matches!(
                     visibility.callable_linkage(candidate),
                     Some(brokk_bifrost_core::analyzer::model::CallableLinkage::External)
-                ) && cpp_header_body_files_are_related(
-                    analyzer,
-                    token,
-                    owner.source(),
-                    candidate.source(),
-                )
+                ) && (related(owner.source(), candidate.source())
+                    || visibility.class_definition_bridges_to_file(
+                        &graph,
+                        owner,
+                        candidate.source(),
+                        &related,
+                    ))
             })
             .collect();
         if let Some(state) = member_trace.as_deref_mut() {
@@ -10239,7 +10308,7 @@ fn cpp_seed_active_path(
         "assignment_expression"
             if node.end_byte() <= cutoff_start
                 && cpp_seed_function_macro_container_binding(ctx, token, node, bindings) => {}
-        "expression_statement"
+        "expression_statement" | "macro_type_specifier"
             if node.end_byte() <= cutoff_start
                 && !cpp_seed_function_macro_local_binding(ctx, token, node, bindings) =>
         {

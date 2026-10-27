@@ -3,6 +3,7 @@
 use git2::Oid;
 use rusqlite::{OptionalExtension, Transaction, params};
 
+use crate::analyzer::semantic::source_admission::SourceAdmissionRefusal;
 use crate::hash::{HashMap, HashSet};
 
 use super::{GenerationId, Result, StoreError, WorkspaceId, WorkspaceSnapshotId};
@@ -373,6 +374,159 @@ pub(super) struct WorkspaceInputRow<'a> {
     pub projection_digest: Option<&'a str>,
 }
 
+/// A live source that source admission refused. It has no source row; this
+/// row completes the revision's input domain with the refusal evidence, so a
+/// reader can tell an explained exclusion from a missing or changed input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct WorkspaceSourceRefusalRow {
+    #[doc(hidden)]
+    pub rel_path: String,
+    #[doc(hidden)]
+    pub blob_oid: Oid,
+    #[doc(hidden)]
+    pub reason: SourceAdmissionRefusal,
+}
+
+impl WorkspaceSourceRefusalRow {
+    /// The `workspace_source_refusals.reason` object.
+    fn reason_json(&self) -> serde_json::Value {
+        use crate::analyzer::semantic::source_admission::AdmissionDimension;
+        use serde_json::json;
+        match &self.reason {
+            SourceAdmissionRefusal::Binary => json!({"code": "binary"}),
+            SourceAdmissionRefusal::ProofRejected => json!({"code": "proof_rejected"}),
+            SourceAdmissionRefusal::StructuralLine { limit, observed } => {
+                json!({"code": "structural_line", "limit": limit, "observed": observed})
+            }
+            SourceAdmissionRefusal::Budget {
+                dimension,
+                limit,
+                observed,
+            } => {
+                let dimension = match dimension {
+                    AdmissionDimension::SourceBytes => "source_bytes",
+                    AdmissionDimension::Nodes => "nodes",
+                    AdmissionDimension::Depth => "depth",
+                    AdmissionDimension::SpanBytes => "span_bytes",
+                    AdmissionDimension::ExcludedNodes => "excluded_nodes",
+                };
+                json!({"code": "budget", "dimension": dimension, "limit": limit, "observed": observed})
+            }
+        }
+    }
+}
+
+/// Refusal rows one publication closes and opens, applied at the revision
+/// that also carries its file-version changes.
+#[derive(Default)]
+pub(super) struct WorkspaceRefusalChanges<'a> {
+    closed_paths: Vec<String>,
+    opened: Vec<&'a WorkspaceSourceRefusalRow>,
+}
+
+impl<'a> WorkspaceRefusalChanges<'a> {
+    fn is_empty(&self) -> bool {
+        self.closed_paths.is_empty() && self.opened.is_empty()
+    }
+
+    /// Replace every open refusal row of one storage language that the
+    /// publisher owns; rows at `foreign_paths` belong to another publisher.
+    pub(super) fn replacing(
+        tx: &Transaction<'_>,
+        workspace_id: &WorkspaceId,
+        lang: &str,
+        generation: GenerationId,
+        rows: &'a [WorkspaceSourceRefusalRow],
+        foreign_paths: &HashSet<String>,
+    ) -> Result<Self> {
+        let mut incoming = HashMap::default();
+        for row in rows {
+            assert!(
+                incoming.insert(row.rel_path.as_str(), row).is_none(),
+                "unique refused paths"
+            );
+            assert!(
+                !foreign_paths.contains(&row.rel_path),
+                "a publisher does not refuse a path it names as foreign: {}",
+                row.rel_path
+            );
+        }
+        let mut changes = Self::default();
+        let mut statement = tx.prepare_cached(
+            "SELECT rel_path, blob_oid, json(reason) FROM workspace_source_refusals
+             WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND valid_until IS NULL",
+        )?;
+        let mut open = statement.query(params![workspace_id.as_str(), lang, generation.0])?;
+        while let Some(row) = open.next()? {
+            let path: String = row.get(0)?;
+            if foreign_paths.contains(&path) {
+                continue;
+            }
+            let (oid, reason): (String, String) = (row.get(1)?, row.get(2)?);
+            let unchanged = incoming
+                .get(path.as_str())
+                .is_some_and(|new| refusal_matches(new, &oid, &reason));
+            if unchanged {
+                incoming.remove(path.as_str());
+            } else {
+                changes.closed_paths.push(path);
+            }
+        }
+        changes.opened.extend(incoming.into_values());
+        Ok(changes)
+    }
+
+    /// Replace the refusal row, if any, of one path in one storage language.
+    pub(super) fn replacing_path(
+        tx: &Transaction<'_>,
+        workspace_id: &WorkspaceId,
+        lang: &str,
+        generation: GenerationId,
+        rel_path: &str,
+        refusal: Option<&'a WorkspaceSourceRefusalRow>,
+    ) -> Result<Self> {
+        if let Some(refusal) = refusal {
+            assert_eq!(
+                refusal.rel_path, rel_path,
+                "a path replacement refuses that path"
+            );
+        }
+        let open = tx
+            .query_row(
+                "SELECT blob_oid, json(reason) FROM workspace_source_refusals
+                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                   AND rel_path = ?4 AND valid_until IS NULL",
+                params![workspace_id.as_str(), lang, generation.0, rel_path],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let unchanged = match (&open, refusal) {
+            (None, None) => true,
+            (Some((oid, reason)), Some(new)) => refusal_matches(new, oid, reason),
+            _ => false,
+        };
+        let mut changes = Self::default();
+        if !unchanged {
+            if open.is_some() {
+                changes.closed_paths.push(rel_path.to_owned());
+            }
+            changes.opened.extend(refusal);
+        }
+        Ok(changes)
+    }
+}
+
+/// Admission is a function of the bytes and the process's admission policy,
+/// which not every language folds into its epoch, so the reason is compared
+/// as well as the blob.
+fn refusal_matches(new: &WorkspaceSourceRefusalRow, oid: &str, reason: &str) -> bool {
+    oid == new.blob_oid.to_string()
+        && serde_json::from_str::<serde_json::Value>(reason)
+            .expect("the schema checks refusal reasons are JSON")
+            == new.reason_json()
+}
+
 /// A complete replacement of the rows one publisher owns in one input family;
 /// omitted families remain selected.
 ///
@@ -403,6 +557,7 @@ pub(super) fn replace_workspace_input_partitions(
     lang: &str,
     generation: GenerationId,
     partitions: &[WorkspaceInputPartition<'_>],
+    refusals: &WorkspaceRefusalChanges<'_>,
 ) -> Result<PublishedWorkspaceInputChanges> {
     super::require_current_generation(tx, lang, generation)?;
     let head = tx
@@ -485,9 +640,11 @@ pub(super) fn replace_workspace_input_partitions(
         head,
         &closed_ids,
         &replacements,
+        refusals,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn publish_workspace_input_changes(
     tx: &Transaction<'_>,
     workspace_id: &WorkspaceId,
@@ -496,10 +653,15 @@ pub(super) fn publish_workspace_input_changes(
     head: Option<i64>,
     closed_ids: &[i64],
     replacements: &[(WorkspaceInputKind, &WorkspaceInputRow<'_>)],
+    refusals: &WorkspaceRefusalChanges<'_>,
 ) -> Result<PublishedWorkspaceInputChanges> {
     let mut inserted = HashMap::default();
     let revision = match head {
-        Some(revision) if closed_ids.is_empty() && replacements.is_empty() => revision,
+        Some(revision)
+            if closed_ids.is_empty() && replacements.is_empty() && refusals.is_empty() =>
+        {
+            revision
+        }
         _ => {
             let revision = head
                 .unwrap_or(0)
@@ -545,6 +707,42 @@ pub(super) fn publish_workspace_input_changes(
                         (*kind, row.relative_path.to_owned()),
                         tx.last_insert_rowid(),
                     );
+                }
+            }
+            {
+                let mut close = tx.prepare_cached(
+                    "UPDATE workspace_source_refusals SET valid_until = ?5
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                       AND rel_path = ?4 AND valid_until IS NULL",
+                )?;
+                for path in &refusals.closed_paths {
+                    assert_eq!(
+                        close.execute(params![
+                            workspace_id.as_str(),
+                            lang,
+                            generation.0,
+                            path,
+                            revision
+                        ])?,
+                        1,
+                        "one open refusal for {path}"
+                    );
+                }
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO workspace_source_refusals(
+                       workspace_id, lang, generation, rel_path, blob_oid, reason, valid_from
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, jsonb(?6), ?7)",
+                )?;
+                for row in &refusals.opened {
+                    insert.execute(params![
+                        workspace_id.as_str(),
+                        lang,
+                        generation.0,
+                        row.rel_path,
+                        row.blob_oid.to_string(),
+                        row.reason_json().to_string(),
+                        revision,
+                    ])?;
                 }
             }
             tx.execute(
@@ -604,6 +802,7 @@ mod tests {
                 &[],
                 &[],
                 &inputs,
+                &[],
                 &[],
             )
             .unwrap();

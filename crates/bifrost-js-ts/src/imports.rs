@@ -47,13 +47,6 @@ pub struct JsTsImportSyntax<'tree> {
     pub is_static: bool,
 }
 
-pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
-    parse_es_import_syntaxes_from_node(node, source)
-        .into_iter()
-        .map(|syntax| syntax.import)
-        .collect()
-}
-
 /// Parse one ESM import statement while retaining its source nodes.
 pub fn parse_es_import_syntaxes_from_node<'tree>(
     node: Node<'tree>,
@@ -563,24 +556,6 @@ pub fn resolve_js_ts_import_info_paths(
     resolve_js_ts_module_specifier(source_file, &module_specifier, language, aliases)
 }
 
-/// Resolve an explicitly supplied raw import snippet.
-///
-/// This compatibility SPI remains available for callers that intentionally
-/// provide raw source. Analyzer consumers with [`ImportInfo`] must use
-/// [`resolve_js_ts_import_info_paths`] so stale display text cannot override
-/// the parser-captured path.
-pub fn resolve_js_ts_import_paths(
-    source_file: &ProjectFile,
-    raw_import: &str,
-    language: Language,
-    aliases: Option<&AliasResolver>,
-) -> Vec<ProjectFile> {
-    let Some(module_path) = extract_import_module_path(raw_import) else {
-        return Vec::new();
-    };
-    resolve_js_ts_module_specifier(source_file, &module_path, language, aliases)
-}
-
 /// Resolve a module specifier to project files. Relative specifiers (`"./foo"`) resolve
 /// against the importing file's directory. A non-relative specifier is matched first
 /// against the importing file's governing `tsconfig.json`/`jsconfig.json` path aliases,
@@ -815,25 +790,6 @@ pub fn node_builtin_module(specifier: &str) -> Option<&'static str> {
 /// key on the package rather than on the whole module.
 pub fn npm_package_of_module_specifier(specifier: &str) -> Option<(&str, Option<&str>)> {
     js_ts_module_identity(specifier).map(|identity| (identity.package, identity.subpath))
-}
-
-fn extract_import_module_path(raw_import: &str) -> Option<String> {
-    let trimmed = raw_import.trim().trim_end_matches(';').trim();
-    if trimmed.starts_with("import ") {
-        if let Some((_, path)) = trimmed.trim_end_matches(';').rsplit_once(" from ") {
-            return Some(path.trim().trim_matches('\'').trim_matches('"').to_string());
-        }
-        let path = trimmed.split_whitespace().nth(1)?;
-        return Some(path.trim().trim_matches('\'').trim_matches('"').to_string());
-    }
-    let require = trimmed.split_once("require(")?.1;
-    let path = require
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim_end_matches(';')
-        .trim();
-    Some(path.trim_matches('\'').trim_matches('"').to_string())
 }
 
 /// The paths one module path could name, grouped in the order the resolver

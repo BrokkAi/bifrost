@@ -5,6 +5,7 @@ use super::results::CodeQueryPointsToCandidate;
 use super::results::CodeQueryRuntimeKeyedReadValue;
 use super::results::CodeQuerySourceSpan;
 use super::*;
+use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::model::CallableArity;
 use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
@@ -1250,6 +1251,11 @@ pub(super) fn render_callable_applicability(
         ordinal: row.ordinal,
         verdict: row.verdict.label(),
         reason: row.reason.map(|reason| reason.label()),
+        phase: row.phase.map(|phase| phase.label()),
+        failing_argument: row.failing_argument.map(|argument| argument.ordinal),
+        failing_conversion: row
+            .failing_argument
+            .map(|argument| argument.conversion.label()),
         tier: row.tier.map(|tier| tier.label()),
         selected: row.selected,
         candidate: render_trace_candidate_ref(
@@ -2404,7 +2410,7 @@ fn exact_semantic_model_declaration(
         {
             return None;
         }
-        let symbol = matched.records[0];
+        let symbol = matched.records[0].clone();
         let exact_origin = declaration.unit.is_synthetic()
             || matches!(
                 &symbol.location,
@@ -2443,30 +2449,40 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         return;
     };
 
-    let roots = overlay
-        .symbols()
-        .iter()
-        .filter(|symbol| {
-            symbol.externally_visible()
-                && !symbol.provenance.ambiguous
-                && (seed.languages.is_empty()
-                    || seed
-                        .languages
-                        .iter()
-                        .any(|language| language.config_label() == symbol.language))
-                && model_pattern_matches(&seed.root, symbol)
-        })
-        .collect::<Vec<_>>();
-    let mut ambiguous_match = overlay.symbols().iter().any(|symbol| {
-        symbol.externally_visible()
-            && symbol.provenance.ambiguous
+    // Search also admits aliases; recheck the root predicate on every candidate.
+    let candidates = match seed.root.name.as_ref() {
+        Some(crate::query::StringPredicate::Exact(name)) => overlay.symbols_named(name).records,
+        _ => {
+            let patterns = crate::analyzer::SearchSymbolPatternBatch::compile(
+                vec![".*".to_owned()],
+                false,
+                None,
+            );
+            overlay
+                .search_with_limit_filter(&patterns, usize::MAX, None, |symbol| {
+                    model_pattern_matches(&seed.root, symbol)
+                })
+                .0
+        }
+    };
+    let mut roots = Vec::new();
+    let mut ambiguous_match = false;
+    for symbol in candidates {
+        if symbol.externally_visible()
             && (seed.languages.is_empty()
                 || seed
                     .languages
                     .iter()
                     .any(|language| language.config_label() == symbol.language))
-            && model_pattern_matches(&seed.root, symbol)
-    });
+            && model_pattern_matches(&seed.root, &symbol)
+        {
+            if symbol.provenance.ambiguous {
+                ambiguous_match = true;
+            } else {
+                roots.push(symbol);
+            }
+        }
+    }
 
     let mut modeled = Vec::new();
     for root in roots {
@@ -2485,18 +2501,19 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     if matched.disposition
                         == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
                     {
-                        modeled.push(matched.records[0]);
+                        modeled.push(std::sync::Arc::clone(&matched.records[0]));
                     }
                 }
             }
             Some(QueryStep::Supertypes(hierarchy)) => {
-                let (symbols, conflict) = model_hierarchy_symbols(&overlay, root, *hierarchy, true);
+                let (symbols, conflict) =
+                    model_hierarchy_symbols(&overlay, &root, *hierarchy, true);
                 modeled.extend(symbols);
                 ambiguous_match |= conflict;
             }
             Some(QueryStep::Subtypes(hierarchy)) => {
                 let (symbols, conflict) =
-                    model_hierarchy_symbols(&overlay, root, *hierarchy, false);
+                    model_hierarchy_symbols(&overlay, &root, *hierarchy, false);
                 modeled.extend(symbols);
                 ambiguous_match |= conflict;
             }
@@ -2584,13 +2601,13 @@ pub(super) fn augment_public_result_with_semantic_overlay(
     }
 }
 
-pub(super) fn model_hierarchy_symbols<'a>(
-    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+pub(super) fn model_hierarchy_symbols(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     root: &crate::analyzer::semantic_model::SemanticModelSymbol,
     traversal: HierarchyTraversal,
     supertypes: bool,
 ) -> (
-    Vec<&'a crate::analyzer::semantic_model::SemanticModelSymbol>,
+    Vec<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     bool,
 ) {
     let max_depth = match traversal {
@@ -2638,9 +2655,9 @@ pub(super) fn model_hierarchy_symbols<'a>(
                 conflict |= !matched.records.is_empty();
                 continue;
             }
-            let symbol = matched.records[0];
+            let symbol = matched.records[0].clone();
             if visited.insert(symbol.id.clone()) {
-                symbols.push(symbol);
+                symbols.push(symbol.clone());
                 queue.push_back((symbol.id.clone(), depth.saturating_add(1)));
             }
         }

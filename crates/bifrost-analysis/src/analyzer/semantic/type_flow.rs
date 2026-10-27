@@ -73,8 +73,8 @@ pub fn external_class_identity(
 /// The same canonical selection with streaming candidates and caller-owned
 /// accounting. A failed visit never inserts a partial result into the cache.
 #[doc(hidden)]
-pub fn external_class_identity_with_visits<'a, E>(
-    overlay: Option<&'a SemanticModelOverlay>,
+pub fn external_class_identity_with_visits<E>(
+    overlay: Option<&SemanticModelOverlay>,
     language: Language,
     qualified_name: &str,
     semantic_model_id: Option<&str>,
@@ -105,16 +105,19 @@ pub fn external_class_identity_with_visits<'a, E>(
         let mut exact = false;
         // Both branches feed the same selection, without allocating a match
         // vector before the caller has charged the candidates.
-        let mut candidate = |symbol: &'a SemanticModelSymbol| -> Result<(), E> {
+        let mut candidate = |symbol: std::sync::Arc<SemanticModelSymbol>| -> Result<(), E> {
             visit()?;
-            if eligible(symbol) {
+            if eligible(&symbol) {
                 if symbol.qualified_name == qualified_name {
                     exact = true;
                 }
-                if fallback.is_some_and(|name| name != symbol.qualified_name) {
+                if fallback
+                    .as_ref()
+                    .is_some_and(|name| name != &symbol.qualified_name)
+                {
                     conflicting_names = true;
                 }
-                fallback = Some(symbol.qualified_name.as_str());
+                fallback = Some(symbol.qualified_name.clone());
             }
             Ok(())
         };
@@ -134,7 +137,7 @@ pub fn external_class_identity_with_visits<'a, E>(
             qualified_name
         } else if conflicting_names {
             return Ok(None);
-        } else if let Some(name) = fallback {
+        } else if let Some(name) = fallback.as_deref() {
             name
         } else {
             return Ok(None);
@@ -143,7 +146,7 @@ pub fn external_class_identity_with_visits<'a, E>(
         let mut requested_id_present = semantic_model_id.is_none();
         for symbol in overlay.symbol_candidates_named(group_name) {
             visit()?;
-            if symbol.qualified_name != group_name || !eligible(symbol) {
+            if symbol.qualified_name != group_name || !eligible(&symbol) {
                 continue;
             }
             requested_id_present |= semantic_model_id == Some(symbol.id.as_str());

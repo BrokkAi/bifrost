@@ -70,7 +70,7 @@ pub enum SemanticIrLoweringOutcome {
 }
 
 /// The head values and encoded child rows of one blob, ready to insert.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 #[doc(hidden)]
 pub struct PreparedSemanticIr {
     producer_epoch: String,

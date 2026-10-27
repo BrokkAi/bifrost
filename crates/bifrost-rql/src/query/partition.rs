@@ -41,6 +41,11 @@ pub enum PlanPartitioning {
     /// The plan is an all-union composition whose leaves may be executed per
     /// seed file and merged in branch order before first-writer deduplication.
     BySeedUnion,
+    /// The plan is `A except B...` over rows whose set-difference key names
+    /// their file. Its rows are the minuend's rows in the minuend's seed order,
+    /// so one execution per seed file merges exactly as a `BySeed` plan's
+    /// does, with the fair-share proof a set source needs.
+    BySeedExcept,
     /// The plan must be executed once over the whole workspace.
     Whole,
 }
@@ -56,10 +61,10 @@ impl PlanPartitioning {
     /// expose different values for the same identity. Leaf-local filters still
     /// run before the set and remain eligible. The remaining shapes are `Whole`:
     ///
-    /// - An intersect/except source, or a union with a non-distributive suffix.
-    ///   Those operators consume cross-seed membership or a deduplicated set
-    ///   of branch rows, so their result cannot be reconstructed from
-    ///   independent seed rows.
+    /// - An intersect source, an except that [`Self::classify_except`] does not
+    ///   accept, or a union with a non-distributive suffix. Those operators
+    ///   consume cross-seed membership or a deduplicated set of branch rows, so
+    ///   their result cannot be reconstructed from independent seed rows.
     ///   A union with an `absent_member` step is also whole because its root
     ///   evidence payload is merged by representative selection rather than by
     ///   traces alone. Eligible unions handle their fair-budget retry boundary
@@ -82,10 +87,16 @@ impl PlanPartitioning {
     /// steps (whose only reordering is a stable sort by artifact file over
     /// seed-major input).
     pub fn classify(plan: &CodeQueryPlan) -> Self {
-        if matches!(&plan.source, CodeQueryPlanSource::Set { .. }) {
-            return Self::classify_union(plan).map_or(Self::Whole, |_| Self::BySeedUnion);
+        match &plan.source {
+            CodeQueryPlanSource::Set {
+                op: SetOperator::Except,
+                ..
+            } => Self::classify_except(plan).map_or(Self::Whole, |_| Self::BySeedExcept),
+            CodeQueryPlanSource::Set { .. } => {
+                Self::classify_union(plan).map_or(Self::Whole, |_| Self::BySeedUnion)
+            }
+            _ => Self::classify_leaf(plan),
         }
-        Self::classify_leaf(plan)
     }
 
     /// Whether one file's rows of `plan` are the rows of `plan` executed with
@@ -95,11 +106,13 @@ impl PlanPartitioning {
     ///
     /// This differs from [`Self::classify`] on purpose. A unit's per-seed
     /// rows must merge into the whole execution's rows exactly, with their
-    /// order, first-writer deduplication and cross-seed membership, so an
-    /// `except` is whole there: its result consults rows of every seed. A
+    /// order, first-writer deduplication and cross-seed membership, so units
+    /// accept only the excepts whose merged order is a seed order
+    /// ([`Self::classify_except`]). A
     /// consumer of one file needs only that file's rows. A set-difference key
     /// that names the row's file (structural matches, occurrences, bindings,
-    /// files: `PipelineKey` in `structural/search/mod.rs`) makes `A except B`
+    /// files: `PipelineKey` in `structural/search/mod.rs`; Python rule facts,
+    /// whose ids fold the row file's path) makes `A except B`
     /// restricted to one file the difference of `A` and `B` restricted to that
     /// file, so the narrowed execution answers it when both branches do.
     /// Every other plan answers it exactly when [`Self::classify`] slices it.
@@ -141,6 +154,7 @@ impl PlanPartitioning {
                             | QueryValueKind::Occurrence
                             | QueryValueKind::Binding
                             | QueryValueKind::File
+                            | QueryValueKind::PythonRuleFact
                     );
                     if !(row_local_suffix && file_keyed) {
                         return false;
@@ -160,7 +174,7 @@ impl PlanPartitioning {
 
     /// Whether this plan may be executed one seed file at a time.
     pub const fn is_by_seed(self) -> bool {
-        matches!(self, Self::BySeed | Self::BySeedUnion)
+        matches!(self, Self::BySeed | Self::BySeedUnion | Self::BySeedExcept)
     }
 
     /// Whether this plan is an eligible all-union composition.
@@ -193,14 +207,13 @@ impl PlanPartitioning {
             return None;
         };
 
-        let mut pending = vec![(plan, 1usize)];
-        let mut maximum_divisor = 1usize;
+        let mut pending = vec![plan];
         let mut leaves = 0usize;
         let mut comparator = None;
-        while let Some((current, divisor)) = pending.pop() {
+        while let Some(current) = pending.pop() {
             match &current.source {
                 CodeQueryPlanSource::Set { op, branches } => {
-                    if *op != super::ir::SetOperator::Union
+                    if *op != SetOperator::Union
                         || current
                             .steps
                             .iter()
@@ -208,11 +221,7 @@ impl PlanPartitioning {
                     {
                         return None;
                     }
-                    let next_divisor = divisor.checked_mul(branches.len())?;
-                    for branch in branches.iter().rev() {
-                        pending.push((branch, next_divisor));
-                    }
-                    maximum_divisor = maximum_divisor.max(next_divisor);
+                    pending.extend(branches.iter().rev());
                 }
                 _ => {
                     if !Self::classify_leaf(current).is_by_seed()
@@ -234,6 +243,73 @@ impl PlanPartitioning {
         }
         if leaves == 0 {
             return None;
+        }
+        Self::fair_share_divisor(plan)
+    }
+
+    /// Validate an `except` whose per-seed executions merge into the whole
+    /// execution's rows, and return its checked fair-share divisor.
+    ///
+    /// The difference keeps the minuend's rows in the minuend's order and
+    /// drops each one whose set-difference key some subtrahend row carries.
+    /// When that key names the row's file and no row leaves its seed's file
+    /// ([`Self::restricts_to_seed_file`]), a minuend row of file F can only be
+    /// excluded by a subtrahend row of F, so the difference over seed F is the
+    /// difference of the two branches over F. The merge then needs the
+    /// minuend's whole order to be a seed order, which holds when the chain of
+    /// minuends ends in a seed-partitionable plan without a set source of its
+    /// own ([`Self::except_minuend_leaf`]): a union minuend orders its rows
+    /// branch-major across every file.
+    pub(crate) fn classify_except(plan: &CodeQueryPlan) -> Option<usize> {
+        let minuend = Self::except_minuend_leaf(plan)?;
+        if matches!(&minuend.source, CodeQueryPlanSource::Set { .. })
+            || !Self::classify_leaf(minuend).is_by_seed()
+            || !Self::restricts_to_seed_file(plan)
+        {
+            return None;
+        }
+        Self::fair_share_divisor(plan)
+    }
+
+    /// The plan whose rows an `except` keeps, following nested excepts through
+    /// their minuends, or `None` when `plan` is not an except. Every except
+    /// keeps its minuend's rows in its minuend's order, so this plan's seed
+    /// family orders the whole difference.
+    pub(crate) fn except_minuend_leaf(plan: &CodeQueryPlan) -> Option<&CodeQueryPlan> {
+        let CodeQueryPlanSource::Set {
+            op: SetOperator::Except,
+            ..
+        } = &plan.source
+        else {
+            return None;
+        };
+        let mut minuend = plan;
+        while let CodeQueryPlanSource::Set {
+            op: SetOperator::Except,
+            branches,
+        } = &minuend.source
+        {
+            minuend = branches.first().expect("a set operation has branches");
+        }
+        Some(minuend)
+    }
+
+    /// The largest product of branch counts along any path from `plan` to a
+    /// non-set leaf.
+    ///
+    /// The executor gives each set branch a fair share of the cumulative
+    /// limits left when it starts, so a branch nested under these sets can be
+    /// cut at a `1/divisor` share of a lane. Merged units below that share
+    /// prove no branch of the whole execution reached its own.
+    pub(crate) fn fair_share_divisor(plan: &CodeQueryPlan) -> Option<usize> {
+        let mut pending = vec![(plan, 1usize)];
+        let mut maximum_divisor = 1usize;
+        while let Some((current, divisor)) = pending.pop() {
+            if let CodeQueryPlanSource::Set { branches, .. } = &current.source {
+                let next_divisor = divisor.checked_mul(branches.len())?;
+                maximum_divisor = maximum_divisor.max(next_divisor);
+                pending.extend(branches.iter().map(|branch| (branch, next_divisor)));
+            }
         }
         Some(maximum_divisor)
     }
@@ -415,23 +491,66 @@ mod tests {
     }
 
     #[test]
-    fn intersect_and_except_stay_whole() {
-        let intersect = json!({
-            "intersect": [
-                { "match": { "kind": "function" } },
-                { "match": { "kind": "function" } }
-            ]
+    fn an_except_partitions_only_when_its_minuend_orders_file_keyed_rows_by_seed() {
+        let leaf = json!({ "match": { "kind": "function" } });
+        let intersect = plan(json!({ "intersect": [leaf.clone(), leaf.clone()] }));
+        assert_eq!(
+            PlanPartitioning::classify(&intersect),
+            PlanPartitioning::Whole
+        );
+
+        let except = plan(json!({ "except": [leaf.clone(), leaf.clone()] }));
+        assert_eq!(
+            PlanPartitioning::classify(&except),
+            PlanPartitioning::BySeedExcept
+        );
+        assert_eq!(PlanPartitioning::fair_share_divisor(&except), Some(2));
+        // A union subtrahend is only a membership set, so it may nest; the
+        // fair share divides along the deepest path.
+        let union_subtrahend = plan(json!({
+            "except": [leaf.clone(), { "union": [leaf.clone(), leaf.clone(), leaf.clone()] }]
+        }));
+        assert_eq!(
+            PlanPartitioning::classify(&union_subtrahend),
+            PlanPartitioning::BySeedExcept
+        );
+        assert_eq!(
+            PlanPartitioning::fair_share_divisor(&union_subtrahend),
+            Some(6)
+        );
+
+        // A nested except keeps its own minuend's rows in seed order.
+        let nested_minuend = plan(json!({
+            "except": [{ "except": [leaf.clone(), leaf.clone()] }, leaf.clone()]
+        }));
+        assert_eq!(
+            PlanPartitioning::classify(&nested_minuend),
+            PlanPartitioning::BySeedExcept
+        );
+        assert_eq!(
+            PlanPartitioning::fair_share_divisor(&nested_minuend),
+            Some(4)
+        );
+
+        // A union minuend orders its rows branch-major across every file, and
+        // a declaration's identity does not name its file.
+        let union_minuend = plan(json!({
+            "except": [{ "union": [leaf.clone(), leaf.clone()] }, leaf.clone()]
+        }));
+        assert!(PlanPartitioning::restricts_to_seed_file(&union_minuend));
+        assert_eq!(
+            PlanPartitioning::classify(&union_minuend),
+            PlanPartitioning::Whole
+        );
+        let declaration = json!({
+            "match": { "kind": "function" },
+            "steps": [{ "op": "enclosing_decl" }]
         });
-        let except = json!({
-            "except": [
-                { "match": { "kind": "function" } },
-                { "match": { "kind": "function" } }
-            ]
-        });
-        for query in [intersect, except] {
-            let plan = plan(query);
-            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
-        }
+        let declarations = plan(json!({ "except": [declaration.clone(), declaration] }));
+        assert_eq!(
+            PlanPartitioning::classify(&declarations),
+            PlanPartitioning::Whole
+        );
     }
 
     #[test]

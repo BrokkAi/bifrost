@@ -1800,6 +1800,23 @@ fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
 /// A parameter with no `type` field contributes an empty spelling rather than
 /// disappearing, because dropping it would shift every later parameter's index.
 fn csharp_callable_parameter_types(node: Node<'_>, source: &str) -> Vec<String> {
+    csharp_callable_parameter_type_nodes(node)
+        .into_iter()
+        .map(|type_node| {
+            type_node
+                .map(|type_node| csharp_type_node_identity(type_node, source))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The `type` node of each parameter of a callable, in the order
+/// [`csharp_callable_parameter_types`] records their spellings.
+///
+/// A query that needs the scope a parameter's type is written in reads the
+/// node back from the declaring file's tree with this function, so the index
+/// it is given is the persisted parameter index by construction.
+pub fn csharp_callable_parameter_type_nodes(node: Node<'_>) -> Vec<Option<Node<'_>>> {
     let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
     };
@@ -1809,20 +1826,10 @@ fn csharp_callable_parameter_types(node: Node<'_>, source: &str) -> Vec<String> 
         if child.kind() != "parameter" {
             continue;
         }
-        types.push(
-            child
-                .child_by_field_name("type")
-                .map(|type_node| csharp_type_node_identity(type_node, source))
-                .unwrap_or_default(),
-        );
+        types.push(child.child_by_field_name("type"));
     }
     if csharp_parameter_list_has_params(parameters) {
-        types.push(
-            parameters
-                .child_by_field_name("type")
-                .map(|type_node| csharp_type_node_identity(type_node, source))
-                .unwrap_or_default(),
-        );
+        types.push(parameters.child_by_field_name("type"));
     }
     types
 }

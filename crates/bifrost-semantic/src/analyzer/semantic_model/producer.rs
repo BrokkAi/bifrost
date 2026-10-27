@@ -34,36 +34,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalArtifactKind {
-    NpmPackageManifest,
-    TypeScriptDeclarationFile,
-    JavaSourceJar,
-    JavaClassJar,
-    ScalaSourceJar,
-    KotlinSourceJar,
-    JdkSourceZip,
-    JdkJmodSet,
-    DotNetAssembly,
-    RustdocJson,
-    RustdocJsonSet,
-    TypeScriptLibrarySet,
-    GoSourceSet,
-    PythonStub,
-    PythonSource,
-    RubyGemArchive,
-    /// One Composer-installed package tree. Composer installs sources rather
-    /// than a compiled artifact, so the ecosystem names the input instead of
-    /// the language, exactly as `NpmPackageManifest` does.
-    ComposerPackageSourceSet,
-    /// One tree of plain PHP declaration stubs: PHP source that states the
-    /// runtime's classes, interfaces, constants and functions with native
-    /// signatures and empty bodies. Distinct from `ComposerPackageSourceSet`,
-    /// which is an installed package's real, executable sources.
-    PhpDeclarationStub,
-    /// One explicit C++ include root containing exact header sources.
-    CppHeaderSourceSet,
-}
+pub use crate::analyzer::semantic_model::ArtifactExtractionKind as ExternalArtifactKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactProductionRequest {
@@ -128,6 +99,15 @@ pub struct ArtifactProduction {
 }
 
 impl ArtifactProduction {
+    pub fn with_extraction(mut self, kind: ExternalArtifactKind, artifact: &ExactArtifact) -> Self {
+        if let Some(pack) = &mut self.pack {
+            pack.extraction = Some(
+                crate::analyzer::semantic_model::ArtifactExtraction::from_artifact(kind, artifact),
+            );
+        }
+        self
+    }
+
     pub fn failed(diagnostic: ProducerDiagnostic, limits: &ArtifactProducerLimits) -> Self {
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
         diagnostics.push_diagnostic(diagnostic);
@@ -183,6 +163,10 @@ pub fn finish_authored_pack_production(
     };
     let carried_sources = carried_source_paths(&shards);
     let pack = (!shards.is_empty()).then(|| AuthoredSemanticModelPack {
+        extraction: Some(crate::analyzer::semantic_model::ArtifactExtraction::single(
+            request.artifact_kind,
+            artifact_sha256,
+        )),
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
         pack_id: request.pack_id.clone(),
         version: request.pack_version.clone(),
@@ -208,6 +192,16 @@ pub fn finish_authored_pack_production(
         completeness,
         diagnostics,
         suppressed_diagnostics,
+    }
+}
+
+impl crate::analyzer::semantic_model::ArtifactExtraction {
+    pub fn from_artifact(kind: ExternalArtifactKind, artifact: &ExactArtifact) -> Self {
+        if artifact.source_entries().is_empty() {
+            Self::single(kind, artifact.sha256())
+        } else {
+            Self::source_set(kind, artifact.sha256())
+        }
     }
 }
 

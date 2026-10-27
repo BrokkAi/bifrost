@@ -91,13 +91,13 @@ fn region_contains(outer: CodeQueryRange, inner: CodeQueryRange) -> bool {
 /// construction rather than by comparison. An assertion policy's subject
 /// selector and each binding of a relational plan are both one query, so both
 /// arrive here.
-struct ExecutedQueryRows {
-    items: Vec<UnitRowItem>,
-    evidence: Vec<UnitRowEvidence>,
-    completion: CodeQueryCompletion,
-    truncated: bool,
-    diagnostics: Vec<CodeQueryDiagnostic>,
-    work: CodeQueryExecutionWork,
+pub(super) struct ExecutedQueryRows {
+    pub(super) items: Vec<UnitRowItem>,
+    pub(super) evidence: Vec<UnitRowEvidence>,
+    pub(super) completion: CodeQueryCompletion,
+    pub(super) truncated: bool,
+    pub(super) diagnostics: Vec<CodeQueryDiagnostic>,
+    pub(super) work: CodeQueryExecutionWork,
 }
 
 impl ExecutedQueryRows {
@@ -583,6 +583,9 @@ fn sliced_assertion_run(
         cancellation: context.cancellation,
         limits,
         workspace_files: &workspace_files,
+        // Shared units are executed with the workspace oracles, which these
+        // units do not hold.
+        subject_batch: None,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget);
     let subject_units = {
@@ -2372,6 +2375,8 @@ fn sliced_relational_bindings(
         cancellation: context.cancellation,
         limits,
         workspace_files: &workspace_files,
+        // Binding queries are not counted as batch consumers.
+        subject_batch: None,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget);
     let mut executed = Vec::with_capacity(queries.len());

@@ -90,6 +90,31 @@ pub(super) fn endpoint_admits_candidate(
             })
 }
 
+/// Candidate reads charge once per request even when no row is offered.
+/// Keeping this in the consumer makes cache replay and SQL reads agree.
+pub(super) fn charge_candidate_requests(session: Option<&ResolutionSession>, count: usize) -> bool {
+    session.is_none_or(|session| session.scope_steps(count))
+}
+
+/// Charge an offered pair before deciding whether it can compose.
+pub(super) fn admit_candidate_pair(
+    session: Option<&ResolutionSession>,
+    request: &EndpointSignature,
+    candidate: &EndpointSignature,
+) -> Option<bool> {
+    if !charge_candidate_requests(session, 1) {
+        return None;
+    }
+    let admitted = endpoint_admits_candidate(request, candidate);
+    let arm = if request.node() == BindingNodeId::universal_root() {
+        super::seam_profile::CandidateAdmissionArm::Root
+    } else {
+        super::seam_profile::CandidateAdmissionArm::Node
+    };
+    super::seam_profile::record_candidate_admission(arm, admitted);
+    Some(admitted)
+}
+
 /// Candidate compositions between cooperative cancellation checks.
 ///
 /// This is a deterministic work quantum, not a duration or deadline. A
@@ -1574,7 +1599,7 @@ impl PreloadedFragmentSource {
         offered_endpoint: fn(&PartialPath) -> &EndpointSignature,
         requests: &[BatchCandidateRequest],
         maximum_page_rows: usize,
-        resolution_session: Option<&ResolutionSession>,
+        _resolution_session: Option<&ResolutionSession>,
         cancellation: &CancellationToken,
         work: &mut usize,
         visitor: &mut dyn FnMut(&[BatchCandidateMatch]) -> StoreResult<bool>,
@@ -1593,9 +1618,6 @@ impl PreloadedFragmentSource {
                 request_ordinal,
                 "preloaded candidate requests must use canonical local ordinals"
             );
-            if resolution_session.is_some_and(|session| !session.scope_step()) {
-                break;
-            }
             *work = work
                 .checked_add(1)
                 .expect("preloaded candidate request work must fit usize");
@@ -1611,9 +1633,6 @@ impl PreloadedFragmentSource {
             while let Some(path_index) =
                 take_next_candidate_in_identity_order(&self.paths, &mut buckets)
             {
-                if resolution_session.is_some_and(|session| !session.scope_step()) {
-                    break 'requests;
-                }
                 *work = work
                     .checked_add(1)
                     .expect("preloaded candidate row work must fit usize");

@@ -144,6 +144,7 @@ pub struct GoMemberDeclaration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoMemberDeclarationKind {
+    Defined,
     Interface { methods: Vec<GoInterfaceMethod> },
     Struct { fields: Vec<GoStructField> },
     Method { pointer_receiver: Option<bool> },
@@ -204,13 +205,37 @@ impl LoweredIntrinsicTypeDescriptor {
     }
 }
 
+/// Package knowledge is independent of the existence of a declaration.
+/// Known(None) denotes the unnamed package; Unknown carries no package proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JvmDeclarationPackage {
+    Known(Option<String>),
+    Unknown,
+}
+
+impl JvmDeclarationPackage {
+    pub fn named(&self) -> Option<&str> {
+        match self {
+            Self::Known(package) => package.as_deref(),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn same_known_package(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Known(left), Self::Known(right)) => Some(left == right),
+            _ => None,
+        }
+    }
+}
+
 /// Selected Java declaration properties needed before inheriting a method.
 /// Missing properties remain unknown; they are never inferred from a signature label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JavaInheritanceDeclaration {
     pub definition: SemanticId,
     pub name: String,
-    pub package: Option<String>,
+    pub package: JvmDeclarationPackage,
     pub kind: JavaInheritanceDeclarationKind,
 }
 
@@ -1441,6 +1466,25 @@ pub struct QualifiedRouteSlotLookup {
     lookup: SemanticId,
 }
 
+/// A JVM alias of an authored declaration, read only for this query.
+/// Owner components and member spelling nominate candidates; the declaration
+/// remains the identity that forward confirmation must prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmAliasProperty {
+    pub definition: SemanticId,
+    pub alias: u32,
+    pub member_name: String,
+    pub owner_segments: Vec<String>,
+    pub kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionJvmAliasKind,
+    pub status: brokk_bifrost_core::analyzer::resolution_facts::ResolutionJvmAliasStatus,
+}
+
+impl SelectedTypedRow<JvmAliasProperty> {
+    pub fn natural_identity(&self) -> (BindingFragmentId, SemanticId, u32) {
+        (self.fragment(), self.row.definition, self.row.alias)
+    }
+}
+
 /// A persisted companion declaration paired with the type that encloses it.
 ///
 /// The storage table is site keyed; the selected reader joins those sites to
@@ -1908,6 +1952,27 @@ pub trait SelectedTypedFactSource {
         Ok((!cancellation.is_cancelled()).then(|| vec![true; definitions.len()]))
     }
 
+    /// All member-file sources of each declaration's selected Go package.
+    /// Missing package membership or an unmounted member returns None for that
+    /// declaration; an incomplete inventory cannot certify placement.
+    fn go_package_member_sources(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<Option<Vec<SemanticId>>>>> {
+        Ok((!cancellation.is_cancelled()).then(|| vec![None; definitions.len()]))
+    }
+
+    /// Whether each source has selected Go placement or authoritative exclusion.
+    /// Source identities come from gap provenance; absent membership proves nothing.
+    fn go_source_placement_proofs(
+        &self,
+        sources: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<bool>>> {
+        Ok((!cancellation.is_cancelled()).then(|| vec![false; sources.len()]))
+    }
+
     /// Admission proof for exact deferred members against a complete receiver
     /// promotion set. Unknown preserves the ordinary name-based demand path.
     /// Each candidate is (definition, owner frontier); preserve input order.
@@ -1982,6 +2047,15 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<String>>> {
         Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+
+    /// Namespace-valued bindings contribute no missing declared value type.
+    fn namespace_definitions(
+        &self,
+        _definitions: &[SemanticId],
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<SemanticId>> {
+        Ok(Vec::new())
     }
 
     /// Module declarations classified by the selected languages' providers.
@@ -2265,6 +2339,32 @@ pub trait SelectedTypedFactSource {
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredMemberScopeProperty>>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
+    /// Enumerate existing JVM alias spellings and owner routes for exact
+    /// authored definitions. Sources without alias facts must stay open.
+    fn visit_jvm_alias_pages_for_definitions(
+        &self,
+        definitions: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        _visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<JvmAliasProperty>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let completion = if definitions.as_slice().is_empty() {
+            ResolutionCompletion::Complete
+        } else {
+            ResolutionCompletion::incomplete(
+                definitions
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(ResolutionIncompleteReason::UnsupportedSemantic),
+            )
+        };
+        Ok(if cancellation.is_cancelled() {
+            TypedFactReadOutcome::cancelled(completion)
+        } else {
+            TypedFactReadOutcome::exhausted(completion)
+        })
+    }
+
     /// Visit companion declarations enclosed by selected type definitions.
     ///
     /// A companion relation is consumed beside member-scope reads, where the
@@ -2462,6 +2562,22 @@ impl JvmDeclarationAccessRules {
     /// cannot name. Direct type references and final members keep access checks.
     pub(crate) const fn inherited_member_requires_accessible_owner(self) -> bool {
         !matches!(self, Self::Java)
+    }
+
+    /// A Java superclass or superinterface name denotes a nominal type
+    /// declaration, so a hierarchy edge's unique selected target is the
+    /// parent itself. Kotlin and Scala supertypes may name type aliases,
+    /// which their type-frontier projection expands first.
+    pub(crate) const fn supertype_references_are_nominal(self) -> bool {
+        matches!(self, Self::Java)
+    }
+
+    /// JLS 6.6.2.1: outside its package, a protected instance field or
+    /// method is accessible through a qualifier only when the qualifier's
+    /// type is the accessing subclass or one of its subtypes. Kotlin and
+    /// Scala keep their existing subclass access rules.
+    pub(crate) const fn protected_access_requires_qualifier_subtype(self) -> bool {
+        matches!(self, Self::Java)
     }
 }
 
@@ -2902,5 +3018,39 @@ mod tests {
                 .map(SelectedTypedRow::<LoweredTypeTransfer>::natural_identity)
                 .collect::<BTreeSet<_>>()
         );
+    }
+}
+
+/// Array operand rules are selected only for producers that emit gate rows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum JvmArrayOperandRules {
+    Java,
+}
+
+impl JvmArrayOperandRules {
+    pub(crate) fn index_type(self, kind: IntrinsicTypeKind, spelling: &str) -> bool {
+        match self {
+            Self::Java => {
+                kind == IntrinsicTypeKind::Primitive
+                    && matches!(spelling, "byte" | "short" | "char" | "int")
+            }
+        }
+    }
+    pub(crate) fn element<T: brokk_bifrost_jvm::java::conversion::JavaConversionTypes>(
+        self,
+        types: &mut T,
+        source: T::Type,
+        target: T::Type,
+    ) -> std::result::Result<brokk_bifrost_jvm::java::conversion::JavaConversion, T::Error> {
+        match self {
+            Self::Java => brokk_bifrost_jvm::java::conversion::classify(types, source, target),
+        }
+    }
+}
+
+pub(crate) fn language_jvm_array_operand_rules(language: Language) -> Option<JvmArrayOperandRules> {
+    match language {
+        Language::Java => Some(JvmArrayOperandRules::Java),
+        _ => None,
     }
 }

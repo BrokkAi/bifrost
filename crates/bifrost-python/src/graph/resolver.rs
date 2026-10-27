@@ -473,23 +473,6 @@ fn focused_annotation_attribute_candidates(
     Vec::new()
 }
 
-/// Return the exact qualifier token when a class target owns part of a
-/// structured annotation attribute chain.
-pub fn annotation_class_qualifier_site<'tree>(
-    graph: &PythonGraphSource<'_>,
-    python: &dyn PythonUsageSource,
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
-    target: &CodeUnit,
-) -> Option<Node<'tree>> {
-    if !target.is_class() {
-        return None;
-    }
-    annotation_class_qualifier_sites(graph, python, file, source, node)
-        .find_map(|(site, owner)| (&owner == target).then_some(site))
-}
-
 /// Class qualifiers in lexical order. The lazy walk preserves the singleton
 /// lookup's early stop, while a batched scan resolves the shared path once.
 pub fn annotation_class_qualifier_sites<'a, 'tree: 'a>(

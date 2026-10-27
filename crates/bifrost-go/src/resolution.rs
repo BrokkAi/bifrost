@@ -1378,6 +1378,24 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .expect("the file scope contains every Go source range")
     }
 
+    fn lexical_scope_for_reference(&self, node: Node<'_>) -> ResolutionScopeId {
+        let mut lexical_scope = self.scope_for_source_node(node);
+        // Struct fields and interface methods have member scopes, not lexical
+        // bindings in type syntax. Keep their binders for member lookup, but
+        // start references outside every containing member scope (including
+        // interface signature scopes). The parent retains type parameters and
+        // enclosing function locals, which do shadow imports in Go.
+        let mut ancestor = Some(lexical_scope);
+        while let Some(id) = ancestor {
+            let scope = self.scope(id);
+            if scope.kind == ResolutionScopeKind::TypeBody {
+                lexical_scope = scope.parent.expect("a Go type body has an enclosing scope");
+            }
+            ancestor = scope.parent;
+        }
+        lexical_scope
+    }
+
     fn slot(&self, id: ResolutionTypeSlotId) -> &ResolutionTypeSlotFact {
         self.facts.type_slot(id)
     }
@@ -1929,19 +1947,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 generic_scope,
             });
         };
-        if matches!(
-            type_node.kind(),
-            "type_identifier"
-                | "identifier"
-                | "qualified_type"
-                | "array_type"
-                | "slice_type"
-                | "implicit_length_array_type"
-                | "map_type"
-                | "channel_type"
-                | "function_type"
-                | "parenthesized_type"
-        ) {
+        if go_underlying_type_is_lowered(type_node.kind()) {
             let syntax = self.lower_type(type_node);
             self.publish_function_type_signature(declaration, syntax.input);
             let subject = self.add_slot(declaration, ResolutionTypeSlotRole::TargetTypeIdentity);
@@ -1993,16 +1999,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 let is_constraint = self.interface_type_is_constraint(type_node);
                 self.lower_interface_type_elements(declaration, type_node, is_constraint);
             }
-            "type_identifier"
-            | "identifier"
-            | "qualified_type"
-            | "array_type"
-            | "slice_type"
-            | "implicit_length_array_type"
-            | "map_type"
-            | "channel_type"
-            | "function_type"
-            | "parenthesized_type" => {}
+            kind if go_underlying_type_is_lowered(kind) => {}
             _ => self.add_gap(declaration, ResolutionGapKind::UnsupportedTypeSyntax),
         }
         Some(TypeContext {
@@ -4274,7 +4271,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
     }
 
     fn lower_qualifier_reference(&mut self, node: Node<'_>) {
-        let scope = self.scope_for_source_node(node);
+        let scope = self.lexical_scope_for_reference(node);
         let Some(reference) = self.add_identifier_site(
             node,
             ResolutionSiteKind::ValueReference,
@@ -4380,7 +4377,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         if !is_spelled_identifier(node) {
             return self.lower_gap_type(node, ResolutionGapKind::MalformedSyntax);
         }
-        let scope = self.scope_for_source_node(node);
+        let scope = self.lexical_scope_for_reference(node);
         let Some(reference) = self.add_identifier_site(
             node,
             ResolutionSiteKind::TypeReference,
@@ -4652,7 +4649,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 let Some(reference) = self.add_identifier_site(
                     node,
                     ResolutionSiteKind::ValueReference,
-                    self.current_scope(),
+                    self.lexical_scope_for_reference(node),
                     ResolutionIdentifierRole::Reference,
                     ResolutionNamespace::Value,
                     None,
@@ -4847,7 +4844,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         let Some(reference) = self.add_identifier_site(
             node,
             ResolutionSiteKind::ValueReference,
-            self.current_scope(),
+            self.lexical_scope_for_reference(node),
             ResolutionIdentifierRole::Reference,
             ResolutionNamespace::Value,
             None,
@@ -5007,7 +5004,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         let Some(reference) = self.add_identifier_site(
             node,
             ResolutionSiteKind::ValueReference,
-            self.current_scope(),
+            self.lexical_scope_for_reference(node),
             ResolutionIdentifierRole::Reference,
             ResolutionNamespace::TypeOrValue,
             None,
@@ -5136,7 +5133,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 let Some(callee) = self.add_identifier_site(
                     base,
                     ResolutionSiteKind::CallableReference,
-                    self.current_scope(),
+                    self.lexical_scope_for_reference(base),
                     ResolutionIdentifierRole::Reference,
                     ResolutionNamespace::TypeOrValue,
                     None,
@@ -5279,7 +5276,6 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 let Some(callee) = self.add_go_call_or_conversion_reference(
                     function,
                     ResolutionSiteKind::CallableReference,
-                    self.current_scope(),
                     None,
                 ) else {
                     self.finish_unsupported_call(node, call);
@@ -5327,7 +5323,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                         let Some(callee) = self.add_identifier_site(
                             instantiated,
                             ResolutionSiteKind::CallableReference,
-                            self.current_scope(),
+                            self.lexical_scope_for_reference(instantiated),
                             ResolutionIdentifierRole::Reference,
                             ResolutionNamespace::TypeOrValue,
                             None,
@@ -5599,7 +5595,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             let callee = self.add_identifier_site(
                 base,
                 ResolutionSiteKind::CallableReference,
-                self.current_scope(),
+                self.lexical_scope_for_reference(base),
                 ResolutionIdentifierRole::Reference,
                 ResolutionNamespace::TypeOrValue,
                 None,
@@ -5656,7 +5652,6 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             self.add_go_call_or_conversion_reference(
                 field,
                 ResolutionSiteKind::CallableReference,
-                self.current_scope(),
                 Some(receiver),
             )?
         } else {
@@ -5687,13 +5682,12 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
         &mut self,
         node: Node<'tree>,
         kind: ResolutionSiteKind,
-        scope: ResolutionScopeId,
         qualifier: Option<ResolutionTypeSlotId>,
     ) -> Option<ResolutionSiteId> {
         self.add_identifier_site(
             node,
             kind,
-            scope,
+            self.lexical_scope_for_reference(node),
             ResolutionIdentifierRole::Reference,
             ResolutionNamespace::TypeOrValue,
             qualifier,
@@ -5804,7 +5798,7 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                 let Some(callee) = self.add_identifier_site(
                     base,
                     ResolutionSiteKind::CallableReference,
-                    self.scope_for_source_node(base),
+                    self.lexical_scope_for_reference(base),
                     ResolutionIdentifierRole::Reference,
                     ResolutionNamespace::TypeOrValue,
                     None,
@@ -6295,6 +6289,28 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             .expect("Go callable parameter count exceeds u32");
         ordinal
     }
+}
+
+/// Underlying-type syntax that `lower_type_declaration` lowers into an
+/// `UnderlyingType` relation; any other kind except a struct or interface
+/// body is `UnsupportedTypeSyntax`. Kept in one place because the lowering
+/// and the gap check once listed these kinds separately and both missed
+/// `generic_type` (#6911).
+fn go_underlying_type_is_lowered(kind: &str) -> bool {
+    matches!(
+        kind,
+        "type_identifier"
+            | "identifier"
+            | "qualified_type"
+            | "generic_type"
+            | "array_type"
+            | "slice_type"
+            | "implicit_length_array_type"
+            | "map_type"
+            | "channel_type"
+            | "function_type"
+            | "parenthesized_type"
+    )
 }
 
 /// Preserve the Go producer's deliberately conservative enumeration contract.

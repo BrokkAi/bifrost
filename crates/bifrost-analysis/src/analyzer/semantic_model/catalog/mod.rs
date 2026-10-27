@@ -1,14 +1,5 @@
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
-use crate::analyzer::semantic_model::GoPinnedPackage;
-use crate::analyzer::semantic_model::csmi::{
-    CsmiCallableValuesModality, CsmiCallableValuesPayload, CsmiCallableValuesShape,
-    CsmiCallableValuesTiming, CsmiCoverageStatus,
-};
-use crate::analyzer::semantic_model::model::{
-    CallableValuesCoverage, CallableValuesFact, CallableValuesFamily,
-};
-
 use crate::analyzer::semantic_model::ActivationSelector;
 use crate::analyzer::semantic_model::CompiledPackManifest;
 use crate::analyzer::semantic_model::CompiledSemanticModelPack;
@@ -17,6 +8,7 @@ use crate::analyzer::semantic_model::CompiledShardDescriptor;
 use crate::analyzer::semantic_model::Completeness;
 use crate::analyzer::semantic_model::DecodeLimits;
 use crate::analyzer::semantic_model::ExactArtifact;
+use crate::analyzer::semantic_model::GoPinnedPackage;
 use crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION;
 use crate::analyzer::semantic_model::decode_manifest;
 use crate::analyzer::semantic_model::decode_validated_shard_for_manifest;
@@ -25,6 +17,7 @@ use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
     SemanticPackActiveSet,
 };
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows;
 pub use brokk_bifrost_semantic::analyzer::semantic_model::catalog::*;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -117,9 +110,20 @@ pub struct LoadedCatalogShard {
     /// Shared with the catalog's decoded-manifest memo and with every other
     /// shard of the same pack (#3101).
     pub manifest: Arc<CompiledPackManifest>,
-    pub shard: CompiledShard,
+    pub descriptor: CompiledShardDescriptor,
+    pub selectors: Vec<ActivationSelector>,
+    pub shard: Option<CompiledShard>,
+    pub has_callable_values: bool,
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
+}
+
+impl LoadedCatalogShard {
+    pub fn decoded(&self) -> &CompiledShard {
+        self.shard
+            .as_ref()
+            .expect("catalog shard payload is decoded")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +171,7 @@ pub struct SemanticPackCatalog {
     instance_identity: u64,
     #[doc(hidden)]
     pub connection: Arc<Mutex<Connection>>,
-    session_callable_values: Arc<Mutex<Option<SessionCallableValuesCatalog>>>,
+    session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
     session_packs: Mutex<Vec<SessionPack>>,
     session_activations: Mutex<HashMap<String, SessionActivation>>,
     rejected_manifests: Mutex<HashSet<String>>,
@@ -303,7 +307,7 @@ impl SemanticPackCatalog {
             options,
             instance_identity,
             connection: Arc::new(Mutex::new(connection)),
-            session_callable_values: Arc::new(Mutex::new(None)),
+            session_catalog: Arc::new(Mutex::new(None)),
             session_packs: Mutex::new(Vec::new()),
             session_activations: Mutex::new(HashMap::new()),
             rejected_manifests: Mutex::new(HashSet::new()),
@@ -337,16 +341,174 @@ impl SemanticPackCatalog {
         Ok(catalog)
     }
 
+    /// Reconcile missing row generations without activating or retaining packs.
+    pub fn reindex(&self, cancellation: &CancellationToken) -> Result<usize, CatalogError> {
+        self.require_writable()?;
+        let mut published = 0;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(CatalogError::Cancelled);
+            }
+            let row = {
+                let connection = self
+                    .connection
+                    .lock()
+                    .expect("semantic catalog mutex poisoned");
+                connection
+                    .query_row(
+                        "SELECT p.manifest_bytes,
+                         s.descriptor_json, o.relative_path, o.stored_size FROM
+                         catalog_pack_shards s JOIN catalog_packs p
+                         USING(manifest_digest) JOIN catalog_objects o ON
+                         o.stored_digest=s.stored_digest LEFT JOIN
+                         catalog_semantic_rows_indexed_shards AS indexed ON
+                         indexed.manifest_digest=s.manifest_digest AND
+                         indexed.shard_id=s.shard_id AND indexed.index_version=4
+                         WHERE p.state='verified' AND indexed.shard_key IS NULL
+                         ORDER BY s.manifest_digest, s.ordinal LIMIT 1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, u64>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        CatalogError::sqlite("select unindexed semantic shard", error)
+                    })?
+            };
+            let Some((manifest_bytes, descriptor_json, path, size)) = row else {
+                break;
+            };
+            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+            let descriptor: CompiledShardDescriptor = serde_json::from_slice(&descriptor_json)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            let lease = self.lease(
+                &manifest.content_sha256,
+                "semantic-reindex",
+                Duration::from_secs(60),
+            )?;
+            let bytes = storage::read(&self.root, &path, &descriptor.stored_sha256, size)?;
+            let shard = self.decode_stored_shard(&manifest, &descriptor, &bytes)?;
+            let mut connection = self
+                .connection
+                .lock()
+                .expect("semantic catalog mutex poisoned");
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| CatalogError::sqlite("begin semantic reindex", error))?;
+            let indexed: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1
+                         FROM catalog_semantic_rows_indexed_shards WHERE
+                         manifest_digest=?1 AND shard_id=?2 AND index_version=4)",
+                    params![manifest.content_sha256, descriptor.shard_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| CatalogError::sqlite("recheck semantic index", error))?;
+            if !indexed {
+                rows::publish_semantic_rows(&transaction, &manifest, &shard)?;
+                published += 1;
+            }
+            transaction
+                .commit()
+                .map_err(|error| CatalogError::sqlite("commit semantic reindex", error))?;
+            if !indexed {
+                self.record_mutation();
+            }
+            drop(connection);
+            lease.release()?;
+        }
+        Ok(published)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn runtime_source_reader(&self) -> CatalogRuntimeSourceReader {
-        CatalogRuntimeSourceReader {
-            durable_connection: Arc::clone(&self.connection),
-            session_callable_values: Arc::clone(&self.session_callable_values),
-            _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
+    fn active_reader_connection(&self) -> Result<Connection, CatalogError> {
+        let mut session = self
+            .session_catalog
+            .lock()
+            .expect("session semantic catalog mutex poisoned");
+        if session.is_none() {
+            *session = Some(open_session_semantic_catalog()?);
         }
+        let connection = brokk_bifrost_semantic::analyzer::semantic_model::catalog::db::open(
+            &self.root,
+            CatalogOpenMode::ReadOnly,
+        )?;
+        brokk_bifrost_core::cache_db::sql_profile::install_catalog_active(&connection);
+        // db::open also sets query_only, which forbids TEMP writes. The main
+        // file remains protected by SQLITE_OPEN_READ_ONLY; membership is TEMP.
+        connection
+            .pragma_update(None, "query_only", false)
+            .map_err(|error| CatalogError::sqlite("enable active TEMP membership", error))?;
+        rows::attach_session_rows(
+            &connection,
+            session.as_ref().expect("session catalog initialized"),
+        )?;
+        Ok(connection)
+    }
+
+    /// A connection and TEMP membership table owned by exactly one active set.
+    pub fn runtime_source_reader<'a>(
+        &self,
+        shards: impl IntoIterator<Item = (&'a str, &'a str, CatalogPackSourceKind)>,
+    ) -> Result<CatalogRuntimeSourceReader, CatalogError> {
+        self.runtime_source_reader_with_shard_keys(shards)
+            .map(|(reader, _)| reader)
+    }
+
+    pub fn runtime_source_reader_with_shard_keys<'a>(
+        &self,
+        shards: impl IntoIterator<Item = (&'a str, &'a str, CatalogPackSourceKind)>,
+    ) -> Result<
+        (
+            CatalogRuntimeSourceReader,
+            Vec<crate::analyzer::store::active_models::CatalogShardRowIdentity>,
+        ),
+        CatalogError,
+    > {
+        use crate::analyzer::store::active_models::{
+            CatalogShardDatabase, CatalogShardRowIdentity,
+        };
+        let connection = self.active_reader_connection()?;
+        let mut identities = Vec::new();
+        for (manifest, shard, kind) in shards {
+            let source = match kind {
+                CatalogPackSourceKind::Embedded | CatalogPackSourceKind::EphemeralWorkspace => {
+                    "session"
+                }
+                _ => "durable",
+            };
+            let shard_key = rows::select_active_shard_source(&connection, manifest, shard, source)?
+                .ok_or_else(|| CatalogError::IndexReconciliationRequired {
+                    manifest_digest: manifest.to_owned(),
+                    shard_id: shard.to_owned(),
+                })?;
+            identities.push(CatalogShardRowIdentity {
+                shard_key,
+                database: if source == "durable" {
+                    CatalogShardDatabase::Durable
+                } else {
+                    CatalogShardDatabase::Session
+                },
+            });
+        }
+        Ok((
+            CatalogRuntimeSourceReader {
+                connection: Arc::new(Mutex::new(connection)),
+                session_catalog: Arc::clone(&self.session_catalog),
+                _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
+            },
+            identities,
+        ))
     }
 
     fn shared_generated_catalog(&self) -> Option<&Self> {
@@ -968,7 +1130,13 @@ impl SemanticPackCatalog {
             source,
             extraction,
         )? {
+            self.reconcile_installed_semantic_rows(&validated)?;
             InstallOutcome {
+                diagnostics: validated
+                    .shards
+                    .iter()
+                    .flat_map(|shard| shard.diagnostics.iter().cloned())
+                    .collect(),
                 manifest_digest: validated.manifest.content_sha256,
                 inserted_manifest: false,
                 inserted_objects: 0,
@@ -1049,6 +1217,7 @@ impl SemanticPackCatalog {
                     production.manifest_digest == validated.manifest.content_sha256
                 });
         let installation = if unchanged {
+            self.reconcile_installed_semantic_rows(&validated)?;
             GeneratedInstallOutcome {
                 production: GeneratedProduction {
                     key: key.clone(),
@@ -1056,6 +1225,11 @@ impl SemanticPackCatalog {
                     completeness: validated.manifest.completeness,
                 },
                 install: InstallOutcome {
+                    diagnostics: validated
+                        .shards
+                        .iter()
+                        .flat_map(|shard| shard.diagnostics.iter().cloned())
+                        .collect(),
                     manifest_digest: validated.manifest.content_sha256,
                     inserted_manifest: false,
                     inserted_objects: 0,
@@ -1630,6 +1804,11 @@ impl SemanticPackCatalog {
                     .remove(&validated.manifest.content_sha256);
                 self.record_mutation();
                 Ok(InstallOutcome {
+                    diagnostics: validated
+                        .shards
+                        .iter()
+                        .flat_map(|shard| shard.diagnostics.iter().cloned())
+                        .collect(),
                     manifest_digest: validated.manifest.content_sha256,
                     inserted_manifest,
                     inserted_objects,
@@ -2003,6 +2182,33 @@ impl SemanticPackCatalog {
         )
     }
 
+    fn reconcile_installed_semantic_rows(
+        &self,
+        validated: &ValidatedPack,
+    ) -> Result<(), CatalogError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("semantic catalog mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                CatalogError::sqlite("begin installed semantic row reconciliation", error)
+            })?;
+        let mut changed = false;
+        for shard in &validated.shards {
+            changed |=
+                rows::publish_semantic_rows(&transaction, &validated.manifest, &shard.decoded)?;
+        }
+        transaction.commit().map_err(|error| {
+            CatalogError::sqlite("commit installed semantic row reconciliation", error)
+        })?;
+        if changed {
+            self.record_mutation();
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn commit_install(
         &self,
@@ -2055,12 +2261,7 @@ impl SemanticPackCatalog {
                 &descriptor.shard_id,
                 &decode_limits_digest(&self.options.decode_limits),
             )?;
-            publish_callable_value_rows(
-                &transaction,
-                &validated.manifest.content_sha256,
-                &descriptor.shard_id,
-                shard.callable_values.as_ref(),
-            )?;
+            rows::publish_semantic_rows(&transaction, &validated.manifest, &shard.decoded)?;
             insert_selectors(
                 &transaction,
                 &validated.manifest.content_sha256,
@@ -2205,7 +2406,7 @@ impl SemanticPackCatalog {
                 "session pack source id must not be empty".to_owned(),
             ));
         }
-        let mut validated = validate_pack(pack, &self.options.decode_limits)?;
+        let validated = validate_pack(pack, &self.options.decode_limits)?;
         let digest = validated.manifest.content_sha256.clone();
         if let Some((artifact, packages)) = exact_source {
             if validated.manifest.language != "go" {
@@ -2225,11 +2426,11 @@ impl SemanticPackCatalog {
         {
             {
                 let mut session_catalog_guard = self
-                    .session_callable_values
+                    .session_catalog
                     .lock()
                     .expect("session callable-values connection mutex poisoned");
                 if session_catalog_guard.is_none() {
-                    *session_catalog_guard = Some(open_session_callable_values_catalog()?);
+                    *session_catalog_guard = Some(open_session_semantic_catalog()?);
                 }
                 let session_catalog = session_catalog_guard
                     .as_mut()
@@ -2265,12 +2466,7 @@ impl SemanticPackCatalog {
                         &shard.descriptor.shard_id,
                         &shard.selectors,
                     )?;
-                    publish_callable_value_rows(
-                        &transaction,
-                        &digest,
-                        &shard.descriptor.shard_id,
-                        shard.callable_values.as_ref(),
-                    )?;
+                    rows::publish_semantic_rows(&transaction, &validated.manifest, &shard.decoded)?;
                 }
                 if let Some((artifact, packages)) = exact_source {
                     insert_exact_go_source_rows(&transaction, &digest, artifact, packages)?;
@@ -2279,15 +2475,19 @@ impl SemanticPackCatalog {
                     CatalogError::sqlite("commit session callable-values publication", error)
                 })?;
             }
-            for shard in &mut validated.shards {
-                // The query path reads only the SQL sidecar. Keep compiled
-                // bytes/selectors for activation and hydration without
-                // retaining a second Rust fact/coverage/identity index.
-                shard.callable_values = None;
-            }
             session_packs.push(SessionPack {
                 manifest: Arc::new(validated.manifest),
-                shards: validated.shards,
+                // Drop decoded facts after publication. The session registry
+                // only needs compiled bytes and selectors for activation.
+                shards: validated
+                    .shards
+                    .into_iter()
+                    .map(|shard| SessionShard {
+                        descriptor: shard.descriptor,
+                        bytes: shard.bytes,
+                        selectors: shard.selectors,
+                    })
+                    .collect(),
                 source: source.clone(),
             });
             self.record_mutation();
@@ -3220,13 +3420,31 @@ impl SemanticPackCatalog {
     }
 
     pub fn load(&self, candidate: &CatalogCandidate) -> Result<LoadedCatalogShard, CatalogMiss> {
-        match self.load_inner(candidate) {
+        self.record_load_result(candidate, self.load_inner(candidate))
+    }
+
+    fn record_load_result(
+        &self,
+        candidate: &CatalogCandidate,
+        result: Result<LoadedCatalogShard, CatalogError>,
+    ) -> Result<LoadedCatalogShard, CatalogMiss> {
+        match result {
             Ok(loaded) => {
                 self.lookup_hits.fetch_add(1, Ordering::Relaxed);
                 Ok(loaded)
             }
             Err(error) => {
                 self.lookup_misses.fetch_add(1, Ordering::Relaxed);
+                if let CatalogError::IndexReconciliationRequired {
+                    manifest_digest,
+                    shard_id,
+                } = error
+                {
+                    return Err(CatalogMiss::IndexReconciliationRequired {
+                        manifest_digest,
+                        shard_id,
+                    });
+                }
                 if matches!(error, CatalogError::Unavailable) {
                     return Err(CatalogMiss::NotFound);
                 }
@@ -3250,359 +3468,39 @@ impl SemanticPackCatalog {
         }
     }
 
-    /// Read one exact callable-values question from the normalized catalog
-    /// rows. The caller is responsible for intersecting catalog availability
-    /// with its active-set and artifact evidence before using returned facts.
+    /// SQL-boundary fixture reader. Product callers must use their active set's
+    /// reader; a catalog itself does not establish activation membership.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn query_callable_values(
         &self,
         query: &CatalogCallableValuesQuery<'_>,
         limits: CatalogCallableValuesQueryLimits,
         cancellation: &CancellationToken,
     ) -> Result<CatalogCallableValuesQueryResult, CatalogError> {
-        let mut result = CatalogCallableValuesQueryResult {
-            facts: Vec::new(),
-            coverage_claims: Vec::new(),
-            executable_coverage: CsmiCoverageStatus::Unknown,
-            examined_records: 0,
-            gap: None,
-        };
-        if cancellation.is_cancelled() {
-            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-            return Ok(result);
+        let connection = self.active_reader_connection()?;
+        if limits.max_records == 0 || cancellation.is_cancelled() {
+            return crate::analyzer::store::model_catalog::query_callable_values_on_connection(
+                &connection,
+                query,
+                limits,
+                cancellation,
+            );
         }
-        if limits.max_records == 0 {
-            result.gap =
-                Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted { max_records: 0 });
-            return Ok(result);
+        // The fixture explicitly selects this one source shard for a low-level
+        // row question; it is not an activation fallback in product code.
+        if !rows::select_active_shard(&connection, query.manifest_digest, query.shard_id)? {
+            return Ok(
+                crate::analyzer::store::model_catalog::callable_values_index_missing_result(limits),
+            );
         }
-
-        let use_durable_catalog = match self.ensure_callable_values_indexed(
-            query.manifest_digest,
-            query.shard_id,
+        crate::analyzer::store::model_catalog::query_callable_values_on_connection(
+            &connection,
+            query,
+            limits,
             cancellation,
-        )? {
-            CallableValuesIndexReadiness::Ready => true,
-            CallableValuesIndexReadiness::Cancelled => {
-                result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-                return Ok(result);
-            }
-            CallableValuesIndexReadiness::Missing => {
-                match self.ensure_session_callable_values_indexed(
-                    query.manifest_digest,
-                    query.shard_id,
-                    cancellation,
-                )? {
-                    CallableValuesIndexReadiness::Ready => false,
-                    CallableValuesIndexReadiness::Cancelled => {
-                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-                        return Ok(result);
-                    }
-                    CallableValuesIndexReadiness::Missing => {
-                        result.gap =
-                            Some(CatalogCallableValuesQueryGap::IndexReconciliationRequired);
-                        return Ok(result);
-                    }
-                }
-            }
-        };
-
-        let connection_guard = if use_durable_catalog {
-            CallableValuesQueryConnection::Durable(
-                self.connection
-                    .lock()
-                    .expect("semantic-pack catalog connection mutex poisoned"),
-            )
-        } else {
-            CallableValuesQueryConnection::Session(
-                self.session_callable_values
-                    .lock()
-                    .expect("session callable-values connection mutex poisoned"),
-            )
-        };
-        let connection = match &connection_guard {
-            CallableValuesQueryConnection::Durable(guard) => &**guard,
-            CallableValuesQueryConnection::Session(guard) => {
-                &guard
-                    .as_ref()
-                    .expect("session callable-values index was checked before querying")
-                    .connection
-            }
-        };
-        let limit = callable_values_sql_limit(limits.max_records.saturating_add(1));
-        let family = match query.question {
-            CatalogCallableValuesQuestion::ReturnedCallable { .. } => {
-                CallableValuesFamily::ReturnedCallables
-            }
-            CatalogCallableValuesQuestion::CallbackInvocation { .. } => {
-                CallableValuesFamily::CallbackInvocations
-            }
-        };
-
-        match query.question {
-            CatalogCallableValuesQuestion::ReturnedCallable {
-                result: result_ordinal,
-            } => {
-                let mut statement =
-                    connection
-                        .prepare(CALLABLE_VALUES_RETURNED_SQL)
-                        .map_err(|error| {
-                            CatalogError::sqlite("prepare returned-callable query", error)
-                        })?;
-                let rows = statement
-                    .query_map(
-                        params![
-                            query.manifest_digest,
-                            query.shard_id,
-                            query.callable,
-                            result_ordinal,
-                            limit,
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            ))
-                        },
-                    )
-                    .map_err(|error| CatalogError::sqlite("query returned-callable rows", error))?;
-                for row in rows {
-                    if cancellation.is_cancelled() {
-                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-                        break;
-                    }
-                    let row = row.map_err(|error| {
-                        CatalogError::sqlite("read returned-callable row", error)
-                    })?;
-                    result.examined_records += 1;
-                    if result.examined_records > limits.max_records {
-                        result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
-                            max_records: limits.max_records,
-                        });
-                        break;
-                    }
-                    let payload = CsmiCallableValuesPayload::ReturnedCallable {
-                        callable: query.callable.to_owned(),
-                        result: u32::try_from(row.1).map_err(|error| {
-                            CatalogError::Integrity(format!(
-                                "stored callable result ordinal is outside u32: {error}"
-                            ))
-                        })?,
-                        target: row.2.clone(),
-                    };
-                    let fact = CallableValuesFact {
-                        payload,
-                        provenance: decode_json_column(&row.3, "callable fact provenance")?,
-                    };
-                    let anonymous_callable = match load_anonymous_callable_identity(
-                        connection,
-                        query.manifest_digest,
-                        query.shard_id,
-                        &row.2,
-                        limits.max_records.saturating_sub(result.examined_records),
-                        cancellation,
-                    )? {
-                        AnonymousCallableIdentityRead::Missing => None,
-                        AnonymousCallableIdentityRead::Found { identity, examined } => {
-                            result.examined_records += examined;
-                            Some(*identity)
-                        }
-                        AnonymousCallableIdentityRead::RecordBudgetExhausted { examined } => {
-                            result.examined_records += examined;
-                            result.gap =
-                                Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
-                                    max_records: limits.max_records,
-                                });
-                            None
-                        }
-                        AnonymousCallableIdentityRead::Cancelled { examined } => {
-                            result.examined_records += examined;
-                            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-                            None
-                        }
-                    };
-                    result.facts.push(CatalogCallableValueFact {
-                        manifest_digest: query.manifest_digest.to_owned(),
-                        shard_id: query.shard_id.to_owned(),
-                        callable: query.callable.to_owned(),
-                        ordinal: row.0,
-                        fact,
-                        anonymous_callable,
-                    });
-                    if result.gap.is_some() {
-                        break;
-                    }
-                }
-            }
-            CatalogCallableValuesQuestion::CallbackInvocation { callback, shape } => {
-                let callback_json = json_text(callback, "callback query location")?;
-                let mut statement =
-                    connection
-                        .prepare(CALLABLE_VALUES_CALLBACK_SQL)
-                        .map_err(|error| {
-                            CatalogError::sqlite("prepare callback-invocation query", error)
-                        })?;
-                let rows = statement
-                    .query_map(
-                        params![
-                            query.manifest_digest,
-                            query.shard_id,
-                            query.callable,
-                            callback_json,
-                            shape.parameters,
-                            shape.results,
-                            limit,
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, String>(4)?,
-                                row.get::<_, String>(5)?,
-                                row.get::<_, String>(6)?,
-                                row.get::<_, String>(7)?,
-                            ))
-                        },
-                    )
-                    .map_err(|error| {
-                        CatalogError::sqlite("query callback-invocation rows", error)
-                    })?;
-                for row in rows {
-                    if cancellation.is_cancelled() {
-                        result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-                        break;
-                    }
-                    let row = row.map_err(|error| {
-                        CatalogError::sqlite("read callback-invocation row", error)
-                    })?;
-                    result.examined_records += 1;
-                    if result.examined_records > limits.max_records {
-                        result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
-                            max_records: limits.max_records,
-                        });
-                        break;
-                    }
-                    let payload = CsmiCallableValuesPayload::CallbackInvocation {
-                        callable: query.callable.to_owned(),
-                        callback: decode_json_column(&row.1, "callback input location")?,
-                        shape: CsmiCallableValuesShape {
-                            parameters: u16::try_from(row.2).map_err(|error| {
-                                CatalogError::Integrity(format!(
-                                    "stored callback parameter shape is outside u16: {error}"
-                                ))
-                            })?,
-                            results: u16::try_from(row.3).map_err(|error| {
-                                CatalogError::Integrity(format!(
-                                    "stored callback result shape is outside u16: {error}"
-                                ))
-                            })?,
-                        },
-                        arguments: decode_json_column(&row.4, "callback arguments")?,
-                        timing: match row.5.as_str() {
-                            "during-call" => CsmiCallableValuesTiming::DuringCall,
-                            value => {
-                                return Err(CatalogError::Integrity(format!(
-                                    "unknown callable callback timing {value:?}"
-                                )));
-                            }
-                        },
-                        modality: match row.6.as_str() {
-                            "may" => CsmiCallableValuesModality::May,
-                            value => {
-                                return Err(CatalogError::Integrity(format!(
-                                    "unknown callable callback modality {value:?}"
-                                )));
-                            }
-                        },
-                    };
-                    if let Err(error) = validate_callable_profile_location(&payload) {
-                        result.gap =
-                            Some(CatalogCallableValuesQueryGap::UnsupportedProjection(error));
-                        break;
-                    }
-                    let fact = CallableValuesFact {
-                        payload,
-                        provenance: decode_json_column(&row.7, "callable fact provenance")?,
-                    };
-                    result.facts.push(CatalogCallableValueFact {
-                        manifest_digest: query.manifest_digest.to_owned(),
-                        shard_id: query.shard_id.to_owned(),
-                        callable: query.callable.to_owned(),
-                        ordinal: row.0,
-                        fact,
-                        anonymous_callable: None,
-                    });
-                }
-            }
-        }
-
-        if result.gap.is_none() && cancellation.is_cancelled() {
-            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-        }
-        if result.gap.is_none() {
-            let remaining = limits.max_records.saturating_sub(result.examined_records);
-            let coverage_limit = callable_values_sql_limit(remaining.saturating_add(1));
-            let mut statement = connection
-                .prepare(CALLABLE_VALUES_COVERAGE_SQL)
-                .map_err(|error| CatalogError::sqlite("prepare callable coverage query", error))?;
-            let rows = statement
-                .query_map(
-                    params![
-                        query.manifest_digest,
-                        query.shard_id,
-                        callable_values_family_name(family),
-                        query.callable,
-                        coverage_limit,
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                        ))
-                    },
-                )
-                .map_err(|error| CatalogError::sqlite("query callable coverage rows", error))?;
-            for row in rows {
-                if cancellation.is_cancelled() {
-                    result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-                    break;
-                }
-                let row =
-                    row.map_err(|error| CatalogError::sqlite("read callable coverage row", error))?;
-                result.examined_records += 1;
-                if result.examined_records > limits.max_records {
-                    result.gap = Some(CatalogCallableValuesQueryGap::RecordBudgetExhausted {
-                        max_records: limits.max_records,
-                    });
-                    break;
-                }
-                let coverage = CallableValuesCoverage {
-                    family: parse_callable_values_family(&row.1)?,
-                    callable: query.callable.to_owned(),
-                    status: parse_coverage_status(&row.2)?,
-                    limitations: decode_json_column(&row.3, "callable coverage limitations")?,
-                    provenance: decode_json_column(&row.4, "callable coverage provenance")?,
-                };
-                result.coverage_claims.push(CatalogCallableValueCoverage {
-                    manifest_digest: query.manifest_digest.to_owned(),
-                    shard_id: query.shard_id.to_owned(),
-                    callable: query.callable.to_owned(),
-                    ordinal: row.0,
-                    coverage,
-                });
-            }
-        }
-        if result.gap.is_none() && cancellation.is_cancelled() {
-            result.gap = Some(CatalogCallableValuesQueryGap::Cancelled);
-        }
-        Ok(result)
+        )
     }
+
     #[doc(hidden)]
     pub fn query_callable_values_on_connection(
         connection: &Connection,
@@ -3651,86 +3549,6 @@ impl SemanticPackCatalog {
             limits,
             cancellation,
         )
-    }
-
-    fn ensure_callable_values_indexed(
-        &self,
-        manifest_digest: &str,
-        shard_id: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<CallableValuesIndexReadiness, CatalogError> {
-        if cancellation.is_cancelled() {
-            return Ok(CallableValuesIndexReadiness::Cancelled);
-        }
-        let connection = self
-            .connection
-            .lock()
-            .expect("semantic-pack catalog connection mutex poisoned");
-        let indexed: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM catalog_callable_values_indexed_shards AS indexed
-                   JOIN catalog_packs AS pack
-                     ON pack.manifest_digest = indexed.manifest_digest
-                   WHERE indexed.manifest_digest = ?1 AND indexed.shard_id = ?2
-                     AND indexed.index_version = 1 AND pack.state = 'verified'
-                 )",
-                params![manifest_digest, shard_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| CatalogError::sqlite("check callable-value shard index", error))?;
-        if indexed {
-            return Ok(CallableValuesIndexReadiness::Ready);
-        }
-        if cancellation.is_cancelled() {
-            return Ok(CallableValuesIndexReadiness::Cancelled);
-        }
-        Ok(CallableValuesIndexReadiness::Missing)
-    }
-
-    fn ensure_session_callable_values_indexed(
-        &self,
-        manifest_digest: &str,
-        shard_id: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<CallableValuesIndexReadiness, CatalogError> {
-        if cancellation.is_cancelled() {
-            return Ok(CallableValuesIndexReadiness::Cancelled);
-        }
-        let session_catalog = self
-            .session_callable_values
-            .lock()
-            .expect("session callable-values connection mutex poisoned");
-        let Some(session_catalog) = session_catalog.as_ref() else {
-            return Ok(CallableValuesIndexReadiness::Missing);
-        };
-        let indexed: bool = session_catalog
-            .connection
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM catalog_callable_values_indexed_shards AS indexed
-                   JOIN catalog_packs AS pack
-                     ON pack.manifest_digest = indexed.manifest_digest
-                   JOIN catalog_pack_shards AS shard
-                     ON shard.manifest_digest = indexed.manifest_digest
-                    AND shard.shard_id = indexed.shard_id
-                   WHERE indexed.manifest_digest = ?1 AND indexed.shard_id = ?2
-                     AND indexed.index_version = 1 AND pack.state = 'verified'
-                 )",
-                params![manifest_digest, shard_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                CatalogError::sqlite("check session callable-value shard index", error)
-            })?;
-        if cancellation.is_cancelled() {
-            return Ok(CallableValuesIndexReadiness::Cancelled);
-        }
-        Ok(if indexed {
-            CallableValuesIndexReadiness::Ready
-        } else {
-            CallableValuesIndexReadiness::Missing
-        })
     }
 
     pub fn accounting(&self) -> Result<CatalogAccounting, CatalogError> {
@@ -3895,6 +3713,247 @@ impl SemanticPackCatalog {
     }
 
     fn load_inner(&self, candidate: &CatalogCandidate) -> Result<LoadedCatalogShard, CatalogError> {
+        if self.candidate_manifest(candidate)?.language == "rust" {
+            return self.load_rust_metadata(candidate);
+        }
+        self.load_with_decoded_payload(candidate)
+    }
+
+    fn load_rust_metadata(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogError> {
+        let loaded = match self.load_metadata_only(candidate) {
+            Err(CatalogError::IndexReconciliationRequired { .. })
+                if self.mode == CatalogOpenMode::ReadWrite =>
+            {
+                // Durable loads reconcile under their lease. Session sources
+                // have no durable object and publish into their own database.
+                let decoded = self.load_decoded(candidate)?;
+                if matches!(candidate.location, CatalogCandidateLocation::Session { .. }) {
+                    let mut session = self
+                        .session_catalog
+                        .lock()
+                        .expect("session semantic catalog mutex poisoned");
+                    let connection = &mut session
+                        .as_mut()
+                        .expect("registered session catalog exists")
+                        .connection;
+                    let transaction = connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(|error| {
+                            CatalogError::sqlite("begin Rust session reconciliation", error)
+                        })?;
+                    rows::publish_semantic_rows(
+                        &transaction,
+                        &decoded.manifest,
+                        decoded
+                            .shard
+                            .as_ref()
+                            .expect("reconciliation decoded the shard"),
+                    )?;
+                    transaction.commit().map_err(|error| {
+                        CatalogError::sqlite("commit Rust session reconciliation", error)
+                    })?;
+                    self.record_mutation();
+                }
+                self.load_metadata_only(candidate)?
+            }
+            result => result?,
+        };
+        if self.mode == CatalogOpenMode::ReadWrite
+            && matches!(candidate.location, CatalogCandidateLocation::Durable)
+        {
+            self.connection
+                .lock()
+                .expect("semantic-pack catalog connection mutex poisoned")
+                .execute(
+                    "UPDATE catalog_packs SET last_used_at = ?2 WHERE manifest_digest = ?1",
+                    params![
+                        candidate.manifest_digest,
+                        crate::cache_db::now_unix_seconds()
+                    ],
+                )
+                .map_err(|error| CatalogError::sqlite("touch loaded pack", error))?;
+        }
+        Ok(loaded)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn load_decoded_for_test(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogMiss> {
+        self.record_load_result(candidate, self.load_with_decoded_payload(candidate))
+    }
+
+    fn load_with_decoded_payload(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogError> {
+        let mut loaded = self.load_decoded(candidate)?;
+        loaded.selectors = match candidate.location {
+            CatalogCandidateLocation::Durable => {
+                let connection = self
+                    .connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned");
+                self.sql_statements.fetch_add(1, Ordering::Relaxed);
+                Self::shard_selectors(&connection, candidate)?
+            }
+            CatalogCandidateLocation::Session { .. } => {
+                let session = self
+                    .session_catalog
+                    .lock()
+                    .expect("session semantic catalog mutex poisoned");
+                self.sql_statements.fetch_add(1, Ordering::Relaxed);
+                Self::shard_selectors(
+                    &session
+                        .as_ref()
+                        .expect("registered session catalog exists")
+                        .connection,
+                    candidate,
+                )?
+            }
+        };
+        Ok(loaded)
+    }
+
+    /// Exercise metadata-only activation for languages not yet switched in product loading.
+    /// A current marker certifies that all of this shard's rows were published.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn load_metadata_only_for_test(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogMiss> {
+        self.record_load_result(candidate, self.load_metadata_only(candidate))
+    }
+
+    fn candidate_manifest(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<Arc<CompiledPackManifest>, CatalogError> {
+        match candidate.location {
+            CatalogCandidateLocation::Durable => self.stored_manifest(&candidate.manifest_digest),
+            CatalogCandidateLocation::Session {
+                pack_ordinal,
+                shard_ordinal,
+            } => {
+                let packs = self
+                    .session_packs
+                    .lock()
+                    .expect("semantic-pack session mutex poisoned");
+                let pack = packs.get(pack_ordinal).ok_or(CatalogError::Unavailable)?;
+                let shard = pack
+                    .shards
+                    .get(shard_ordinal)
+                    .ok_or(CatalogError::Unavailable)?;
+                if pack.manifest.content_sha256 != candidate.manifest_digest
+                    || shard.descriptor != candidate.descriptor
+                {
+                    return Err(CatalogError::Unavailable);
+                }
+                Ok(Arc::clone(&pack.manifest))
+            }
+        }
+    }
+
+    fn load_metadata_only(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogError> {
+        let manifest = self.candidate_manifest(candidate)?;
+        let (selectors, has_callable_values) = match candidate.location {
+            CatalogCandidateLocation::Durable => {
+                self.validate_stored_python_profile_pack(&manifest)?;
+                self.validated_manifest_inventory(&manifest)?;
+                let connection = self
+                    .connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned");
+                let selectors = Self::shard_selectors(&connection, candidate)?;
+                let presence = self.metadata_only_presence(&connection, candidate)?;
+                (selectors, presence)
+            }
+            CatalogCandidateLocation::Session { .. } => {
+                let session = self
+                    .session_catalog
+                    .lock()
+                    .expect("session semantic catalog mutex poisoned");
+                let connection = &session
+                    .as_ref()
+                    .expect("registered session catalog exists")
+                    .connection;
+                let selectors = Self::shard_selectors(connection, candidate)?;
+                let presence = self.metadata_only_presence(connection, candidate)?;
+                (selectors, presence)
+            }
+        };
+        Ok(LoadedCatalogShard {
+            manifest,
+            descriptor: candidate.descriptor.clone(),
+            selectors,
+            shard: None,
+            has_callable_values,
+            source_kind: candidate.source_kind,
+            source_id: candidate.source_id.clone(),
+        })
+    }
+
+    fn metadata_only_presence(
+        &self,
+        connection: &Connection,
+        candidate: &CatalogCandidate,
+    ) -> Result<bool, CatalogError> {
+        self.sql_statements.fetch_add(2, Ordering::Relaxed);
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM catalog_semantic_payload_families AS family
+                  WHERE family.shard_key=marker.shard_key AND family.family='callable_values')
+             FROM catalog_semantic_rows_indexed_shards AS marker
+             JOIN catalog_packs AS pack USING (manifest_digest)
+             WHERE pack.state = 'verified' AND marker.manifest_digest = ?1
+               AND marker.shard_id = ?2 AND marker.index_version = 4",
+                params![candidate.manifest_digest, candidate.shard_id,],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("load metadata-only shard marker", error))?
+            .ok_or_else(|| CatalogError::IndexReconciliationRequired {
+                manifest_digest: candidate.manifest_digest.clone(),
+                shard_id: candidate.shard_id.clone(),
+            })
+    }
+
+    fn shard_selectors(
+        connection: &Connection,
+        candidate: &CatalogCandidate,
+    ) -> Result<Vec<ActivationSelector>, CatalogError> {
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT selector_json FROM catalog_selectors
+             WHERE manifest_digest=?1 AND shard_id=?2 ORDER BY selector_ordinal",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare full shard selectors", error))?;
+        let rows = statement
+            .query_map(
+                params![candidate.manifest_digest, candidate.shard_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| CatalogError::sqlite("query full shard selectors", error))?;
+        rows.map(|row| {
+            let json =
+                row.map_err(|error| CatalogError::sqlite("read full shard selector", error))?;
+            serde_json::from_slice(&json)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))
+        })
+        .collect()
+    }
+
+    fn load_decoded(
+        &self,
+        candidate: &CatalogCandidate,
+    ) -> Result<LoadedCatalogShard, CatalogError> {
         match candidate.location {
             CatalogCandidateLocation::Durable if self.mode == CatalogOpenMode::ReadWrite => {
                 let lease = self.lease(
@@ -3929,7 +3988,7 @@ impl SemanticPackCatalog {
         // SQLite once per loaded shard (#3101).
         let manifest = self.stored_manifest(&candidate.manifest_digest)?;
         self.validate_stored_python_profile_pack(&manifest)?;
-        let mut connection = self
+        let connection = self
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
@@ -3956,14 +4015,6 @@ impl SemanticPackCatalog {
             .optional()
             .map_err(|error| CatalogError::sqlite("load candidate location", error))?
             .ok_or(CatalogError::Unavailable)?;
-        self.object_reads.fetch_add(1, Ordering::Relaxed);
-        let bytes = storage::read(
-            &self.root,
-            &row.0,
-            &candidate.descriptor.stored_sha256,
-            row.1,
-        )?;
-        self.validated_manifest_inventory(&manifest)?;
         let limits_digest = decode_limits_digest(&self.options.decode_limits);
         self.sql_statements.fetch_add(1, Ordering::Relaxed);
         let certified: bool = connection
@@ -3978,6 +4029,32 @@ impl SemanticPackCatalog {
                 |row| row.get(0),
             )
             .map_err(|error| CatalogError::sqlite("lookup shard validation", error))?;
+        if self.mode == CatalogOpenMode::ReadOnly {
+            let indexed: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1
+                         FROM catalog_semantic_rows_indexed_shards WHERE
+                         manifest_digest=?1 AND shard_id=?2 AND index_version=4)",
+                    params![candidate.manifest_digest, candidate.shard_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| CatalogError::sqlite("check read-only semantic rows", error))?;
+            if !indexed {
+                return Err(CatalogError::IndexReconciliationRequired {
+                    manifest_digest: candidate.manifest_digest.clone(),
+                    shard_id: candidate.shard_id.clone(),
+                });
+            }
+        }
+        drop(connection);
+        self.object_reads.fetch_add(1, Ordering::Relaxed);
+        let bytes = storage::read(
+            &self.root,
+            &row.0,
+            &candidate.descriptor.stored_sha256,
+            row.1,
+        )?;
+        self.validated_manifest_inventory(&manifest)?;
         let shard = if certified {
             crate::analyzer::semantic_model::artifact::hydrate_certified_shard(
                 &manifest,
@@ -3989,6 +4066,10 @@ impl SemanticPackCatalog {
         } else {
             let shard = self.decode_stored_shard(&manifest, &candidate.descriptor, &bytes)?;
             if self.mode == CatalogOpenMode::ReadWrite {
+                let connection = self
+                    .connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned");
                 record_shard_validation(
                     &connection,
                     &manifest.content_sha256,
@@ -3999,6 +4080,10 @@ impl SemanticPackCatalog {
             shard
         };
         if self.mode == CatalogOpenMode::ReadWrite {
+            let mut connection = self
+                .connection
+                .lock()
+                .expect("semantic-pack catalog connection mutex poisoned");
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| {
@@ -4006,21 +4091,16 @@ impl SemanticPackCatalog {
                 })?;
             let indexed: bool = transaction
                 .query_row(
-                    "SELECT EXISTS(
-                       SELECT 1 FROM catalog_callable_values_indexed_shards
-                       WHERE manifest_digest = ?1 AND shard_id = ?2 AND index_version = 1
-                     )",
+                    "SELECT EXISTS( SELECT 1
+                         FROM catalog_semantic_rows_indexed_shards WHERE
+                         manifest_digest = ?1 AND shard_id = ?2 AND index_version =
+                         4 )",
                     params![&candidate.manifest_digest, &candidate.shard_id],
                     |row| row.get(0),
                 )
                 .map_err(|error| CatalogError::sqlite("check callable-value load index", error))?;
             if !indexed {
-                publish_callable_value_rows(
-                    &transaction,
-                    &candidate.manifest_digest,
-                    &candidate.shard_id,
-                    shard.callable_values.as_ref(),
-                )?;
+                rows::publish_semantic_rows(&transaction, &manifest, &shard)?;
             }
             transaction.commit().map_err(|error| {
                 CatalogError::sqlite("commit callable-value load reconciliation", error)
@@ -4040,7 +4120,10 @@ impl SemanticPackCatalog {
         }
         Ok(LoadedCatalogShard {
             manifest,
-            shard,
+            descriptor: candidate.descriptor.clone(),
+            selectors: Vec::new(),
+            has_callable_values: shard.callable_values().is_some(),
+            shard: Some(shard),
             source_kind: candidate.source_kind,
             source_id: candidate.source_id.clone(),
         })
@@ -4071,7 +4154,10 @@ impl SemanticPackCatalog {
         let decoded = self.decode_stored_shard(&pack.manifest, &shard.descriptor, &shard.bytes)?;
         Ok(LoadedCatalogShard {
             manifest: Arc::clone(&pack.manifest),
-            shard: decoded,
+            descriptor: candidate.descriptor.clone(),
+            selectors: Vec::new(),
+            has_callable_values: decoded.callable_values().is_some(),
+            shard: Some(decoded),
             source_kind: candidate.source_kind,
             source_id: candidate.source_id.clone(),
         })
@@ -4690,6 +4776,7 @@ pub(crate) mod python_profile_reopen_tests {
 #[cfg(test)]
 pub(crate) mod callable_value_catalog_tests {
     use crate::analyzer::semantic_model::catalog::go_extraction_support_22::*;
+    use crate::analyzer::semantic_model::catalog::{CatalogError, CatalogMiss};
 
     use rusqlite::params;
 
@@ -4726,8 +4813,6 @@ pub(crate) mod callable_value_catalog_tests {
     use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCallableValuesShape;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::csmi::model::CsmiCoverageStatus;
-
-    use rusqlite::TransactionBehavior;
 
     #[test]
     fn sql_questions_preserve_alternatives_unknowns_scoped_coverage_and_exact_shape() {
@@ -4897,12 +4982,6 @@ pub(crate) mod callable_value_catalog_tests {
                 )
                 .expect("register the same populated publication under another source ID");
 
-            assert!(
-                catalog.session_packs.lock().unwrap()[0].shards[0]
-                    .callable_values
-                    .is_none()
-            );
-
             let result = catalog
                 .query_callable_values(
                     &query(
@@ -4929,14 +5008,14 @@ pub(crate) mod callable_value_catalog_tests {
                 0,
                 "session registration never installs into the read-only durable catalog"
             );
-            let session_catalog = catalog.session_callable_values.lock().unwrap();
+            let session_catalog = catalog.session_catalog.lock().unwrap();
             assert_eq!(
                 session_catalog
                     .as_ref()
                     .unwrap()
                     .connection
                     .query_row(
-                        "SELECT count(*) FROM catalog_callable_values_indexed_shards
+                        "SELECT count(*) FROM catalog_semantic_rows_indexed_shards
                          WHERE manifest_digest = ?1 AND shard_id = ?2",
                         params![
                             &pack.manifest.content_sha256,
@@ -4952,45 +5031,274 @@ pub(crate) mod callable_value_catalog_tests {
     }
 
     #[test]
+    fn rust_metadata_loading_reconciles_once_and_read_only_requires_reindex() {
+        use crate::analyzer::semantic_model::SourceFormat;
+        use crate::analyzer::semantic_model::artifact::thread_shard_wire_read_count;
+        use crate::analyzer::semantic_model::catalog::{DurablePackSource, DurablePackSourceKind};
+        use crate::analyzer::semantic_model::compiler::{CompilerOptions, compile_source};
+        let mut source: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../../testdata/semantic-model-packs/declarations-v1.json"
+        ))
+        .unwrap();
+        source["language"] = "rust".into();
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "rust-reconciliation".into(),
+                },
+            )
+            .unwrap();
+        let candidate = CatalogCandidate {
+            manifest_digest: pack.manifest.content_sha256.clone(),
+            shard_id: pack.manifest.shards[0].shard_id.clone(),
+            descriptor: pack.manifest.shards[0].clone(),
+            completeness: pack.manifest.completeness,
+            source_kind: CatalogPackSourceKind::Installed,
+            source_id: "rust-reconciliation".into(),
+            location: CatalogCandidateLocation::Durable,
+        };
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM catalog_semantic_rows_indexed_shards", [])
+            .unwrap();
+        let read_only = SemanticPackCatalog::open(
+            catalog.root(),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let before = thread_shard_wire_read_count();
+        let miss = read_only.load(&candidate).unwrap_err();
+        assert!(matches!(
+            miss,
+            CatalogMiss::IndexReconciliationRequired { .. }
+        ));
+        assert!(
+            brokk_bifrost_semantic::analyzer::semantic_model::runtime::catalog_miss_reason(&miss)
+                .contains("bifrost-semantic-pack reindex CATALOG")
+        );
+        assert_eq!(thread_shard_wire_read_count(), before);
+        assert!(catalog.load(&candidate).unwrap().shard.is_none());
+        assert_eq!(thread_shard_wire_read_count(), before + 1);
+        assert!(catalog.load(&candidate).unwrap().shard.is_none());
+        assert!(read_only.load(&candidate).unwrap().shard.is_none());
+        assert_eq!(thread_shard_wire_read_count(), before + 1);
+        catalog
+            .register_compiled_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::EphemeralWorkspace,
+                    source_id: "rust-session".into(),
+                },
+            )
+            .unwrap();
+        let mut candidate = candidate;
+        candidate.location = CatalogCandidateLocation::Session {
+            pack_ordinal: 0,
+            shard_ordinal: 0,
+        };
+        candidate.source_kind = CatalogPackSourceKind::EphemeralWorkspace;
+        catalog
+            .session_catalog
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute("DELETE FROM catalog_semantic_rows_indexed_shards", [])
+            .unwrap();
+        let before = thread_shard_wire_read_count();
+        assert!(catalog.load(&candidate).unwrap().shard.is_none());
+        assert_eq!(thread_shard_wire_read_count(), before + 1);
+        assert!(catalog.load(&candidate).unwrap().shard.is_none());
+        assert_eq!(thread_shard_wire_read_count(), before + 1);
+    }
+
+    #[test]
+    fn reindex_restores_missing_semantic_rows_and_is_idempotent() {
+        let (catalog, pack) = install_fixture();
+        let count = |table: &str| {
+            catalog
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert!(count("catalog_declaration_members") > 0);
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM catalog_semantic_rows_indexed_shards", [])
+            .unwrap();
+        assert_eq!(count("catalog_declaration_members"), 0);
+        assert_eq!(count("catalog_callable_value_facts"), 0);
+        assert_eq!(
+            catalog.reindex(&CancellationToken::new()).unwrap(),
+            pack.manifest.shards.len()
+        );
+        assert!(count("catalog_declaration_members") > 0);
+        assert!(count("catalog_callable_value_facts") > 0);
+        assert_eq!(catalog.reindex(&CancellationToken::new()).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_only_activation_requires_reindex_without_quarantining_or_decoding() {
+        let (catalog, pack) = install_fixture();
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM catalog_semantic_rows_indexed_shards", [])
+            .unwrap();
+        let read_only = SemanticPackCatalog::open(
+            catalog.root(),
+            CatalogOpenMode::ReadOnly,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let candidate = CatalogCandidate {
+            manifest_digest: pack.manifest.content_sha256.clone(),
+            shard_id: pack.manifest.shards[0].shard_id.clone(),
+            descriptor: pack.manifest.shards[0].clone(),
+            completeness: pack.manifest.completeness,
+            source_kind: CatalogPackSourceKind::Installed,
+            source_id: "callable-values-fixture".to_owned(),
+            location: CatalogCandidateLocation::Durable,
+        };
+        let miss = read_only.load(&candidate).unwrap_err();
+        assert_eq!(
+            miss,
+            CatalogMiss::IndexReconciliationRequired {
+                manifest_digest: candidate.manifest_digest.clone(),
+                shard_id: candidate.shard_id.clone()
+            }
+        );
+        assert!(
+            brokk_bifrost_semantic::analyzer::semantic_model::runtime::catalog_miss_reason(&miss)
+                .contains("bifrost-semantic-pack reindex CATALOG")
+        );
+        assert_eq!(read_only.object_reads.load(Ordering::Relaxed), 0);
+        assert!(read_only.rejected_manifests.lock().unwrap().is_empty());
+        assert!(matches!(
+            read_only.runtime_source_reader(std::iter::once((
+                candidate.manifest_digest.as_str(),
+                candidate.shard_id.as_str(),
+                candidate.source_kind
+            ))),
+            Err(CatalogError::IndexReconciliationRequired { .. })
+        ));
+        assert_eq!(
+            catalog
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM catalog_packs WHERE state='quarantined'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn legacy_missing_index_is_a_gap_until_bounded_normal_hydration_repairs_it() {
         let (catalog, pack) = install_fixture();
         let manifest = &pack.manifest.content_sha256;
         let shard = &pack.manifest.shards[0].shard_id;
         {
-            let mut connection = catalog.connection.lock().unwrap();
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .unwrap();
-            transaction
-                .execute(
-                    "DELETE FROM catalog_anonymous_callable_identities
-                     WHERE manifest_digest = ?1 AND shard_id = ?2",
-                    params![manifest, shard],
+            let connection = catalog.connection.lock().unwrap();
+            // Recreate a populated v23 catalog without changing any retained
+            // callable-value table or child table. Opening v25 must not decode.
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                         DROP TRIGGER catalog_semantic_rows_delete_callable;",
                 )
                 .unwrap();
-            transaction
-                .execute(
-                    "DELETE FROM catalog_callable_value_facts
-                     WHERE manifest_digest = ?1 AND shard_id = ?2",
-                    params![manifest, shard],
+            let tables = connection
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for table in tables {
+                if connection
+                    .prepare(&format!("SELECT shard_key FROM {table} LIMIT 0"))
+                    .is_ok()
+                {
+                    connection
+                        .execute_batch(&format!("DROP TABLE {table}"))
+                        .unwrap();
+                }
+            }
+            connection
+                .execute_batch(
+                    "CREATE TABLE
+                         catalog_callable_values_indexed_shards(manifest_digest
+                         TEXT NOT NULL, shard_id TEXT NOT NULL, index_version
+                         INTEGER NOT NULL, PRIMARY KEY(manifest_digest, shard_id),
+                         FOREIGN KEY(manifest_digest, shard_id) REFERENCES
+                         catalog_pack_shards(manifest_digest, shard_id) ON DELETE
+                         CASCADE) STRICT; PRAGMA user_version=23; PRAGMA
+                         foreign_keys=ON;",
                 )
                 .unwrap();
-            transaction
-                .execute(
-                    "DELETE FROM catalog_callable_value_coverage
-                     WHERE manifest_digest = ?1 AND shard_id = ?2",
-                    params![manifest, shard],
-                )
-                .unwrap();
-            transaction
-                .execute(
-                    "DELETE FROM catalog_callable_values_indexed_shards
-                     WHERE manifest_digest = ?1 AND shard_id = ?2",
-                    params![manifest, shard],
-                )
-                .unwrap();
-            transaction.commit().unwrap();
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM catalog_callable_value_facts",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap()
+                    > 0
+            );
         }
+        let migrated = brokk_bifrost_semantic::analyzer::semantic_model::catalog::db::open(
+            catalog.root(),
+            CatalogOpenMode::ReadWrite,
+        )
+        .unwrap();
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT count(*) FROM catalog_semantic_rows_indexed_shards",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT count(*) FROM catalog_callable_value_facts",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "v25 invalidates derived publications so exact presence is recovered by reconciliation"
+        );
+        drop(migrated);
         let object_reads = catalog.object_reads.load(Ordering::Relaxed);
         let no_budget = catalog
             .query_callable_values(
@@ -5027,7 +5335,7 @@ pub(crate) mod callable_value_catalog_tests {
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT count(*) FROM catalog_callable_values_indexed_shards
+                    "SELECT count(*) FROM catalog_semantic_rows_indexed_shards
                      WHERE manifest_digest = ?1 AND shard_id = ?2",
                     params![manifest, shard],
                     |row| row.get::<_, i64>(0),
@@ -5173,23 +5481,47 @@ pub(crate) mod generated_production_cache_version_tests {
         let original_sources = source_rows(&catalog);
         assert_eq!(original_sources.len(), 2);
         // Recreate schema 8, with both an old and a still-current digest.
-        catalog.connection.lock().unwrap().execute_batch(
-            "CREATE UNIQUE INDEX catalog_generated_productions_identity ON catalog_generated_productions(input_digest, producer_name, producer_version, schema_version);
-             ALTER TABLE catalog_generated_productions DROP COLUMN generated_cache_version;
-             DROP VIEW catalog_verified_generated_productions;
-             DROP TABLE catalog_shard_validations;
-             DROP TABLE catalog_anonymous_callable_signature_shapes;
-             DROP TABLE catalog_anonymous_callable_identity_anchors;
-             DROP TABLE catalog_anonymous_callable_identities;
-             DROP TABLE catalog_callable_value_coverage;
-             DROP TABLE catalog_callable_value_facts;
-             DROP TABLE catalog_callable_values_indexed_shards;
-             DROP TABLE catalog_exact_go_package_files;
-             DROP TABLE catalog_exact_go_packages;
-             DROP TABLE catalog_exact_go_source_files;
-             DROP TABLE catalog_exact_go_source_sets;
-             PRAGMA user_version = 8;"
-        ).unwrap();
+        catalog
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE UNIQUE INDEX
+                         catalog_generated_productions_identity ON
+                         catalog_generated_productions(input_digest, producer_name,
+                         producer_version, schema_version); ALTER TABLE
+                         catalog_generated_productions DROP COLUMN
+                         generated_cache_version; DROP VIEW
+                         catalog_verified_generated_productions; DROP TRIGGER
+                         catalog_semantic_rows_delete_callable; DROP TABLE
+                         catalog_declaration_names; DROP TABLE
+                         catalog_member_aliases; DROP TABLE
+                         catalog_runtime_exposures; DROP TABLE
+                         catalog_runtime_behaviors; DROP TABLE
+                         catalog_declaration_types; DROP TABLE
+                         catalog_declaration_members; DROP TABLE
+                         catalog_declaration_relations; DROP TABLE
+                         catalog_generator_rules; DROP TABLE
+                         catalog_procedure_summaries; DROP TABLE
+                         catalog_collection_flows; DROP TABLE
+                         catalog_conditional_type_refinements; DROP TABLE
+                         catalog_deferred_yields; DROP TABLE
+                         catalog_runtime_value_payloads; DROP TABLE
+                         catalog_runtime_contract_payloads; DROP TABLE
+                         catalog_shard_validations; DROP TABLE
+                         catalog_anonymous_callable_signature_shapes; DROP TABLE
+                         catalog_anonymous_callable_identity_anchors; DROP TABLE
+                         catalog_anonymous_callable_identities; DROP TABLE
+                         catalog_callable_value_coverage; DROP TABLE
+                         catalog_callable_value_facts; DROP TABLE
+                         catalog_semantic_payload_families; DROP TABLE
+                         catalog_semantic_rows_indexed_shards; DROP TABLE
+                         catalog_exact_go_package_files; DROP TABLE
+                         catalog_exact_go_packages; DROP TABLE
+                         catalog_exact_go_source_files; DROP TABLE
+                         catalog_exact_go_source_sets; PRAGMA user_version = 8;",
+            )
+            .unwrap();
         drop(catalog);
 
         let catalog = SemanticPackCatalog::open(

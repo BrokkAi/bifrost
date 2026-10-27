@@ -746,6 +746,8 @@ pub struct BundleInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasePackInstallation {
+    pub diagnostics:
+        Vec<brokk_bifrost_analysis::analyzer::semantic_model::catalog::UnresolvedSummaryCallee>,
     pub pack_id: String,
     pub pack_version: String,
     pub manifest_digest: String,
@@ -3404,6 +3406,7 @@ fn install_verified_release_bundle(
             };
             Ok((
                 ReleasePackInstallation {
+                    diagnostics: installed.diagnostics,
                     pack_id: pack.pack_id.clone(),
                     pack_version: pack.pack_version.clone(),
                     manifest_digest: installed.manifest_digest,
@@ -3473,6 +3476,7 @@ fn install_verified_release_bundle(
         };
         let manifest_digest = installation.install.manifest_digest;
         installed.push(ReleasePackInstallation {
+            diagnostics: installation.install.diagnostics,
             pack_id: generated.pack_id.clone(),
             pack_version: generated.pack_version.clone(),
             manifest_digest: manifest_digest.clone(),
@@ -4962,6 +4966,7 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == "schema.callable_surface_version")
         );
         let mut legacy_authored = authored;
+        legacy_authored.extraction = None; // Schema 2 predates extraction authority.
         // Reconstruct the schema-2 producer contract explicitly: unlike the
         // schema-8 pinned request above, a legacy native pack requires an
         // engine range. This synthetic downgrade is only used to prove stale
@@ -5522,11 +5527,11 @@ mod tests {
         .unwrap();
         let pack = &bundle.index.packs[0];
         let (manifest, _) = read_compiled_manifest(&root, &pack.pack_id, &pack.manifest).unwrap();
-        assert!(
-            manifest.schema_version < SEMANTIC_MODEL_SCHEMA_VERSION,
-            "a producer's pack declares the lowest schema its content needs, found {}",
-            manifest.schema_version
+        assert_eq!(
+            manifest.schema_version, 19,
+            "extraction authority requires schema 19"
         );
+        assert!(manifest.extraction.is_some());
 
         // Restamp the bundle as another engine's output, keeping it
         // internally consistent and checksummed.

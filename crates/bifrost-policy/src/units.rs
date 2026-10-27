@@ -1299,7 +1299,7 @@ pub struct UnitSnapshots {
 
 impl UnitSnapshots {
     /// A comparison of one snapshot with itself: a full scan, or the base
-    /// half of a diff run.
+    /// half of a diff run. It verifies units computed on that snapshot.
     pub const fn of(snapshot: StableDigest) -> Self {
         Self {
             base: snapshot,
@@ -1314,11 +1314,13 @@ impl UnitSnapshots {
 /// store to look units up in and a workspace to verify them against, and one
 /// that does not executes exactly as it always has. There is no mode to set.
 ///
-/// The base half of a `--diff-base` run holds one too. Its changed facts are
-/// the base against itself, which states that nothing moved, so it reuses
-/// exactly the units an earlier run computed on this same base -- a full scan
-/// of the base revision, or an earlier evaluation of it -- and recomputes
-/// every other one.
+/// A full scan and the base half of a `--diff-base` run hold one too. Their
+/// changed facts are the workspace against itself, which states that nothing
+/// moved, so a unit computed on this same snapshot -- by an earlier scan of
+/// this tree, or an earlier evaluation of this base -- has its name-index
+/// reads proved by that empty set and every other read checked against the
+/// workspace itself. A unit without name-index reads is verified wherever it
+/// came from, and one with them from another snapshot is recomputed.
 pub struct PolicyIncrementalContext<'a> {
     store: &'a Mutex<dyn PolicyUnitStore>,
     workspace: &'a WorkspaceAnalyzer,
@@ -1330,7 +1332,6 @@ pub struct PolicyIncrementalContext<'a> {
     snapshots: UnitSnapshots,
     inputs: WorkspaceUnitInputs,
     base: IncrementalBaseState,
-    reuse_existing: bool,
     verdicts: ArtifactVerdictLog,
     runs: Mutex<Vec<PolicyIncrementalRun>>,
     units: Mutex<Vec<(PolicyId, Vec<PolicyUnitKey>)>>,
@@ -1362,41 +1363,11 @@ impl<'a> PolicyIncrementalContext<'a> {
             snapshots,
             inputs,
             base,
-            reuse_existing: true,
             verdicts: ArtifactVerdictLog::default(),
             runs: Mutex::new(Vec::new()),
             units: Mutex::new(Vec::new()),
             staged: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Publish complete units from a full scan without reusing any.
-    ///
-    /// A full scan is the exhaustive evaluation every other run is compared
-    /// with, so it computes every unit afresh. What it publishes carries the
-    /// scanned snapshot's identity, which is what lets a later diff run whose
-    /// base is that snapshot reuse it.
-    pub fn for_publication(
-        store: &'a Mutex<dyn PolicyUnitStore>,
-        workspace: &'a WorkspaceAnalyzer,
-        changed: &'a ChangedFacts,
-        inputs: WorkspaceUnitInputs,
-        snapshot: StableDigest,
-    ) -> Self {
-        let mut context = Self::new(
-            store,
-            workspace,
-            changed,
-            inputs,
-            IncrementalBaseState::Evaluated,
-            UnitSnapshots::of(snapshot),
-        );
-        context.reuse_existing = false;
-        context
-    }
-
-    pub const fn reuses_existing(&self) -> bool {
-        self.reuse_existing
     }
 
     /// The content identity of the workspace this context evaluates.

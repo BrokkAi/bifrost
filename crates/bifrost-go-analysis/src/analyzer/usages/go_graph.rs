@@ -282,6 +282,22 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
                 overloads.first().expect("non-empty Go usage target group"),
             );
         }
+        // A source that admission refused can hold references to any target,
+        // so this scan cannot prove their absence.
+        let unproven = match self.go.graph_source_exclusions() {
+            Ok(excluded) if excluded.is_empty() => None,
+            Ok(excluded) => Some(excluded.into_iter().map(|(file, _)| file).collect()),
+            Err(error) => {
+                self.go.record_query_failure(error);
+                Some(Vec::new())
+            }
+        };
+        if let Some(excluded) = unproven {
+            return GraphUsageOutcome::TerminalFailure(unavailable_go_graph_diagnostic(
+                overloads.first().expect("non-empty Go usage target group"),
+                &GoGraphBuildError::from_files(excluded),
+            ));
+        }
         let edge_index = match self.go.usage_edge_index() {
             Ok(edge_index) => edge_index,
             Err(error) => {

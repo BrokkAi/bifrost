@@ -5599,7 +5599,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
     fn authored_external_summary(
         &self,
         selection: &ResolvedSelection,
-    ) -> Option<&CompiledProcedureSummary> {
+    ) -> Option<Arc<CompiledProcedureSummary>> {
         let call = selection.call.as_ref()?;
         self.authored_external_summary_for_call(
             selection.modeled_target_origin,
@@ -5613,7 +5613,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
         modeled_target_origin: Option<&'static str>,
         modeled_member_id: Option<&str>,
         call: &CallSiteHandle,
-    ) -> Option<&CompiledProcedureSummary> {
+    ) -> Option<Arc<CompiledProcedureSummary>> {
         if modeled_target_origin != Some("semantic_model") {
             return None;
         }
@@ -5653,7 +5653,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
         {
             return None;
         }
-        Some(summary.record)
+        Some(Arc::clone(&summary.record))
     }
 
     fn authored_external_summary_fresh_result_for_call(

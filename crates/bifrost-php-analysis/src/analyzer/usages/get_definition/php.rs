@@ -2709,10 +2709,10 @@ fn php_instance_receiver_fqn(
 /// The one class a local binding proves for `name`, or `None` when it proves
 /// none or more than one.
 ///
-/// The shared `first_precise` helper answers with an arbitrary member of a
-/// multi-target precise set, which for a union-typed PHP local would be
-/// first-arm-wins under another name. Every single-owner reader here must fail
-/// closed on a union instead.
+/// The shared `first_precise` helper requires a single-target binding, and a
+/// union-typed PHP local seeds one target per arm. Picking one arm would be
+/// first-arm-wins under another name, so every single-owner reader here must
+/// fail closed on a union instead.
 fn php_precise_owner(bindings: &LocalInferenceEngine<String>, name: &str) -> Option<String> {
     let mut owners = php_precise_owners(bindings, name);
     (owners.len() == 1).then(|| owners.remove(0))

@@ -5,6 +5,10 @@
 //! rejects captures and rebindings before returning the edit set.
 
 use crate::analyzer::go::GoAnalyzer;
+use brokk_bifrost_analysis::analyzer::rename::exact::{
+    ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue, RenameAssemblyLimits,
+    RenameSourceIssue, assemble_exact_rename, check_rename_authority,
+};
 
 use crate::analyzer::go::selected_reverse::GoSelectedReverseOutcome;
 
@@ -14,11 +18,7 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_analysis::analyzer::rename::MAX_RENAME_IDENTIFIER_BYTES;
 
-use brokk_bifrost_analysis::analyzer::rename::RenameEdit;
-
 use brokk_bifrost_analysis::analyzer::rename::RenameFailure;
-
-use brokk_bifrost_analysis::analyzer::rename::RenameFileEdits;
 
 use brokk_bifrost_analysis::analyzer::rename::RenameResult;
 
@@ -26,15 +26,9 @@ use brokk_bifrost_analysis::analyzer::resolution::seam_profile::GoRenamePhase;
 
 use brokk_bifrost_analysis::analyzer::resolution::seam_profile::go_rename_phase;
 
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
-
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeDerivationResult;
-
 use brokk_bifrost_analysis::analyzer::usages::finder::DEFAULT_MAX_FILES;
 
 use brokk_bifrost_analysis::analyzer::usages::finder::DEFAULT_MAX_USAGES;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -47,7 +41,6 @@ use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
-use std::collections::BTreeMap;
 
 /// Native Go rename preparation. It remains outside Go production dispatch.
 pub struct GoNativeRenameProvider;
@@ -131,7 +124,11 @@ fn native_go_rename(
     let (original, conflict) =
         match go_selected_inverse_for_rename_original(go, target, new_name, cancellation) {
             (GoSelectedReverseOutcome::Ready(answer), conflict) => (answer, conflict),
-            (GoSelectedReverseOutcome::Unavailable(reason), _) => {
+            (
+                GoSelectedReverseOutcome::Unavailable(reason)
+                | GoSelectedReverseOutcome::TargetUncovered(reason),
+                _,
+            ) => {
                 return Err(failure("incomplete_analysis", reason));
             }
             (GoSelectedReverseOutcome::Stale(reason), _) => {
@@ -148,130 +145,24 @@ fn native_go_rename(
         return Err(conflict);
     }
     let edit_assembly_phase = go_rename_phase(GoRenamePhase::EditAssembly);
-    require_complete_proven(&original, "original")?;
-    if original.edges.len() > DEFAULT_MAX_USAGES {
-        return Err(failure(
-            "too_many_callsites",
-            format!(
-                "native Go rename exceeds the usage limit: {}",
-                original.edges.len()
-            ),
-        ));
-    }
-
-    let target_source = project
-        .read_source(target.source())
-        .map_err(|error| failure("incomplete_analysis", error.to_string()))?;
-    if !go
-        .inner
-        .source_matches_selected_native_content(target.source(), &target_source)
-    {
-        return Err(failure(
-            "incomplete_analysis",
-            "native Go rename target source differs from selected content",
-        ));
-    }
-    let declaration =
-        brokk_bifrost_analysis::analyzer::declaration_range::code_unit_declaration_name_range(
-            go,
-            target.source(),
-            &target_source,
-            target,
-        )
-        .ok_or_else(|| {
-            failure(
-                "incomplete_analysis",
-                "native Go rename target has no structured declaration name",
-            )
-        })?;
-    let mut edits_by_file = BTreeMap::<ProjectFile, (String, Vec<RenameEdit>)>::new();
-    for edge in &original.edges {
-        let file = edge.site.file.clone();
-        if !edits_by_file.contains_key(&file) {
-            if edits_by_file.len() >= DEFAULT_MAX_FILES {
-                return Err(failure(
-                    "too_many_files",
-                    "native Go rename exceeds the file limit",
-                ));
-            }
-            let source = project
-                .read_source(&file)
-                .map_err(|error| failure("incomplete_analysis", error.to_string()))?;
-            if !go
-                .inner
-                .source_matches_selected_native_content(&file, &source)
-            {
-                return Err(failure(
-                    "incomplete_analysis",
-                    format!("native Go rename source differs from selected content: {file}"),
-                ));
-            }
-            edits_by_file.insert(file.clone(), (source, Vec::new()));
-        }
-        let (source, edits) = edits_by_file
-            .get_mut(&file)
-            .expect("selected Go rename source was admitted");
-        let spelling = source
-            .get(edge.site.range.start_byte..edge.site.range.end_byte)
-            .ok_or_else(|| {
-                failure(
-                    "incomplete_analysis",
-                    format!(
-                        "native Go inverse range is outside {file}: {:?}",
-                        edge.site.range
-                    ),
-                )
-            })?;
-        // References through a type alias bind to the target while retaining
-        // the alias's spelling. They belong to the binding comparison, but
-        // renaming the underlying declaration must leave that spelling alone.
-        if spelling == target.identifier() {
-            edits.push(RenameEdit {
-                start_byte: edge.site.range.start_byte,
-                end_byte: edge.site.range.end_byte,
-                new_text: new_name.to_owned(),
-            });
-        }
-    }
-    if !edits_by_file.contains_key(target.source()) {
-        if edits_by_file.len() >= DEFAULT_MAX_FILES {
-            return Err(failure(
-                "too_many_files",
-                "native Go rename exceeds the file limit",
-            ));
-        }
-        edits_by_file.insert(target.source().clone(), (target_source.clone(), Vec::new()));
-    }
-    let declaration_source = &edits_by_file
-        .get(target.source())
-        .expect("target source was admitted")
-        .0;
-    if declaration_source.get(declaration.start_byte..declaration.end_byte)
-        != Some(target.identifier())
-    {
-        return Err(failure(
-            "incomplete_analysis",
-            "native Go declaration range does not contain its structured identifier",
-        ));
-    }
-    edits_by_file
-        .get_mut(target.source())
-        .expect("target source was admitted")
-        .1
-        .push(RenameEdit {
-            start_byte: declaration.start_byte,
-            end_byte: declaration.end_byte,
-            new_text: new_name.to_owned(),
-        });
-
-    let rename_files = build_rename_files(edits_by_file, target.identifier(), new_name)?;
-    let result = RenameResult {
-        target: target.clone(),
-        old_name: target.identifier().to_owned(),
-        files: rename_files,
-    };
+    let assembled = assemble_exact_rename(
+        go,
+        project,
+        target,
+        new_name,
+        &original,
+        RenameAssemblyLimits {
+            max_usages: DEFAULT_MAX_USAGES,
+            max_files: DEFAULT_MAX_FILES,
+        },
+        cancellation,
+        &GoRenameHooks(go),
+    )
+    .map_err(rename_assembly_failure)?
+    .ok_or_else(|| failure("cancelled", "native Go rename was cancelled"))?;
+    let result = assembled.result;
     drop(edit_assembly_phase);
-    if cancellation.is_cancelled() || project.analysis_generation() != generation {
+    if check_rename_authority(project, generation, cancellation).is_err() {
         return Err(failure(
             "incomplete_analysis",
             "native Go rename was cancelled or selected generation changed",
@@ -295,72 +186,69 @@ fn native_go_rename(
     }
 }
 
-fn build_rename_files(
-    edits_by_file: BTreeMap<ProjectFile, (String, Vec<RenameEdit>)>,
-    old_name: &str,
-    new_name: &str,
-) -> Result<Vec<RenameFileEdits>, RenameFailure> {
-    let mut files = Vec::new();
-    for (file, (original, mut edits)) in edits_by_file {
-        edits.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
-        edits.dedup_by_key(|edit| (edit.start_byte, edit.end_byte));
-        if edits
-            .windows(2)
-            .any(|pair| pair[1].start_byte < pair[0].end_byte)
+struct GoRenameHooks<'a>(&'a GoAnalyzer);
+
+impl ExactRenameHooks for GoRenameHooks<'_> {
+    type FileState = ();
+
+    fn admit_source(&self, file: &ProjectFile, source: &str) -> Result<(), RenameSourceIssue> {
+        if !self
+            .0
+            .inner
+            .source_matches_selected_native_content(file, source)
         {
-            return Err(failure(
-                "incomplete_analysis",
-                "native Go rename edits overlap",
-            ));
+            return Err(RenameSourceIssue::ContentChanged);
         }
-        for edit in &edits {
-            if edit.new_text != new_name
-                || original.get(edit.start_byte..edit.end_byte) != Some(old_name)
-            {
-                return Err(failure(
-                    "incomplete_analysis",
-                    format!(
-                        "native Go rename edit is not an exact identifier replacement: {edit:?}"
-                    ),
-                ));
-            }
-        }
-        if !edits.is_empty() {
-            files.push(RenameFileEdits { file, edits });
-        }
+        Ok(())
     }
-    Ok(files)
 }
 
-fn require_complete_proven(
-    result: &EdgeDerivationResult,
-    world: &str,
-) -> Result<(), RenameFailure> {
-    require_complete_inventory(result, world)?;
-    if result
-        .edges
-        .iter()
-        .any(|edge| edge.proof != UsageProof::Proven)
-    {
-        return Err(failure(
-            "incomplete_analysis",
-            format!("{world} Go inverse evidence is incomplete or unproven: {result:?}"),
-        ));
-    }
-    Ok(())
-}
-
-fn require_complete_inventory(
-    result: &EdgeDerivationResult,
-    world: &str,
-) -> Result<(), RenameFailure> {
-    if result.completeness != EdgeCompleteness::Complete {
-        return Err(failure(
-            "incomplete_analysis",
-            format!("{world} Go inverse inventory is incomplete: {result:?}"),
-        ));
-    }
-    Ok(())
+fn rename_assembly_failure(issue: RenameAssemblyIssue<'_>) -> RenameFailure {
+    let message = match issue {
+        RenameAssemblyIssue::IncompleteInventory(result) => {
+            format!("original Go inverse inventory is incomplete: {result:?}")
+        }
+        RenameAssemblyIssue::UnprovenInventory(result) => {
+            format!("original Go inverse evidence is incomplete or unproven: {result:?}")
+        }
+        RenameAssemblyIssue::TooManyUsages(count) => {
+            return failure(
+                "too_many_callsites",
+                format!("native Go rename exceeds the usage limit: {count}"),
+            );
+        }
+        RenameAssemblyIssue::TooManyFiles => {
+            return failure("too_many_files", "native Go rename exceeds the file limit");
+        }
+        RenameAssemblyIssue::ReadSource(error) => error.to_string(),
+        RenameAssemblyIssue::Source {
+            file,
+            issue: RenameSourceIssue::ContentChanged,
+        } => format!("native Go rename source differs from selected content: {file}"),
+        RenameAssemblyIssue::Source {
+            issue: RenameSourceIssue::ParseFailed,
+            ..
+        }
+        | RenameAssemblyIssue::MissingReferenceName(_) => {
+            unreachable!("Go rename uses exact inverse ranges without parsing")
+        }
+        RenameAssemblyIssue::MissingDeclarationName => {
+            "native Go rename target has no structured declaration name".into()
+        }
+        RenameAssemblyIssue::RangeOutsideSource { file, range } => {
+            format!("native Go inverse range is outside {file}: {range:?}")
+        }
+        RenameAssemblyIssue::DeclarationSpellingMismatch => {
+            "native Go declaration range does not contain its structured identifier".into()
+        }
+        RenameAssemblyIssue::Edit(ExactRenameEditIssue::Overlap) => {
+            "native Go rename edits overlap".into()
+        }
+        RenameAssemblyIssue::Edit(ExactRenameEditIssue::InexactReplacement(edit)) => {
+            format!("native Go rename edit is not an exact identifier replacement: {edit:?}")
+        }
+    };
+    failure("incomplete_analysis", message)
 }
 
 fn failure(kind: &'static str, message: impl Into<String>) -> RenameFailure {

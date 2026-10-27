@@ -1244,7 +1244,10 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        let store_context = super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+            project.as_ref(),
+            &config,
+        )?;
         Self::build_filtered(project, config, Some(languages), store_context, None)
     }
 
@@ -1290,7 +1293,10 @@ impl WorkspaceAnalyzer {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        let store_context = super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+            project.as_ref(),
+            &config,
+        )?;
         Self::build_filtered(project, config, None, store_context, None)
     }
 
@@ -1318,7 +1324,10 @@ impl WorkspaceAnalyzer {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::scoped_store_context(project.as_ref())?;
+        let store_context = super::tree_sitter_analyzer::scoped_store_context_with_config(
+            project.as_ref(),
+            &config,
+        )?;
         Self::build_filtered(project, config, None, store_context, None)
     }
 
@@ -1372,7 +1381,10 @@ impl WorkspaceAnalyzer {
                 context.cancellation = cache.cancellation.clone();
                 context
             }
-            None => crate::analyzer::ephemeral_store_context(project.as_ref())?,
+            None => super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+                project.as_ref(),
+                &config,
+            )?,
         };
         store_context.revision_blobs = Some(blobs);
         Self::build_filtered(project, config, languages, store_context, None)
@@ -1401,7 +1413,11 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
     ) -> Result<(Self, Arc<AnalyzerBuildTierAccess>), StoreError> {
         Self::build_with_tier_access(|observer| {
-            let mut store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+            let mut store_context =
+                super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+                    project.as_ref(),
+                    &config,
+                )?;
             store_context.build_tier_access = Arc::clone(observer);
             Self::build_filtered(project, config, None, store_context, None)
         })
@@ -1427,7 +1443,11 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        let store_context = super::tree_sitter_analyzer::persistent_store_context_with_config(
+            project.as_ref(),
+            &config,
+            true,
+        )?;
         Self::build_filtered(project, config, Some(languages), store_context, None)
     }
 
@@ -1485,11 +1505,11 @@ impl WorkspaceAnalyzer {
     ) -> Result<Self, StoreError> {
         let mut store_context = {
             let _scope = profiling::scope("WorkspaceAnalyzer::open_persistent_store");
-            if automatic_gc {
-                crate::analyzer::persistent_store_context(project.as_ref())?
-            } else {
-                crate::analyzer::persistent_store_context_without_automatic_gc(project.as_ref())?
-            }
+            super::tree_sitter_analyzer::persistent_store_context_with_config(
+                project.as_ref(),
+                &config,
+                automatic_gc,
+            )?
         };
         if let Some(tier_access) = tier_access {
             store_context.build_tier_access = tier_access;

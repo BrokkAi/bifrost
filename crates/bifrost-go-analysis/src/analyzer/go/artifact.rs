@@ -224,7 +224,8 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
         };
         DependencyPackProduction {
             pack: Some(AuthoredSemanticModelPack {
-                schema_version:
+                extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::source_set(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtractionKind::GoSourceSet, artifact.sha256())),
+schema_version:
                     brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id,
                 version: request.version,
@@ -340,7 +341,8 @@ impl GoModulePackProducer {
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: Some(AuthoredSemanticModelPack {
-                schema_version:
+                extraction: Some(brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
+schema_version:
                     brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),
@@ -968,6 +970,8 @@ fn module_type_drafts(
                     .collect();
                 TypeDraft {
                     fact: TypeFact {
+                        implemented_traits_complete: false,
+                        generic_trait_impls_complete: false,
                         jvm_inventory: None,
                         type_parameter_defaults: Vec::new(),
                         implemented_traits: Vec::new(),
@@ -1222,6 +1226,8 @@ fn collect_type_draft(
     }
     types.push(TypeDraft {
         fact: TypeFact {
+            implemented_traits_complete: false,
+            generic_trait_impls_complete: false,
             jvm_inventory: None,
             type_parameter_defaults: Vec::new(),
             implemented_traits: Vec::new(),
@@ -2662,6 +2668,7 @@ var privateValue int
         assert!(!members.iter().any(|member| member.name == "privateValue"));
         assert!(members.iter().any(|member| member.name == "PublicConstant"));
         let pack = AuthoredSemanticModelPack {
+            extraction: None,
             schema_version:
                 brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
             pack_id: "bifrost.test.go".to_owned(),

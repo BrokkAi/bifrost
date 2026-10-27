@@ -115,11 +115,68 @@ labelled_enum! {
     /// `Unknown` is never equal to `Applicable`: a resolver that cannot decide
     /// (unknown shape, unsupported language capability) says so, and an exact
     /// assertion over it becomes unreliable rather than clean.
+    ///
+    /// `LessSpecific` is an applicable candidate that another applicable
+    /// candidate of the same phase is strictly more specific than (JLS
+    /// 15.12.2.5). It accepts the call but cannot be chosen, so it is neither
+    /// counted as an applicable winner nor as a rejection of the call shape.
     ApplicabilityVerdict, ALL_APPLICABILITY_VERDICTS {
         Applicable => "applicable",
         Inapplicable => "inapplicable",
         Unknown => "unknown",
+        LessSpecific => "less_specific",
     }
+}
+
+labelled_enum! {
+    /// The Java method-invocation phase (JLS 15.12.2.2 to 15.12.2.4) whose
+    /// test decided a candidate's verdict.
+    ///
+    /// - `Strict`: identity and widening conversions only.
+    /// - `Loose`: strict conversions plus boxing and unboxing.
+    /// - `VariableArity`: loose conversions with a variable arity method's
+    ///   trailing arguments expanded into its repeated parameter.
+    ///
+    /// A later phase runs only when no candidate is applicable in an earlier
+    /// one. A fixed-arity candidate rejected for its arity fails potential
+    /// applicability (JLS 15.12.2.1) before any phase and records none.
+    InvocationPhase, ALL_INVOCATION_PHASES {
+        Strict => "strict",
+        Loose => "loose",
+        VariableArity => "variable_arity",
+    }
+}
+
+labelled_enum! {
+    /// The conversion a candidate's first failing argument would need to reach
+    /// its formal parameter type (JLS 5.3). None of these is permitted in a
+    /// strict invocation context.
+    ///
+    /// - `NarrowingPrimitive`: a numeric argument whose formal is not wider
+    ///   (JLS 5.1.3, including the widening-and-narrowing `byte` to `char` of
+    ///   JLS 5.1.4). No invocation context permits it.
+    /// - `Boxing`: a primitive argument with a reference formal (JLS 5.1.7).
+    ///   Only a loose invocation context permits it.
+    /// - `NoPrimitiveConversion`: `boolean` and a numeric type. No conversion
+    ///   relates them.
+    /// - `NoWideningReference`: a reference formal outside the argument type's
+    ///   complete supertype closure, so no widening reference conversion
+    ///   exists (JLS 5.1.5).
+    ArgumentConversion, ALL_ARGUMENT_CONVERSIONS {
+        NarrowingPrimitive => "narrowing_primitive",
+        Boxing => "boxing",
+        NoPrimitiveConversion => "no_primitive_conversion",
+        NoWideningReference => "no_widening_reference",
+    }
+}
+
+/// The first argument that keeps a candidate from being applicable in its
+/// deciding phase, and the conversion that argument would need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FailingArgument {
+    /// The zero-based ordinal of the argument in the call's ordered shape.
+    pub ordinal: u32,
+    pub conversion: ArgumentConversion,
 }
 
 labelled_enum! {
@@ -426,6 +483,8 @@ fn callable_vocabularies_are_unique_and_round_trip() {
     super::assert_vocabulary_round_trip!(ALL_ARGUMENT_LIST_KINDS, ArgumentListKind);
     super::assert_vocabulary_round_trip!(ALL_CALL_SHAPE_COVERAGES, CallShapeCoverage);
     super::assert_vocabulary_round_trip!(ALL_APPLICABILITY_VERDICTS, ApplicabilityVerdict);
+    super::assert_vocabulary_round_trip!(ALL_INVOCATION_PHASES, InvocationPhase);
+    super::assert_vocabulary_round_trip!(ALL_ARGUMENT_CONVERSIONS, ArgumentConversion);
     super::assert_vocabulary_round_trip!(ALL_CALLABLE_REJECTION_REASONS, CallableRejectionReason);
     super::assert_vocabulary_round_trip!(ALL_SELECTION_RESOLUTIONS, SelectionResolution);
     super::assert_vocabulary_round_trip!(ALL_RECEIVER_CONTRACTS, ReceiverContract);

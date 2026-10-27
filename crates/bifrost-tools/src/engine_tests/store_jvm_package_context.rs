@@ -80,6 +80,7 @@ pub mod tests {
                 &[],
                 &inputs,
                 &[],
+                &[],
             )
             .unwrap()
     }

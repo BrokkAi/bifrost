@@ -664,6 +664,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             factory,
             operation.as_deref_mut(),
             constraint.as_ref(),
+            None,
         ) {
             if selected.is_some() {
                 return None;
@@ -694,10 +695,10 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             return None;
         }
     }
-    let owner = declaring_owner;
+    let owner = &declaring_owner.owner;
     let member = rust_node_text(terminal, source);
     let proof = if has_receiver {
-        ExactExternalCallProof::rust_bound_external_member(&owner, member, parameter_count)
+        declaring_owner.proof(member, parameter_count)
     } else {
         ExactExternalCallProof::rust_external_call(
             format!("{}::{member}", owner.replace('.', "::")),
@@ -706,7 +707,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
     };
     Some((
         proof,
-        ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner, member),
+        ResolverOwnedExternalCalleeIdentity::new(Language::Rust, declaring_owner.owner, member),
     ))
 }
 
@@ -764,15 +765,20 @@ fn exact_rust_external_receiver_call<'analyzer>(
         operation_factory,
         operation,
         None,
+        None,
     )?;
-    if !rust_external_bound_receiver_callable_declaration(&overlay, &owner, member, parameter_count)
-        || cancellation.is_some_and(CancellationToken::is_cancelled)
+    if !rust_external_bound_receiver_callable_declaration(
+        &overlay,
+        &owner.owner,
+        member,
+        parameter_count,
+    ) || cancellation.is_some_and(CancellationToken::is_cancelled)
     {
         return None;
     }
     Some((
-        ExactExternalCallProof::rust_bound_external_member(&owner, member, parameter_count),
-        ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner, member),
+        owner.proof(member, parameter_count),
+        ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner.owner, member),
     ))
 }
 
@@ -977,13 +983,14 @@ pub(crate) fn exact_rust_external_method_call_attempt_with_operation<
             operation_factory,
             operation,
             None,
+            None,
         )?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
         Some((
-            ExactExternalCallProof::rust_bound_external_member(&owner, member, parameter_count),
-            ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner, member),
+            owner.proof(member, parameter_count),
+            ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner.owner, member),
         ))
     })
 }
@@ -1084,13 +1091,13 @@ fn rust_external_bound_receiver_callable_declaration(
     callable.externally_visible() && !callable.provenance.ambiguous
 }
 
-fn rust_external_callable_match_with_overlay<'a>(
-    overlay: &'a brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+fn rust_external_callable_match_with_overlay(
+    overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
     owner: &str,
     member: &str,
     parameter_count: u32,
     has_receiver: bool,
-) -> Option<SemanticModelCallableMatch<'a>> {
+) -> Option<SemanticModelCallableMatch> {
     let owner = RustOverlayCrates::new(Some(overlay)).referenceable_symbol(owner)?;
     let callable = overlay.callable_for_application(
         SemanticModelCallableKey::new(

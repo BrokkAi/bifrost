@@ -74,6 +74,7 @@ pub fn code_query_result_fixtures_json() -> Value {
                     .collect(),
                 bases: bases.into_iter().map(Some).collect(),
                 provenance: SemanticModelProvenance {
+                    extraction: None,
                     active_model_set_hash: "1".repeat(64),
                     pack_digest: "2".repeat(64),
                     pack_id: "test-only-python-runtime-bases".to_owned(),

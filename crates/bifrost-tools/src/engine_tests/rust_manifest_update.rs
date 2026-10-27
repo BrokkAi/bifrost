@@ -546,9 +546,50 @@ mod rust_manifest_update_tests {
     #[test]
     fn a_metadata_and_profile_manifest_edit_changes_nothing() {
         assert_manifest_edit_is_incremental(
-            "[package]\nedition = \"2021\"\nversion = \"0.2.0\"\nname = \"app\"\n\
+            "[package]\nedition = \"2021\"\nversion = \"0.1.0\"\nname = \"app\"\n\
          description = \"now described\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n\n\
          [profile.release]\nopt-level = 3\n",
+        );
+    }
+
+    /// (e) A package version is topology, not metadata: `[patch]` selection
+    /// compares a replacement's version with the dependency requirement, so a
+    /// version-only edit re-derives the workspace and matches a fresh build.
+    #[test]
+    #[hardwon(
+        "#6856: a version-only manifest edit must re-derive because [patch] selection reads the version"
+    )]
+    fn a_version_only_manifest_edit_rederives_and_matches_a_fresh_build() {
+        let project = fixture(&[
+            ("Cargo.toml", WORKSPACE),
+            ("app/Cargo.toml", APP_MANIFEST_WITH_DEP),
+            ("dep/Cargo.toml", DEP_MANIFEST),
+            ("app/src/lib.rs", APP_LIB),
+            ("dep/src/lib.rs", DEP_LIB),
+        ]);
+        let bumped = APP_MANIFEST_WITH_DEP.replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+        assert_ne!(
+            bumped, APP_MANIFEST_WITH_DEP,
+            "the edit changes only the version"
+        );
+        let Edited {
+            updated,
+            fresh,
+            full_updates,
+            ..
+        } = edit_and_rebuild(&project, &[("app/Cargo.toml", &bumped)]);
+        assert_eq!(full_updates, 1, "a version edit re-derives the workspace");
+        let expected = observe(&fresh);
+        assert!(expected.crate_rows_current);
+        assert!(
+            has_edge(&expected, "caller", "target"),
+            "the fixture keeps its cross-crate edge: {:?}",
+            expected.edges
+        );
+        assert_eq!(
+            observe(&updated),
+            expected,
+            "the updated analyzer must publish what a fresh build of the edited tree publishes"
         );
     }
 

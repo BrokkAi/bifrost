@@ -4331,7 +4331,7 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         receiver: Node<'tree>,
         member: &str,
         parameter_count: usize,
-    ) -> Option<&CollectionFlowContract> {
+    ) -> Option<std::sync::Arc<CollectionFlowContract>> {
         let overlay = self.semantic_model_overlay.as_deref()?;
         let identity = self.expression_structured_type_identity(receiver)?;
         let owner_name = identity.nominal_name()?;
@@ -4360,7 +4360,10 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         overlay.unique_complete_collection_flow(&callable.id)
     }
 
-    fn modeled_map_update_flow(&self, receiver: Node<'tree>) -> Option<&CollectionFlowContract> {
+    fn modeled_map_update_flow(
+        &self,
+        receiver: Node<'tree>,
+    ) -> Option<std::sync::Arc<CollectionFlowContract>> {
         let flow = self.modeled_collection_flow(receiver, "update", 2)?;
         if matches!(
             flow.payload.receiver_substitution,

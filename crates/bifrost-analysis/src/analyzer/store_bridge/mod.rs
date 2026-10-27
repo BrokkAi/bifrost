@@ -3,6 +3,9 @@ pub mod epoch;
 #[allow(dead_code, unused_imports)]
 pub mod fact_reference_edges;
 pub mod go_graph;
+pub(crate) mod graph_unit;
+mod graph_workers;
+pub mod jvm_graph;
 #[doc(hidden)]
 pub mod parsed_blob;
 pub mod rust_graph;

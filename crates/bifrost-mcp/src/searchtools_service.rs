@@ -810,7 +810,7 @@ mod workspace_semantic_model_configuration_tests {
             first_match.disposition,
             SemanticModelOverlayDisposition::Unique
         );
-        let first_symbol = first_match.records[0];
+        let first_symbol = &first_match.records[0];
         assert_eq!(
             first_symbol.provenance.activation.source_kind,
             "ephemeral_workspace"
@@ -834,9 +834,11 @@ mod workspace_semantic_model_configuration_tests {
             .analyzer()
             .semantic_model_overlay()
             .expect("repeated workspace activation publishes an overlay");
-        let second_symbol = second_overlay
-            .symbols_named("workspace.GeneratedJobMaker")
-            .records[0];
+        let second_symbol = std::sync::Arc::clone(
+            &second_overlay
+                .symbols_named("workspace.GeneratedJobMaker")
+                .records[0],
+        );
         assert_eq!(
             first_symbol.provenance.activation.source_id,
             second_symbol.provenance.activation.source_id

@@ -39,6 +39,7 @@ mod rust_indirect_table_tests {
                     &[],
                     &[manifest.clone(), lock],
                     &[],
+                    &[],
                 )
                 .unwrap()
         };

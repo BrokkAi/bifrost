@@ -7,8 +7,7 @@
 
 use crate::declarations::parse_python_tree;
 use brokk_bifrost_core::clones::{
-    CloneNormalizationRules, clone_ast_signature, clone_ast_signature_from_root,
-    normalized_clone_tokens, normalized_clone_tokens_from_root,
+    CloneNormalizationRules, clone_ast_signature_from_root, normalized_clone_tokens_from_root,
 };
 #[cfg(test)]
 use brokk_bifrost_core::clones::{
@@ -59,22 +58,6 @@ const PYTHON_CLONE_NORMALIZATION_RULES: CloneNormalizationRules = CloneNormaliza
     comment_kinds: &["comment"],
     ignored_ast_kinds: &[],
 };
-
-pub fn normalized_clone_tokens_python(source: &str) -> Vec<String> {
-    normalized_clone_tokens(
-        parse_clone_tree(source),
-        source,
-        PYTHON_CLONE_NORMALIZATION_RULES,
-    )
-}
-
-pub fn build_python_clone_ast_signature(source: &str) -> String {
-    clone_ast_signature(
-        parse_clone_tree(source),
-        source,
-        PYTHON_CLONE_NORMALIZATION_RULES,
-    )
-}
 
 /// Parse and prepare one Python clone candidate, stopping before AST-label work
 /// when the normalized token threshold cannot be met.

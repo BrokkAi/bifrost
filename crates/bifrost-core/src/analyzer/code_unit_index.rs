@@ -886,3 +886,63 @@ mod parent_of_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod narrowest_enclosing_properties {
+    use super::narrowest_enclosing_by_lines;
+    use crate::analyzer::model::Range;
+    use proptest::prelude::*;
+
+    fn lines(start_line: usize, length: usize) -> Range {
+        Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_line,
+            end_line: start_line + length,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Brute-force reference: a candidate qualifies through the first of its
+        /// ranges that covers the whole query line span; the qualifying
+        /// candidate with the fewest lines wins, and the earliest candidate wins
+        /// a tie.
+        #[test]
+        fn picks_the_candidate_with_the_fewest_enclosing_lines(
+            candidates in proptest::collection::vec(
+                proptest::collection::vec((0usize..20, 0usize..15), 0..4),
+                0..8,
+            ),
+            query in (0usize..25, 0usize..6),
+        ) {
+            let (query_start, query_length) = query;
+            let query_end = query_start + query_length;
+            let input: Vec<(usize, Vec<Range>)> = candidates
+                .iter()
+                .enumerate()
+                .map(|(id, ranges)| {
+                    (id, ranges.iter().map(|&(s, l)| lines(s, l)).collect())
+                })
+                .collect();
+
+            let mut best: Option<(usize, usize)> = None;
+            for (id, ranges) in candidates.iter().enumerate() {
+                for &(start, length) in ranges {
+                    if start <= query_start && start + length >= query_end {
+                        if best.is_none_or(|(_, fewest)| length < fewest) {
+                            best = Some((id, length));
+                        }
+                        break;
+                    }
+                }
+            }
+
+            prop_assert_eq!(
+                narrowest_enclosing_by_lines(input, query_start, query_end),
+                best.map(|(id, _)| id)
+            );
+        }
+    }
+}

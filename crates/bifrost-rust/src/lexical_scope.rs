@@ -5,7 +5,7 @@ use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPathKind};
 use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::weighted_cache::{build_weighted_cache, weight_source_text};
-use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::hash::HashMap;
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -87,6 +87,31 @@ pub(crate) fn rust_cfg_argument_condition(
     arguments: Node<'_>,
     source: &str,
 ) -> Option<RustCfgCondition> {
+    let mut cursor = arguments.walk();
+    let children = arguments
+        .children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect::<Vec<_>>();
+    let [open, inner @ .., close] = children.as_slice() else {
+        return None;
+    };
+    if arguments.kind() != "token_tree" || open.kind() != "(" || close.kind() != ")" {
+        return None;
+    }
+    // A trailing comma is legal in cfg(predicate,).
+    let inner = if inner.last().is_some_and(|node| node.kind() == ",") {
+        &inner[..inner.len() - 1]
+    } else {
+        inner
+    };
+    rust_cfg_predicate_condition(inner, source)
+}
+
+/// Read one configuration predicate from structurally selected token nodes.
+pub(crate) fn rust_cfg_predicate_condition(
+    predicate: &[Node<'_>],
+    source: &str,
+) -> Option<RustCfgCondition> {
     use brokk_bifrost_core::analyzer::rust_facts::RustCfgInstruction;
     enum Work<'tree> {
         Predicate(Vec<Node<'tree>>),
@@ -96,15 +121,24 @@ pub(crate) fn rust_cfg_argument_condition(
         if node.kind() != "token_tree" {
             return None;
         }
+        let mut cursor = node.walk();
+        let children = node
+            .children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .collect::<Vec<_>>();
+        let [open, inner @ .., close] = children.as_slice() else {
+            return None;
+        };
+        if open.kind() != "(" || close.kind() != ")" {
+            return None;
+        }
         let mut groups = Vec::new();
         let mut group = Vec::new();
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
+        for &child in inner {
             if child.is_extra() {
                 continue;
             }
             match child.kind() {
-                "(" | ")" => {}
                 "," => {
                     if group.is_empty() {
                         return None;
@@ -119,11 +153,7 @@ pub(crate) fn rust_cfg_argument_condition(
         }
         Some(groups)
     }
-    let mut groups = arguments_of(arguments)?;
-    if groups.len() != 1 {
-        return None;
-    }
-    let mut work = vec![Work::Predicate(groups.pop()?)];
+    let mut work = vec![Work::Predicate(predicate.to_vec())];
     let mut output = Vec::new();
     while let Some(task) = work.pop() {
         let nodes = match task {
@@ -134,6 +164,14 @@ pub(crate) fn rust_cfg_argument_condition(
             Work::Predicate(nodes) => nodes,
         };
         let first = *nodes.first()?;
+        if nodes.len() == 1 && first.kind() == "boolean_literal" {
+            output.push(match crate::declarations::rust_node_text(first, source) {
+                "true" => RustCfgInstruction::All(0),
+                "false" => RustCfgInstruction::Any(0),
+                _ => unreachable!("boolean literal has a boolean value"),
+            });
+            continue;
+        }
         if first.kind() != "identifier" {
             return None;
         }
@@ -636,31 +674,6 @@ fn rust_use_statements(root: Node<'_>, source: &str) -> Arc<Vec<RustUseStatement
     statements
 }
 
-pub fn visible_import_binder_at(source: &str, reference_byte: usize) -> ImportBinder {
-    let Some(tree) = parse_rust_tree(source) else {
-        return ImportBinder::empty();
-    };
-    visible_import_binder_in_tree(tree.root_node(), source, reference_byte)
-}
-
-pub fn visible_import_binders_at(source: &str, reference_byte: usize) -> Vec<ImportBinder> {
-    let Some(tree) = parse_rust_tree(source) else {
-        return Vec::new();
-    };
-    visible_import_binders_in_tree(tree.root_node(), source, reference_byte)
-}
-
-fn visible_import_binders_in_tree(
-    root: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-) -> Vec<ImportBinder> {
-    visible_import_binders_with_scopes_in_tree(root, source, reference_byte)
-        .into_iter()
-        .map(|(_, binder)| binder)
-        .collect()
-}
-
 /// The scope-start byte of each binder's enclosing visibility scope, so
 /// `self`/`super` module specifiers can be resolved against the lexical
 /// module the import actually lives in (not just the file package).
@@ -694,16 +707,6 @@ pub fn visible_import_binders_with_scopes_in_tree(
         .into_iter()
         .map(|((start, _), binder)| (start, binder))
         .collect()
-}
-
-pub fn visible_import_binders_with_scopes_at(
-    source: &str,
-    reference_byte: usize,
-) -> Vec<(usize, ImportBinder)> {
-    let Some(tree) = parse_rust_tree(source) else {
-        return Vec::new();
-    };
-    visible_import_binders_with_scopes_in_tree(tree.root_node(), source, reference_byte)
 }
 
 /// The file package plus the inline `mod` path enclosing `byte` — the
@@ -820,58 +823,28 @@ pub(crate) fn lexical_scope_kind(kind: &str) -> bool {
     )
 }
 
-pub fn name_shadowed_at(source: &str, name: &str, reference_byte: usize) -> bool {
-    let Some(tree) = parse_rust_tree(source) else {
-        return false;
-    };
-    name_shadowed_in_tree(tree.root_node(), source, name, reference_byte)
-}
-
-pub fn name_shadowed_in_tree(
-    root: Node<'_>,
-    source: &str,
-    name: &str,
-    reference_byte: usize,
-) -> bool {
-    rust_lexical_scope_index(root, source).name_bound_at(name, reference_byte)
-}
-
-#[derive(Clone, Copy)]
-struct BindingVisibility {
-    start: usize,
-    end: usize,
-    function: Option<(usize, usize)>,
-}
-
 #[derive(Clone, Copy)]
 struct ItemVisibility {
+    declaration_start: usize,
     start: usize,
     end: usize,
     module: Option<(usize, usize)>,
-    function: Option<(usize, usize)>,
 }
 
-/// Position-aware Rust binding visibility for one parsed file.
+/// Position-aware Rust item visibility for one parsed file.
 pub struct RustLexicalScopeIndex {
-    bindings: HashMap<String, Vec<BindingVisibility>>,
     items: HashMap<String, Vec<ItemVisibility>>,
     modules: Vec<(usize, usize)>,
-    functions: Vec<(usize, usize)>,
 }
 
 impl RustLexicalScopeIndex {
     pub fn new(root: Node<'_>, source: &str) -> Self {
         let mut index = Self {
-            bindings: HashMap::default(),
             items: HashMap::default(),
             modules: Vec::new(),
-            functions: Vec::new(),
         };
-        let mut stack = vec![(root, None, None, false, root.start_byte(), root.end_byte())];
-        while let Some((raw_node, function, module, associated_type, scope_start, scope_end)) =
-            stack.pop()
-        {
-            let mut child_function = function;
+        let mut stack = vec![(root, None, false, root.start_byte(), root.end_byte())];
+        while let Some((raw_node, module, associated_type, scope_start, scope_end)) = stack.pop() {
             let mut child_module = module;
             let node = unwrap_attributes(raw_node);
             let child_associated_type = match node.kind() {
@@ -883,75 +856,23 @@ impl RustLexicalScopeIndex {
             let mut child_scope_end = scope_end;
             match node.kind() {
                 "function_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
-                    let function_range = (node.start_byte(), node.end_byte());
-                    index.functions.push(function_range);
-                    child_function = Some(function_range);
+                    index.add_item_binding(node, scope_start, scope_end, source, module);
                     if let Some(body) = node.child_by_field_name("body") {
                         child_scope_end = body.end_byte();
-                        index.add_parameter_bindings(node, body, source, child_function);
                     }
                 }
                 "function_signature_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
-                }
-                "closure_expression" => {
-                    if let Some(body) = node.child_by_field_name("body") {
-                        index.add_parameter_bindings(node, body, source, function);
-                    }
+                    index.add_item_binding(node, scope_start, scope_end, source, module);
                 }
                 "block" | "declaration_list" => {
                     child_scope_start = node.start_byte();
                     child_scope_end = node.end_byte();
                 }
-                "let_declaration" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern") {
-                        index.add_pattern_bindings(
-                            pattern,
-                            node.end_byte(),
-                            scope_end,
-                            source,
-                            function,
-                        );
-                    }
-                }
-                "let_condition" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern")
-                        && let Some(end) = let_condition_visibility_end(node)
-                    {
-                        index.add_pattern_bindings(pattern, node.end_byte(), end, source, function);
-                    }
-                }
-                "match_arm" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern") {
-                        index.add_pattern_bindings(
-                            pattern,
-                            pattern.end_byte(),
-                            node.end_byte(),
-                            source,
-                            function,
-                        );
-                    }
-                }
-                "for_expression" => {
-                    if let (Some(pattern), Some(body)) = (
-                        node.child_by_field_name("pattern"),
-                        node.child_by_field_name("body"),
-                    ) {
-                        index.add_pattern_bindings(
-                            pattern,
-                            body.start_byte(),
-                            body.end_byte(),
-                            source,
-                            function,
-                        );
-                    }
-                }
                 "type_item" if !associated_type => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
+                    index.add_item_binding(node, scope_start, scope_end, source, module);
                 }
                 "struct_item" | "enum_item" | "union_item" | "trait_item" | "mod_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
+                    index.add_item_binding(node, scope_start, scope_end, source, module);
                     if node.kind() == "mod_item" {
                         let module_range = (node.start_byte(), node.end_byte());
                         index.modules.push(module_range);
@@ -966,7 +887,6 @@ impl RustLexicalScopeIndex {
             stack.extend(children.into_iter().rev().map(|child| {
                 (
                     child,
-                    child_function,
                     child_module,
                     child_associated_type,
                     child_scope_start,
@@ -977,16 +897,21 @@ impl RustLexicalScopeIndex {
         index
     }
 
-    pub fn name_bound_at(&self, name: &str, byte: usize) -> bool {
-        self.visibility_contains(&self.bindings, name, byte)
-    }
-
     pub fn item_bound_at(&self, name: &str, byte: usize) -> bool {
         self.item_visible_at(name, byte, |_| true)
     }
 
-    pub fn local_item_bound_at(&self, name: &str, byte: usize) -> bool {
-        self.item_visible_at(name, byte, |item| item.function.is_some())
+    /// Whether this exact declaration is visible, rather than another item
+    /// of the same spelling in a sibling module or lexical scope.
+    pub fn item_declaration_visible_at(
+        &self,
+        name: &str,
+        declaration_start: usize,
+        byte: usize,
+    ) -> bool {
+        self.item_visible_at(name, byte, |item| {
+            item.declaration_start == declaration_start
+        })
     }
 
     fn item_visible_at(
@@ -1008,88 +933,12 @@ impl RustLexicalScopeIndex {
         })
     }
 
-    fn visibility_contains(
-        &self,
-        entries: &HashMap<String, Vec<BindingVisibility>>,
-        name: &str,
-        byte: usize,
-    ) -> bool {
-        let function = self
-            .functions
-            .iter()
-            .copied()
-            .filter(|(start, end)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end)| end - start);
-        entries.get(name).is_some_and(|bindings| {
-            bindings.iter().any(|binding| {
-                binding.function == function && binding.start <= byte && byte < binding.end
-            })
-        })
-    }
-
-    fn add_parameter_bindings(
-        &mut self,
-        node: Node<'_>,
-        body: Node<'_>,
-        source: &str,
-        function: Option<(usize, usize)>,
-    ) {
-        let Some(parameters) = node.child_by_field_name("parameters") else {
-            return;
-        };
-        let mut cursor = parameters.walk();
-        for parameter in parameters.named_children(&mut cursor) {
-            if matches!(
-                parameter.kind(),
-                "attributes" | "line_comment" | "block_comment"
-            ) {
-                continue;
-            }
-            let pattern = parameter
-                .child_by_field_name("pattern")
-                .unwrap_or(parameter);
-            self.add_pattern_bindings(
-                pattern,
-                body.start_byte(),
-                body.end_byte(),
-                source,
-                function,
-            );
-        }
-    }
-
-    fn add_pattern_bindings(
-        &mut self,
-        pattern: Node<'_>,
-        start: usize,
-        end: usize,
-        source: &str,
-        function: Option<(usize, usize)>,
-    ) {
-        if start >= end {
-            return;
-        }
-        let mut names = HashSet::default();
-        collect_pattern_bindings(pattern, source, &mut names);
-        for name in names {
-            self.bindings
-                .entry(name)
-                .or_default()
-                .push(BindingVisibility {
-                    start,
-                    end,
-                    function,
-                });
-        }
-    }
-
     fn add_item_binding(
         &mut self,
         item: Node<'_>,
         start: usize,
         end: usize,
         source: &str,
-        function: Option<(usize, usize)>,
         module: Option<(usize, usize)>,
     ) {
         let Some(name) = item.child_by_field_name("name") else {
@@ -1103,15 +952,17 @@ impl RustLexicalScopeIndex {
             .entry(name.to_string())
             .or_default()
             .push(ItemVisibility {
+                declaration_start: item.start_byte(),
                 start,
                 end,
                 module,
-                function,
             });
     }
 }
 
-fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
+/// End of the successful body and later condition-chain clauses.
+#[doc(hidden)]
+pub fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
     while let Some(parent) = node.parent() {
         if matches!(parent.kind(), "if_expression" | "while_expression") {
             return parent
@@ -1125,109 +976,6 @@ fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
         node = parent;
     }
     None
-}
-
-pub fn local_item_name_shadowed_in_tree(
-    root: Node<'_>,
-    source: &str,
-    name: &str,
-    reference_byte: usize,
-) -> bool {
-    local_name_shadowed_in_tree_with_collector(
-        root,
-        source,
-        name,
-        reference_byte,
-        collect_visible_local_items,
-    )
-}
-
-fn local_name_shadowed_in_tree_with_collector<'tree>(
-    root: Node<'tree>,
-    source: &str,
-    name: &str,
-    reference_byte: usize,
-    collect_items: fn(Node<'tree>, &str, usize, &mut HashSet<String>),
-) -> bool {
-    let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
-        return false;
-    };
-    let Some(body) = scope.child_by_field_name("body") else {
-        return false;
-    };
-    let mut items = HashSet::default();
-    collect_items(body, source, reference_byte, &mut items);
-    items.contains(name)
-}
-
-/// Whether a visible local item occupies Rust's type or module namespace.
-///
-/// Value-only items such as functions, constants, and statics can share a
-/// name with a module path. Do not let those items shadow a type/module import.
-pub fn local_type_item_name_shadowed_in_tree(
-    root: Node<'_>,
-    source: &str,
-    name: &str,
-    reference_byte: usize,
-) -> bool {
-    local_name_shadowed_in_tree_with_collector(
-        root,
-        source,
-        name,
-        reference_byte,
-        collect_visible_local_type_items,
-    )
-}
-
-fn collect_visible_local_items(
-    mut scope: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    loop {
-        let mut cursor = scope.walk();
-        for node in scope.named_children(&mut cursor) {
-            if matches!(
-                node.kind(),
-                "struct_item"
-                    | "enum_item"
-                    | "trait_item"
-                    | "type_item"
-                    | "function_item"
-                    | "const_item"
-                    | "static_item"
-            ) {
-                collect_local_item_name(node, source, out);
-            }
-        }
-        let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte)
-        else {
-            return;
-        };
-        scope = child_scope;
-    }
-}
-
-fn collect_visible_local_type_items(
-    mut scope: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    loop {
-        let mut cursor = scope.walk();
-        for node in scope.named_children(&mut cursor) {
-            if is_type_namespace_item(node) {
-                collect_local_item_name(node, source, out);
-            }
-        }
-        let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte)
-        else {
-            return;
-        };
-        scope = child_scope;
-    }
 }
 
 // #5911: aliases and conditional std ownership must select the same type
@@ -1701,6 +1449,91 @@ where
     Ok(matches!(selection, RustLexicalSelection::Complete))
 }
 
+/// Recognize a bare pattern name occupied by a value item rather than a
+/// binding. Shorthand struct fields force binding syntax and bypass lookup.
+/// Unknown selections retain the caller's tentative binding and its gaps.
+#[doc(hidden)]
+pub fn rust_pattern_identifier_is_value_item_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    name: Node<'tree>,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
+    charge(1)?;
+    if name.kind() != "identifier"
+        || name.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "mut_pattern" | "ref_pattern" | "captured_pattern"
+            )
+        })
+    {
+        return Ok(false);
+    }
+    let text = crate::declarations::rust_node_text(name, source);
+    // Constructors occupy pattern position, while prelude functions such as
+    // `drop` can be shadowed by a binding. Select lexical items before falling
+    // through to the prelude, so a written function can shadow `None` too.
+    let prelude_constructor =
+        text == "None" || crate::prelude::rust_std_constructor_fact(text).is_some();
+    let selection = visit_rust_lexical_selection_bounded(
+        root,
+        source,
+        name,
+        charge,
+        |event, _| {
+            let occupied = match event {
+                RustLexicalSelectionEvent::Parameter(parameter) => {
+                    parameter.kind() == "const_parameter"
+                        && parameter.child_by_field_name("name").is_some_and(|name| {
+                            crate::declarations::rust_node_text(name, source) == text
+                        })
+                }
+                RustLexicalSelectionEvent::Item(item) => {
+                    // Associated members require `Self::`; they are not
+                    // unqualified value bindings in an implementation body.
+                    if crate::syntax::parent_outside_attributes(item).is_some_and(|scope| {
+                        scope.kind() == "declaration_list"
+                            && scope.parent().is_some_and(|owner| {
+                                matches!(owner.kind(), "impl_item" | "trait_item")
+                            })
+                    }) {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    if item.kind() == "function_item"
+                        && item.child_by_field_name("name").is_some_and(|name| {
+                            crate::declarations::rust_node_text(name, source) == text
+                        })
+                    {
+                        return Ok(ControlFlow::Break(false));
+                    }
+                    matches!(item.kind(), "const_item" | "static_item" | "struct_item")
+                        && item.child_by_field_name("name").is_some_and(|name| {
+                            crate::declarations::rust_node_text(name, source) == text
+                        })
+                }
+                RustLexicalSelectionEvent::Import(_, leaf) => {
+                    matches!(leaf.import.binding_name(), RustImportBindingName::Named(binding) if binding == text)
+                }
+                _ => false,
+            };
+            Ok(if occupied {
+                ControlFlow::Break(true)
+            } else {
+                ControlFlow::Continue(())
+            })
+        },
+    )?;
+    Ok(match selection {
+        RustLexicalSelection::Selected(occupied) => occupied,
+        RustLexicalSelection::Complete | RustLexicalSelection::Unknown => prelude_constructor,
+    })
+}
+
 /// Select the nearest value binding visible at a use. Like the scope index,
 /// lets activate after their declaration, parameters over the callable body,
 /// and pattern binders only over their arm/loop/condition body. The returned
@@ -1893,6 +1726,9 @@ fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> b
                                 | "tuple_pattern"
                                 | "tuple_struct_pattern"
                                 | "struct_pattern"
+                                | "slice_pattern"
+                                | "or_pattern"
+                                | "captured_pattern"
                                 | "ref_pattern"
                                 | "mut_pattern"
                         )
@@ -1907,23 +1743,6 @@ fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> b
     false
 }
 
-fn enclosing_function_or_closure(root: Node<'_>, reference_byte: usize) -> Option<Node<'_>> {
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() <= reference_byte && reference_byte < node.end_byte() {
-            if matches!(node.kind(), "function_item" | "closure_expression") {
-                best = Some(node);
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-    }
-    best
-}
-
 fn contains_byte(node: Node<'_>, byte: usize) -> bool {
     brokk_bifrost_core::analyzer::model::byte_range_contains(
         node.start_byte(),
@@ -1932,54 +1751,34 @@ fn contains_byte(node: Node<'_>, byte: usize) -> bool {
     )
 }
 
-fn child_lexical_scope_containing_reference(
-    mut node: Node<'_>,
-    reference_byte: usize,
-) -> Option<Node<'_>> {
-    loop {
-        let mut cursor = node.walk();
-        let mut next = None;
-        for child in node.named_children(&mut cursor) {
-            if contains_byte(child, reference_byte) {
-                if lexical_scope_kind(child.kind()) {
-                    return Some(child);
-                }
-                next = Some(child);
-                break;
-            }
-        }
-        node = next?;
-    }
-}
-
-fn collect_local_item_name(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    if let Some(name) = node.child_by_field_name("name") {
-        let text = crate::declarations::rust_node_text(name, source).trim();
-        if !text.is_empty() {
-            out.insert(text.to_string());
-        }
-    }
-}
-
-fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
+/// Pattern binding candidates in source order. Constant and unit-constructor
+/// identifiers require value-namespace selection by the caller.
+#[doc(hidden)]
+pub fn rust_pattern_binding_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut out = Vec::new();
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "scoped_identifier" | "scoped_type_identifier" => {}
+            "scoped_identifier"
+            | "scoped_type_identifier"
+            | "range_pattern"
+            | "macro_invocation" => {}
+            "match_pattern" => {
+                let guard = node.child_by_field_name("condition").map(|node| node.id());
+                let mut cursor = node.walk();
+                stack.extend(
+                    node.named_children(&mut cursor)
+                        .filter(|child| Some(child.id()) != guard),
+                );
+            }
             "identifier" => {
-                let text = crate::declarations::rust_node_text(node, source).trim();
-                if !text.is_empty() {
-                    out.insert(text.to_string());
-                }
+                out.push(node);
             }
             "field_pattern" => {
                 if let Some(pattern) = node.child_by_field_name("pattern") {
                     stack.push(pattern);
                 } else if let Some(name) = node.child_by_field_name("name") {
-                    let text = crate::declarations::rust_node_text(name, source).trim();
-                    if !text.is_empty() {
-                        out.insert(text.to_string());
-                    }
+                    out.push(name);
                 }
             }
             "struct_pattern" => {
@@ -2007,6 +1806,9 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
                                 | "tuple_pattern"
                                 | "tuple_struct_pattern"
                                 | "struct_pattern"
+                                | "slice_pattern"
+                                | "or_pattern"
+                                | "captured_pattern"
                                 | "ref_pattern"
                                 | "mut_pattern"
                         )
@@ -2018,6 +1820,8 @@ fn collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<Stri
             }
         }
     }
+    out.sort_by_key(Node::start_byte);
+    out
 }
 
 #[cfg(test)]
@@ -2065,22 +1869,6 @@ fn apply_from_stdin() -> u8 { 1 }
     }
 
     #[test]
-    #[hardwon(
-        "4c73366ac22d: The parsed alias keeps the lowercase source item as its named target instead of treating it as a namespace import."
-    )]
-    fn aliased_lowercase_import_preserves_the_named_target() {
-        let source = "use crate::models::with_tracing::{linear_no_bias as linear};\n";
-        let binder = visible_import_binder_at(source, source.len());
-        let binding = binder
-            .bindings
-            .get("linear")
-            .expect("the alias must be visible");
-
-        assert_eq!(binding.kind, ImportKind::Named);
-        assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
-    }
-
-    #[test]
     fn extern_crate_is_structured_and_does_not_enter_use_binder() {
         let source = "extern crate dependency as dep;\n";
         let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
@@ -2093,75 +1881,6 @@ fn apply_from_stdin() -> u8 { 1 }
         let mut binder = ImportBinder::empty();
         insert_rust_import_binding(&mut binder, &import.info);
         assert!(binder.bindings.is_empty());
-    }
-
-    #[test]
-    #[hardwon(
-        "75d44cf79d6d: A parsed as _ import remains absent from the ordinary name map while a neighboring named import binds normally."
-    )]
-    fn unnamed_import_does_not_enter_the_ordinary_name_map() {
-        let source = "use crate::Trait as _;\nuse crate::Named;\n";
-        let binder = visible_import_binder_at(source, source.len());
-
-        assert!(!binder.bindings.contains_key("_"));
-        assert!(binder.bindings.contains_key("Named"));
-    }
-
-    #[test]
-    fn local_type_item_shadow_ignores_value_items() {
-        let source = r#"
-fn function_value() {
-    fn extjson() {}
-    let _: extjson::models::DateTimeBody = todo(); // FUNCTION_VALUE
-}
-
-fn const_value() {
-    const extjson: usize = 0;
-    let _: extjson::models::DateTimeBody = todo(); // CONST_VALUE
-}
-
-fn static_value() {
-    static extjson: usize = 0;
-    let _: extjson::models::DateTimeBody = todo(); // STATIC_VALUE
-}
-
-fn type_item() {
-    struct extjson;
-    let _: extjson::models::DateTimeBody = todo(); // TYPE_ITEM
-}
-"#;
-        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
-        for marker in ["FUNCTION_VALUE", "CONST_VALUE", "STATIC_VALUE"] {
-            let reference_byte = source.find(marker).expect("reference marker");
-            assert!(
-                !local_type_item_name_shadowed_in_tree(
-                    tree.root_node(),
-                    source,
-                    "extjson",
-                    reference_byte,
-                ),
-                "value item must not shadow a type/module path ({marker})"
-            );
-        }
-        let reference_byte = source.find("TYPE_ITEM").expect("reference marker");
-        assert!(local_type_item_name_shadowed_in_tree(
-            tree.root_node(),
-            source,
-            "extjson",
-            reference_byte,
-        ));
-    }
-
-    #[test]
-    fn parameter_attributes_do_not_create_lexical_bindings() {
-        let source = "fn f(#[Marker] actual: u8, neighbor: u8) { use_value(actual, neighbor); }";
-        let tree = super::parse_rust_tree_uncached(source).expect("Rust tree");
-        assert!(!tree.root_node().has_error());
-        let index = super::RustLexicalScopeIndex::new(tree.root_node(), source);
-        let position = source.find("use_value").expect("body call");
-        assert!(index.name_bound_at("actual", position));
-        assert!(index.name_bound_at("neighbor", position));
-        assert!(!index.name_bound_at("Marker", position));
     }
 
     #[test]
@@ -2278,5 +1997,172 @@ mod selected {
         assert_eq!(absolute_alias.kind, ImportKind::Named);
         assert_eq!(absolute_alias.module_specifier, "");
         assert_eq!(absolute_alias.imported_name.as_deref(), Some("crate"));
+    }
+}
+
+#[cfg(test)]
+mod ownership_lexical_boundary {
+    use super::*;
+
+    #[test]
+    fn ownership_lexical_selection_respects_activation_and_recovery() {
+        // Each selected Local token is a type field of a parameter or let.
+        // An inner alias is independent of a recovered outer sibling, whereas
+        // an unknown attribute macro or cfg on the selected scope stays open.
+        for (source, selected) in [
+            (
+                "type Local = (); #[repr(C)] struct S; fn f(x: Local) {}",
+                true,
+            ),
+            (
+                "type Local = (); macro_rules! test { () => {} } #[test] fn helper() {} fn f(x: Local) {}",
+                false,
+            ),
+            (
+                "type Local = (); fn test() {} #[test] fn helper() {} fn f(x: Local) {}",
+                true,
+            ),
+            (
+                "type Local = (); #[cfg(feature = \"conditional\")] fn f(x: Local) {}",
+                false,
+            ),
+            (
+                "fn f() { type Local = (); let x: Local = (); } fn broken( {}",
+                true,
+            ),
+        ] {
+            let tree = parse_rust_tree_uncached(source).unwrap();
+            let root = tree.root_node();
+            let mut pending = vec![root];
+            let mut site = None;
+            while let Some(node) = pending.pop() {
+                if matches!(node.kind(), "parameter" | "let_declaration") {
+                    site = node.child_by_field_name("type");
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            let site = site.unwrap();
+            assert_eq!(site.kind(), "type_identifier");
+            assert_eq!(crate::declarations::rust_node_text(site, source), "Local");
+            let head =
+                rust_type_head_at_bounded(root, source, site, "Local", &mut |_| Ok::<_, ()>(()))
+                    .unwrap();
+            assert_eq!(
+                matches!(head, RustTypeHead::Item(_)),
+                selected,
+                "{source}: {head:?}"
+            );
+            if let RustTypeHead::Item(item) = head {
+                assert_eq!(item.kind(), "type_item");
+                assert_eq!(
+                    item.child_by_field_name("type").unwrap().kind(),
+                    "unit_type"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod qs3_pattern_contract {
+    use super::*;
+
+    #[test]
+    fn qs3_pattern_grammar_boundary() {
+        let source = concat!(
+            "fn f() { let Some(x) = input;\n",
+            "let closure = |Some(z): Option<u8>| z;\n",
+            "for Some(w) in items {}\n",
+            "match input { Some(y) if predicate(y) => (), Some(v) => () } }",
+        );
+        let tree = parse_rust_tree_uncached(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut patterns = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "tuple_struct_pattern" {
+                let head = node.child_by_field_name("type").unwrap();
+                assert_eq!(head.kind(), "identifier");
+                assert_eq!(&source[head.byte_range()], "Some");
+                assert!(!pattern_contains_binding_identifier(node, head));
+                let candidates = rust_pattern_binding_identifiers(node);
+                assert_eq!(candidates.len(), 1);
+                let candidate = candidates[0];
+                assert_eq!(candidate.kind(), "identifier");
+                assert!(pattern_contains_binding_identifier(node, candidate));
+                patterns.push((
+                    &source[candidate.byte_range()],
+                    candidate.start_byte(),
+                    candidate.end_byte(),
+                ));
+            }
+            if node.kind() == "match_pattern" {
+                let binders = rust_pattern_binding_identifiers(node);
+                let guard = node.child_by_field_name("condition");
+                assert_eq!(binders.len(), 1);
+                assert_eq!(
+                    &source[binders[0].byte_range()],
+                    if guard.is_some() { "y" } else { "v" }
+                );
+                if let Some(guard) = guard {
+                    assert_eq!(guard.kind(), "call_expression");
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        patterns.sort_by_key(|(_, start, _)| *start);
+        assert_eq!(
+            patterns,
+            [
+                ("x", 18, 19),
+                ("z", 50, 51),
+                ("w", 78, 79),
+                ("y", 112, 113),
+                ("v", 143, 144)
+            ]
+        );
+    }
+
+    #[test]
+    fn qs3_inline_module_grammar_boundary() {
+        let source = "mod a { trait Visible { fn default_a() {} } fn here() {} } mod b { trait Visible { fn default_b() {} } fn there() {} } fn outside() {}";
+        let tree = parse_rust_tree_uncached(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let index = RustLexicalScopeIndex::new(tree.root_node(), source);
+        let mut stack = vec![tree.root_node()];
+        let mut traits = Vec::new();
+        let mut functions = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "trait_item" {
+                traits.push(node);
+            }
+            if node.kind() == "function_item" {
+                functions.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        traits.sort_by_key(Node::start_byte);
+        functions.sort_by_key(Node::start_byte);
+        assert_eq!(traits.len(), 2);
+        assert_eq!(functions.len(), 5);
+        for (i, declaration) in traits.iter().enumerate() {
+            assert_eq!(
+                declaration.parent().unwrap().parent().unwrap().kind(),
+                "mod_item"
+            );
+            for (j, function) in functions.iter().enumerate() {
+                assert_eq!(
+                    index.item_declaration_visible_at(
+                        "Visible",
+                        declaration.start_byte(),
+                        function.start_byte()
+                    ),
+                    j < 4 && i == j / 2
+                );
+            }
+        }
     }
 }

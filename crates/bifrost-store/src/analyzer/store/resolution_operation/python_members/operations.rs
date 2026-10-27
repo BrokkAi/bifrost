@@ -9,16 +9,117 @@ pub(in crate::analyzer::store::resolution_operation) struct OperationRow {
     mount: u32,
     site: u32,
     form: u8,
-    callee: Option<SemanticId>,
-    receiver: Option<SemanticId>,
+    pub(super) callee: Option<SemanticId>,
+    pub(super) receiver: Option<SemanticId>,
     owners: std::rc::Rc<[SemanticId]>,
 }
 impl OperationRow {
     // Receiver disjointness is enough for universe exclusion. Demanding the
     // builtin setter while proving that same builtin would create a cycle.
     // Unresolved candidates stay open; member rows also prove API authority.
+    pub fn module_receiver(
+        &self,
+        rules: &PythonRules<'_, '_, '_>,
+        answers: &[(DemandReferenceKey, &FactResolutionAnswer)],
+    ) -> Result<Option<ModuleMutation>> {
+        let Some(receiver) = self.receiver else {
+            return Ok(None);
+        };
+        let mut mutation = ModuleMutation {
+            targets: Vec::new(),
+            complete: false,
+        };
+        let Some((_, answer)) = answers.iter().find(|(key, _)| key.reference == receiver) else {
+            return Ok(Some(mutation));
+        };
+        if answer.binding().completion() != &ResolutionCompletion::Complete {
+            return Ok(Some(mutation));
+        }
+        // A module declaration denotes the module object. An ordinary variable
+        // declaration denotes a cell and cannot prove receiver disjointness.
+        let mut modules = !answer.binding().targets().is_empty();
+        for target in answer.binding().targets() {
+            let Some(ordinal) = target.ordinal() else {
+                modules = false;
+                break;
+            };
+            let mount = super::super::SelectedMountTable::new(&rules.ready.inventory)
+                .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+            let blob = rules
+                .ready
+                .inventory
+                .mount_record_by_ordinal(mount.ordinal())?
+                .blob_id();
+            let module = super::super::python_demand::module_declaration_site(
+                rules.ready.inventory.connection(),
+                blob,
+            )?
+            .map(|site| crate::analyzer::resolution::mounted_site_semantic(mount.fragment(), site));
+            modules &= module == Some(*target);
+        }
+        if modules {
+            mutation.targets = answer.binding().targets().to_vec();
+            mutation.complete = true;
+            return Ok(Some(mutation));
+        }
+        let frontiers = answer
+            .projections()
+            .iter()
+            .filter(|projection| projection.reference() == receiver)
+            .flat_map(|projection| {
+                answer
+                    .projected_frontiers()
+                    .iter()
+                    .filter(move |frontier| frontier.slot() == projection.output_slot())
+            })
+            .collect::<Vec<_>>();
+        mutation.complete = !frontiers.is_empty();
+        for frontier in frontiers {
+            mutation.complete &= frontier.completion() == &ResolutionCompletion::Complete
+                && !frontier.possible_values().is_empty();
+            for value in frontier.possible_values() {
+                if let ResolutionSlotValue::TypeObject(ty, None) = value {
+                    mutation.targets.push(ty.identity());
+                } else {
+                    // A runtime nominal type alone does not identify a module
+                    // object, and can include unmodeled aliases/subclasses.
+                    mutation.complete = false;
+                }
+            }
+        }
+        Ok(Some(mutation))
+    }
+
     pub fn universe_prerequisites(&self) -> impl Iterator<Item = SemanticId> {
         self.receiver.into_iter()
+    }
+}
+
+// A source close keeps only the receiver's identity proof, never all forward
+// answers or a workspace owner index. Applicability cannot change this owner.
+pub(in crate::analyzer::store::resolution_operation) struct ModuleMutation {
+    targets: Vec<SemanticId>,
+    complete: bool,
+}
+impl ModuleMutation {
+    pub fn namespace_completion(&self, reason: SemanticId) -> ResolutionCompletion {
+        if self.complete && !self.targets.is_empty() {
+            ResolutionCompletion::Complete
+        } else {
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                reason,
+            )])
+        }
+    }
+
+    pub fn completion(&self, owner: SemanticId) -> ResolutionCompletion {
+        if self.complete && !self.targets.is_empty() && !self.targets.contains(&owner) {
+            ResolutionCompletion::Complete
+        } else {
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                owner,
+            )])
+        }
     }
 }
 
@@ -99,6 +200,40 @@ pub(in crate::analyzer::store::resolution_operation) fn source_rows(
             ));
             Ok(Read::ready(operations))
         },
+    )
+}
+
+/// Whole-space closure is independent of the spelling currently requested.
+/// Candidate receivers are still proved by the shared prerequisite pump.
+pub(super) fn attribute_rows(
+    half: &PythonMemberContext<'_, '_, '_>,
+    owner: SemanticId,
+) -> Result<Read<Vec<OperationRow>>> {
+    if fixed_owner(half.rules.ready, owner) {
+        return Ok(Read::ready(Vec::new()));
+    }
+    attribute_source_rows(half.rules, half.reference, &[owner])
+}
+
+pub(in crate::analyzer::store::resolution_operation) fn attribute_source_rows(
+    rules: &PythonRules<'_, '_, '_>,
+    reference: SemanticId,
+    owners: &[SemanticId],
+) -> Result<Read<Vec<OperationRow>>> {
+    source_rows(
+        rules,
+        reference,
+        "",
+        owners,
+        &["SELECT mounts.mount_ordinal,op.site,op.form,callee.semantic_key,receiver.semantic_key
+           FROM temp.selected_resolution_mounts mounts
+           JOIN resolution_unit_summary_members member ON member.summary_id=?3 AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
+           JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?1
+           JOIN python_member_operations op ON op.blob_id=mounts.blob_id AND op.effect IN (1,2)
+           LEFT JOIN resolution_semantic_sites callee ON callee.blob_id=op.blob_id AND callee.source_site=op.callee_reference AND callee.semantic_role='reference'
+           LEFT JOIN resolution_semantic_sites receiver ON receiver.blob_id=op.blob_id AND receiver.source_site=op.receiver_reference AND receiver.semantic_role='reference'
+           WHERE mounts.storage_language='python'
+           ORDER BY mounts.mount_ordinal,op.site,op.form"],
     )
 }
 
@@ -291,8 +426,8 @@ pub(in crate::analyzer::store::resolution_operation) fn prove(
                 callee,
             )));
         };
-        completion = completion.combine(selected.completion());
-        if selected.completion() != &ResolutionCompletion::Complete {
+        completion = completion.combine(selected.binding().completion());
+        if selected.binding().completion() != &ResolutionCompletion::Complete {
             return Ok(OperationProof::Possible {
                 class_object: false,
                 completion,

@@ -43,15 +43,15 @@ mod ruby_extraction_tests {
         let owner = constants.unique_type("Example::Factory").unwrap();
         assert_eq!(
             constants
-                .declared_result(constants.callable(owner, "new", 0).unwrap())
+                .declared_result(&constants.callable(&owner, "new", 0).unwrap())
                 .unwrap()
                 .qualified_name,
             "Example::Product"
         );
-        assert!(constants.callable(owner, "new", 1).is_none());
+        assert!(constants.callable(&owner, "new", 1).is_none());
         assert!(
             RubyOverlayConstants::new(None)
-                .declared_result(constants.callable(owner, "new", 0).unwrap())
+                .declared_result(&constants.callable(&owner, "new", 0).unwrap())
                 .is_none()
         );
     }

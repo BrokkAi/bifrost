@@ -2,6 +2,7 @@
 
 use crate::analyzer::fq_name::FqName;
 use crate::analyzer::model::LanguageDialect;
+use crate::analyzer::resolution_facts::IntrinsicTypeKind;
 use crate::analyzer::structural::spec::StructuralSpec;
 use crate::analyzer::usages::reference_site::node_range;
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
@@ -31,10 +32,22 @@ impl ParserFlavor {
 
 /// Language syntax and rules independent of query-time engine state.
 pub trait LanguageKnowledge: Send + Sync {
-    /// Promote the exact static operand type names for one numeric expression.
-    /// Names come from selected type descriptors, never source-text parsing.
-    fn numeric_promotion(&self, _operands: &[Option<&str>]) -> Option<&'static str> {
+    /// Promote the exact static operand type names for one numeric expression
+    /// to the intrinsic result type. Names come from selected type descriptors,
+    /// never source-text parsing.
+    fn numeric_promotion(
+        &self,
+        _operands: &[Option<&str>],
+    ) -> Option<(IntrinsicTypeKind, &'static str)> {
         None
+    }
+
+    /// Whether an inferred local's static type is exactly its initializer's
+    /// type. Later writes must conform to that type but never widen it, so
+    /// they contribute observed values without feeding the declared type.
+    /// Languages whose inference reads later writes keep the default.
+    fn inferred_local_type_is_initializer_type(&self) -> bool {
+        false
     }
 
     /// Select an operand whose static type proves string concatenation.
@@ -50,6 +63,13 @@ pub trait LanguageKnowledge: Send + Sync {
     /// binding. The declared value type must still prove call applicability.
     fn call_may_apply_value(&self) -> bool {
         false
+    }
+
+    /// Whether invocation applicability may select among callee declarations.
+    /// Languages with applicability-independent binding may keep a positioned
+    /// callee reference complete while its call obligation remains incomplete.
+    fn call_applicability_may_select_callee(&self) -> bool {
+        true
     }
 
     /// Invocation validity cannot change a callable's written result type.

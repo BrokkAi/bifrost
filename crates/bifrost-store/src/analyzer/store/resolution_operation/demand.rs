@@ -1097,6 +1097,10 @@ impl ClosedForwardSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
+    fn candidate_admission_session(&self) -> Option<&ResolutionSession> {
+        Some(self.session)
+    }
+
     fn identity_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
@@ -1127,6 +1131,10 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
         completion: &ResolutionCompletion,
     ) -> ResolutionCompletion {
         self.base.scope_reverse_inventory_completion(completion)
+    }
+
+    fn namespace_definition_languages(&self) -> Vec<crate::analyzer::Language> {
+        self.base.namespace_definition_languages()
     }
 
     fn semantic_language_of(
@@ -1182,6 +1190,15 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
     ) -> Result<Option<[u8; 32]>> {
         self.base
             .shared_name_digest_for_identity(identity, cancellation)
+    }
+
+    fn supports_direct_type_shapes(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        self.base
+            .supports_direct_type_shapes(reference, cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {

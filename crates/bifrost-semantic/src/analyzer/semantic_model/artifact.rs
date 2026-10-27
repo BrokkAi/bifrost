@@ -1,4 +1,6 @@
+use crate::analyzer::semantic_model::ArtifactExtraction;
 use crate::analyzer::semantic_model::conversion::authored_concurrency_effect_from_compiled;
+use std::sync::Arc;
 
 use crate::analyzer::semantic_model::conversion::authored_declared_effect_from_compiled;
 
@@ -43,7 +45,9 @@ const PROCEDURE_ID_INVENTORY_PREFIX: &str = "procedure:";
 #[doc(hidden)]
 pub const PROCEDURE_TARGET_INVENTORY_PREFIX: &str = "procedure-target:";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadKind {
     DeclarationFacts,
@@ -51,14 +55,14 @@ pub enum PayloadKind {
     ProcedureSummaries,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactEncoding {
     Raw,
     Deflate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompiledShardDescriptor {
     pub shard_id: String,
@@ -75,9 +79,11 @@ pub struct CompiledShardDescriptor {
     pub stored_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompiledPackManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<ArtifactExtraction>,
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -110,7 +116,7 @@ pub struct CompiledPackManifest {
     pub shards: Vec<CompiledShardDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSetInputs {
     /// Digest of the canonical exact source set, including paths and bytes.
@@ -119,7 +125,7 @@ pub struct SourceSetInputs {
     pub files: Vec<SourceInputFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceInputFile {
     pub path: String,
@@ -143,6 +149,8 @@ impl CompiledPackManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompiledShard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<ArtifactExtraction>,
     #[doc(hidden)]
     pub schema_version: u32,
     pub(crate) pack_id: String,
@@ -159,13 +167,13 @@ pub struct CompiledShard {
     pub(crate) completeness: Completeness,
     pub(crate) safety: Safety,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runtime_values: Option<RuntimeValuesPayload>,
+    pub(crate) runtime_values: Option<Arc<RuntimeValuesPayload>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runtime_contracts: Option<RuntimeContractsPayload>,
+    pub(crate) runtime_contracts: Option<Arc<RuntimeContractsPayload>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) collection_flows: Option<CollectionFlowsPayload>,
+    pub(crate) collection_flows: Option<Arc<CollectionFlowsPayload>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) deferred_yields: Option<DeferredYieldsPayload>,
+    pub(crate) deferred_yields: Option<Arc<DeferredYieldsPayload>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,22 +203,22 @@ impl CompiledShard {
             .saturating_add(
                 self.runtime_values
                     .as_ref()
-                    .map_or(0, RuntimeValuesPayload::record_count),
+                    .map_or(0, |payload| RuntimeValuesPayload::record_count(payload)),
             )
             .saturating_add(
                 self.runtime_contracts
                     .as_ref()
-                    .map_or(0, RuntimeContractsPayload::record_count),
+                    .map_or(0, |payload| RuntimeContractsPayload::record_count(payload)),
             )
             .saturating_add(
                 self.collection_flows
                     .as_ref()
-                    .map_or(0, CollectionFlowsPayload::record_count),
+                    .map_or(0, |payload| CollectionFlowsPayload::record_count(payload)),
             )
             .saturating_add(
                 self.deferred_yields
                     .as_ref()
-                    .map_or(0, DeferredYieldsPayload::record_count),
+                    .map_or(0, |payload| DeferredYieldsPayload::record_count(payload)),
             )
             .saturating_add(
                 self.conditional_type_refinements
@@ -256,15 +264,15 @@ impl CompiledShard {
         self.cpp_portability.as_ref()
     }
 
-    pub fn runtime_values(&self) -> Option<&RuntimeValuesPayload> {
+    pub fn runtime_values(&self) -> Option<&Arc<RuntimeValuesPayload>> {
         self.runtime_values.as_ref()
     }
 
-    pub fn runtime_contracts(&self) -> Option<&RuntimeContractsPayload> {
+    pub fn runtime_contracts(&self) -> Option<&Arc<RuntimeContractsPayload>> {
         self.runtime_contracts.as_ref()
     }
 
-    pub fn collection_flows(&self) -> Option<&CollectionFlowsPayload> {
+    pub fn collection_flows(&self) -> Option<&Arc<CollectionFlowsPayload>> {
         self.collection_flows.as_ref()
     }
 
@@ -272,7 +280,7 @@ impl CompiledShard {
         self.conditional_type_refinements.as_ref()
     }
 
-    pub fn deferred_yields(&self) -> Option<&DeferredYieldsPayload> {
+    pub fn deferred_yields(&self) -> Option<&Arc<DeferredYieldsPayload>> {
         self.deferred_yields.as_ref()
     }
 
@@ -286,17 +294,17 @@ impl CompiledShard {
 pub enum CompiledPayload {
     DeclarationFacts {
         #[serde(default)]
-        types: Vec<TypeFact>,
+        types: Vec<Arc<TypeFact>>,
         #[serde(default)]
-        members: Vec<MemberFact>,
+        members: Vec<Arc<MemberFact>>,
         #[serde(default)]
-        relations: Vec<RelationFact>,
+        relations: Vec<Arc<RelationFact>>,
     },
     GeneratorRules {
-        rules: Vec<GeneratorRule>,
+        rules: Vec<Arc<GeneratorRule>>,
     },
     ProcedureSummaries {
-        summaries: Vec<CompiledProcedureSummary>,
+        summaries: Vec<Arc<CompiledProcedureSummary>>,
     },
 }
 
@@ -945,6 +953,12 @@ pub enum CompiledAtomicOperation {
     ReadModifyWrite,
 }
 
+pub type CompiledDeclarationFactSlices<'a> = (
+    &'a [Arc<TypeFact>],
+    &'a [Arc<MemberFact>],
+    &'a [Arc<RelationFact>],
+);
+
 impl CompiledPayload {
     pub fn payload_kind(&self) -> PayloadKind {
         match self {
@@ -966,7 +980,7 @@ impl CompiledPayload {
         }
     }
 
-    pub fn declaration_facts(&self) -> Option<(&[TypeFact], &[MemberFact], &[RelationFact])> {
+    pub fn declaration_facts(&self) -> Option<CompiledDeclarationFactSlices<'_>> {
         match self {
             Self::DeclarationFacts {
                 types,
@@ -977,14 +991,14 @@ impl CompiledPayload {
         }
     }
 
-    pub fn generator_rules(&self) -> Option<&[GeneratorRule]> {
+    pub fn generator_rules(&self) -> Option<&[Arc<GeneratorRule>]> {
         match self {
             Self::DeclarationFacts { .. } | Self::ProcedureSummaries { .. } => None,
             Self::GeneratorRules { rules } => Some(rules),
         }
     }
 
-    pub fn procedure_summaries(&self) -> Option<&[CompiledProcedureSummary]> {
+    pub fn procedure_summaries(&self) -> Option<&[Arc<CompiledProcedureSummary>]> {
         match self {
             Self::ProcedureSummaries { summaries } => Some(summaries),
             Self::DeclarationFacts { .. } | Self::GeneratorRules { .. } => None,
@@ -996,6 +1010,8 @@ impl CompiledPayload {
 #[serde(deny_unknown_fields)]
 #[doc(hidden)]
 pub struct WireCompiledShard {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extraction: Option<ArtifactExtraction>,
     schema_version: u32,
     pack_id: String,
     pack_version: String,
@@ -1135,6 +1151,13 @@ pub fn decode_manifest(
     let manifest: CompiledPackManifest = serde_json::from_slice(bytes)
         .map_err(|error| ArtifactError::InvalidJson(error.to_string()))?;
     require_version(manifest.schema_version)?;
+    if let Some(extraction) = &manifest.extraction
+        && (manifest.schema_version < 19 || !is_lower_sha256(extraction.digest()))
+    {
+        return Err(ArtifactError::InvalidDescriptor(
+            "invalid artifact extraction authority".into(),
+        ));
+    }
     manifest
         .compatibility
         .validate_for_schema(manifest.schema_version)
@@ -1337,6 +1360,26 @@ pub fn decode_shard(
     Ok(shard)
 }
 
+static SHARD_WIRE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide shard decode attempts, including certified hydration. Incremented
+/// once at the common read boundary before integrity, inflation and parse checks.
+/// Failed attempts count too. Use snapshot differences for isolated workloads.
+pub fn shard_wire_read_count() -> u64 {
+    SHARD_WIRE_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static THREAD_SHARD_WIRE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-local accounting avoids unrelated concurrent decoders in one process.
+#[cfg(any(test, feature = "test-support"))]
+pub fn thread_shard_wire_read_count() -> u64 {
+    THREAD_SHARD_WIRE_READS.with(std::cell::Cell::get)
+}
+
 // This performs the integrity checks needed on every read, including reads of
 // previously validated bytes. Semantic validation remains in decode_shard.
 #[doc(hidden)]
@@ -1345,6 +1388,9 @@ pub fn read_shard_wire(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<(WireCompiledShard, Vec<u8>), ArtifactError> {
+    SHARD_WIRE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(any(test, feature = "test-support"))]
+    THREAD_SHARD_WIRE_READS.with(|count| count.set(count.get() + 1));
     validate_descriptor(descriptor, limits)?;
     let actual_stored = u64::try_from(bytes.len())
         .map_err(|_| ArtifactError::LimitExceeded("stored shard byte limit"))?;
@@ -1460,14 +1506,15 @@ pub fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         license: wire.license,
         completeness: wire.completeness,
         safety: wire.safety,
-        runtime_values: wire.runtime_values,
-        runtime_contracts: wire.runtime_contracts,
-        collection_flows: wire.collection_flows,
-        deferred_yields: wire.deferred_yields,
+        runtime_values: wire.runtime_values.map(Arc::new),
+        runtime_contracts: wire.runtime_contracts.map(Arc::new),
+        collection_flows: wire.collection_flows.map(Arc::new),
+        deferred_yields: wire.deferred_yields.map(Arc::new),
         conditional_type_refinements: wire.conditional_type_refinements,
         callable_values: wire.callable_values,
         cpp_portability: wire.cpp_portability,
         python_correspondence: wire.python_correspondence,
+        extraction: wire.extraction,
         payload: wire.payload,
     }
 }
@@ -1533,6 +1580,7 @@ fn validate_shard_envelope(
         || shard.license != manifest.license
         || shard.completeness != manifest.completeness
         || shard.safety != manifest.safety
+        || shard.extraction != manifest.extraction
     {
         return Err(ArtifactError::InvalidDescriptor(
             "shard envelope does not match manifest".to_owned(),
@@ -1662,13 +1710,13 @@ pub fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactError> {
         completeness: Completeness,
         safety: &'a Safety,
         #[serde(skip_serializing_if = "Option::is_none")]
-        runtime_values: &'a Option<RuntimeValuesPayload>,
+        runtime_values: &'a Option<Arc<RuntimeValuesPayload>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        runtime_contracts: &'a Option<RuntimeContractsPayload>,
+        runtime_contracts: &'a Option<Arc<RuntimeContractsPayload>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        collection_flows: &'a Option<CollectionFlowsPayload>,
+        collection_flows: &'a Option<Arc<CollectionFlowsPayload>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        deferred_yields: &'a Option<DeferredYieldsPayload>,
+        deferred_yields: &'a Option<Arc<DeferredYieldsPayload>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         conditional_type_refinements: &'a Option<ConditionalTypeRefinementsPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1677,6 +1725,8 @@ pub fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactError> {
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "Option::is_none")]
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extraction: &'a Option<ArtifactExtraction>,
         payload: &'a CompiledPayload,
     }
     let bytes = canonical_json(&SemanticView {
@@ -1697,6 +1747,7 @@ pub fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactError> {
         callable_values: &shard.callable_values,
         cpp_portability: &shard.cpp_portability,
         python_correspondence: &shard.python_correspondence,
+        extraction: &shard.extraction,
         payload: &shard.payload,
     })?;
     Ok(digest_hex(SEMANTIC_HASH_DOMAIN, &bytes))
@@ -1718,6 +1769,8 @@ pub fn manifest_semantic_digest(manifest: &CompiledPackManifest) -> Result<Strin
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "Option::is_none")]
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extraction: &'a Option<ArtifactExtraction>,
         shards: Vec<(&'a str, &'a str)>,
     }
     let bytes = canonical_json(&ManifestSemanticView {
@@ -1731,6 +1784,7 @@ pub fn manifest_semantic_digest(manifest: &CompiledPackManifest) -> Result<Strin
         safety: &manifest.safety,
         cpp_portability: &manifest.cpp_portability,
         python_correspondence: &manifest.python_correspondence,
+        extraction: &manifest.extraction,
         shards: manifest
             .shards
             .iter()
@@ -1759,6 +1813,8 @@ pub fn manifest_content_digest(manifest: &CompiledPackManifest) -> Result<String
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "Option::is_none")]
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extraction: &'a Option<ArtifactExtraction>,
         #[serde(skip_serializing_if = "<[String]>::is_empty")]
         carried_sources: &'a [String],
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1780,6 +1836,7 @@ pub fn manifest_content_digest(manifest: &CompiledPackManifest) -> Result<String
         safety: &manifest.safety,
         cpp_portability: &manifest.cpp_portability,
         python_correspondence: &manifest.python_correspondence,
+        extraction: &manifest.extraction,
         carried_sources: &manifest.carried_sources,
         source_inputs: &manifest.source_inputs,
         semantic_sha256: &manifest.semantic_sha256,
@@ -2085,9 +2142,19 @@ fn collect_implemented_trait_refs(
     fact: &crate::analyzer::semantic_model::model::ImplementedTraitFact,
     ids: &mut HashSet<String>,
 ) {
-    collect_declared_type_refs(&fact.trait_type, ids);
-    for binding in &fact.associated_types {
-        collect_declared_type_refs(&binding.r#type, ids);
+    let mut pending = vec![fact];
+    while let Some(fact) = pending.pop() {
+        collect_declared_type_refs(&fact.trait_type, ids);
+        if let Some(pattern) = &fact.self_pattern {
+            collect_self_pattern_refs(pattern, ids);
+        }
+        for binding in &fact.associated_types {
+            collect_declared_type_refs(&binding.r#type, ids);
+        }
+        for bound in &fact.bounds {
+            collect_declared_type_refs(&bound.subject, ids);
+            pending.push(&bound.bound);
+        }
     }
 }
 
@@ -2117,6 +2184,7 @@ fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
 
 fn authored_pack_from_compiled_shard(shard: &CompiledShard) -> AuthoredSemanticModelPack {
     AuthoredSemanticModelPack {
+        extraction: shard.extraction.clone(),
         schema_version: shard.schema_version,
         pack_id: shard.pack_id.clone(),
         version: shard.pack_version.clone(),
@@ -2136,11 +2204,12 @@ fn authored_pack_from_compiled_shard(shard: &CompiledShard) -> AuthoredSemanticM
 }
 
 #[doc(hidden)]
-pub fn authored_pack_from_decoded_shards(
+pub fn authored_pack_from_decoded_shards<'a>(
     manifest: &CompiledPackManifest,
-    shards: &[CompiledShard],
+    shards: impl IntoIterator<Item = &'a CompiledShard>,
 ) -> AuthoredSemanticModelPack {
     AuthoredSemanticModelPack {
+        extraction: manifest.extraction.clone(),
         schema_version: manifest.schema_version,
         pack_id: manifest.pack_id.clone(),
         version: manifest.version.clone(),
@@ -2155,7 +2224,10 @@ pub fn authored_pack_from_decoded_shards(
         carried_sources: manifest.carried_sources.clone(),
         cpp_portability: manifest.cpp_portability.clone(),
         python_correspondence: manifest.python_correspondence.clone(),
-        shards: shards.iter().map(authored_shard_from_compiled).collect(),
+        shards: shards
+            .into_iter()
+            .map(authored_shard_from_compiled)
+            .collect(),
     }
 }
 
@@ -2164,10 +2236,10 @@ fn authored_shard_from_compiled(shard: &CompiledShard) -> AuthoredShard {
         id: shard.shard_id.clone(),
         activation: shard.activation.clone(),
         payload: authored_payload_from_compiled(&shard.payload),
-        runtime_values: shard.runtime_values.clone(),
-        runtime_contracts: shard.runtime_contracts.clone(),
-        collection_flows: shard.collection_flows.clone(),
-        deferred_yields: shard.deferred_yields.clone(),
+        runtime_values: shard.runtime_values.as_deref().cloned(),
+        runtime_contracts: shard.runtime_contracts.as_deref().cloned(),
+        collection_flows: shard.collection_flows.as_deref().cloned(),
+        deferred_yields: shard.deferred_yields.as_deref().cloned(),
         conditional_type_refinements: shard.conditional_type_refinements.clone(),
         callable_values: shard.callable_values.clone(),
     }
@@ -2180,17 +2252,23 @@ fn authored_payload_from_compiled(payload: &CompiledPayload) -> AuthoredPayload 
             members,
             relations,
         } => AuthoredPayload::DeclarationFacts {
-            types: types.clone(),
-            members: members.clone(),
-            relations: relations.clone(),
+            types: types.iter().map(|record| record.as_ref().clone()).collect(),
+            members: members
+                .iter()
+                .map(|record| record.as_ref().clone())
+                .collect(),
+            relations: relations
+                .iter()
+                .map(|record| record.as_ref().clone())
+                .collect(),
         },
         CompiledPayload::GeneratorRules { rules } => AuthoredPayload::GeneratorRules {
-            rules: rules.clone(),
+            rules: rules.iter().map(|record| record.as_ref().clone()).collect(),
         },
         CompiledPayload::ProcedureSummaries { summaries } => AuthoredPayload::ProcedureSummaries {
             summaries: summaries
                 .iter()
-                .map(authored_procedure_summary_from_compiled)
+                .map(|summary| authored_procedure_summary_from_compiled(summary))
                 .collect(),
         },
     }

@@ -13,6 +13,21 @@ pub type ModuleDefinitionProvider =
         &crate::CancellationToken,
     ) -> crate::analyzer::store::Result<Vec<crate::analyzer::resolution::SemanticId>>;
 
+/// Operation-owned namespace classification; implementations retain only bounded
+/// exact-read memos for the lifetime of the selected typed source.
+pub trait NamespaceDefinitionClassifier {
+    fn definitions(
+        &self,
+        selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<
+            '_,
+        >,
+        definitions: &[crate::analyzer::resolution::SemanticId],
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<Vec<crate::analyzer::resolution::SemanticId>>;
+}
+
+pub type NamespaceDefinitionProvider = fn() -> Box<dyn NamespaceDefinitionClassifier>;
+
 pub trait StoreLanguageSupport: Send + Sync {
     /// Go member lookup keeps these namespaces without blocking lexical
     /// names in other namespaces. Other member kinds retain lexical authority.
@@ -25,6 +40,11 @@ pub trait StoreLanguageSupport: Send + Sync {
 
     /// No provider means typed evaluation never reads module rows for this language.
     fn module_definition_provider(&self) -> Option<ModuleDefinitionProvider> {
+        None
+    }
+
+    /// No provider means namespace classification performs no language reads.
+    fn namespace_definition_provider(&self) -> Option<NamespaceDefinitionProvider> {
         None
     }
 
@@ -310,6 +330,18 @@ pub mod neutral_fixture {
             depth,
             _thread: std::marker::PhantomData,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::analyzer::store) fn dependency_overlay_fixture(
+        support: &'static dyn StoreLanguageSupport,
+    ) -> NeutralRulesFixture {
+        let fixture = neutral_rules_fixture(&[Language::Rust]);
+        OVERLAYS.with(|overlays| {
+            overlays.borrow_mut().last_mut().unwrap()[language_index(Language::Rust).unwrap()] =
+                Some(support);
+        });
+        fixture
     }
 
     impl Drop for NeutralRulesFixture {

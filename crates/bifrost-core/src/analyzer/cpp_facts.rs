@@ -97,6 +97,28 @@ impl CppGuardSet {
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
+
+    pub fn retained_bytes(&self) -> usize {
+        let mut bytes = self.nodes.capacity() * std::mem::size_of::<CppGuardNode>()
+            + self.roots.capacity() * std::mem::size_of::<usize>();
+        for node in &self.nodes {
+            match node {
+                CppGuardNode::Defined(value)
+                | CppGuardNode::Undefined(value)
+                | CppGuardNode::Expression(value)
+                | CppGuardNode::NegatedExpression(value)
+                | CppGuardNode::Truthy(value)
+                | CppGuardNode::Falsy(value)
+                | CppGuardNode::Opaque(value)
+                | CppGuardNode::NegatedOpaque(value) => bytes += value.capacity(),
+                CppGuardNode::All(children) | CppGuardNode::Any(children) => {
+                    bytes += children.capacity() * std::mem::size_of::<usize>();
+                }
+                CppGuardNode::Boolean(_) | CppGuardNode::Constant(_) => {}
+            }
+        }
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,11 +359,38 @@ pub struct CppIncludeFact {
     pub quoted: bool,
 }
 
+/// One `namespace name = target;` definition, as written.
+///
+/// A namespace alias names no declaration of its own, so it is a source fact
+/// of the file rather than a declaration property. The shared
+/// namespace-binding resolver reads these rows for forward and inverse
+/// lookup alike; it decides visibility from the occurrence's range (source
+/// order), the lexical scope, and the guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppNamespaceAliasFact {
+    /// The `namespace_alias_definition` node.
+    pub occurrence: SourceOccurrenceId,
+    pub name: String,
+    /// The target namespace path, outermost first, or `None` when the target
+    /// has no structured path (a C++26 splice).
+    pub target: Option<Vec<String>>,
+    /// Whether the target is written with a leading `::`.
+    pub target_global: bool,
+    /// The named namespaces that enclose the definition, outermost first.
+    pub namespace: Vec<String>,
+    /// The block that encloses a block-scope alias.
+    pub block: Option<SourceOccurrenceId>,
+    /// The preprocessor requirements the definition stands under, or `None`
+    /// when its guard environment cannot be represented.
+    pub guards: Option<CppGuardSet>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CppSourceFacts {
     pub includes: Vec<CppIncludeFact>,
     pub declarations: Vec<CppDeclarationSourceFact>,
     pub using_namespaces: Vec<(SourceOccurrenceId, String)>,
+    pub namespace_aliases: Vec<CppNamespaceAliasFact>,
     pub expressions: Vec<CppExpressionFact>,
     pub statement_facts: CppStatementFactRows,
 }
@@ -387,6 +436,13 @@ impl CppSourceFacts {
                 .using_namespaces
                 .iter()
                 .all(|(occurrence, _)| occurrence.index() < source.occurrence_count())
+            && self.namespace_aliases.iter().all(|alias| {
+                alias.occurrence.index() < source.occurrence_count()
+                    && alias
+                        .block
+                        .is_none_or(|block| block.index() < source.occurrence_count())
+                    && alias.guards.as_ref().is_none_or(CppGuardSet::valid)
+            })
             && self
                 .expressions
                 .iter()
@@ -425,24 +481,7 @@ impl CppSourceFacts {
                 .into_iter()
                 .flatten()
             {
-                bytes += guards.nodes.capacity() * std::mem::size_of::<CppGuardNode>()
-                    + guards.roots.capacity() * std::mem::size_of::<usize>();
-                for node in &guards.nodes {
-                    match node {
-                        CppGuardNode::Defined(value)
-                        | CppGuardNode::Undefined(value)
-                        | CppGuardNode::Expression(value)
-                        | CppGuardNode::NegatedExpression(value)
-                        | CppGuardNode::Truthy(value)
-                        | CppGuardNode::Falsy(value)
-                        | CppGuardNode::Opaque(value)
-                        | CppGuardNode::NegatedOpaque(value) => bytes += value.capacity(),
-                        CppGuardNode::All(children) | CppGuardNode::Any(children) => {
-                            bytes += children.capacity() * std::mem::size_of::<usize>();
-                        }
-                        CppGuardNode::Boolean(_) | CppGuardNode::Constant(_) => {}
-                    }
-                }
+                bytes += guards.retained_bytes();
             }
             bytes += (fact.written_owner.capacity()
                 + fact.lexical_path.capacity()
@@ -533,6 +572,20 @@ impl CppSourceFacts {
                     }
                 }
             }
+        }
+        bytes += self.namespace_aliases.capacity() * std::mem::size_of::<CppNamespaceAliasFact>();
+        for alias in &self.namespace_aliases {
+            bytes += alias.name.capacity()
+                + (alias.target.as_ref().map_or(0, Vec::capacity) + alias.namespace.capacity())
+                    * std::mem::size_of::<String>()
+                + alias
+                    .target
+                    .iter()
+                    .flatten()
+                    .chain(&alias.namespace)
+                    .map(String::capacity)
+                    .sum::<usize>()
+                + alias.guards.as_ref().map_or(0, CppGuardSet::retained_bytes);
         }
         bytes += self
             .includes

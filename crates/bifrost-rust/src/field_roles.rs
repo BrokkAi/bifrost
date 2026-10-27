@@ -75,35 +75,6 @@ pub fn rust_is_field_declaration_name(
     )
 }
 
-pub fn rust_struct_field_references(container: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
-    let (owner_type, body, child_kind, container_kind) = match container.kind() {
-        "struct_expression" => (
-            container.child_by_field_name("name")?,
-            container.child_by_field_name("body")?,
-            None,
-            RustStructFieldContainer::Literal,
-        ),
-        "struct_pattern" => (
-            container.child_by_field_name("type")?,
-            container,
-            Some("field_pattern"),
-            RustStructFieldContainer::Pattern,
-        ),
-        _ => return None,
-    };
-
-    let mut cursor = body.walk();
-    let names = body
-        .named_children(&mut cursor)
-        .filter(|child| child_kind.is_none_or(|kind| child.kind() == kind))
-        .filter_map(|child| match container_kind {
-            RustStructFieldContainer::Literal => initializer_name(child),
-            RustStructFieldContainer::Pattern => child.child_by_field_name("name"),
-        })
-        .collect();
-    Some((owner_type, names))
-}
-
 fn initializer_name(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "field_initializer" => node.child_by_field_name("field"),

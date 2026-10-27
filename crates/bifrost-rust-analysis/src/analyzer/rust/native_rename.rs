@@ -5,6 +5,10 @@
 //! The production Rust language support registers this exact provider.
 
 use crate::analyzer::rust::RustAnalyzer;
+use brokk_bifrost_analysis::analyzer::rename::exact::{
+    ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue, RenameAssemblyLimits,
+    RenameSourceIssue, assemble_exact_rename, check_exact_rename_edits, check_rename_authority,
+};
 
 use crate::analyzer::rust::selected_projection::rust_selected_workspace_identity_gap;
 
@@ -45,10 +49,6 @@ use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResol
 use brokk_bifrost_analysis::analyzer::store::WorkspaceFileRow;
 
 use brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots;
-
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -398,22 +398,15 @@ fn rust_counterfactual_files(
             .map_err(|error| error.to_string())?;
         let mut edits = file_edits.edits.clone();
         edits.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
-        if edits
-            .windows(2)
-            .any(|pair| pair[1].start_byte < pair[0].end_byte)
-        {
-            return Err("rename edits overlap".to_string());
-        }
-        for edit in &edits {
-            if edit.new_text != new_name
-                || original.get(edit.start_byte..edit.end_byte) != Some(result.old_name.as_str())
-            {
-                return Err(format!(
+        check_exact_rename_edits(&original, &edits, &result.old_name, new_name).map_err(
+            |issue| match issue {
+                ExactRenameEditIssue::Overlap => "rename edits overlap".to_owned(),
+                ExactRenameEditIssue::InexactReplacement(edit) => format!(
                     "rename edit is not an exact {:?} -> {:?} identifier replacement: {edit:?}",
                     result.old_name, new_name
-                ));
-            }
-        }
+                ),
+            },
+        )?;
         let mut hypothetical = original.clone();
         for edit in edits.iter().rev() {
             hypothetical.replace_range(edit.start_byte..edit.end_byte, &edit.new_text);
@@ -864,8 +857,6 @@ pub fn native_rust_rename(
 
     use brokk_bifrost_analysis::analyzer::rename::MAX_RENAME_IDENTIFIER_BYTES;
 
-    use brokk_bifrost_analysis::analyzer::rename::RenameFileEdits;
-
     use brokk_bifrost_analysis::analyzer::usages::finder::DEFAULT_MAX_FILES;
 
     use brokk_bifrost_analysis::analyzer::usages::finder::DEFAULT_MAX_USAGES;
@@ -882,94 +873,21 @@ pub fn native_rust_rename(
         };
         assert_eq!(answers.len(), 1);
         let answer = answers.pop().expect("one requested rename target");
-        if answer.completeness != EdgeCompleteness::Complete
-            || answer
-                .edges
-                .iter()
-                .any(|edge| edge.proof != UsageProof::Proven)
-        {
-            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                format!("native rename reference evidence is incomplete or ambiguous: {answer:?}"),
-            ));
-        }
-        if answer.edges.len() > DEFAULT_MAX_USAGES {
-            return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                "native rename exceeds the usage limit",
-            ));
-        }
-        let mut files = BTreeMap::<ProjectFile, (String, Vec<RenameEdit>)>::new();
-        let mut ranges = answer
-            .edges
-            .into_iter()
-            .map(|edge| (edge.site.file, edge.site.range))
-            .collect::<Vec<_>>();
-        let target_source = project.read_source(target.source())?;
-        let declaration =
-            brokk_bifrost_analysis::analyzer::declaration_range::code_unit_declaration_name_range(
-                rust,
-                target.source(),
-                &target_source,
-                target,
-            )
-            .ok_or_else(|| {
-                brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                    "native rename target has no canonical declaration name",
-                )
-            })?;
-        ranges.push((target.source().clone(), declaration));
-        for (file, range) in ranges {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            if !files.contains_key(&file) {
-                if files.len() >= DEFAULT_MAX_FILES {
-                    return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                        "native rename exceeds the file limit",
-                    ));
-                }
-                let source = project.read_source(&file)?;
-                if !rust
-                    .inner
-                    .source_matches_selected_native_content(&file, &source)
-                {
-                    return Err(brokk_bifrost_analysis::analyzer::store::StoreError::new(
-                        format!("native rename source changed: {file}"),
-                    ));
-                }
-                files.insert(file.clone(), (source, Vec::new()));
-            }
-            let (source, edits) = files.get_mut(&file).expect("rename source was admitted");
-            let spelling = source
-                .get(range.start_byte..range.end_byte)
-                .ok_or_else(|| {
-                    brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
-                        "native rename range is outside {file}: {range:?}"
-                    ))
-                })?;
-            // Aliased references bind the target but their independent local
-            // spelling must not be renamed with the declaration.
-            if spelling != target.identifier() {
-                continue;
-            }
-            edits.push(RenameEdit {
-                start_byte: range.start_byte,
-                end_byte: range.end_byte,
-                new_text: new_name.to_owned(),
-            });
-        }
-        let files = files
-            .into_iter()
-            .filter_map(|(file, (_, mut edits))| {
-                edits.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
-                edits.dedup_by_key(|edit| (edit.start_byte, edit.end_byte));
-                (!edits.is_empty()).then_some(RenameFileEdits { file, edits })
-            })
-            .collect();
-        Ok(Some(RenameResult {
-            target: target.clone(),
-            old_name: target.identifier().to_owned(),
-            files,
-        }))
+        let assembled = assemble_exact_rename(
+            rust,
+            project,
+            target,
+            new_name,
+            &answer,
+            RenameAssemblyLimits {
+                max_usages: DEFAULT_MAX_USAGES,
+                max_files: DEFAULT_MAX_FILES,
+            },
+            cancellation,
+            &RustRenameHooks(rust),
+        )
+        .map_err(rename_assembly_failure)?;
+        Ok(assembled.map(|assembled| assembled.result))
     });
     let result = match selected {
         RustSelectedReverseOutcome::Ready(Some(result)) => result,
@@ -980,7 +898,7 @@ pub fn native_rust_rename(
         }
     };
     let safety = validate_selected_rust_rename(rust, project, &result, new_name, cancellation);
-    if cancellation.is_cancelled() || project.analysis_generation() != generation {
+    if check_rename_authority(project, generation, cancellation).is_err() {
         return Err("native rename cancelled or selected generation changed".to_owned());
     }
     match safety {
@@ -989,4 +907,63 @@ pub fn native_rust_rename(
             "native rename cannot certify capture safety: {failure:?}"
         )),
     }
+}
+
+struct RustRenameHooks<'a>(&'a RustAnalyzer);
+
+impl ExactRenameHooks for RustRenameHooks<'_> {
+    type FileState = ();
+
+    fn admit_source(&self, file: &ProjectFile, source: &str) -> Result<(), RenameSourceIssue> {
+        if !self
+            .0
+            .inner
+            .source_matches_selected_native_content(file, source)
+        {
+            return Err(RenameSourceIssue::ContentChanged);
+        }
+        Ok(())
+    }
+}
+
+fn rename_assembly_failure(
+    issue: RenameAssemblyIssue<'_>,
+) -> brokk_bifrost_analysis::analyzer::store::StoreError {
+    use brokk_bifrost_analysis::analyzer::store::StoreError;
+    let message = match issue {
+        RenameAssemblyIssue::IncompleteInventory(result)
+        | RenameAssemblyIssue::UnprovenInventory(result) => {
+            format!("native rename reference evidence is incomplete or ambiguous: {result:?}")
+        }
+        RenameAssemblyIssue::TooManyUsages(_) => "native rename exceeds the usage limit".into(),
+        RenameAssemblyIssue::TooManyFiles => "native rename exceeds the file limit".into(),
+        RenameAssemblyIssue::ReadSource(error) => return error.into(),
+        RenameAssemblyIssue::Source {
+            file,
+            issue: RenameSourceIssue::ContentChanged,
+        } => format!("native rename source changed: {file}"),
+        RenameAssemblyIssue::Source {
+            issue: RenameSourceIssue::ParseFailed,
+            ..
+        }
+        | RenameAssemblyIssue::MissingReferenceName(_) => {
+            unreachable!("Rust rename uses exact inverse ranges without parsing")
+        }
+        RenameAssemblyIssue::MissingDeclarationName => {
+            "native rename target has no canonical declaration name".into()
+        }
+        RenameAssemblyIssue::RangeOutsideSource { file, range } => {
+            format!("native rename range is outside {file}: {range:?}")
+        }
+        RenameAssemblyIssue::DeclarationSpellingMismatch => {
+            "native rename declaration range does not contain its structured identifier".into()
+        }
+        RenameAssemblyIssue::Edit(ExactRenameEditIssue::Overlap) => {
+            "native rename edits overlap".into()
+        }
+        RenameAssemblyIssue::Edit(ExactRenameEditIssue::InexactReplacement(edit)) => {
+            format!("native rename edit is not an exact identifier replacement: {edit:?}")
+        }
+    };
+    StoreError::new(message)
 }

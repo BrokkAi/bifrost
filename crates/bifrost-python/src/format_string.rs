@@ -276,7 +276,7 @@ pub fn parse_percent_format(value: &str) -> PercentFormat {
             while cursor < chars.len() && chars[cursor] != ')' {
                 cursor += 1;
             }
-            if cursor == chars.len() || cursor == start {
+            if cursor == chars.len() {
                 result.complete = false;
                 break;
             }
@@ -385,6 +385,31 @@ impl PercentFormat {
 mod tests {
     use super::*;
 
+    // CPython: "%()s" % {"": "ok"} == "ok".
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: empty percent mapping keys are valid"
+    )]
+    fn qs6_empty_percent_mapping_key() {
+        let parsed = parse_percent_format("%()s");
+        assert!(parsed.complete, "{parsed:?}");
+        assert_eq!(parsed.named_fields, HashSet::from([String::new()]));
+        assert_eq!(parsed.items[0].mapping_key.as_deref(), Some(""));
+        assert_eq!(parsed.positional_slots, 0);
+    }
+
+    // string.Formatter.parse accepts all three conversions; !q is invalid.
+    #[test]
+    fn qs6_format_conversion_corpus() {
+        for conversion in ['s', 'r', 'a'] {
+            let parsed = parse_brace_format(&format!("{{name!{conversion}}}"));
+            assert!(parsed.complete, "{parsed:?}");
+            assert_eq!(parsed.named_fields, HashSet::from(["name".into()]));
+        }
+        assert!(!parse_brace_format("{name!q}").complete);
+        assert!(!parse_percent_format("%(unclosed").complete);
+    }
+
     #[test]
     fn brace_fields_decode_numbering_names_and_escapes() {
         let parsed = parse_brace_format("{{literal}} {} {2[name]} {user.name!r:>{width}}");
@@ -459,5 +484,42 @@ mod tests {
         assert_eq!(parsed.items[0].source_char, 0);
         assert_eq!(parsed.items[1].source_char, 3);
         assert_eq!(parsed.unsupported_conversions, vec![('Z', 4)]);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn qs6_format_caps_count_characters_not_utf8_bytes() {
+        for length in [8191, 8192, 8193] {
+            let brace_suffix = "{{}}{name}";
+            let percent_suffix = "%%%(name)s";
+            let padding = length - 10;
+            let brace = parse_brace_format(&format!("{}{brace_suffix}", "\u{e9}".repeat(padding)));
+            let percent =
+                parse_percent_format(&format!("{}{percent_suffix}", "\u{e9}".repeat(padding)));
+            assert_eq!(brace.complete, length <= 8192);
+            assert_eq!(percent.complete, length <= 8192);
+            if length <= 8192 {
+                assert_eq!(
+                    brace.fields,
+                    vec![BraceField {
+                        selector: BraceSelector::Named("name".into()),
+                        source_char: padding + 4
+                    }]
+                );
+                assert_eq!(percent.items.len(), 1);
+                assert_eq!(percent.items[0].source_char, padding + 2);
+                assert_eq!(percent.items[0].mapping_key.as_deref(), Some("name"));
+                assert_eq!(percent.items[0].conversion, 's');
+            } else {
+                assert!(brace.fields.is_empty());
+                assert!(percent.items.is_empty());
+                assert!(brace.named_fields.is_empty());
+                assert!(percent.named_fields.is_empty());
+            }
+        }
     }
 }

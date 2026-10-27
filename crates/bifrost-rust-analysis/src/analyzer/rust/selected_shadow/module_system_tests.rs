@@ -2094,3 +2094,41 @@ fn directive_3_milestone_1_rust_fact_baseline_records_declarations_shadowing_and
         vec![provider_target_range]
     );
 }
+
+#[test]
+#[hardwon("#5658: a cancelled selected inverse query lost its cancellation reason")]
+fn selected_inverse_preserves_cancellation_after_successful_admission() {
+    use brokk_bifrost_core::cancellation::CancellationToken;
+
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"inverse_cancel\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+    let target = analyzer
+        .all_declarations()
+        .find(|unit| unit.identifier() == "target")
+        .expect("target declaration");
+    let cancellation = CancellationToken::default();
+    let RustSelectedReferenceIndexOutcome::Ready(index) =
+        build_rust_selected_reference_index(&analyzer, &cancellation)
+    else {
+        panic!("selected inverse admission must succeed");
+    };
+    assert!(
+        !index.inverse_for(&target).edges.is_empty(),
+        "the real inverse query must run before cancellation"
+    );
+    cancellation.cancel();
+    let answer = index.inverse_for(&target);
+    assert!(answer.edges.is_empty());
+    assert_eq!(answer.completeness, EdgeCompleteness::Incomplete {
+        reasons: vec![brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason::Cancelled],
+    });
+}

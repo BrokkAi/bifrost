@@ -4,6 +4,23 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
+/// The operands of a Python conditional expression (`value if test else
+/// alternative`).
+///
+/// The grammar leaves `conditional_expression` without fields, so its operands
+/// can only be selected positionally. Skipping extras is required: a backslash
+/// line continuation before `else` otherwise appears as a fourth named child
+/// and trips the operand-count check (#4797).
+pub(crate) fn python_conditional_expression_operands(node: Node<'_>) -> Option<[Node<'_>; 3]> {
+    assert_eq!(node.kind(), "conditional_expression");
+    let mut cursor = node.walk();
+    let operands: Vec<Node<'_>> = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect();
+    operands.try_into().ok()
+}
+
 pub(crate) fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
     python_parameter_name_bounded(node, source, || true)
         .expect("unbounded parameter name lookup completes")
@@ -23,6 +40,7 @@ pub(crate) fn python_parameter_name_bounded(
 }
 
 /// The exact binder token, shared by signature and native lexical production.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn python_parameter_node(node: Node<'_>) -> Option<Node<'_>> {
     python_parameter_node_bounded(node, || true).expect("unbounded parameter token lookup")
 }
@@ -606,6 +624,126 @@ pub(crate) fn python_contains_all_identifier(node: Node<'_>, source: &str) -> bo
 #[cfg(test)]
 mod tests {
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn qs6_python_syntax_field_boundary() {
+        use super::*;
+        for (source, expected) in [
+            ("sys.argv[1]", Some("sys.argv")),
+            ("obj.member[key]", Some("obj.member")),
+            ("obj.nested.member[key]", None),
+            ("values[key]", None),
+            ("obj.member", None),
+        ] {
+            let tree = crate::declarations::parse_python_tree(source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let expression = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            let seed = crate::runtime_values::python_runtime_keyed_access_seed(expression);
+            assert_eq!(seed.map(|node| &source[node.byte_range()]), expected);
+            if let Some(seed) = seed {
+                assert_eq!(seed.kind(), "attribute");
+                assert_eq!(
+                    expression.child_by_field_name("value").unwrap().id(),
+                    seed.id()
+                );
+                assert_eq!(seed.child_by_field_name("object").unwrap().start_byte(), 0);
+                assert_eq!(seed.start_byte(), 0);
+                assert_eq!(seed.end_byte(), expected.unwrap().len());
+            }
+        }
+        for (annotation, names) in [
+            ("pkg.Type", vec!["pkg", "Type"]),
+            ("pkg.Outer.Inner[int]", vec!["pkg", "Outer", "Inner"]),
+            ("Outer[T].Inner", vec!["Outer", "Inner"]),
+        ] {
+            let source = format!("def f() -> {annotation}: pass\n");
+            let tree = crate::declarations::parse_python_tree(&source).unwrap();
+            assert!(!tree.root_node().has_error());
+            let annotation_node = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("return_type")
+                .unwrap();
+            let path = python_static_type_path(annotation_node).unwrap();
+            assert_eq!(
+                path.iter()
+                    .map(|node| &source[node.byte_range()])
+                    .collect::<Vec<_>>(),
+                names
+            );
+            for node in path {
+                assert_eq!(node.kind(), "identifier");
+                assert!(node.start_byte() >= annotation_node.start_byte());
+                assert!(node.end_byte() <= annotation_node.end_byte());
+            }
+        }
+        let source = "@factory()()\ndef f(): pass\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        let decorator = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        assert_eq!(decorator.kind(), "decorator");
+        let call = decorator.named_child(0).unwrap();
+        assert_eq!(call.kind(), "call");
+        assert_eq!(call.child_by_field_name("function").unwrap().kind(), "call");
+        let callee = decorator_callee(decorator).unwrap();
+        assert_eq!(callee.kind(), "identifier");
+        assert_eq!(callee.byte_range(), 1..8);
+        assert_eq!(&source[callee.byte_range()], "factory");
+    }
+
+    #[test]
+    fn qs6_deferred_annotation_live_token_ranges() {
+        use super::*;
+        let source = "# \u{e9}\ndef f(x: \"pkg.Type[Other]\") -> \"Result\": pass\nordinary = \"text\"\ny: Literal[\"value\"]\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let fresh = CancellationToken::new();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let mut pending = vec![tree.root_node()];
+        let mut strings = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "string" {
+                strings.push(node);
+            }
+            for index in (0..node.named_child_count()).rev() {
+                pending.push(node.named_child(index).unwrap());
+            }
+        }
+        assert_eq!(strings.len(), 4);
+        let mut names = Vec::new();
+        for string in strings {
+            let no_token = python_deferred_annotation_identifier_ranges(string, source, None);
+            assert_eq!(
+                python_deferred_annotation_identifier_ranges(string, source, Some(&fresh)),
+                no_token
+            );
+            assert!(
+                python_deferred_annotation_identifier_ranges(string, source, Some(&cancelled))
+                    .is_none()
+            );
+            if let Some(ranges) = no_token {
+                for range in ranges {
+                    assert!(range.start_byte > string.start_byte());
+                    assert!(range.end_byte < string.end_byte());
+                    assert_eq!(range.start_line, 2);
+                    assert_eq!(range.end_line, 2);
+                    names.push(&source[range.start_byte..range.end_byte]);
+                }
+            }
+        }
+        assert_eq!(names, ["pkg", "Type", "Other", "Result"]);
+    }
 
     #[test]
     #[hardwon("#5044: commented parentheses must preserve import identity and budget exhaustion")]

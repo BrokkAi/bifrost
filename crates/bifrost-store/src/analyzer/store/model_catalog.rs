@@ -323,22 +323,13 @@ pub fn callable_values_publication_present(
 ) -> Result<bool, CatalogError> {
     connection
         .query_row(
-            "SELECT EXISTS(
-               SELECT 1
-               FROM catalog_callable_values_indexed_shards AS indexed
-               JOIN catalog_packs AS pack
-                 ON pack.manifest_digest = indexed.manifest_digest
-               JOIN catalog_pack_shards AS shard
-                 ON shard.manifest_digest = indexed.manifest_digest
-                AND shard.shard_id = indexed.shard_id
-               WHERE indexed.manifest_digest = ?1
-                 AND indexed.shard_id = ?2
-                 AND indexed.index_version = 1
-                 AND pack.state = 'verified')",
+            "SELECT EXISTS(SELECT 1
+                         FROM active_catalog_semantic_rows_indexed_shards WHERE
+                         manifest_digest=?1 AND shard_id=?2 AND index_version=4)",
             params![manifest_digest, shard_id],
             |row| row.get(0),
         )
-        .map_err(|error| CatalogError::sqlite("check callable-values publication", error))
+        .map_err(|error| CatalogError::sqlite("check active semantic publication", error))
 }
 
 pub fn callable_values_index_missing_result(
@@ -385,14 +376,8 @@ pub fn read_go_source_from_connection(
     }
     let published: bool = connection
         .query_row(
-            "SELECT EXISTS(
-               SELECT 1
-               FROM catalog_packs AS pack
-               JOIN catalog_pack_shards AS shard
-                 ON shard.manifest_digest = pack.manifest_digest
-               WHERE pack.manifest_digest = ?1
-                 AND pack.state = 'verified'
-                 AND shard.shard_id = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM active_catalog_pack_shards
+                         WHERE manifest_digest=?1 AND shard_id=?2)",
             params![request.manifest_digest, request.shard_id],
             |row| row.get(0),
         )
@@ -404,7 +389,7 @@ pub fn read_go_source_from_connection(
         .query_row(
             "SELECT EXISTS(
                SELECT 1
-               FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+               FROM active_catalog_selectors
                WHERE manifest_digest = ?1
                  AND shard_id = ?2
                  AND artifact_sha256 = ?3)",
@@ -422,7 +407,7 @@ pub fn read_go_source_from_connection(
     let source_set_present: bool = connection
         .query_row(
             "SELECT EXISTS(
-               SELECT 1 FROM catalog_exact_go_source_sets
+               SELECT 1 FROM active_catalog_exact_go_source_sets
                WHERE manifest_digest = ?1 AND artifact_sha256 = ?2)",
             params![request.manifest_digest, request.artifact_sha256],
             |row| row.get(0),
@@ -437,8 +422,7 @@ pub fn read_go_source_from_connection(
             "SELECT relative_path, source_text,
                     length(CAST(relative_path AS BLOB)),
                     length(CAST(source_text AS BLOB))
-             FROM catalog_exact_go_source_files
-                  INDEXED BY catalog_exact_go_source_files_read
+             FROM active_catalog_exact_go_source_files
              WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
              ORDER BY relative_path",
         )
@@ -505,7 +489,7 @@ pub fn read_go_source_from_connection(
             "SELECT package_ordinal, import_path, package_name,
                     length(CAST(import_path AS BLOB)),
                     length(CAST(package_name AS BLOB))
-             FROM catalog_exact_go_packages INDEXED BY catalog_exact_go_packages_read
+             FROM active_catalog_exact_go_packages
              WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
              ORDER BY package_ordinal",
         )
@@ -589,8 +573,7 @@ pub fn read_go_source_from_connection(
         .prepare(
             "SELECT package_ordinal, file_ordinal, relative_path,
                     length(CAST(relative_path AS BLOB))
-             FROM catalog_exact_go_package_files
-                  INDEXED BY catalog_exact_go_package_files_ordered_read
+             FROM active_catalog_exact_go_package_files
              WHERE manifest_digest = ?1 AND artifact_sha256 = ?2
              ORDER BY package_ordinal, file_ordinal",
         )
@@ -801,8 +784,8 @@ impl From<SessionPackSourceKind> for CatalogPackSourceKind {
 /// workspace-sized source index.
 #[derive(Clone)]
 pub struct CatalogRuntimeSourceReader {
-    pub durable_connection: Arc<Mutex<Connection>>,
-    pub session_callable_values: Arc<Mutex<Option<SessionCallableValuesCatalog>>>,
+    pub connection: Arc<Mutex<Connection>>,
+    pub session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
     pub _ephemeral_root: Option<Arc<TempDir>>,
 }
 
@@ -814,42 +797,295 @@ impl fmt::Debug for CatalogRuntimeSourceReader {
     }
 }
 
+/// One raw result owns its record and shares only the selected shard metadata.
+#[derive(Debug, Clone)]
+pub struct CatalogRawRecord<T> {
+    pub record: Arc<T>,
+    pub shard: Arc<super::active_models::ActiveSemanticModelShardMetadata>,
+}
+
+/// A published active set has no per-question recovery from lost storage.
+/// Never turn a failed read into a pack-blind empty semantic answer.
+pub fn semantic_catalog_question<T>(
+    statement: &str,
+    key: impl fmt::Debug,
+    answer: Result<T, CatalogError>,
+) -> T {
+    answer.unwrap_or_else(|error| {
+        panic!("active semantic question {statement}, key {key:?}: {error:?}")
+    })
+}
+
 impl CatalogRuntimeSourceReader {
+    /// Decode the result of one named product statement. Nothing is retained
+    /// across questions. Source database is part of every physical row identity.
+    pub fn raw_records<T: serde::de::DeserializeOwned>(
+        &self,
+        statement: &str,
+        bindings: impl rusqlite::Params,
+        shards: &[Arc<super::active_models::ActiveSemanticModelShard>],
+    ) -> Result<Vec<CatalogRawRecord<T>>, CatalogError> {
+        self.raw_rows(statement, bindings, shards, |row| {
+            let json: String = row.get("record_json")?;
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    row.as_ref()
+                        .column_index("record_json")
+                        .expect("record column exists"),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+    }
+
+    /// Stream scalar columns until the visitor has its answer or is cancelled.
+    /// The visitor must not issue another question on this same connection.
+    pub fn visit_scalar_rows(
+        &self,
+        statement: &str,
+        bindings: impl rusqlite::Params,
+        mut visit: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<bool>,
+    ) -> Result<(), CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("active semantic reader mutex poisoned");
+        let mut query = connection
+            .prepare_cached(statement)
+            .map_err(|error| CatalogError::sqlite("prepare semantic scalar question", error))?;
+        let mut rows = query
+            .query(bindings)
+            .map_err(|error| CatalogError::sqlite("query semantic scalar question", error))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| CatalogError::sqlite("step semantic scalar question", error))?
+        {
+            if !visit(row)
+                .map_err(|error| CatalogError::sqlite("read semantic scalar question", error))?
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Request-local scalar projections which do not publish record handles.
+    pub fn scalar_question<T>(
+        &self,
+        statement: &str,
+        bindings: impl rusqlite::Params,
+        mut read: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, CatalogError> {
+        let mut result = Vec::new();
+        self.visit_scalar_rows(statement, bindings, |row| {
+            result.push(read(row)?);
+            Ok(true)
+        })?;
+        Ok(result)
+    }
+
+    /// Column-only questions (relations, names and payload projections) use the
+    /// same active-set/metadata join without inventing persisted JSON records.
+    pub fn raw_rows<T>(
+        &self,
+        statement: &str,
+        bindings: impl rusqlite::Params,
+        shards: &[Arc<super::active_models::ActiveSemanticModelShard>],
+        decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<CatalogRawRecord<T>>, CatalogError> {
+        use super::active_models::CatalogShardDatabase;
+        let connection = self
+            .connection
+            .lock()
+            .expect("active semantic reader mutex poisoned");
+        let mut query = connection
+            .prepare_cached(statement)
+            .map_err(|error| CatalogError::sqlite("prepare raw semantic question", error))?;
+        let rows = query
+            .query_map(bindings, |row| {
+                let source: String = row.get("source_db")?;
+                let shard_key: i64 = row.get("shard_key")?;
+                let database = match source.as_str() {
+                    "durable" => CatalogShardDatabase::Durable,
+                    "session" => CatalogShardDatabase::Session,
+                    _ => unreachable!("active view has a validated source database"),
+                };
+                let shard = shards
+                    .iter()
+                    .find(|shard| {
+                        shard.row_store.is_some_and(|identity| {
+                            identity.database == database && identity.shard_key == shard_key
+                        })
+                    })
+                    .expect("active row belongs to selected shard metadata");
+                Ok(CatalogRawRecord {
+                    record: Arc::new(decode(row)?),
+                    shard: Arc::clone(&shard.metadata),
+                })
+            })
+            .map_err(|error| CatalogError::sqlite("query raw semantic records", error))?;
+        rows.map(|row| row.map_err(|error| CatalogError::sqlite("read raw semantic record", error)))
+            .collect()
+    }
+
+    /// Follow same-shard callees with indexed ID questions. Missing IDs remain
+    /// absent, and the visited set terminates cycles without loading the shard.
+    pub fn procedure_summary_family<'a>(
+        &self,
+        shard: &Arc<super::active_models::ActiveSemanticModelShard>,
+        roots: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Arc<[Arc<crate::analyzer::semantic_model::CompiledProcedureSummary>]>, CatalogError>
+    {
+        use super::active_models::CatalogShardDatabase;
+        use crate::analyzer::semantic_model::CompiledSummaryEffect;
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        let identity = shard
+            .row_store
+            .expect("row-backed shard has a catalog identity");
+        let source = match identity.database {
+            CatalogShardDatabase::Durable => "durable",
+            CatalogShardDatabase::Session => "session",
+        };
+        let mut pending = roots.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let mut visited = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let records = self.raw_records::<crate::analyzer::semantic_model::CompiledProcedureSummary>(
+                statements::SUMMARY_BY_ID,
+                rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key, ":id": id },
+                std::slice::from_ref(shard),
+            )?;
+            for record in records {
+                for effect in &record.record.effects {
+                    match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => pending.push(callee.clone()),
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                            pending.extend(candidates.iter().cloned())
+                        }
+                        _ => {}
+                    }
+                }
+                result.push(record.record);
+            }
+        }
+        result.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(result.into())
+    }
+
+    /// The first pair is only a fast comparison. The schema does not prove
+    /// first (model_id, id) uniqueness across shards: the full-sequence tie-break
+    /// is required and must not be removed as redundant.
+    pub fn procedure_summary_shard_order(
+        &self,
+        selected: &Arc<super::active_models::ActiveSemanticModelShard>,
+        shards: &[Arc<super::active_models::ActiveSemanticModelShard>],
+    ) -> Result<usize, CatalogError> {
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+        let selected_first = self.summary_order_keys(selected, statements::SUMMARY_SHARD_FIRST)?;
+        let mut selected_sequence = None;
+        let mut rank = 0;
+        for shard in shards.iter().filter(|shard| {
+            shard.descriptor.payload_kind
+                == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries
+        }) {
+            let order = shard.manifest.language.cmp(&selected.manifest.language);
+            let order = if order.is_eq() {
+                let first = self.summary_order_keys(shard, statements::SUMMARY_SHARD_FIRST)?;
+                let order = first.cmp(&selected_first);
+                if order.is_eq() {
+                    let full = match &selected_sequence {
+                        Some(full) => full,
+                        None => selected_sequence.insert(
+                            self.summary_order_keys(selected, statements::SUMMARY_SHARD_SEQUENCE)?,
+                        ),
+                    };
+                    self.summary_order_keys(shard, statements::SUMMARY_SHARD_SEQUENCE)?
+                        .cmp(full)
+                } else {
+                    order
+                }
+            } else {
+                order
+            };
+            rank += usize::from(order.is_lt());
+        }
+        Ok(rank)
+    }
+
+    fn summary_order_keys(
+        &self,
+        shard: &Arc<super::active_models::ActiveSemanticModelShard>,
+        statement: &str,
+    ) -> Result<Vec<(String, String)>, CatalogError> {
+        use super::active_models::CatalogShardDatabase;
+        let identity = shard.row_store.expect("summary shard has catalog identity");
+        let source = match identity.database {
+            CatalogShardDatabase::Durable => "durable",
+            CatalogShardDatabase::Session => "session",
+        };
+        let connection = self
+            .connection
+            .lock()
+            .expect("active semantic reader mutex poisoned");
+        let mut query = connection
+            .prepare_cached(statement)
+            .map_err(|error| CatalogError::sqlite("prepare summary shard order", error))?;
+        let rows = query
+            .query_map(
+                rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key },
+                |row| Ok((row.get("model_id")?, row.get("record_id")?)),
+            )
+            .map_err(|error| CatalogError::sqlite("query summary shard order", error))?;
+        rows.map(|row| row.map_err(|error| CatalogError::sqlite("read summary shard order", error)))
+            .collect()
+    }
+
+    /// Exact payload presence, including present-empty payloads, from the marker.
+    pub fn callable_values_presence(
+        &self,
+        identity: super::active_models::CatalogShardRowIdentity,
+    ) -> Result<bool, CatalogError> {
+        self.payload_family_presence(identity,
+            brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily::CallableValues)
+    }
+
+    pub fn payload_family_presence(
+        &self,
+        identity: super::active_models::CatalogShardRowIdentity,
+        family: brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily,
+    ) -> Result<bool, CatalogError> {
+        let source = match identity.database {
+            super::active_models::CatalogShardDatabase::Durable => "durable",
+            super::active_models::CatalogShardDatabase::Session => "session",
+        };
+        self.connection
+            .lock()
+            .expect("catalog reader mutex poisoned")
+            .query_row(
+                statements::PAYLOAD_FAMILY_PRESENCE,
+                rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key,
+                ":family": family.as_str() },
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("read semantic payload family presence", error))
+    }
+
     pub fn query_callable_values(
         &self,
         query: &CatalogCallableValuesQuery<'_>,
         limits: CatalogCallableValuesQueryLimits,
         cancellation: &CancellationToken,
     ) -> Result<CatalogCallableValuesQueryResult, CatalogError> {
-        let durable = self
-            .durable_connection
+        let connection = self
+            .connection
             .lock()
-            .expect("semantic-pack catalog connection mutex poisoned");
-        if callable_values_publication_present(&durable, query.manifest_digest, query.shard_id)? {
-            return query_callable_values_on_connection(&durable, query, limits, cancellation);
-        }
-        drop(durable);
-
-        let session = self
-            .session_callable_values
-            .lock()
-            .expect("session callable-values connection mutex poisoned");
-        let Some(session) = session.as_ref() else {
-            return Ok(callable_values_index_missing_result(limits));
-        };
-        if callable_values_publication_present(
-            &session.connection,
-            query.manifest_digest,
-            query.shard_id,
-        )? {
-            return query_callable_values_on_connection(
-                &session.connection,
-                query,
-                limits,
-                cancellation,
-            );
-        }
-        Ok(callable_values_index_missing_result(limits))
+            .expect("active semantic reader mutex poisoned");
+        // Publication is checked once when activation binds this connection.
+        query_callable_values_on_connection(&connection, query, limits, cancellation)
     }
 
     pub fn read_go_source(
@@ -858,25 +1094,11 @@ impl CatalogRuntimeSourceReader {
         limits: CatalogGoSourceReadLimits,
         cancellation: &CancellationToken,
     ) -> Result<Option<CatalogExactGoSourceSet>, CatalogError> {
-        let durable = self
-            .durable_connection
+        let connection = self
+            .connection
             .lock()
-            .expect("semantic-pack catalog connection mutex poisoned");
-        if let Some(source) =
-            read_go_source_from_connection(&durable, request, limits, cancellation)?
-        {
-            return Ok(Some(source));
-        }
-        drop(durable);
-
-        let session = self
-            .session_callable_values
-            .lock()
-            .expect("session callable-values connection mutex poisoned");
-        let Some(session) = session.as_ref() else {
-            return Ok(None);
-        };
-        read_go_source_from_connection(&session.connection, request, limits, cancellation)
+            .expect("active semantic reader mutex poisoned");
+        read_go_source_from_connection(&connection, request, limits, cancellation)
     }
 }
 
@@ -920,6 +1142,293 @@ pub fn activation_catalog_kind(kind: SemanticPackActivationSourceKind) -> Catalo
         SemanticPackActivationSourceKind::Embedded => CatalogPackSourceKind::Embedded,
         SemanticPackActivationSourceKind::EphemeralWorkspace => {
             CatalogPackSourceKind::EphemeralWorkspace
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_identity_properties {
+    use super::*;
+    use crate::analyzer::store::{AnalyzerStore, SemanticPackActiveReference};
+
+    #[test]
+    fn catalog_source_identities_round_trip_through_active_rows() {
+        use SemanticPackActivationSourceKind as Activation;
+        // Literal SQL spellings and expected kinds are the external contract;
+        // identical digest/source pairs deliberately cannot disambiguate kinds.
+        let cases = [
+            (
+                "installed",
+                Activation::Installed,
+                Some(DurablePackSourceKind::Installed),
+            ),
+            (
+                "generated",
+                Activation::Generated,
+                Some(DurablePackSourceKind::Generated),
+            ),
+            (
+                "pre_shipped",
+                Activation::PreShipped,
+                Some(DurablePackSourceKind::PreShipped),
+            ),
+            (
+                "workspace_produced",
+                Activation::WorkspaceProduced,
+                Some(DurablePackSourceKind::WorkspaceProduced),
+            ),
+            ("embedded", Activation::Embedded, None),
+            ("ephemeral_workspace", Activation::EphemeralWorkspace, None),
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sources.db");
+        for (literal, activation, durable) in cases {
+            let store = AnalyzerStore::open_persistent(&path).unwrap();
+            let source_kind = match durable {
+                Some(kind) => {
+                    assert_eq!(durable_activation_kind(activation), Some(kind));
+                    CatalogPackSourceKind::from(kind)
+                }
+                None => CatalogPackSourceKind::from(match activation {
+                    Activation::Embedded => SessionPackSourceKind::Embedded,
+                    Activation::EphemeralWorkspace => SessionPackSourceKind::EphemeralWorkspace,
+                    _ => unreachable!(),
+                }),
+            };
+            let member = SemanticPackActiveReference {
+                manifest_digest: "a".repeat(64),
+                source_kind: activation,
+                source_id: "same-source".into(),
+                workspace_produced: matches!(
+                    activation,
+                    Activation::WorkspaceProduced | Activation::EphemeralWorkspace
+                ),
+            };
+            store
+                .replace_semantic_pack_active_set(std::slice::from_ref(&member))
+                .unwrap();
+            {
+                let conn = Connection::open(&path).unwrap();
+                let stored: String = conn
+                    .query_row(
+                        "SELECT source_kind FROM semantic_pack_active_members",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(stored, literal);
+                assert_eq!(source_kind.as_str(), stored);
+                assert_eq!(CatalogPackSourceKind::parse(&stored).unwrap(), source_kind);
+                if let Some(kind) = durable {
+                    assert_eq!(kind.as_str(), stored);
+                    assert_eq!(DurablePackSourceKind::parse(&stored).unwrap(), kind);
+                }
+            }
+            drop(store);
+            let reopened = AnalyzerStore::open_persistent(&path).unwrap();
+            assert_eq!(
+                reopened
+                    .semantic_pack_active_set()
+                    .unwrap()
+                    .unwrap()
+                    .members,
+                vec![member]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod semantic_row_plan_tests {
+    use super::*;
+    use crate::analyzer::store::planner_statistics::pinned_plans::{
+        plan_rows, semantic_catalog_pins,
+    };
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+    fn seed(connection: &Connection) {
+        connection.execute_batch(r#"
+            INSERT INTO catalog_packs(manifest_digest,state) VALUES(printf('%064d',1),'verified');
+            INSERT INTO catalog_pack_shards(manifest_digest,shard_id) VALUES(printf('%064d',1),'s');
+            INSERT INTO catalog_semantic_rows_indexed_shards(shard_key,manifest_digest,shard_id,index_version) VALUES(1,printf('%064d',1),'s',4);
+            WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<256)
+            INSERT INTO catalog_declaration_types(record_key,shard_key,record_id,record_json)
+            SELECT v,1,'Type'||v,'{"type_kind":"trait"}' FROM n;
+            INSERT INTO catalog_declaration_names(shard_key,record_key,name,language,namespace,identity_name)
+            SELECT 1,record_key,record_id,'rust','type',1 FROM catalog_declaration_types;
+            INSERT INTO catalog_declaration_members(record_key,shard_key,record_id,owner_id,name,language,record_json)
+            SELECT record_key,1,'member'||record_key,'Owner'||record_key,'name'||record_key,'rust','{}' FROM catalog_declaration_types;
+            INSERT INTO catalog_member_aliases(shard_key,member_key,alias)
+            SELECT 1,record_key,'alias'||record_key FROM catalog_declaration_members;
+            INSERT INTO catalog_declaration_relations(shard_key,origin,record_id,from_id,to_id,relation_kind)
+            SELECT 1,'relation_fact','relation'||record_key,record_id,'Base'||record_key,'references' FROM catalog_declaration_types;
+            INSERT INTO catalog_procedure_summaries(shard_key,language,target_path,target_symbol,owner_fqn,member,has_receiver,declared_arity,variadic,minimum_actual_count,record_json)
+            SELECT 1,'rust','path'||record_key,'symbol'||record_key,'Owner'||record_key,'name'||record_key,0,0,0,0,
+              json_object('id','sum'||record_key,'model_id','pack.sum'||record_key) FROM catalog_declaration_types;
+        "#).unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6685: active views read the 7.8 MB manifest BLOB overflow chain on every row to check pack state"
+    )]
+    fn semantic_catalog_questions_never_recheck_pack_state_in_both_statistics_states() {
+        use crate::analyzer::store::planner_statistics::pinned_plans::plan_rows_for_sql;
+        use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements::RAW_STATEMENTS;
+        for state in PlannerStatisticsState::BOTH {
+            let durable = open_session_semantic_catalog().unwrap();
+            let session = open_session_semantic_catalog().unwrap();
+            seed(&durable.connection);
+            seed(&session.connection);
+            rows::attach_session_rows(&durable.connection, &session).unwrap();
+            for source in ["durable", "session"] {
+                assert!(
+                    rows::select_active_shard_source(
+                        &durable.connection,
+                        &format!("{:064}", 1),
+                        "s",
+                        source
+                    )
+                    .unwrap()
+                    .is_some()
+                );
+            }
+            state.install(&durable.connection);
+            let mut plans = semantic_catalog_pins()
+                .into_iter()
+                .map(|(query, _)| {
+                    (
+                        query.name.to_owned(),
+                        plan_rows(&durable.connection, &query).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for &(name, sql) in RAW_STATEMENTS {
+                let count = durable.connection.prepare(sql).unwrap().parameter_count();
+                let params = vec![rusqlite::types::Value::Null; count];
+                plans.push((
+                    name.to_owned(),
+                    plan_rows_for_sql(&durable.connection, sql, &params).unwrap(),
+                ));
+            }
+            for (name, plan) in plans {
+                assert!(
+                    plan.iter().all(|line| !line.contains("catalog_packs")),
+                    "{state} {name}: active membership must not read pack metadata: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6685: candidate search rescanned every owner name for each member spelling"
+    )]
+    fn semantic_catalog_keyed_questions_use_pinned_indexes_in_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let durable = open_session_semantic_catalog().unwrap();
+            let session = open_session_semantic_catalog().unwrap();
+            seed(&durable.connection);
+            seed(&session.connection);
+            rows::attach_session_rows(&durable.connection, &session).unwrap();
+            rows::select_active_shard_source(
+                &durable.connection,
+                &format!("{:064}", 1),
+                "s",
+                "durable",
+            )
+            .unwrap();
+            rows::select_active_shard_source(
+                &durable.connection,
+                &format!("{:064}", 1),
+                "s",
+                "session",
+            )
+            .unwrap();
+            state.install(&durable.connection);
+            for (query, index) in semantic_catalog_pins() {
+                let plan = plan_rows(&durable.connection, &query).unwrap();
+                let uses = plan
+                    .iter()
+                    .filter(|line| line.contains(index) && line.contains("SEARCH"))
+                    .count();
+                if query.name == "semantic_search_candidates" {
+                    assert!(uses > 0, "{state}: owner map must be indexed: {plan:?}");
+                    assert!(
+                        plan.iter().any(|line| line
+                            .contains("SEARCH o USING AUTOMATIC COVERING INDEX")
+                            && line.contains("language=?")
+                            && line.contains("owner_id=?")),
+                        "{state}: owner lookup must seek both key columns: {plan:?}"
+                    );
+                    assert_eq!(
+                        plan.iter()
+                            .filter(|line| line.contains("MATERIALIZE owner_names"))
+                            .count(),
+                        1,
+                        "{state}: owner JSON must be materialized once: {plan:?}"
+                    );
+                    assert_eq!(
+                        plan.iter()
+                            .filter(|line| line.contains("SCAN owner_json VIRTUAL TABLE"))
+                            .count(),
+                        1,
+                        "{state}: owner JSON must be scanned only for materialization: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(
+                            |line| !line.contains("CORRELATED") && !line.starts_with("SCAN o ")
+                        ),
+                        "{state}: candidates cannot rescan the owner map: {plan:?}"
+                    );
+                    eprintln!("{state}: indexed search owner plan: {plan:?}");
+                } else {
+                    assert!(
+                        uses >= 2,
+                        "{state} {}: expected {index} in both source branches: {plan:?}",
+                        query.name
+                    );
+                }
+                if [
+                    "semantic_search_owner_qualifications",
+                    "semantic_search_types_by_ids",
+                    "semantic_search_members_by_ids",
+                ]
+                .contains(&query.name.as_str())
+                {
+                    assert!(
+                        plan.iter()
+                            .all(|line| !line.contains("MATERIALIZE active_catalog_declaration_")),
+                        "{state}: indexed search cannot materialize whole active records: {plan:?}"
+                    );
+                    assert_eq!(
+                        plan.iter()
+                            .filter(|line| line.contains("SCAN json_each VIRTUAL TABLE"))
+                            .count(),
+                        1,
+                        "{state}: requested IDs must be decoded once: {plan:?}"
+                    );
+                }
+                if query.name == "semantic_summary_id" {
+                    let keyed = plan
+                        .iter()
+                        .filter(|line| {
+                            line.contains(index) && line.contains("shard_key=? AND record_id=?")
+                        })
+                        .count();
+                    assert!(
+                        keyed >= 2,
+                        "{state}: summary dependency reads must seek both ID-index columns: {plan:?}"
+                    );
+                    eprintln!("{state}: summary-ID keyed plan: {plan:?}");
+                }
+            }
+            for (name, sql) in statements::RAW_STATEMENTS {
+                durable
+                    .connection
+                    .prepare(sql)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+            }
         }
     }
 }

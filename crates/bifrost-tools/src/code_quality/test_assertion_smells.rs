@@ -28,7 +28,7 @@ use crate::code_quality::structured_quality::reasons;
 
 use crate::code_quality::structured_quality::render_quality_findings;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, IAnalyzer};
 
 use brokk_bifrost_core::analyzer::model::TestAssertionSmell;
 
@@ -174,6 +174,10 @@ pub fn report_test_assertion_smells(
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<TestAssertionSmell> = Vec::new();
     let mut remaining_candidates = MAX_TEST_ASSERTION_CANDIDATES;
+    // A detector that cannot read a file's source or syntax records why on the
+    // open request, and the file yields no findings. That must make the
+    // analysis incomplete, not an empty answer that claims to be complete.
+    let detection = AnalyzerQueryScope::new(analyzer);
     for file in &resolved.files {
         if !analyzer.contains_tests(file) {
             continue;
@@ -193,6 +197,8 @@ pub fn report_test_assertion_smells(
             break;
         }
     }
+    let detection_reads_complete = detection.read_completion().is_ok();
+    drop(detection);
 
     let mut filtered: Vec<TestAssertionSmell> = findings
         .into_iter()
@@ -239,7 +245,7 @@ pub fn report_test_assertion_smells(
         !resolved.input_truncated
             && resolved.skipped_inputs == 0
             && resolved.ambiguous_paths.is_empty(),
-        !analysis_truncated,
+        !analysis_truncated && detection_reads_complete,
         requested_findings_cap,
         filtered.len(),
     );

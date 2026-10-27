@@ -32,9 +32,9 @@ use crate::graph::extractor::{
     BareCallTargetResolution, LexicalScopeResolution, enclosing_lexical_scope_components,
     has_persisted_global_field_identity, initialized_ordinary_type_imports,
     ordinary_using_declaration_type_node, resolve_bare_call_target,
-    resolve_ordinary_using_declaration_owner, resolve_type_components_lexically_at,
-    resolve_type_node_lexically, resolve_using_enum_declaration_owner,
-    using_enum_declaration_type_node,
+    resolve_ordinary_using_declaration_owner, resolve_type_components_in_authoritative_scope,
+    resolve_type_components_lexically_at, resolve_type_node_lexically,
+    resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
 };
 use crate::graph::resolver::field_declared_binding;
 use crate::graph::resolver::{
@@ -863,12 +863,20 @@ fn recovered_sentinel_type_resolution(
     let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
     let components = cpp_type_name_components(node, ctx.source)?;
     let global = is_globally_qualified_cpp_name(node);
-    Some(ctx.visibility.resolve_type_components_lexically(
-        &ctx.analyzer,
-        ctx.file,
+    Some(resolve_type_components_in_authoritative_scope(
+        node,
         &components,
         global,
-        &scope,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        None,
+        false,
+        false,
+        false,
+        scope,
     ))
 }
 
@@ -1284,6 +1292,21 @@ fn resolve_declaring_member_owner_cached(
 }
 
 fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
+    let range = brokk_bifrost_core::analyzer::Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    if let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range)
+        && let Some(owner) =
+            brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
+                ctx.analyzer.parent_of(unit)
+            })
+            .find(|unit| unit.is_class())
+    {
+        return Some(owner);
+    }
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
@@ -1395,6 +1418,37 @@ fn receiver_type_unit(
             // type, unless it is a known (shadowed) untyped local — never reinterpret
             // a value as a static type.
             first_precise(bindings, name).or_else(|| {
+                if !bindings.is_shadowed(name)
+                    && let Some(receiver_owner) = enclosing_callable_owner(receiver, ctx)
+                {
+                    match resolve_declaring_member_owner(
+                        &ctx.analyzer,
+                        ctx.visibility,
+                        ctx.file,
+                        &receiver_owner,
+                        name,
+                    ) {
+                        EnclosingMemberOwnerResolution::Owner(owner) => {
+                            let fields = ctx
+                                .visibility
+                                .visible_members_for_owner_name(ctx.file, &owner, name)
+                                .into_iter()
+                                .filter(|candidate| candidate.is_field())
+                                .collect::<Vec<_>>();
+                            if let [field] = fields.as_slice() {
+                                return field_declared_binding(
+                                    &ctx.analyzer,
+                                    ctx.visibility,
+                                    ctx.file,
+                                    field,
+                                )
+                                .and_then(|binding| binding.unit);
+                            }
+                        }
+                        EnclosingMemberOwnerResolution::Ambiguous => return None,
+                        EnclosingMemberOwnerResolution::Missing => {}
+                    }
+                }
                 if !bindings.is_shadowed(name)
                     && let Some(unit) = global_receiver_type_unit(ctx, name)
                 {

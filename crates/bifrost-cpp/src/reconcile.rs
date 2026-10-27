@@ -204,6 +204,22 @@ mod tests {
     #[test]
     #[hardwon("#1134: real namespace segments were mistaken for class nesting")]
     fn genuine_namespace_chain_keeps_namespace_reading() {
+        // A lexical namespace and a qualified namespace prefix must join
+        // before the visible class table is consulted.
+        let visible = [VisibleClass {
+            package: "a::b",
+            nested_short_name: "Outer$Inner",
+        }];
+        assert_eq!(
+            reconcile_out_of_line_member_identity(
+                &["b", "Outer", "Inner"],
+                "method",
+                &["a"],
+                &visible
+            ),
+            Some(identity("a::b", "Outer$Inner", "method"))
+        );
+
         let table = [VisibleClass {
             package: "ns1::ns2",
             nested_short_name: "Klass",

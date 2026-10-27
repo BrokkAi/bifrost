@@ -1,4 +1,10 @@
 #[doc(hidden)]
+pub mod rows;
+
+#[doc(hidden)]
+pub mod statements;
+
+#[doc(hidden)]
 pub mod db;
 #[doc(hidden)]
 pub mod storage;
@@ -60,6 +66,8 @@ use crate::analyzer::semantic_model::ArtifactProducerLimits;
 use crate::analyzer::semantic_model::CompiledPackManifest;
 
 use crate::analyzer::semantic_model::CompiledSemanticModelPack;
+
+use crate::analyzer::semantic_model::CompiledShard;
 
 use crate::analyzer::semantic_model::CompiledShardDescriptor;
 
@@ -216,7 +224,10 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 57: Scala operator-named classes retain indexed declarations and constructors;
 /// local case-class companions cannot publish fabricated global JVM aliases.
 /// 59: Rust source-set aliases, primitive owners and structured trait contracts (#6542).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 61;
+// 62: schema-19 extraction authority and Rust implementation inventories.
+// #6898: C++ header-pack owner records are class-first instead of HashMap-order-dependent.
+// Grammar 0.24.6 changes unnamed enum-base trees (#6902).
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 64;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -390,6 +401,7 @@ pub struct CatalogExactGoSourceSet {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallOutcome {
+    pub diagnostics: Vec<UnresolvedSummaryCallee>,
     pub manifest_digest: String,
     pub inserted_manifest: bool,
     pub inserted_objects: usize,
@@ -866,9 +878,17 @@ pub struct CatalogGcOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogMiss {
+    IndexReconciliationRequired {
+        manifest_digest: String,
+        shard_id: String,
+    },
     NotFound,
-    Quarantined { reason: String },
-    Incompatible { reason: String },
+    Quarantined {
+        reason: String,
+    },
+    Incompatible {
+        reason: String,
+    },
 }
 
 /// One pack that names a queried coordinate but rejects its exact version.
@@ -939,6 +959,10 @@ pub enum CatalogError {
     Artifact(String),
     Integrity(String),
     ReadOnly,
+    IndexReconciliationRequired {
+        manifest_digest: String,
+        shard_id: String,
+    },
     CatalogTooNew {
         found: i64,
         supported: i64,
@@ -986,6 +1010,16 @@ impl fmt::Display for CatalogError {
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Sqlite { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Artifact(message) | Self::Integrity(message) => formatter.write_str(message),
+            Self::IndexReconciliationRequired {
+                manifest_digest,
+                shard_id,
+            } => {
+                write!(
+                    formatter,
+                    "semantic rows missing for {manifest_digest}/{shard_id}; "
+                )?;
+                formatter.write_str("run bifrost-semantic-pack reindex CATALOG")
+            }
             Self::ReadOnly => formatter.write_str("semantic-pack catalog is read-only"),
             Self::CatalogTooNew { found, supported } => write!(
                 formatter,
@@ -1047,7 +1081,8 @@ pub const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 // matching the formal-layout interpreter while rejecting positional fixed tails.
 #[doc(hidden)]
 // 11: validate schema-18 Rust defaults, trait impls and associated projections.
-pub const SHARD_VALIDATION_VERSION: u32 = 11;
+pub // 12: schema-19 extraction envelopes and implementation conditions.
+const SHARD_VALIDATION_VERSION: u32 = 12;
 
 #[doc(hidden)]
 pub fn decode_limits_digest(limits: &DecodeLimits) -> String {
@@ -1081,10 +1116,8 @@ pub const CERTIFIED_SHARD_SQL: &str = "SELECT EXISTS(
 #[doc(hidden)]
 pub const CALLABLE_VALUES_RETURNED_SQL: &str = "SELECT fact.fact_ordinal,
        fact.result_ordinal, fact.target, fact.provenance_json
-FROM catalog_callable_value_facts AS fact
-JOIN catalog_packs AS pack ON pack.manifest_digest = fact.manifest_digest
-WHERE pack.state = 'verified'
-  AND fact.manifest_digest = ?1 AND fact.shard_id = ?2
+FROM active_catalog_callable_value_facts AS fact
+WHERE fact.manifest_digest = ?1 AND fact.shard_id = ?2
   AND fact.family = 'returned-callables' AND fact.callable = ?3
   AND fact.result_ordinal = ?4
 ORDER BY fact.fact_ordinal
@@ -1095,10 +1128,8 @@ pub const CALLABLE_VALUES_CALLBACK_SQL: &str = "SELECT fact.fact_ordinal,
        fact.callback_location_json, fact.callback_parameters,
        fact.callback_results, fact.arguments_json, fact.timing,
        fact.modality, fact.provenance_json
-FROM catalog_callable_value_facts AS fact
-JOIN catalog_packs AS pack ON pack.manifest_digest = fact.manifest_digest
-WHERE pack.state = 'verified'
-  AND fact.manifest_digest = ?1 AND fact.shard_id = ?2
+FROM active_catalog_callable_value_facts AS fact
+WHERE fact.manifest_digest = ?1 AND fact.shard_id = ?2
   AND fact.family = 'callback-invocations' AND fact.callable = ?3
   AND fact.callback_location_json = ?4
   AND fact.callback_parameters = ?5 AND fact.callback_results = ?6
@@ -1109,10 +1140,8 @@ LIMIT ?7";
 pub const CALLABLE_VALUES_COVERAGE_SQL: &str = "SELECT coverage.coverage_ordinal,
        coverage.family, coverage.status, coverage.limitations_json,
        coverage.provenance_json
-FROM catalog_callable_value_coverage AS coverage
-JOIN catalog_packs AS pack ON pack.manifest_digest = coverage.manifest_digest
-WHERE pack.state = 'verified'
-  AND coverage.manifest_digest = ?1 AND coverage.shard_id = ?2
+FROM active_catalog_callable_value_coverage AS coverage
+WHERE coverage.manifest_digest = ?1 AND coverage.shard_id = ?2
   AND coverage.family = ?3 AND coverage.callable = ?4
 ORDER BY coverage.coverage_ordinal
 LIMIT ?5";
@@ -1122,16 +1151,15 @@ pub const ANONYMOUS_CALLABLE_IDENTITY_SQL: &str = "SELECT identity.artifact_sha2
        identity.package_import_path, identity.anchor_file, identity.anchor_start,
        identity.anchor_end, identity.signature_file, identity.signature_start,
        identity.signature_end
-FROM catalog_anonymous_callable_identities AS identity
-JOIN catalog_packs AS pack ON pack.manifest_digest = identity.manifest_digest
-WHERE pack.state = 'verified' AND identity.manifest_digest = ?1
+FROM active_catalog_anonymous_callable_identities AS identity
+WHERE identity.manifest_digest = ?1
   AND identity.shard_id = ?2 AND identity.callable_id = ?3";
 
 #[doc(hidden)]
 pub const ANONYMOUS_CALLABLE_IDENTITY_ANCHORS_SQL: &str = "SELECT 'anchor' AS row_kind,
        chain_kind AS subkind, ordinal, file, byte_start, byte_end,
        declaration_kind, NULL AS variadic, NULL AS arity
-FROM catalog_anonymous_callable_identity_anchors
+FROM active_catalog_anonymous_callable_identity_anchors
 WHERE manifest_digest = ?1 AND shard_id = ?2 AND callable_id = ?3
 ORDER BY chain_kind, ordinal
 LIMIT ?4";
@@ -1140,7 +1168,7 @@ LIMIT ?4";
 pub const ANONYMOUS_CALLABLE_IDENTITY_SHAPES_SQL: &str = "SELECT 'shape' AS row_kind,
        shape_kind AS subkind, ordinal, file, byte_start, byte_end,
        NULL AS declaration_kind, variadic, arity
-FROM catalog_anonymous_callable_signature_shapes
+FROM active_catalog_anonymous_callable_signature_shapes
 WHERE manifest_digest = ?1 AND shard_id = ?2 AND callable_id = ?3
 ORDER BY shape_kind, ordinal
 LIMIT ?4";
@@ -1174,9 +1202,18 @@ pub struct SemanticPackCatalogCacheIdentity {
     pub sqlite_data_version: u64,
 }
 
+/// Nonfatal install note: a summary dependency is not defined in its shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSummaryCallee {
+    pub shard_id: String,
+    pub summary_id: String,
+    pub callee_id: String,
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct ValidatedShard {
+    pub diagnostics: Vec<UnresolvedSummaryCallee>,
     #[doc(hidden)]
     pub descriptor: CompiledShardDescriptor,
     #[doc(hidden)]
@@ -1184,7 +1221,8 @@ pub struct ValidatedShard {
     #[doc(hidden)]
     pub selectors: Vec<ActivationSelector>,
     #[doc(hidden)]
-    pub callable_values: Option<CallableValuesPayload>,
+    /// Decoded facts live through publication, never in the session registry.
+    pub decoded: CompiledShard,
 }
 
 #[doc(hidden)]
@@ -1222,24 +1260,41 @@ pub struct SessionPack {
     #[doc(hidden)]
     pub manifest: Arc<CompiledPackManifest>,
     #[doc(hidden)]
-    pub shards: Vec<ValidatedShard>,
+    pub shards: Vec<SessionShard>,
     #[doc(hidden)]
     pub source: SessionPackSource,
 }
 
+/// Session activation keeps compiled bytes and selectors, not decoded facts.
+#[derive(Clone)]
 #[doc(hidden)]
-pub struct SessionCallableValuesCatalog {
+pub struct SessionShard {
+    #[doc(hidden)]
+    pub descriptor: CompiledShardDescriptor,
+    #[doc(hidden)]
+    pub bytes: Vec<u8>,
+    #[doc(hidden)]
+    pub selectors: Vec<ActivationSelector>,
+}
+
+#[doc(hidden)]
+pub struct SessionSemanticCatalog {
     // Field order closes the SQLite connection before TempDir removes its
     // database and any SQLite sidecars on Windows.
     #[doc(hidden)]
     pub connection: Connection,
+    /// The canonical database path. Readers attach it to connections opened
+    /// with SQLITE_OPEN_NOFOLLOW, which rejects a symlink anywhere in the
+    /// path; macOS temp directories live under /var -> /private/var (#4604).
+    #[doc(hidden)]
+    pub path: PathBuf,
     _root: TempDir,
 }
 
 #[doc(hidden)]
 pub enum CallableValuesQueryConnection<'a> {
     Durable(std::sync::MutexGuard<'a, Connection>),
-    Session(std::sync::MutexGuard<'a, Option<SessionCallableValuesCatalog>>),
+    Session(std::sync::MutexGuard<'a, Option<SessionSemanticCatalog>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1421,7 +1476,6 @@ pub fn validate_pack(
         .map_err(|error| CatalogError::Artifact(error.to_string()))?;
 
     let mut shards = Vec::with_capacity(pack.shards.len());
-    let mut python_shards = Vec::new();
     let mut matched = HashSet::with_capacity(pack.shards.len());
     for descriptor in &manifest.shards {
         let mut artifacts = pack
@@ -1444,21 +1498,45 @@ pub fn validate_pack(
             decode_validated_shard_for_manifest(&manifest, descriptor, &artifact.bytes, limits)
                 .map_err(|error| CatalogError::Artifact(error.to_string()))?;
         let selectors = decoded.activation.clone();
-        let callable_values = decoded.callable_values.clone();
-        if manifest.language == "python" {
-            python_shards.push(decoded);
+        let mut diagnostics = Vec::new();
+        if let Some(summaries) = decoded.payload().procedure_summaries() {
+            use crate::analyzer::semantic_model::CompiledSummaryEffect;
+            let defined = summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<HashSet<_>>();
+            for summary in summaries {
+                for effect in &summary.effects {
+                    let callees: &[String] = match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => std::slice::from_ref(callee),
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => candidates,
+                        _ => &[],
+                    };
+                    for callee in callees
+                        .iter()
+                        .filter(|callee| !defined.contains(callee.as_str()))
+                    {
+                        diagnostics.push(UnresolvedSummaryCallee {
+                            shard_id: descriptor.shard_id.as_str().to_owned(),
+                            summary_id: summary.id.clone(),
+                            callee_id: callee.clone(),
+                        });
+                    }
+                }
+            }
         }
         shards.push(ValidatedShard {
+            diagnostics,
             descriptor: descriptor.clone(),
             bytes: artifact.bytes.clone(),
             selectors,
-            callable_values,
+            decoded,
         });
     }
     if manifest.language == "python" {
         let authored = crate::analyzer::semantic_model::artifact::authored_pack_from_decoded_shards(
             &manifest,
-            &python_shards,
+            shards.iter().map(|shard| &shard.decoded),
         );
         let diagnostics =
             crate::analyzer::semantic_model::validate::validate_csmi_profile_evidence(&authored);
@@ -1781,16 +1859,34 @@ pub fn insert_manifest(
             |row| row.get(0),
         )
         .map_err(|error| CatalogError::sqlite("check existing pack manifest", error))?;
+    let extraction_kind = manifest
+        .extraction
+        .as_ref()
+        .map(|extraction| serde_json::to_value(extraction.kind))
+        .transpose()
+        .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+    let extraction_input_kind =
+        manifest
+            .extraction
+            .as_ref()
+            .map(|extraction| match extraction.inputs {
+                crate::analyzer::semantic_model::ArtifactExtractionInputs::Single { .. } => {
+                    "single"
+                }
+                crate::analyzer::semantic_model::ArtifactExtractionInputs::SourceSet { .. } => {
+                    "source_set"
+                }
+            });
     transaction
         .execute(
             "INSERT INTO catalog_packs(
                manifest_digest, semantic_digest, manifest_bytes, schema_version,
                pack_id, pack_version, producer_name, producer_version,
                language, ecosystem, bifrost_compatibility, provenance_json,
-               license, completeness, state, installed_at, verified_at
+               license, completeness, state, installed_at, verified_at, extraction_kind, extraction_input_kind, extraction_digest
              ) VALUES(
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-               ?14, 'verified', ?15, ?15
+               ?14, 'verified', ?15, ?15, ?16, ?17, ?18
              )
              ON CONFLICT(manifest_digest) DO UPDATE SET
                semantic_digest = excluded.semantic_digest,
@@ -1807,7 +1903,10 @@ pub fn insert_manifest(
                license = excluded.license,
                completeness = excluded.completeness,
                state = 'verified',
-               verified_at = excluded.verified_at",
+               verified_at = excluded.verified_at,
+               extraction_kind = excluded.extraction_kind,
+               extraction_input_kind = excluded.extraction_input_kind,
+               extraction_digest = excluded.extraction_digest",
             params![
                 &manifest.content_sha256,
                 &manifest.semantic_sha256,
@@ -1824,7 +1923,10 @@ pub fn insert_manifest(
                     .map_err(|error| CatalogError::Integrity(error.to_string()))?,
                 &manifest.license,
                 manifest.completeness.label(),
-                now
+                now,
+                extraction_kind.as_ref().and_then(|kind| kind.as_str()),
+                extraction_input_kind,
+                manifest.extraction.as_ref().map(|extraction| extraction.digest()),
             ],
         )
         .map_err(|error| CatalogError::sqlite("insert pack manifest", error))?;
@@ -2234,16 +2336,6 @@ pub fn publish_callable_value_rows(
     shard_id: &str,
     payload: Option<&CallableValuesPayload>,
 ) -> Result<(), CatalogError> {
-    // The publication is shared by all source IDs for this manifest/shard.
-    // Replace its marker with the rows in the same transaction so registering
-    // another source cannot leave a stale marker or duplicate the publication.
-    transaction
-        .execute(
-            "DELETE FROM catalog_callable_values_indexed_shards
-             WHERE manifest_digest = ?1 AND shard_id = ?2",
-            params![manifest_digest, shard_id],
-        )
-        .map_err(|error| CatalogError::sqlite("replace callable-value shard marker", error))?;
     transaction
         .execute(
             "DELETE FROM catalog_callable_value_facts
@@ -2471,14 +2563,6 @@ pub fn publish_callable_value_rows(
         }
     }
 
-    transaction
-        .execute(
-            "INSERT INTO catalog_callable_values_indexed_shards(
-               manifest_digest, shard_id, index_version
-             ) VALUES(?1, ?2, 1)",
-            params![manifest_digest, shard_id],
-        )
-        .map_err(|error| CatalogError::sqlite("publish callable-value shard marker", error))?;
     Ok(())
 }
 
@@ -2575,15 +2659,24 @@ pub fn callable_values_sql_limit(value: usize) -> i64 {
 }
 
 #[doc(hidden)]
-pub fn open_session_callable_values_catalog() -> Result<SessionCallableValuesCatalog, CatalogError>
-{
+pub fn open_session_semantic_catalog() -> Result<SessionSemanticCatalog, CatalogError> {
+    open_session_semantic_catalog_in(&std::env::temp_dir())
+}
+
+#[doc(hidden)]
+pub fn open_session_semantic_catalog_in(
+    parent: &Path,
+) -> Result<SessionSemanticCatalog, CatalogError> {
     let root = tempfile::Builder::new()
         .prefix("bifrost-session-callable-values-")
-        .tempdir()
+        .tempdir_in(parent)
         .map_err(|error| CatalogError::io("create session callable-values root", error))?;
-    let path = root.path().join("session-callable-values.sqlite");
+    let path = std::fs::canonicalize(root.path())
+        .map_err(|error| CatalogError::io("canonicalize session callable-values root", error))?
+        .join("session-callable-values.sqlite");
     let mut connection = Connection::open(&path)
         .map_err(|error| CatalogError::sqlite("open session callable-values database", error))?;
+    brokk_bifrost_core::cache_db::sql_profile::install_catalog_session(&connection);
     connection.set_transaction_behavior(TransactionBehavior::Immediate);
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -2598,13 +2691,13 @@ pub fn open_session_callable_values_catalog() -> Result<SessionCallableValuesCat
     connection
         .pragma_update(None, "cache_size", -8192_i64)
         .map_err(|error| CatalogError::sqlite("bound session callable-values page cache", error))?;
-    // This database is deleted with the session; rollback journaling and fsync only add disk flushes.
+    // WAL lets per-active-set attached readers coexist with session registration.
     let journal_mode: String = connection
-        .pragma_update_and_check(None, "journal_mode", "MEMORY", |row| row.get(0))
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
         .map_err(|error| {
             CatalogError::sqlite("configure session callable-values journal mode", error)
         })?;
-    assert_eq!(journal_mode.to_ascii_lowercase(), "memory");
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     connection
         .execute_batch(
             "PRAGMA synchronous = OFF;
@@ -2669,10 +2762,19 @@ pub fn open_session_callable_values_catalog() -> Result<SessionCallableValuesCat
         .execute_batch(db::CALLABLE_VALUE_ROWS_SQL)
         .map_err(|error| CatalogError::sqlite("create session callable-values rows", error))?;
     connection
+        .execute_batch(&format!(
+            "{}\n{}\n{}",
+            db::SEMANTIC_ROWS_SQL,
+            db::SEMANTIC_ROW_QUESTIONS_SQL,
+            db::SEMANTIC_PAYLOAD_FAMILIES_SQL
+        ))
+        .map_err(|error| CatalogError::sqlite("create session semantic record rows", error))?;
+    connection
         .execute_batch(db::EXACT_GO_SOURCE_ROWS_SQL)
         .map_err(|error| CatalogError::sqlite("create session exact Go source rows", error))?;
-    Ok(SessionCallableValuesCatalog {
+    Ok(SessionSemanticCatalog {
         connection,
+        path,
         _root: root,
     })
 }
@@ -3483,6 +3585,68 @@ mod lease_expiry_tests {
         assert!(
             expires_at > 1,
             "the first GC in second 1 must not expire the lease"
+        );
+    }
+}
+
+#[cfg(test)]
+mod extraction_storage_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{
+        ArtifactExtraction, ArtifactExtractionKind, AuthoredSemanticModelPack, CompilerOptions,
+        compile_pack, decode_manifest,
+    };
+
+    #[test]
+    fn extraction_claim_survives_catalog_rows_and_certified_hydration() {
+        let source = include_bytes!("../../../../tests/fixtures/extraction-contract.json");
+        let mut pack: AuthoredSemanticModelPack = serde_json::from_slice(source).unwrap();
+        pack.schema_version = 19;
+        pack.compatibility.bifrost = None;
+        pack.extraction = Some(ArtifactExtraction::single(
+            ArtifactExtractionKind::JavaClassJar,
+            &"a".repeat(64),
+        ));
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let directory = TempDir::new().unwrap();
+        // db::open uses SQLITE_OPEN_NOFOLLOW, which rejects a symlink anywhere
+        // in the path; macOS temp directories live under /var -> /private/var
+        // (#4604), and production passes canonical paths.
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let mut connection = db::open(&root, CatalogOpenMode::ReadWrite).unwrap();
+        let transaction = connection.transaction().unwrap();
+        insert_manifest(
+            &transaction,
+            &compiled.manifest,
+            &compiled.manifest_bytes,
+            1,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let row: (String, String, String, Vec<u8>) = connection.query_row(
+            "SELECT extraction_kind, extraction_input_kind, extraction_digest, manifest_bytes FROM catalog_packs",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(
+            (&*row.0, &*row.1, &*row.2),
+            ("java_class_jar", "single", &*"a".repeat(64))
+        );
+        let manifest = decode_manifest(&row.3, &DecodeLimits::default()).unwrap();
+        let shard = crate::analyzer::semantic_model::artifact::hydrate_certified_shard(
+            &manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(manifest.extraction, pack.extraction);
+        assert_eq!(shard.extraction, pack.extraction);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
         );
     }
 }

@@ -118,7 +118,9 @@ int run(bool a, bool b, bool c, bool d, bool e, bool f, bool g, bool h, bool i, 
             .filter_map(|fact| fact.variable.as_deref())
             .any(|name| name == "i")
     );
-    assert!(rows.switches.iter().any(|fact| fact.missing_enum_case));
+    // A global enumerator is not a parameter or local operand declaration.
+    assert_eq!(rows.switches.len(), 1);
+    assert!(!rows.switches[0].missing_enum_case);
     assert_eq!(rows.switch_cases.len(), 2);
     assert_eq!(rows.enums.len(), 1);
     assert_eq!(rows.enumerators.len(), 3);
@@ -133,7 +135,7 @@ int run(bool a, bool b, bool c, bool d, bool e, bool f, bool g, bool h, bool i, 
     assert!(
         rows.statements
             .iter()
-            .any(|fact| fact.kind == StatementFactKind::MissingCaseInSwitch)
+            .all(|fact| fact.kind != StatementFactKind::MissingCaseInSwitch)
     );
 }
 

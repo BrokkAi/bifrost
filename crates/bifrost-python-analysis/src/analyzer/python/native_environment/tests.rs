@@ -1,7 +1,11 @@
 use super::*;
 use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
-use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryObservation;
+use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
+    PythonSummaryAuthority, PythonSummaryObservation,
+};
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
 use brokk_bifrost_core::analyzer::project::{OverlayProject, TestProject};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -15,27 +19,21 @@ fn profile() -> PythonSummaryProfile {
         python_version: None,
     }
 }
-fn stage(environment: &PythonNativeEnvironment, fixture: &BuiltInlineTestProject, revision: i64) {
-    environment.begin(revision).unwrap();
-    let project = fixture.project_dyn();
-    for file in project.analyzable_files(Language::Python).unwrap() {
-        let source = project.read_source(&file).unwrap();
-        environment
-            .stage_source(project.clone(), &file, &source, revision)
-            .unwrap();
+fn workspace_profile() -> PythonSummaryProfile {
+    PythonSummaryProfile {
+        authority: PythonSummaryAuthority::Workspace,
+        roots: Vec::new(),
+        ordered: false,
+        ..profile()
     }
 }
-fn build(
-    environment: &PythonNativeEnvironment,
-    fixture: &BuiltInlineTestProject,
-    revision: i64,
-) -> String {
-    stage(environment, fixture, revision);
+fn build(environment: &PythonNativeEnvironment, fixture: &BuiltInlineTestProject) -> (i64, String) {
+    let revision = environment.publish_project(fixture.project_dyn()).unwrap();
     let receipt = environment
         .reconcile(revision, &CancellationToken::default())
         .unwrap();
     assert!(receipt.failed.is_empty(), "{receipt:?}");
-    environment.render(revision).unwrap()
+    (revision, environment.render(revision).unwrap())
 }
 
 #[test]
@@ -46,91 +44,124 @@ fn python_environment_profiles_reopen_withdraw_cancel_and_shuffle() {
         .file("src/user.py", "from pkg.model import Widget\n")
         .build();
     let database = fixture.root().join("environment.db");
-    let environment = PythonNativeEnvironment::open(&database, profile()).unwrap();
-    let initial = build(&environment, &fixture, 1);
+    let environment = PythonNativeEnvironment::open(&database, fixture.root(), profile()).unwrap();
+    let (first, initial) = build(&environment, &fixture);
     assert!(
         initial.contains("pkg.model | module | selected"),
         "{initial}"
     );
-    stage(&environment, &fixture, 1);
     let warm = environment
-        .reconcile(1, &CancellationToken::default())
+        .reconcile(first, &CancellationToken::default())
         .unwrap();
     assert_eq!(warm.unchanged, 1, "{warm:?}");
     let mut typing = profile();
     typing.observation = PythonSummaryObservation::Typing;
-    let other = PythonNativeEnvironment::open(&database, typing.clone()).unwrap();
-    let typing_render = build(&other, &fixture, 1);
+    let other = PythonNativeEnvironment::open(&database, fixture.root(), typing.clone()).unwrap();
+    let (typing_revision, typing_render) = build(&other, &fixture);
+    assert_eq!(typing_revision, first);
     assert!(typing_render.starts_with("authority=supplied_analysis observation=typing"));
-    assert_eq!(
-        environment.render(1).unwrap(),
-        initial,
-        "other profile cannot replace runtime"
-    );
+    assert_eq!(environment.render(first).unwrap(), initial);
     drop(other);
     drop(environment);
-    let environment = PythonNativeEnvironment::open(&database, profile()).unwrap();
+    let environment = PythonNativeEnvironment::open(&database, fixture.root(), profile()).unwrap();
     assert_eq!(
-        environment.render(1).unwrap(),
+        environment.render(first).unwrap(),
         initial,
         "reopen needs no TEMP metadata"
     );
-    // Cancellation after real input publication must preserve the old revision
-    // and clear every language staging relation; no partial summary is visible.
-    stage(&environment, &fixture, 2);
+    let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+    assert!(overlay.set(
+        fixture.root().join("src/pkg/model.py"),
+        "class Widget: pass\n# edit\n".into()
+    ));
+    let revision = environment
+        .publish_project(Arc::new(overlay.snapshot()))
+        .unwrap();
+    assert!(revision > first);
+    // Cancel while the first file is being placed, after the stream reached it.
     let cancelled = CancellationToken::default();
-    cancelled.cancel();
-    assert!(environment.reconcile(2, &cancelled).unwrap().cancelled);
-    assert_eq!(environment.render(1).unwrap(), initial);
-    environment.publication.store.conn.execute(|conn| {
-        let rows: i64 = conn
-            .query_row("SELECT count(*) FROM temp.py_env_files", [], |row| {
-                row.get(0)
-            })
+    let cancel_at_root = cancelled.clone();
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reached_root = reached.clone();
+    let root = python_environment_root(fixture.root().to_owned());
+    let mut snapshot = environment.publication.snapshot.clone();
+    snapshot.revision = revision;
+    let receipt = environment
+        .publication
+        .store
+        .reconcile_python_environment(
+            &snapshot,
+            workspace_profile(),
+            move |path, inputs| {
+                reached_root.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancel_at_root.cancel();
+                root(path, inputs)
+            },
+            &cancelled,
+        )
+        .unwrap();
+    assert!(receipt.cancelled, "{receipt:?}");
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "selected file placement ran"
+    );
+    assert_eq!(environment.render(first).unwrap(), initial);
+    environment.publication.store.conn.execute(move |conn| {
+        let staged: i64 = conn
+            .query_row("SELECT count(*) FROM temp.py_env_files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(staged, 0);
+        let published: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM resolution_unit_summary_versions WHERE valid_from=?1",
+                [revision],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            published, 0,
+            "cancellation must not publish a partial summary"
+        );
     });
-    build(&environment, &fixture, 2);
-    environment.begin(3).unwrap();
+    let edited = environment
+        .reconcile(revision, &CancellationToken::default())
+        .unwrap();
+    assert_eq!(edited.derived, 1, "{edited:?}");
+    let empty = environment
+        .publish_sources(fixture.project_dyn(), &BTreeSet::new())
+        .unwrap();
     let withdrawal = environment
-        .reconcile(3, &CancellationToken::default())
+        .reconcile(empty, &CancellationToken::default())
         .unwrap();
     assert!(withdrawal.failed.is_empty(), "{withdrawal:?}");
     assert_eq!(
-        environment.render(3).unwrap(),
+        environment.render(empty).unwrap(),
         "no live Python environment\n"
     );
-    assert_eq!(environment.render(1).unwrap(), initial);
-    let other = PythonNativeEnvironment::open(&database, typing).unwrap();
+    assert_eq!(environment.render(first).unwrap(), initial);
+    let other = PythonNativeEnvironment::open(&database, fixture.root(), typing).unwrap();
     assert_eq!(
-        other.render(1).unwrap(),
+        other.render(first).unwrap(),
         typing_render,
         "withdrawal is profile-local"
     );
-
-    let shuffled =
-        PythonNativeEnvironment::open(&fixture.root().join("shuffled.db"), profile()).unwrap();
-    shuffled.begin(1).unwrap();
-    let project = fixture.project_dyn();
-    for file in project
-        .analyzable_files(Language::Python)
-        .unwrap()
-        .into_iter()
-        .rev()
-    {
-        let source = project.read_source(&file).unwrap();
-        shuffled
-            .stage_source(project.clone(), &file, &source, 1)
-            .unwrap();
-    }
-    let receipt = shuffled
-        .reconcile(1, &CancellationToken::default())
-        .unwrap();
-    assert!(receipt.failed.is_empty(), "{receipt:?}");
+    let shuffled = PythonNativeEnvironment::open(
+        &fixture.root().join("shuffled.db"),
+        fixture.root(),
+        profile(),
+    )
+    .unwrap();
+    let (shuffled_revision, shuffled_render) = build(&shuffled, &fixture);
     assert_eq!(
-        shuffled.render(1).unwrap(),
-        initial,
-        "allocation/enumeration order must not select providers"
+        shuffled_render, initial,
+        "allocation order must not select providers"
+    );
+    assert_eq!(
+        shuffled
+            .reconcile(shuffled_revision, &CancellationToken::default())
+            .unwrap()
+            .unchanged,
+        1
     );
 }
 
@@ -144,67 +175,49 @@ fn python_environment_snapshot_root_and_marker_edits_match_fresh() {
         .file("source/pkg/model.py", "class Widget: pass\n")
         .file("source/app.py", "from pkg.model import Widget\n")
         .build();
-    let workspace = PythonSummaryProfile {
-        authority: PythonSummaryAuthority::Workspace,
-        roots: Vec::new(),
-        ordered: false,
-        ..profile()
-    };
-    let environment =
-        PythonNativeEnvironment::open(&fixture.root().join("edits.db"), workspace.clone()).unwrap();
-    let first = build(&environment, &fixture, 1);
-    assert!(first.contains("pkg.model | module | selected"), "{first}");
+    let environment = PythonNativeEnvironment::open(
+        &fixture.root().join("edits.db"),
+        fixture.root(),
+        workspace_profile(),
+    )
+    .unwrap();
+    let first = environment.publish_project(fixture.project_dyn()).unwrap();
+    // Publish B before deriving A: A's roots must still read its own exact bytes.
     let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
     assert!(overlay.set(
         fixture.root().join("pyproject.toml"),
         "[tool.setuptools.packages.find]\nwhere = ['.']\n".into()
     ));
     let selected: Arc<dyn Project> = Arc::new(overlay.snapshot());
-    for (revision, project) in [(2, selected.clone()), (3, fixture.project_dyn())] {
-        environment.begin(revision).unwrap();
-        for file in project.analyzable_files(Language::Python).unwrap() {
-            environment
-                .stage_source(
-                    project.clone(),
-                    &file,
-                    &project.read_source(&file).unwrap(),
-                    revision,
-                )
-                .unwrap();
-        }
-        let receipt = environment
-            .reconcile(revision, &CancellationToken::default())
-            .unwrap();
-        assert!(receipt.failed.is_empty(), "{receipt:?}");
+    let second = environment.publish_project(selected.clone()).unwrap();
+    assert!(second > first);
+    // Make every source/configuration read fail on disk. Reconcile has no Project.
+    for path in ["pyproject.toml", "source/pkg/model.py", "source/app.py"] {
+        std::fs::remove_file(fixture.root().join(path)).unwrap();
     }
-    assert_eq!(environment.render(1).unwrap(), first);
-    assert_eq!(environment.render(3).unwrap(), first);
+    let derived = environment
+        .reconcile(first, &CancellationToken::default())
+        .unwrap();
+    assert_eq!(derived.derived, 1, "nonempty SQL-only derive: {derived:?}");
+    let initial = environment.render(first).unwrap();
+    assert!(
+        initial.contains("pkg.model | module | selected"),
+        "{initial}"
+    );
+    let warm = environment
+        .reconcile(first, &CancellationToken::default())
+        .unwrap();
+    assert_eq!(warm.unchanged, 1, "nonempty SQL-only reuse: {warm:?}");
     assert!(
         environment
-            .render(2)
-            .unwrap()
-            .contains("source.pkg.model | module")
-    );
-    let fresh = PythonNativeEnvironment::open(&fixture.root().join("fresh.db"), workspace).unwrap();
-    fresh.begin(2).unwrap();
-    for file in selected.analyzable_files(Language::Python).unwrap() {
-        fresh
-            .stage_source(
-                selected.clone(),
-                &file,
-                &selected.read_source(&file).unwrap(),
-                2,
-            )
-            .unwrap();
-    }
-    assert!(
-        fresh
-            .reconcile(2, &CancellationToken::default())
+            .reconcile(second, &CancellationToken::default())
             .unwrap()
             .failed
             .is_empty()
     );
-    assert_eq!(fresh.render(2).unwrap(), environment.render(2).unwrap());
+    let changed = environment.render(second).unwrap();
+    assert!(changed.contains("source.pkg.model | module"), "{changed}");
+    assert_eq!(environment.render(first).unwrap(), initial);
 }
 
 #[test]
@@ -213,15 +226,13 @@ fn python_environment_setup_root_and_marker_lifecycle() {
         .file("setup.py", "from setuptools import setup as configure\nconfigure(packages=['pkg'], package_dir={'': 'source'})\n")
         .file("source/pkg/model.py", "x = 1\n")
         .build();
-    let selected = PythonSummaryProfile {
-        authority: PythonSummaryAuthority::Workspace,
-        roots: Vec::new(),
-        ordered: false,
-        ..profile()
-    };
-    let environment =
-        PythonNativeEnvironment::open(&fixture.root().join("markers.db"), selected).unwrap();
-    let initial = build(&environment, &fixture, 1);
+    let environment = PythonNativeEnvironment::open(
+        &fixture.root().join("markers.db"),
+        fixture.root(),
+        workspace_profile(),
+    )
+    .unwrap();
+    let (first, initial) = build(&environment, &fixture);
     assert!(
         initial.contains("pkg.model | module | selected"),
         "{initial}"
@@ -233,29 +244,37 @@ fn python_environment_setup_root_and_marker_lifecycle() {
         "x = 2\n".into()
     ));
     let project: Arc<dyn Project> = Arc::new(overlay.snapshot());
-    environment.begin(2).unwrap();
-    for file in project.analyzable_files(Language::Python).unwrap() {
+    let second = environment.publish_project(project.clone()).unwrap();
+    assert!(
         environment
-            .stage_source(
-                project.clone(),
-                &file,
-                &project.read_source(&file).unwrap(),
-                2,
-            )
-            .unwrap();
-    }
-    let receipt = environment
-        .reconcile(2, &CancellationToken::default())
-        .unwrap();
-    assert!(receipt.failed.is_empty(), "{receipt:?}");
-    let marked = environment.render(2).unwrap();
+            .reconcile(second, &CancellationToken::default())
+            .unwrap()
+            .failed
+            .is_empty()
+    );
+    let marked = environment.render(second).unwrap();
     assert!(marked.contains("pkg | package | selected"), "{marked}");
     assert!(marked.contains("pkg | namespace | shadowed"), "{marked}");
-    assert_eq!(environment.render(1).unwrap(), initial);
+    assert_eq!(environment.render(first).unwrap(), initial);
+    let fresh = PythonNativeEnvironment::open(
+        &fixture.root().join("fresh.db"),
+        fixture.root(),
+        workspace_profile(),
+    )
+    .unwrap();
+    let fresh_revision = fresh.publish_project(project).unwrap();
+    assert!(
+        fresh
+            .reconcile(fresh_revision, &CancellationToken::default())
+            .unwrap()
+            .failed
+            .is_empty()
+    );
+    assert_eq!(fresh.render(fresh_revision).unwrap(), marked);
     assert_eq!(
-        build(&environment, &fixture, 3),
+        build(&environment, &fixture).1,
         initial,
-        "removed marker must restore the namespace"
+        "removed marker restores namespace"
     );
 }
 
@@ -264,32 +283,73 @@ fn python_environment_failed_publication_rolls_back() {
     let fixture = InlineTestProject::with_language(Language::Python)
         .file("src/a.py", "x = 1\n")
         .build();
-    let environment =
-        PythonNativeEnvironment::open(&fixture.root().join("failure.db"), profile()).unwrap();
-    stage(&environment, &fixture, 1);
+    let environment = PythonNativeEnvironment::open(
+        &fixture.root().join("failure.db"),
+        fixture.root(),
+        profile(),
+    )
+    .unwrap();
+    let revision = environment.publish_project(fixture.project_dyn()).unwrap();
     environment.publication.store.conn.execute(|conn| conn.execute_batch("CREATE TRIGGER refuse_python_summary BEFORE INSERT ON python_unit_summary_roots BEGIN SELECT RAISE(ABORT,'injected summary publication failure'); END;")).unwrap();
     assert!(
         environment
-            .reconcile(1, &CancellationToken::default())
+            .reconcile(revision, &CancellationToken::default())
             .is_err()
     );
     assert_eq!(
-        environment.render(1).unwrap(),
+        environment.render(revision).unwrap(),
         "no live Python environment\n"
     );
-    environment.publication.store.conn.execute(|conn| {
+    environment.publication.store.conn.execute(move |conn| {
         let summaries: i64 = conn
             .query_row(
                 "SELECT count(*) FROM resolution_unit_summaries WHERE lang='python'",
                 [],
-                |row| row.get(0),
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(summaries, 0);
         conn.execute_batch("DROP TRIGGER refuse_python_summary")
             .unwrap();
     });
-    assert!(build(&environment, &fixture, 1).contains("a | module | selected"));
+    assert!(
+        build(&environment, &fixture)
+            .1
+            .contains("a | module | selected")
+    );
+}
+
+#[test]
+fn python_environment_selected_configuration_requires_retained_bytes() {
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pyproject.toml",
+            "[tool.setuptools.packages.find]\nwhere = ['src']\n",
+        )
+        .file("src/a.py", "x = 1\n")
+        .build();
+    let environment = PythonNativeEnvironment::open(
+        &fixture.root().join("missing.db"),
+        fixture.root(),
+        workspace_profile(),
+    )
+    .unwrap();
+    let revision = environment.publish_project(fixture.project_dyn()).unwrap();
+    environment
+        .publication
+        .store
+        .conn
+        .execute(|conn| conn.execute("DELETE FROM workspace_input_sources", []))
+        .unwrap();
+    let error = environment
+        .reconcile(revision, &CancellationToken::default())
+        .unwrap_err();
+    assert!(error.is_missing_required_source_facts(), "{error}");
+    assert!(error.to_string().contains("pyproject.toml"), "{error}");
+    assert_eq!(
+        environment.render(revision).unwrap(),
+        "no live Python environment\n"
+    );
 }
 
 #[test]
@@ -302,29 +362,23 @@ fn python_environment_concurrent_profiles_are_independent() {
     let database = fixture.root().join("concurrent.db");
     std::thread::scope(|scope| {
         let runtime = scope.spawn(|| {
-            let environment = PythonNativeEnvironment::open(&database, profile()).unwrap();
-            build(&environment, &fixture, 1)
+            let environment =
+                PythonNativeEnvironment::open(&database, fixture.root(), profile()).unwrap();
+            build(&environment, &fixture).1
         });
         let typing = scope.spawn(|| {
             let mut selected = profile();
             selected.observation = PythonSummaryObservation::Typing;
-            let environment = PythonNativeEnvironment::open(&database, selected).unwrap();
-            build(&environment, &fixture, 1)
+            let environment =
+                PythonNativeEnvironment::open(&database, fixture.root(), selected).unwrap();
+            build(&environment, &fixture).1
         });
         assert!(runtime.join().unwrap().contains("observation=runtime"));
         assert!(typing.join().unwrap().contains("observation=typing"));
     });
-    assert!(
-        PythonNativeEnvironment::open(&database, profile())
-            .unwrap()
-            .render(1)
-            .unwrap()
-            .contains("observation=runtime")
-    );
 }
 
-/// A receipt, deliberately not a timing gate. Inputs are supplied by the lane
-/// runner so ordinary tests never scan a checkout or discover an interpreter.
+/// A receipt, deliberately not a timing gate. Never scans a checkout by default.
 #[test]
 #[ignore = "requires BIFROST_PYTHON_ENV_ROOT and BIFROST_PYTHON_ENV_FILES"]
 fn measure_python_environment_reconcile() {
@@ -338,37 +392,39 @@ fn measure_python_environment_reconcile() {
     let mut selected = profile();
     selected.roots = vec![PathBuf::new()];
     let environment =
-        PythonNativeEnvironment::open(&directory.path().join("corpus.db"), selected).unwrap();
-    let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Python));
-    let first = manifest.lines().next().expect("nonempty corpus");
-    for revision in [1, 2] {
-        environment.begin(revision).unwrap();
+        PythonNativeEnvironment::open_scoped(&directory.path().join("corpus.db"), &root, selected)
+            .unwrap();
+    let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Python));
+    let files: BTreeSet<_> = manifest
+        .lines()
+        .map(|relative| ProjectFile::new(&root, relative))
+        .collect();
+    let first = files.first().expect("nonempty corpus");
+    let overlay = Arc::new(OverlayProject::new(base.clone()));
+    assert!(overlay.set(
+        first.abs_path(),
+        format!(
+            "{}\n# native environment receipt edit\n",
+            base.read_source(first).unwrap()
+        )
+    ));
+    for project in [base, Arc::new(overlay.snapshot()) as Arc<dyn Project>] {
         let started = Instant::now();
-        let mut files = 0;
-        for relative in manifest.lines() {
-            let file = ProjectFile::new(&root, relative);
-            let mut source = project.read_source(&file).unwrap();
-            if revision == 2 && relative == first {
-                source.push_str("\n# native environment receipt edit\n");
-            }
-            environment
-                .stage_source(project.clone(), &file, &source, revision)
-                .unwrap();
-            files += 1;
-        }
-        let staging = started.elapsed();
+        let revision = environment.publish_sources(project, &files).unwrap();
+        let publication = started.elapsed();
         let receipt = environment
             .reconcile(revision, &CancellationToken::default())
             .unwrap();
         assert!(receipt.failed.is_empty(), "{receipt:?}");
         println!(
-            "PYTHON_ENV_RECEIPT root={} files={files} revision={revision} input_seconds={} reconcile={receipt:?}",
+            "PYTHON_ENV_RECEIPT root={} files={} revision={revision} input_seconds={} reconcile={receipt:?}",
             root.display(),
-            staging.as_secs_f64()
+            files.len(),
+            publication.as_secs_f64()
         );
         assert!(
             receipt.statements > 0,
-            "measurement must count actual SQL statements"
+            "actual SQL statements must be counted"
         );
     }
 }
@@ -387,6 +443,7 @@ fn module_rebindings_retained_temporal_selection() {
     let database = fixture.root().join("bindings.db");
     let environment = PythonNativeEnvironment::open(
         &database,
+        fixture.root(),
         PythonSummaryProfile {
             authority: PythonSummaryAuthority::SuppliedAnalysis,
             observation: PythonSummaryObservation::Runtime,
@@ -397,33 +454,22 @@ fn module_rebindings_retained_temporal_selection() {
         },
     )
     .unwrap();
-    environment.begin(1).unwrap();
-    let project = fixture.project_dyn();
-    for file in project.analyzable_files(Language::Python).unwrap() {
-        environment
-            .stage_source(
-                project.clone(),
-                &file,
-                &project.read_source(&file).unwrap(),
-                1,
-            )
-            .unwrap();
-    }
+    let revision = environment.publish_project(fixture.project_dyn()).unwrap();
     let receipt = environment
-        .reconcile(1, &CancellationToken::default())
+        .reconcile(revision, &CancellationToken::default())
         .unwrap();
     assert!(receipt.failed.is_empty(), "{receipt:?}");
     let rhs = source.find("decorate(convert)").unwrap() + "decorate(".len();
     let after = source.find("convert(1)").unwrap();
     let final_read = source.rfind("convert").unwrap();
     let rhs_trace = environment
-        .temporal_binding_trace(1, "src/timeline.py", rhs, "convert")
+        .temporal_binding_trace(revision, "src/timeline.py", rhs, "convert")
         .unwrap();
     let after_trace = environment
-        .temporal_binding_trace(1, "src/timeline.py", after, "convert")
+        .temporal_binding_trace(revision, "src/timeline.py", after, "convert")
         .unwrap();
     let final_trace = environment
-        .temporal_binding_trace(1, "src/timeline.py", final_read, "convert")
+        .temporal_binding_trace(revision, "src/timeline.py", final_read, "convert")
         .unwrap();
     let function = format!("Function@{}:", source.find("def convert").unwrap());
     let assignment = format!("Assign@{}:", source.find("convert = decorate").unwrap());
@@ -446,5 +492,90 @@ fn module_rebindings_retained_temporal_selection() {
     assert!(
         !final_trace.contains(&assignment),
         "exhaustive arms: {final_trace}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#6108: cold bulk publication skipped Python native binding rows"
+)]
+fn python_trial_cold_index_publishes_scoped_blobs() {
+    const CHILD: &str = "BIFROST_PYTHON_COLD_INDEX_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for trial in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "analyzer::python::native_environment::tests::python_trial_cold_index_publishes_scoped_blobs",
+                "--nocapture",
+            ]).env(CHILD, "1").env_remove("BIFROST_TRIAL_NATIVE_PYTHON");
+            if trial {
+                // Presence, including an empty value, selects the trial.
+                command.env("BIFROST_TRIAL_NATIVE_PYTHON", "");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "trial={trial}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "the selected child test must run: trial={trial}: {output:?}",
+            );
+        }
+        return;
+    }
+    use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
+    // The project is authored inline: this crate is open core, and the root
+    // `tests/` tree is private and absent from the projected public workspace.
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/__init__.py",
+            "from .model import Widget\n__all__ = [\"Widget\"]\n",
+        )
+        .file("pkg/model.py", "class Widget: pass\nx = 1\n")
+        .file(
+            "api.py",
+            "from pkg import model\nfrom pkg.model import Widget\nimport absent.provider as unknown\n",
+        )
+        .file("reexport.py", "from pkg import *\n")
+        .build();
+    let project = fixture.project_dyn();
+    let expected = project.analyzable_files(Language::Python).unwrap().len();
+    assert!(
+        expected > 1,
+        "the cold index must visit multiple Python files"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("cold.db");
+    let store = AnalyzerStore::open_persistent(&database).unwrap();
+    let context = store_context_from_store(project.as_ref(), store, false);
+    let store = context.store.clone();
+    let _analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+        project,
+        PythonAdapter::default(),
+        Default::default(),
+        context,
+        None,
+    )
+    .unwrap();
+    let sql = store.read_conn().unwrap();
+    let indexed: usize = sql
+        .query_row(
+            "SELECT count(*) FROM blobs WHERE lang='python'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed, expected, "prove the cold indexing path ran");
+    let published: usize = sql.query_row(
+        "SELECT count(*) FROM python_binding_source source JOIN blobs ON blobs.id=source.blob_id WHERE blobs.lang='python'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        published,
+        if super::super::trial_native_python_selected() {
+            expected
+        } else {
+            0
+        }
     );
 }

@@ -1476,7 +1476,7 @@ mod jvm_extraction_tests {
                         |row| brokk_bifrost_analysis::analyzer::resolution::fact_source::JavaInheritanceDeclaration {
                             definition: row.definition(),
                             name: String::new(),
-                            package: Some(package.to_owned()),
+                            package: brokk_bifrost_analysis::analyzer::resolution::fact_source::JvmDeclarationPackage::Known(Some(package.to_owned())),
                             kind:
                                 brokk_bifrost_analysis::analyzer::resolution::fact_source::JavaInheritanceDeclarationKind::Type {
                                     is_interface: false,

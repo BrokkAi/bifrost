@@ -48,7 +48,10 @@ use brokk_bifrost_rust::declarations::{
     rust_callable_dispatch_extensibility, rust_node_text, rust_nominal_type_path,
 };
 use brokk_bifrost_rust::format_args::{RustFormattingMacro, RustLoggingMacro, RustValueMacro};
-use brokk_bifrost_rust::lexical_scope::rust_pattern_identifier_binding_bounded;
+use brokk_bifrost_rust::lexical_scope::{
+    let_condition_visibility_end, rust_pattern_binding_identifiers,
+    rust_pattern_identifier_binding_bounded, rust_pattern_identifier_is_value_item_bounded,
+};
 use brokk_bifrost_rust::macro_matcher::ExportedMacroDefinitions;
 use brokk_bifrost_rust::ownership::{
     RustOwnershipClass, RustOwnershipIncomplete, RustOwnershipIndex, RustReferenceCoercion,
@@ -66,8 +69,6 @@ use brokk_bifrost_analysis::analyzer::declared_scalar::rust_scalar_type_from_lit
 use brokk_bifrost_analysis::analyzer::declared_scalar::rust_scalar_type_from_type;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
-
-use brokk_bifrost_analysis::analyzer::lexical_definitions::binding_excluded_child_fields;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 
@@ -131,7 +132,15 @@ use brokk_bifrost_core::hash::HashSet;
 // unchanged source must not reuse artifacts that omitted those transfers.
 // BrokkAi/tree-sitter-rust#3: grammar 0.24.7 changes inclusive prefix ranges
 // from assignments to ranges, changing effects for unchanged source.
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v48";
+// #6409: successful let conditions and shorthand fields acquire binding slots.
+// #6853: #6842 changed format_args::parse_rust_format_string, which this
+// lowerer calls: raw `{r#x}` and bare `{_}` names no longer become implicit
+// captures. A change to any brokk-bifrost-rust function this lowerer reaches
+// bumps this version. Decide by tracing calls from this file, not by module:
+// #6912 changed macro_matcher's item fragment and attribute lowering, which
+// the lowerer imports (ExportedMacroDefinitions,
+// macro_invocation_is_locally_bound) but does not reach, so it kept v51.
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v51";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 /// Bound on the reference levels peeled from a method receiver while
 /// recovering the written type the call auto-derefs through. Real receiver
@@ -1662,8 +1671,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if let Some(shape) = declared_shape {
                 self.value_shapes.insert(value, shape);
             }
-            for name in slot.names {
-                self.parameters.insert(name.into_boxed_str(), value);
+            if let Some(pattern) = node.child_by_field_name("pattern").filter(|pattern| {
+                identity_binding_identifier(*pattern).is_none() && !is_wildcard_pattern(*pattern)
+            }) {
+                let body = callable.child_by_field_name("body").unwrap_or(callable);
+                for name in rust_pattern_binding_identifiers(pattern) {
+                    if !rust_pattern_identifier_is_value_item_bounded(
+                        self.source_root,
+                        self.source,
+                        name,
+                        &mut |entries| {
+                            charge_rust_tuple_work(builder, self.session.cancellation(), entries)
+                        },
+                    )? {
+                        self.index_local_binding(
+                            builder,
+                            name,
+                            body.start_byte(),
+                            (body.start_byte(), body.end_byte()),
+                            None,
+                        )?;
+                    }
+                }
+                self.unsupported_pattern_gaps(
+                    builder,
+                    entry,
+                    pattern,
+                    node,
+                    "Rust parameter pattern payload projections are not lowered",
+                )?;
+            } else {
+                for name in slot.names {
+                    self.parameters.insert(name.into_boxed_str(), value);
+                }
             }
         }
         if let Some(receiver) = self.receiver {
@@ -2414,6 +2454,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map_or(PointerAccessWidth::Unknown, PointerAccessWidth::Exact)
     }
 
+    fn index_local_binding(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        name: Node<'tree>,
+        visible_from: usize,
+        scope: (usize, usize),
+        initializer: Option<Node<'tree>>,
+    ) -> Result<ValueId, RustLoweringError> {
+        let text = node_text(self.source, name).expect("pattern binding has source text");
+        let metadata = self.value_mapping(builder, name)?;
+        let place = self.local_binding_place(builder, metadata.source);
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        self.binding_places.insert(value, place);
+        self.binding_metadata.insert(value, metadata);
+        self.binding_nodes.insert(value, name);
+        self.binding_scopes
+            .insert(value, (visible_from, scope.0, scope.1));
+        self.locals
+            .entry(text.into())
+            .or_default()
+            .push(LocalBinding {
+                declaration_start: name.start_byte(),
+                visible_from,
+                scope_start: scope.0,
+                scope_end: scope.1,
+                value,
+                initializer,
+            });
+        Ok(value)
+    }
+
     fn emit_local_bindings(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2434,32 +2507,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             {
                 let simple_binding = identity_binding_identifier(pattern).map(|name| name.id());
                 for name in rust_pattern_binding_identifiers(pattern) {
-                    let Some(text) = node_text(self.source, name) else {
+                    if rust_pattern_identifier_is_value_item_bounded(
+                        self.source_root,
+                        self.source,
+                        name,
+                        &mut |entries| {
+                            charge_rust_tuple_work(builder, self.session.cancellation(), entries)
+                        },
+                    )? {
                         continue;
-                    };
-                    let metadata = self.value_mapping(builder, name)?;
-                    let place = self.local_binding_place(builder, metadata.source);
-                    let value = self.session.add_value_with_metadata(
+                    }
+                    let value = self.index_local_binding(
                         builder,
-                        metadata,
-                        SemanticValueKind::Local,
+                        name,
+                        node.end_byte(),
+                        (scope_start, scope_end),
+                        node.child_by_field_name("value"),
                     )?;
-                    self.binding_places.insert(value, place);
-                    self.binding_metadata.insert(value, metadata);
-                    self.binding_nodes.insert(value, name);
-                    self.binding_scopes
-                        .insert(value, (node.end_byte(), scope_start, scope_end));
-                    self.locals
-                        .entry(text.into())
-                        .or_default()
-                        .push(LocalBinding {
-                            declaration_start: name.start_byte(),
-                            visible_from: node.end_byte(),
-                            scope_start,
-                            scope_end,
-                            value,
-                            initializer: node.child_by_field_name("value"),
-                        });
                     if simple_binding == Some(name.id()) {
                         // The declared type states the shape when there is one;
                         // otherwise the initializer does. The walk is preorder, so a
@@ -2577,8 +2641,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // local per component, so `for (key, value) in map` mints two
             // (#2705); binding only the single-identifier form left both names
             // unbound and silently dropped every flow through such a loop.
-            if matches!(node.kind(), "for_expression" | "match_arm")
-                && let Some(pattern) = node.child_by_field_name("pattern")
+            if matches!(
+                node.kind(),
+                "for_expression" | "match_arm" | "let_condition"
+            ) && let Some(pattern) = node.child_by_field_name("pattern")
                 && let Some(body) = node
                     .child_by_field_name("body")
                     .or_else(|| node.child_by_field_name("value"))
@@ -2590,43 +2656,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     && node
                         .child_by_field_name("value")
                         .is_some_and(rust_iteration_element_is_definitely_non_dropping);
-                let visible_from = if node.kind() == "match_arm" {
+                let visible_from = if node.kind() == "let_condition" {
+                    node.end_byte()
+                } else if node.kind() == "match_arm" {
                     pattern.start_byte()
                 } else {
                     body.start_byte()
                 };
-                let (scope_start, scope_end) = if node.kind() == "match_arm" {
+                let (scope_start, scope_end) = if node.kind() == "let_condition" {
+                    let Some(end) = let_condition_visibility_end(node) else {
+                        return Ok(WalkControl::Continue);
+                    };
+                    (node.end_byte(), end)
+                } else if node.kind() == "match_arm" {
                     (node.start_byte(), node.end_byte())
                 } else {
                     (body.start_byte(), body.end_byte())
                 };
                 for name in rust_pattern_binding_identifiers(pattern) {
-                    let Some(text) = node_text(self.source, name) else {
+                    if rust_pattern_identifier_is_value_item_bounded(
+                        self.source_root,
+                        self.source,
+                        name,
+                        &mut |entries| {
+                            charge_rust_tuple_work(builder, self.session.cancellation(), entries)
+                        },
+                    )? {
                         continue;
-                    };
-                    let metadata = self.value_mapping(builder, name)?;
-                    let place = self.local_binding_place(builder, metadata.source);
-                    let value = self.session.add_value_with_metadata(
+                    }
+                    let value = self.index_local_binding(
                         builder,
-                        metadata,
-                        SemanticValueKind::Local,
+                        name,
+                        visible_from,
+                        (scope_start, scope_end),
+                        None,
                     )?;
-                    self.binding_places.insert(value, place);
-                    self.binding_metadata.insert(value, metadata);
-                    self.binding_nodes.insert(value, name);
-                    self.binding_scopes
-                        .insert(value, (visible_from, scope_start, scope_end));
-                    self.locals
-                        .entry(text.into())
-                        .or_default()
-                        .push(LocalBinding {
-                            declaration_start: name.start_byte(),
-                            visible_from,
-                            scope_start,
-                            scope_end,
-                            value,
-                            initializer: None,
-                        });
                     if element_is_non_dropping {
                         self.definitely_non_dropping.insert(value);
                     }
@@ -3439,36 +3503,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         target_mutable: bool,
         target_referent: Node<'tree>,
     ) -> Result<(), RustOwnershipIncomplete> {
-        if target_mutable && !mutable {
-            return Err(RustOwnershipIncomplete::UnsupportedType);
+        match self.ownership.classify_reference_parts(
+            mutable,
+            referent,
+            target_mutable,
+            target_referent,
+        ) {
+            RustReferenceCoercion::SharedAlias
+            | RustReferenceCoercion::MutableAlias
+            | RustReferenceCoercion::MutableToSharedReborrow
+            | RustReferenceCoercion::ArrayReferenceToSlice => Ok(()),
+            RustReferenceCoercion::Incomplete(reason) => Err(reason),
         }
-        if self
-            .ownership
-            .exact_type_equivalence(referent, target_referent)?
-        {
-            return Ok(());
-        }
-        if referent.kind() == "array_type"
-            && referent.child_by_field_name("length").is_some()
-            && (target_referent.kind() == "slice_type"
-                || (target_referent.kind() == "array_type"
-                    && target_referent.child_by_field_name("length").is_none()))
-        {
-            let source_element = referent
-                .child_by_field_name("element")
-                .ok_or(RustOwnershipIncomplete::MissingType)?;
-            let target_element = target_referent
-                .child_by_field_name("element")
-                .or_else(|| first_named_child(target_referent))
-                .ok_or(RustOwnershipIncomplete::MissingType)?;
-            if self
-                .ownership
-                .exact_type_equivalence(source_element, target_element)?
-            {
-                return Ok(());
-            }
-        }
-        Err(RustOwnershipIncomplete::UnsupportedType)
     }
 
     fn compatible_transfer_ownership(
@@ -4642,6 +4688,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 );
                 Ok(())
             }
+            ("let_condition", _) => {
+                let pattern = required_field(node, "pattern")?;
+                let value = required_field(node, "value")?;
+                let decision = self.point(builder, node, Vec::new())?;
+                let success = self.point(builder, pattern, Vec::new())?;
+                if !self.declaration_binding_values(node).is_empty() {
+                    self.unsupported_pattern_gaps(
+                        builder,
+                        success,
+                        pattern,
+                        value,
+                        "what a successful Rust let condition binds depends on the scrutinee's runtime shape",
+                    )?;
+                }
+                self.session.add_target_edge(
+                    builder,
+                    decision,
+                    EdgeTarget {
+                        point: success,
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                )?;
+                self.session
+                    .add_target_edge(builder, decision, when_false)?;
+                self.session.add_target_edge(builder, success, when_true)?;
+                let subject =
+                    self.expression_value(builder, value, expression_value_kind(value))?;
+                self.session.add_guard_fact(
+                    builder,
+                    decision,
+                    GuardPredicate::Opaque {
+                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                    },
+                    Some(subject),
+                    Some(GuardArm {
+                        target_point: success,
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    }),
+                    Some(GuardArm {
+                        target_point: when_false.point,
+                        kind: when_false.kind,
+                    }),
+                )?;
+                stack.push(Work::Expression {
+                    node: value,
+                    entry,
+                    next: EdgeTarget::normal(decision),
+                    scope,
+                });
+                Ok(())
+            }
             ("let_chain", _) => {
                 let conditions = runtime_expression_children(node);
                 self.schedule_condition_chain(
@@ -5194,6 +5291,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(builder.push_scope(Some(parent), ScopeBinding::Cleanup { region }))
     }
 
+    fn condition_needs_pattern_cleanup(&self, node: Node<'tree>) -> bool {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if current.kind() == "let_condition"
+                && (!self.declaration_binding_values(current).is_empty()
+                    || current.child_by_field_name("value").is_some_and(|value| {
+                        // A wildcard or unit pattern binds nothing, but an
+                        // evaluated temporary can still own a destructor.
+                        !self.is_place(value) && !self.expression_is_definitely_non_dropping(value)
+                    }))
+            {
+                return true;
+            }
+            if current.id() != node.id()
+                && matches!(
+                    current.kind(),
+                    "function_item" | "closure_expression" | "async_block" | "gen_block"
+                )
+            {
+                continue;
+            }
+            stack.extend(named_children(current));
+        }
+        false
+    }
+
     fn declaration_binding_values(&self, declaration: Node<'tree>) -> Vec<ValueId> {
         let mut values = Vec::new();
         let Some(pattern) = declaration.child_by_field_name("pattern") else {
@@ -5308,7 +5431,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if let Some(value) = self.local_declaration_value(text, name.start_byte()) {
                 let mut ancestor = name;
                 let by_reference = loop {
-                    if ancestor.kind() == "ref_pattern" {
+                    if ancestor.kind() == "ref_pattern"
+                        || (ancestor.kind() == "field_pattern"
+                            && direct_child_kind(ancestor, "ref"))
+                    {
                         break true;
                     }
                     if ancestor.id() == pattern.id() {
@@ -5350,6 +5476,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: MemoryAccessKind::LexicalCell,
                             location,
                             value: address,
+                        },
+                    )?;
+                }
+                if !by_reference {
+                    // Selecting a pattern initializes its slot, but the payload
+                    // projection is still unknown. Never assign the aggregate's
+                    // scalar facts to a component.
+                    let payload = self.value(builder, point, SemanticValueKind::Temporary)?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::Assignment {
+                            target: value,
+                            value: payload,
                         },
                     )?;
                 }
@@ -5412,7 +5552,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         SemanticGapDischarge::InertDropGlue,
                     )?;
                 }
-            } else if let Some(name) = identity_binding_identifier(pattern) {
+            } else if let Some(name) = identity_binding_identifier(pattern).filter(|name| {
+                node_text(self.source, *name)
+                    .and_then(|text| self.local_declaration_value(text, name.start_byte()))
+                    .is_some()
+            }) {
                 let name_text = node_text(self.source, name).ok_or_else(|| {
                     RustLoweringError::Invalid("Rust binding has an invalid name range".into())
                 })?;
@@ -5907,7 +6051,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let value = self.expression_value(builder, right, expression_value_kind(right))?;
         let (target, mut evaluations) = self.assignment_target(builder, left, terminal, scope)?;
         self.write_assignment_target(builder, terminal, target, right, value)?;
-        evaluations.push(right);
+        // Rust evaluates a plain assignment's RHS before evaluating its
+        // dereference place. The terminal writes only after both evaluations.
+        if rust_dereference_operand(left).is_some() {
+            evaluations.insert(0, right);
+        } else {
+            evaluations.push(right);
+        }
         self.session.add_target_edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
@@ -5919,6 +6069,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    fn is_builtin_mutable_reference(&self, node: Node<'tree>) -> bool {
+        if self.expression_ownership(node) == RustOwnershipClass::MutableReference {
+            return true;
+        }
+        // A borrow establishes a built-in reference even when the referent's
+        // type is unavailable. Resolve the local structurally so shadowing
+        // cannot borrow another binding's initializer evidence.
+        let node = peel_rust_parentheses(node);
+        let initializer = if node.kind() == "identifier" {
+            node_text(self.source, node)
+                .and_then(|name| self.local_binding_at(name, node.start_byte()))
+                .and_then(|binding| binding.initializer)
+        } else {
+            Some(node)
+        };
+        initializer.is_some_and(|initializer| {
+            let initializer = peel_rust_parentheses(initializer);
+            initializer.kind() == "reference_expression" && rust_reference_is_mutable(initializer)
+        })
+    }
+
     fn assignment_target(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -5928,20 +6099,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(RustAssignmentTarget, Vec<Node<'tree>>), RustLoweringError> {
         if left.kind() == "unary_expression"
             && let Some(pointer_node) = rust_dereference_operand(left)
-            && self.is_raw_pointer_expression(pointer_node)
+            && (self.is_raw_pointer_expression(pointer_node)
+                || self.is_builtin_mutable_reference(pointer_node))
         {
             let pointer =
                 self.expression_value(builder, pointer_node, expression_value_kind(pointer_node))?;
-            let width = self.pointer_width_for_expression(pointer_node);
-            let metadata = self.metadata(terminal)?;
-            self.add_pointer_access(terminal, pointer, PointerAccessKind::Write, width, metadata);
-            if width == PointerAccessWidth::Unknown {
-                self.add_incomplete_fact(
+            if self.is_raw_pointer_expression(pointer_node) {
+                let width = self.pointer_width_for_expression(pointer_node);
+                let metadata = self.metadata(terminal)?;
+                self.add_pointer_access(
                     terminal,
-                    SemanticIncompleteSubject::Value(pointer),
-                    SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                    pointer,
+                    PointerAccessKind::Write,
+                    width,
                     metadata,
                 );
+                if width == PointerAccessWidth::Unknown {
+                    self.add_incomplete_fact(
+                        terminal,
+                        SemanticIncompleteSubject::Value(pointer),
+                        SemanticIncompleteReason::Pointer(PointerIncompleteReason::UnknownLayout),
+                        metadata,
+                    );
+                }
+            } else if !self.expression_type(left).is_some_and(|ty| match ty {
+                RustValueType::Declared(ty) => rust_type_is_definitely_non_dropping(ty),
+                RustValueType::Borrowed { .. } => true,
+            }) {
+                // Built-in dereference does not call DerefMut, but replacing
+                // its referent may still invoke Drop.
+                self.add_drop_omission_gaps(
+                    builder,
+                    terminal,
+                    "place assignment may replace a live value",
+                    SemanticGapDischarge::None,
+                )?;
             }
             let location = self.session.add_memory_location(
                 builder,
@@ -6620,9 +6812,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let old = match target {
             RustAssignmentTarget::Binding(value) => value,
             RustAssignmentTarget::Memory { kind, location } => {
-                if kind == MemoryAccessKind::Dereference {
-                    let pointer_node = rust_dereference_operand(left)
-                        .expect("a dereference assignment target has a pointer operand");
+                if kind == MemoryAccessKind::Dereference
+                    && let Some(pointer_node) = rust_dereference_operand(left)
+                    && self.is_raw_pointer_expression(pointer_node)
+                {
                     let pointer = self.expression_value(
                         builder,
                         pointer_node,
@@ -6773,7 +6966,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .child_by_field_name("alternative")
             .and_then(first_named_child);
         let condition_entry = self.point(builder, condition, Vec::new())?;
-        let consequence_has_bindings = condition_introduces_pattern_bindings(condition);
+        let consequence_has_bindings = self.condition_needs_pattern_cleanup(condition);
         let consequence_scope = if consequence_has_bindings {
             self.push_cleanup_scope(builder, scope, condition)?
         } else {
@@ -6877,9 +7070,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // Only an arm that actually binds a name introduces a value
                 // whose identity and drop obligation are unresolved. A literal
                 // or wildcard arm introduces neither.
-                let binds = arms[index]
-                    .child_by_field_name("pattern")
-                    .is_some_and(rust_pattern_binds_value);
+                let binds = !self.declaration_binding_values(arms[index]).is_empty();
                 if !binds {
                     continue;
                 }
@@ -7018,7 +7209,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 continue_edge_kind: ControlEdgeKind::LoopBack,
             },
         );
-        let body_has_bindings = condition_introduces_pattern_bindings(condition);
+        let body_has_bindings = self.condition_needs_pattern_cleanup(condition);
         let body_scope = if body_has_bindings {
             self.push_cleanup_scope(builder, loop_scope, condition)?
         } else {
@@ -10083,64 +10274,6 @@ fn is_wildcard_pattern(pattern: Node<'_>) -> bool {
     pattern.kind() == "_"
 }
 
-/// Whether this pattern introduces a binding.
-///
-/// A bare `identifier` in pattern position binds; a path that names a variant
-/// or constant reaches the tree as the `type` field of a struct or
-/// tuple-struct pattern, or as a `scoped_identifier`, and binds nothing. A
-/// unit variant written bare (`None`) is indistinguishable from a binding in
-/// the syntax alone and is counted as binding, which only adds a gap.
-fn rust_pattern_binds_value(pattern: Node<'_>) -> bool {
-    !rust_pattern_binding_identifiers(pattern).is_empty()
-}
-
-/// Every identifier this pattern binds, in source order.
-///
-/// One `identifier`, possibly wrapped in `mut` or `ref`, is the common case. A
-/// tuple, slice, or struct pattern binds one identifier per component, which is
-/// the shape `for (key, value) in map` writes (#2705): before this, such a
-/// pattern bound nothing at all, so the loop body's `value` began a fresh
-/// unrelated value and the iterable's contents stopped flowing into the body.
-///
-/// The exclusions are the same ones [`rust_pattern_binds_value`] always
-/// applied: a `match_pattern`'s `condition` is a guard expression rather than a
-/// pattern, a struct or tuple-struct pattern's `type` names the variant, and a
-/// `scoped_identifier` is a path. A unit variant written bare (`None`) is
-/// indistinguishable from a binding in the syntax alone and is counted as one,
-/// which only adds a value nothing reads.
-///
-/// The walk is an explicit stack: pattern nesting in a source file is
-/// unbounded.
-fn rust_pattern_binding_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
-    let mut bindings = Vec::new();
-    let mut pending = vec![pattern];
-    while let Some(current) = pending.pop() {
-        match current.kind() {
-            "identifier" => {
-                bindings.push(current);
-                continue;
-            }
-            "scoped_identifier" => continue,
-            _ => {}
-        }
-        // `condition` is the `if` guard of a `match_pattern` (`Some(x) if x > 0`).
-        let excluded = binding_excluded_child_fields(Language::Rust, current.kind())
-            .iter()
-            .copied()
-            .chain(["condition"])
-            .filter_map(|field| current.child_by_field_name(field))
-            .map(|node| node.id())
-            .collect::<Vec<_>>();
-        pending.extend(
-            named_children(current)
-                .into_iter()
-                .filter(|child| !excluded.contains(&child.id())),
-        );
-    }
-    bindings.sort_by_key(Node::start_byte);
-    bindings
-}
-
 fn rust_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
     let mut parent = node.parent();
     while let Some(candidate) = parent {
@@ -10405,6 +10538,11 @@ fn is_rust_assignment_target(node: Node<'_>) -> bool {
 
 /// The `Self` type of the `impl` block this callable is declared in.
 fn rust_impl_self_type(callable: Node<'_>) -> Option<Node<'_>> {
+    let callable = if callable.kind() == "self_parameter" {
+        callable.parent()?.parent()?
+    } else {
+        callable
+    };
     let mut current = callable;
     while let Some(parent) = current.parent() {
         if parent.kind() == "impl_item" {
@@ -11182,6 +11320,66 @@ impl RustReceiverTypeFacts {
         }
     }
 
+    /// Explicit declared receiver type, using the same position-aware binding
+    /// facts as owner lookup. Unknown inferred types stay unknown.
+    pub(crate) fn declared_receiver_type<'tree>(
+        &self,
+        source: &str,
+        tree: &'tree tree_sitter::Tree,
+        mut expression: Node<'tree>,
+    ) -> Option<Node<'tree>> {
+        let mut visited = HashSet::default();
+        loop {
+            if !visited.insert(expression.id()) {
+                return None;
+            }
+            match expression.kind() {
+                "parenthesized_expression" => expression = first_named_child(expression)?,
+                "reference_expression" => expression = rust_reference_expression_value(expression)?,
+                "unary_expression" => expression = rust_dereference_operand(expression)?,
+                "type_cast_expression" => return expression.child_by_field_name("type"),
+                "identifier" | "self" => {
+                    let binding =
+                        self.binding_at(node_text(source, expression)?, expression.start_byte())?;
+                    if let Some(range) = binding.declared_type {
+                        return rust_node_at_range(tree, range);
+                    }
+                    expression = rust_node_at_range(tree, binding.initializer?)?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The implicit receiver's borrow is outside the impl target type node.
+    /// Keep it for coherence even though nominal lookup uses that target.
+    pub(crate) fn implicit_receiver_is_borrowed(
+        &self,
+        tree: &tree_sitter::Tree,
+        expression: Node<'_>,
+    ) -> bool {
+        if expression.kind() != "self" {
+            return false;
+        }
+        let Some(binding) = self.binding_at("self", expression.start_byte()) else {
+            return false;
+        };
+        let mut node = tree.root_node().named_descendant_for_byte_range(
+            binding.declaration_start,
+            binding.declaration_start + 1,
+        );
+        while let Some(current) = node {
+            if current.kind() == "self_parameter" {
+                return rust_self_parameter_is_borrowed(current);
+            }
+            if current.kind() == "function_item" {
+                break;
+            }
+            node = current.parent();
+        }
+        false
+    }
+
     fn binding_at(&self, name: &str, byte: usize) -> Option<RustReceiverBindingFact> {
         let bindings = self.bindings.get(name)?;
         let best = bindings
@@ -11326,12 +11524,12 @@ impl RustReceiverTypeFacts {
                         return None;
                     };
                     let resolved = unique_rust_model_symbol(overlay, &symbol.qualified_name)?;
-                    return nominal_rust_model_type(resolved)
+                    return nominal_rust_model_type(&resolved)
                         .then(|| resolved.qualified_name.clone());
                 }
                 TypeRef::Named { name, .. } => {
                     let symbol = unique_rust_model_symbol(overlay, name)?;
-                    return nominal_rust_model_type(symbol).then(|| symbol.qualified_name.clone());
+                    return nominal_rust_model_type(&symbol).then(|| symbol.qualified_name.clone());
                 }
                 _ => return None,
             }
@@ -11386,10 +11584,10 @@ fn nominal_rust_model_type(symbol: &SemanticModelSymbol) -> bool {
         )
 }
 
-fn unique_rust_model_symbol<'a>(
-    overlay: &'a SemanticModelOverlay,
+fn unique_rust_model_symbol(
+    overlay: &SemanticModelOverlay,
     identity: &str,
-) -> Option<&'a SemanticModelSymbol> {
+) -> Option<std::sync::Arc<SemanticModelSymbol>> {
     let symbol = RustOverlayCrates::new(Some(overlay)).referenceable_symbol(identity)?;
     (symbol.owner_id.is_none()
         && symbol.language == Language::Rust.config_label()
@@ -11908,25 +12106,6 @@ fn control_label(node: Node<'_>, source: &str) -> Option<Box<str>> {
 use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind as direct_named_child_kind, has_child_of_kind as direct_child_kind,
 };
-
-fn condition_introduces_pattern_bindings(node: Node<'_>) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "let_condition" {
-            return true;
-        }
-        if current.id() != node.id()
-            && matches!(
-                current.kind(),
-                "function_item" | "closure_expression" | "async_block" | "gen_block"
-            )
-        {
-            continue;
-        }
-        stack.extend(named_children(current));
-    }
-    false
-}
 
 /// Procedure syntax roles for the Rust lowering. A block's statements and
 /// its trailing expression are statements; items declare and do not run.

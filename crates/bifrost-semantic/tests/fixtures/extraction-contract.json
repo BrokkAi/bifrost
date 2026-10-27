@@ -1,0 +1,29 @@
+{
+  "schema_version": 19,
+  "pack_id": "test.extraction-contract",
+  "version": "1.0.0",
+  "producer": {"name": "test-producer", "version": "1.0.0"},
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {},
+  "provenance": {"source": "Synthetic test-only extraction contract fixture; no third-party data"},
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": {"generated_code_only": false, "review_required": false},
+  "shards": [{
+    "id": "declarations.fixture",
+    "activation": [{"package": {"name": "example:fixture", "version": "=1.0.0"}}],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "type.fixture",
+        "name": "example.Fixture",
+        "type_kind": "class",
+        "visibility": "public",
+        "locator": {"kind": "artifact", "path": "example/Fixture.class", "symbol": "example.Fixture"}
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}

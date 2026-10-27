@@ -697,6 +697,15 @@ pub(super) fn produce<'source, 'unit>(
             .filter(|identifier| identifier.role == ResolutionIdentifierRole::Reference)
             .map(|identifier| identifier.site),
     );
+    // File modules have path-derived identities. Blob facts own only the
+    // nameless declaration; the selected mount supplies the module's path.
+    let scope = ResolutionScopeId::new(0);
+    let site = p.site(root, scope, ResolutionSiteKind::ModuleDeclaration);
+    p.facts
+        .define_module(site, ResolutionNamespace::Value, Some(scope));
+    p.facts.route_owned_module_declarations.push(site);
+    let declaration = p.collector.declare_node(root, None);
+    p.declarations.push((site, declaration));
     guards::validate(&p.facts);
     (p.facts, p.occurrences, p.declarations)
 }

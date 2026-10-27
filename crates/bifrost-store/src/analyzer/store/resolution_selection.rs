@@ -170,17 +170,6 @@ pub fn selected_resolution_temp_schema_sql() -> &'static str {
              CREATE TEMP TABLE IF NOT EXISTS selected_resolution_scope_mounts(
                mount_ordinal INTEGER NOT NULL PRIMARY KEY CHECK(mount_ordinal >= 0)
              ) WITHOUT ROWID, STRICT;
-             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_typed_requests_1(
-               mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
-               key0          INTEGER NOT NULL CHECK(key0 >= 0),
-               PRIMARY KEY(mount_ordinal, key0)
-             ) WITHOUT ROWID, STRICT;
-             CREATE TEMP TABLE IF NOT EXISTS selected_resolution_typed_requests_2(
-               mount_ordinal INTEGER NOT NULL CHECK(mount_ordinal >= 0),
-               key0          INTEGER NOT NULL CHECK(key0 >= 0),
-               key1          INTEGER NOT NULL CHECK(key1 >= 0),
-               PRIMARY KEY(mount_ordinal, key0, key1)
-             ) WITHOUT ROWID, STRICT;
              {module_placements_schema}",
             stage_schema = super::resolution_stage::schema_sql(),
             module_placements_schema = super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL,
@@ -224,8 +213,6 @@ DELETE FROM temp.selected_resolution_scope_mounts;
 DELETE FROM temp.selected_rust_transient_placement_attributes;
 DELETE FROM temp.selected_resolution_transient_placements;
 DELETE FROM temp.selected_resolution_mounts;
-DELETE FROM temp.selected_resolution_typed_requests_1;
-DELETE FROM temp.selected_resolution_typed_requests_2;
 DELETE FROM temp.selected_resolution_overlay_masks;
 DELETE FROM temp.selected_resolution_content_mounts;
 DELETE FROM temp.selected_resolution_languages;
@@ -1286,6 +1273,10 @@ impl SelectedResolutionMountRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SelectedResolutionUnavailable {
+    JvmContextUnavailable {
+        storage_language: String,
+        persisted_relative_path: String,
+    },
     GoContextUnavailable {
         persisted_relative_path: String,
     },
@@ -1349,6 +1340,11 @@ pub enum SelectedResolutionStale {
         storage_language: String,
     },
     MountInventoryChanged,
+    /// While this operation had lent the in-memory fallback's writer
+    /// connection, another user wrote rows or schema there that an ordinary
+    /// selection read never writes, so its temp selection is no longer known
+    /// to be the one it installed.
+    LentWriterChanged,
     TransientAnalysisGeneration {
         expected: u64,
         actual: u64,
@@ -1423,8 +1419,6 @@ pub struct SelectedResolutionMountInventory<'store> {
     stage_request_used: Cell<bool>,
     stage_request_identity: u64,
     stage_content_epoch: Cell<u64>,
-    /// Set by an uncounted temp write, which may have staged rows (tests do).
-    stage_written_directly: Cell<bool>,
     /// Version of arbitrary owned TEMP row writes. Staged read memos must
     /// distinguish them from publication commits and private request buffers.
     stage_direct_write_epoch: Cell<u64>,
@@ -1465,6 +1459,12 @@ pub struct SelectedResolutionMountInventory<'store> {
     /// may finish several point operations after private TEMP schema setup;
     /// the same unchanged stamp need not reread every mount for each finish.
     inventory_revalidation_memo: Cell<Option<SelectedResolutionReadStamp>>,
+    /// Enabled only while a ReadySelectedResolution owns this inventory.
+    /// One entry, replaced at the existing scope/stage read-memo boundary.
+    operation_change_stamp: Option<Cell<Option<OperationChangeStamp>>>,
+    /// Family occupancy is bounded by the fixed stage schema, never by hosts.
+    /// Only the current scope/epochs are retained for this request.
+    stage_family_occupancy: RefCell<StageFamilyOccupancyMemo>,
     /// Context tokens committed by this operation, whose rows live in its temp database.
     published_context_tokens: RefCell<HashSet<i64>>,
     /// The derive-helper gaps this operation has already decided; see
@@ -1479,6 +1479,34 @@ pub struct SelectedResolutionMountInventory<'store> {
     generic_formals_schema_ready: Cell<bool>,
     generic_formal_defaults_schema_ready: Cell<bool>,
     reverse_candidate_keys_schema_ready: Cell<bool>,
+    /// The snapshots whose revision rows this selection staged on the
+    /// in-memory fallback's writer connection; `None` for a pooled reader.
+    /// See [`Self::lend_writer`].
+    writer_installed_snapshots: Option<WorkspaceSnapshots>,
+    /// Set when another store user made a change other than an ordinary
+    /// selection read while this inventory had lent its writer connection.
+    /// The temp selection is then not known to be this one, so the operation
+    /// is stale and its selection is not retained.
+    lent_writer_changed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct OperationChangeStamp {
+    scope: [u8; 32],
+    stage: (u64, u64),
+    stamp: super::WorkspaceSelectionStamp,
+}
+
+#[derive(Default)]
+struct StageFamilyOccupancyMemo {
+    key: Option<([u8; 32], (u64, u64))>,
+    families: HashMap<super::resolution_stage::StageFamily, StageFamilyOccupancy>,
+}
+
+#[derive(Clone, Copy)]
+struct StageFamilyOccupancy {
+    global: bool,
+    scoped: bool,
 }
 
 /// Freshness of the retained reader, excluding its private buffers and owned schema setup.
@@ -1655,13 +1683,22 @@ impl RetainedResolutionSelection {
     }
 
     fn current_stamp(&self, conn: &Connection) -> Result<SelectedResolutionReadStamp> {
-        let mut stamp = read_change_stamp(
+        Ok(self.stamp_from_workspace(conn, super::workspace_selection_stamp(conn)?))
+    }
+
+    fn stamp_from_workspace(
+        &self,
+        conn: &Connection,
+        stamp: super::WorkspaceSelectionStamp,
+    ) -> SelectedResolutionReadStamp {
+        let mut stamp = selected_read_stamp(
             conn,
             self.owned_change_baseline,
             self.committed_request_changes.get(),
-        )?;
+            stamp,
+        );
         stamp.temp_schema_version -= self.committed_schema_changes.get();
-        Ok(stamp)
+        stamp
     }
 
     #[doc(hidden)]
@@ -1682,6 +1719,16 @@ impl SelectedResolutionMountInventory<'_> {
         &self,
     ) -> &[super::language_support::ModuleDefinitionProvider] {
         &self.retained().ready.module_definition_providers
+    }
+
+    pub(crate) fn namespace_definition_providers(
+        &self,
+    ) -> &[(
+        String,
+        Language,
+        super::language_support::NamespaceDefinitionProvider,
+    )] {
+        &self.retained().ready.namespace_definition_providers
     }
 
     pub(crate) fn has_conditional_type_seeds(&self) -> bool {
@@ -1913,21 +1960,16 @@ impl SelectedResolutionMountInventory<'_> {
     /// request on the same inventory pays a cold open: 329 statements instead
     /// of 3 on the 256-mount point fixture, measured when the forward crate
     /// scope reached the production point route.
-    /// `replace_resolution_requests_1` and `_2` account their own inserts the
-    /// same way; this is the form for a write whose row count the caller does
-    /// not already hold.
     #[doc(hidden)]
     pub fn with_owned_temp_write<T>(
         &self,
         write: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
-        // This escape hatch may write the scope relation directly. Private
-        // typed request buffers use their own writer and do not invalidate
-        // header answers, because the header query does not read them.
+        // This escape hatch may write the scope relation directly.
         *self.path_endpoint_header_memo.borrow_mut() = Default::default();
         self.inventory_revalidation_memo.set(None);
         // Invalidate even if an arbitrary writer returns an error after a
-        // partial write. Private typed request buffers do not use this path.
+        // partial write.
         self.stage_direct_write_epoch.set(
             self.stage_direct_write_epoch
                 .get()
@@ -1942,12 +1984,6 @@ impl SelectedResolutionMountInventory<'_> {
             .checked_sub(before)
             .expect("a temp write cannot lower the connection's change counter");
         self.account_committed_request_changes(changed);
-        if changed != 0 {
-            // An arbitrary temp write may have written stage content (tests
-            // stage rows this way), so stage readers must run again. This is
-            // not a content commit and does not move the coverage fingerprint.
-            self.stage_written_directly.set(true);
-        }
         Ok(value)
     }
 
@@ -1966,12 +2002,79 @@ impl SelectedResolutionMountInventory<'_> {
         self.stage_request_used.set(true);
     }
 
-    /// Whether this operation has committed no stage content. Production
-    /// content enters only through a capsule admission or projection, each of
-    /// which counts its commit; a stage reader over content tables may then
-    /// answer from the flag without issuing a statement.
-    pub(in crate::analyzer::store) fn stage_has_no_content(&self) -> bool {
-        self.stage_content_epoch.get() == 0 && !self.stage_written_directly.get()
+    /// No committed content, including arbitrary direct writes that failed
+    /// after inserting rows. Private request buffers do not publish content.
+    fn stage_has_no_content(&self) -> bool {
+        self.staged_read_epoch() == (0, 0)
+    }
+
+    /// Scoped readers must prove absence in the same scope as their SQL.
+    pub(super) fn stage_family_is_empty(
+        &self,
+        family: super::resolution_stage::StageFamily,
+    ) -> Result<bool> {
+        Ok(!self.stage_family_occupancy(family)?.scoped)
+    }
+
+    /// A scoped inner-join read is empty when any mandatory family is empty.
+    /// Optional joins and union arms do not belong in this list.
+    pub(super) fn stage_read_is_empty(
+        &self,
+        required: &[super::resolution_stage::StageFamily],
+    ) -> Result<bool> {
+        assert!(
+            !required.is_empty(),
+            "a stage read names its mandatory families"
+        );
+        for &family in required {
+            if self.stage_family_is_empty(family)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Proof readers retain rows outside scope and require global absence.
+    pub(super) fn stage_family_is_globally_empty(
+        &self,
+        family: super::resolution_stage::StageFamily,
+    ) -> Result<bool> {
+        Ok(!self.stage_family_occupancy(family)?.global)
+    }
+
+    fn stage_family_occupancy(
+        &self,
+        family: super::resolution_stage::StageFamily,
+    ) -> Result<StageFamilyOccupancy> {
+        if self.stage_has_no_content() {
+            return Ok(StageFamilyOccupancy {
+                global: false,
+                scoped: false,
+            });
+        }
+        let key = (self.scope_identity(), self.staged_read_epoch());
+        let mut memo = self.stage_family_occupancy.borrow_mut();
+        if memo.key != Some(key) {
+            memo.families.clear();
+            memo.key = Some(key);
+        }
+        if let Some(occupancy) = memo.families.get(&family) {
+            return Ok(*occupancy);
+        }
+        // One existence probe per demanded family and epoch, shared by every
+        // reader. Both answers come from the same TEMP snapshot. Do not scan
+        // or retain the host inventory in Rust.
+        let occupancy = self
+            .connection()
+            .prepare_cached(family.occupancy_sql())?
+            .query_row([], |row| {
+                Ok(StageFamilyOccupancy {
+                    global: row.get(0)?,
+                    scoped: row.get(1)?,
+                })
+            })?;
+        memo.families.insert(family, occupancy);
+        Ok(occupancy)
     }
 
     #[doc(hidden)]
@@ -2209,6 +2312,8 @@ impl SelectedResolutionMountInventory<'_> {
                 .prepare_cached("PRAGMA temp.schema_version")?
                 .query_row([], |row| row.get(0))?)
         };
+        // Even a partially failed DDL batch must not leave a cached witness.
+        self.clear_operation_change_stamp();
         let before = schema_version()?;
         connection.execute_batch(sql)?;
         let changes = schema_version()? - before;
@@ -2292,6 +2397,7 @@ impl SelectedResolutionMountInventory<'_> {
         );
         self.connection().execute_batch("BEGIN DEFERRED")?;
         self.stage_read.set(true);
+        self.clear_operation_change_stamp();
         Ok(())
     }
 
@@ -2301,6 +2407,7 @@ impl SelectedResolutionMountInventory<'_> {
     pub(super) fn end_stage_read(&self) -> Result<()> {
         assert!(self.stage_read.get(), "no crate stage holds a read");
         self.stage_read.set(false);
+        self.clear_operation_change_stamp();
         self.commit_stage_read()
     }
 
@@ -2312,15 +2419,107 @@ impl SelectedResolutionMountInventory<'_> {
     #[doc(hidden)]
     pub fn pause_stage_read(&self) -> Result<()> {
         if self.stage_read.get() {
+            self.clear_operation_change_stamp();
             self.commit_stage_read()?;
         }
         Ok(())
+    }
+
+    /// Let code outside this operation use the store until
+    /// [`Self::reclaim_writer`]. A pooled reader is the operation's own
+    /// connection and is not lent.
+    ///
+    /// The in-memory fallback reads through the one writer connection, so an
+    /// operation that held it while a caller read the store would wait for
+    /// itself (#6018). The temp selection stays on the connection, and an
+    /// ordinary read of this selection's snapshots finds its revision rows
+    /// already installed. A read of other snapshots replaces them until
+    /// [`Self::reclaim_writer`] restores them.
+    pub(crate) fn lend_writer(&mut self) -> Result<()> {
+        if !self.conn.excludes_store_access() {
+            return Ok(());
+        }
+        assert!(
+            !self.stage_read.get(),
+            "a crate stage does not lend its reader"
+        );
+        assert_no_statement_in_progress(self.connection());
+        let installed = lent_writer_installed_snapshots(
+            self.lent_writer_changed,
+            &self.writer_installed_snapshots,
+        );
+        self.conn.lend_writer(installed)
+    }
+
+    /// Take back a connection lent by [`Self::lend_writer`] before this
+    /// operation answers, waiting for it while observing `cancellation`.
+    /// `Current` also covers a reader that was not lent.
+    ///
+    /// The selection keeps its authority while every other user of the
+    /// connection only applied ordinary workspace selections: their writes
+    /// replace only its revision rows, which it restores. After any other
+    /// write its temp rows may belong to another operation: the operation is
+    /// stale and stays stale, and its connection stays lent so the caller can
+    /// still read the store.
+    pub(crate) fn reclaim_writer(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedResolutionRevalidationOutcome> {
+        if !self.conn.is_lent_writer() {
+            return Ok(SelectedResolutionRevalidationOutcome::Current);
+        }
+        if !self.lent_writer_changed {
+            match self.take_back_writer(Some(cancellation))? {
+                super::WriterReclaim::Unchanged | super::WriterReclaim::Restored { .. } => {
+                    return Ok(SelectedResolutionRevalidationOutcome::Current);
+                }
+                super::WriterReclaim::Cancelled => {
+                    return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
+                }
+                super::WriterReclaim::Changed => self.lend_writer()?,
+            }
+        }
+        Ok(SelectedResolutionRevalidationOutcome::Stale(
+            SelectedResolutionStale::LentWriterChanged,
+        ))
+    }
+
+    /// Take back a lent connection for this operation's own cleanup and
+    /// final authority check, which need it whatever the request's
+    /// cancellation says.
+    pub(crate) fn end_writer_loan(&mut self) -> Result<()> {
+        if self.conn.is_lent_writer() {
+            self.take_back_writer(None)?;
+        }
+        Ok(())
+    }
+
+    fn take_back_writer(
+        &mut self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<super::WriterReclaim> {
+        let installed = lent_writer_installed_snapshots(
+            self.lent_writer_changed,
+            &self.writer_installed_snapshots,
+        );
+        let reclaim = self.conn.reclaim_writer(cancellation, installed)?;
+        match reclaim {
+            // The restored connection holds exactly what this selection
+            // staged, so the retained stamp still describes it.
+            super::WriterReclaim::Restored { changes } => {
+                self.account_committed_request_changes(changes);
+            }
+            super::WriterReclaim::Changed => self.lent_writer_changed = true,
+            super::WriterReclaim::Unchanged | super::WriterReclaim::Cancelled => {}
+        }
+        Ok(reclaim)
     }
 
     #[doc(hidden)]
     pub fn resume_stage_read(&self) -> Result<()> {
         if self.stage_read.get() {
             assert!(self.connection().is_autocommit());
+            self.clear_operation_change_stamp();
             self.connection().execute_batch("BEGIN DEFERRED")?;
         }
         Ok(())
@@ -2359,93 +2558,56 @@ impl SelectedResolutionMountInventory<'_> {
         &self,
     ) -> Result<Option<super::WorkspaceSelectionStamp>> {
         if self.retained().interior_certificates.main_is_readonly {
-            super::workspace_selection_stamp(self.connection()).map(Some)
+            self.operation_workspace_stamp().map(Some)
         } else {
             Ok(None)
         }
     }
 
+    pub(super) fn begin_operation_reads(&mut self) {
+        assert!(self.operation_change_stamp.is_none());
+        self.operation_change_stamp = Some(Cell::new(None));
+    }
+
+    fn clear_operation_change_stamp(&self) {
+        *self.stage_family_occupancy.borrow_mut() = Default::default();
+        if let Some(memo) = &self.operation_change_stamp {
+            memo.set(None);
+        }
+    }
+
+    fn operation_workspace_stamp(&self) -> Result<super::WorkspaceSelectionStamp> {
+        let Some(memo) = &self.operation_change_stamp else {
+            return super::workspace_selection_stamp(self.connection());
+        };
+        let scope = self.scope_identity();
+        let stage = self.staged_read_epoch();
+        if let Some(cached) = memo.get()
+            && cached.scope == scope
+            && cached.stage == stage
+        {
+            return Ok(cached.stamp);
+        }
+        // Selected main facts and mounts are immutable for this operation.
+        // Arbitrary TEMP writes advance the direct epoch before writing, even
+        // on failure; publication commits advance the content epoch before
+        // another selected read. Private buffers are excluded from authority.
+        let stamp = super::workspace_selection_stamp(self.connection())?;
+        memo.set(Some(OperationChangeStamp {
+            scope,
+            stage,
+            stamp,
+        }));
+        Ok(stamp)
+    }
+
     #[doc(hidden)]
     pub fn read_change_stamp(&self) -> Result<SelectedResolutionReadStamp> {
-        self.retained().current_stamp(self.connection())
-    }
-
-    #[doc(hidden)]
-    pub fn replace_resolution_requests_1(
-        &self,
-        requests: impl IntoIterator<Item = (SelectedResolutionMountOrdinal, i64)>,
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
-        let requests = requests
-            .into_iter()
-            .map(|(mount, key)| (mount, [key]))
-            .collect();
-        self.replace_resolution_request_rows(
-            requests,
-            "DELETE FROM temp.selected_resolution_typed_requests_1",
-            "INSERT INTO temp.selected_resolution_typed_requests_1(mount_ordinal, key0) \
-             VALUES(?1, ?2)",
-            cancellation,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn replace_resolution_requests_2(
-        &self,
-        requests: impl IntoIterator<Item = (SelectedResolutionMountOrdinal, i64, i64)>,
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
-        let requests = requests
-            .into_iter()
-            .map(|(mount, first, second)| (mount, [first, second]))
-            .collect();
-        self.replace_resolution_request_rows(
-            requests,
-            "DELETE FROM temp.selected_resolution_typed_requests_2",
-            "INSERT INTO temp.selected_resolution_typed_requests_2(mount_ordinal, key0, key1) \
-             VALUES(?1, ?2, ?3)",
-            cancellation,
-        )
-    }
-
-    fn replace_resolution_request_rows<const WIDTH: usize>(
-        &self,
-        requests: Vec<(SelectedResolutionMountOrdinal, [i64; WIDTH])>,
-        delete_sql: &str,
-        insert_sql: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
-        assert!(requests.len() <= SELECTED_MOUNT_PAGE_ROWS);
-        assert!(
-            requests
-                .iter()
-                .all(|(_, keys)| keys.iter().all(|key| *key >= 0))
-        );
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
-        let transaction = TempWrite::begin(self.connection())?;
-        let mut changed = self.connection().prepare_cached(delete_sql)?.execute([])?;
-        let mut statement = self.connection().prepare_cached(insert_sql)?;
-        for (mount, keys) in requests {
-            if cancellation.is_cancelled() {
-                drop(statement);
-                transaction.rollback()?;
-                return Ok(false);
-            }
-            let parameters = std::iter::once(i64::from(mount.get())).chain(keys);
-            changed += statement.execute(params_from_iter(parameters))?;
-        }
-        drop(statement);
-        if cancellation.is_cancelled() {
-            transaction.rollback()?;
-            return Ok(false);
-        }
-        transaction.commit()?;
-        self.account_committed_request_changes(
-            u64::try_from(changed).expect("request changes fit u64"),
-        );
-        Ok(!cancellation.is_cancelled())
+        // Keep the connection's unowned-write accounting fresh even on a
+        // pragma memo hit. Successful private buffer writes cancel exactly.
+        Ok(self
+            .retained()
+            .stamp_from_workspace(self.connection(), self.operation_workspace_stamp()?))
     }
 
     #[doc(hidden)]
@@ -2457,7 +2619,14 @@ impl SelectedResolutionMountInventory<'_> {
             return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
         }
         self.retention_authorized = false;
-        let current = self.read_change_stamp()?;
+        if self.lent_writer_changed {
+            return Ok(SelectedResolutionRevalidationOutcome::Stale(
+                SelectedResolutionStale::LentWriterChanged,
+            ));
+        }
+        // Finish is an external freshness boundary, not an interior memo hit.
+        self.clear_operation_change_stamp();
+        let current = self.retained().current_stamp(self.connection())?;
         if cancellation.is_cancelled() {
             return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
         }
@@ -2516,6 +2685,10 @@ impl SelectedResolutionMountInventory<'_> {
 
 impl Drop for SelectedResolutionMountInventory<'_> {
     fn drop(&mut self) {
+        if let Err(error) = self.end_writer_loan() {
+            eprintln!("failed to check the lent selected resolution writer: {error}");
+            self.lent_writer_changed = true;
+        }
         if self.stage_request_used.get()
             && let Err(error) = self.with_owned_temp_write(|connection| {
                 connection.execute_batch(super::resolution_stage::CLEAR_REQUEST_SQL)?;
@@ -2536,7 +2709,7 @@ impl Drop for SelectedResolutionMountInventory<'_> {
             retained.current_stamp(&self.conn)
         };
         match current {
-            Ok(current) if current == retained.stamp => {
+            Ok(current) if current == retained.stamp && !self.lent_writer_changed => {
                 self.conn.put_retained_resolution_selection(retained);
             }
             Ok(_) | Err(_) => {
@@ -2545,6 +2718,19 @@ impl Drop for SelectedResolutionMountInventory<'_> {
             }
         }
     }
+}
+
+/// The snapshots a lent writer connection's revision rows are to hold, or
+/// `None` once the lending selection's authority over them is gone.
+fn lent_writer_installed_snapshots(
+    changed: bool,
+    installed: &Option<WorkspaceSnapshots>,
+) -> Option<&WorkspaceSnapshots> {
+    (!changed).then(|| {
+        installed
+            .as_ref()
+            .expect("a writer-backed selection records its installed snapshots")
+    })
 }
 
 /// A write to this reader's temp tables.
@@ -2646,24 +2832,36 @@ fn read_change_stamp(
     owned_change_baseline: u64,
     committed_request_changes: u64,
 ) -> Result<SelectedResolutionReadStamp> {
-    // Table-valued pragmas prepare an inner statement on every scan, even when
-    // their outer SELECT is cached. Cache the direct pragmas instead.
+    Ok(selected_read_stamp(
+        conn,
+        owned_change_baseline,
+        committed_request_changes,
+        super::workspace_selection_stamp(conn)?,
+    ))
+}
+
+fn selected_read_stamp(
+    conn: &Connection,
+    owned_change_baseline: u64,
+    committed_request_changes: u64,
+    stamp: super::WorkspaceSelectionStamp,
+) -> SelectedResolutionReadStamp {
     let super::WorkspaceSelectionStamp {
         main_data_version,
         main_schema_version,
         temp_schema_version,
-    } = super::workspace_selection_stamp(conn)?;
+    } = stamp;
     let unowned_changes = conn
         .total_changes()
         .checked_sub(owned_change_baseline)
         .and_then(|changes| changes.checked_sub(committed_request_changes))
         .expect("owned selection changes are a subset of connection total changes");
-    Ok(SelectedResolutionReadStamp {
+    SelectedResolutionReadStamp {
         main_data_version,
         main_schema_version,
         temp_schema_version,
         unowned_changes,
-    })
+    }
 }
 
 /// Bounded language authority metadata; the workspace identity has validated
@@ -2671,6 +2869,11 @@ fn read_change_stamp(
 struct RetainedSelectedMetadata {
     // Bounded by the registered language inventory, independent of mount count.
     module_definition_providers: Vec<super::language_support::ModuleDefinitionProvider>,
+    namespace_definition_providers: Vec<(
+        String,
+        Language,
+        super::language_support::NamespaceDefinitionProvider,
+    )>,
     has_conditional_type_seeds: bool,
     // A fixed selection property, so endpoint admission need not query language
     // rows on every newly borrowed Rust-only operation.
@@ -2700,6 +2903,19 @@ impl RetainedSelectedMetadata {
                 .filter_map(|language| {
                     super::store_language_support(language.semantic_language())?
                         .module_definition_provider()
+                })
+                .collect(),
+            namespace_definition_providers: staged
+                .languages
+                .iter()
+                .filter_map(|language| {
+                    let provider = super::store_language_support(language.semantic_language())?
+                        .namespace_definition_provider()?;
+                    Some((
+                        language.storage_language().to_owned(),
+                        language.semantic_language(),
+                        provider,
+                    ))
                 })
                 .collect(),
             has_conditional_type_seeds: staged.languages.iter().any(|language| {
@@ -2822,7 +3038,10 @@ impl AnalyzerStore {
                 },
             ));
         }
-        let mut conn = self.active_read_conn_for_resolution(&validated)?;
+        let Some(mut conn) = self.cancellable_read_conn_for_resolution(&validated, cancellation)?
+        else {
+            return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
+        };
         // These indexed query shapes have parameter-independent access-path
         // laws. Keep plans and planner policy for the retained pooled reader;
         // a general checkout restores its prior policy. Writer fallback stays
@@ -2887,7 +3106,6 @@ impl AnalyzerStore {
                     );
                     return Ok(SelectedResolutionMountInventoryOutcome::Ready(Box::new(
                         SelectedResolutionMountInventory {
-                            conn,
                             retained: Some(retained),
                             requested_mounts: RequestedResolutionMountRows::default(),
                             enumerated_mounts: OnceCell::new(),
@@ -2898,7 +3116,6 @@ impl AnalyzerStore {
                             stage_request_used: Cell::new(false),
                             stage_request_identity: next_stage_request_identity(),
                             stage_content_epoch: Cell::new(0),
-                            stage_written_directly: Cell::new(false),
                             stage_direct_write_epoch: Cell::new(0),
                             scope_identity: Cell::new(scope_identity_of(&[])),
                             crate_access: RefCell::default(),
@@ -2907,15 +3124,22 @@ impl AnalyzerStore {
                             site_row_memo: RefCell::default(),
                             path_endpoint_header_memo: RefCell::default(),
                             inventory_revalidation_memo: Cell::new(None),
+                            operation_change_stamp: None,
+                            stage_family_occupancy: RefCell::default(),
                             published_context_tokens: RefCell::default(),
                             derive_helper_decisions: RefCell::default(),
                             stage_read: Cell::new(false),
                             generic_formals_schema_ready: Cell::new(false),
                             generic_formal_defaults_schema_ready: Cell::new(false),
                             reverse_candidate_keys_schema_ready: Cell::new(false),
+                            writer_installed_snapshots: conn
+                                .excludes_store_access()
+                                .then(|| selected_snapshots.clone()),
+                            lent_writer_changed: false,
                             shared_names: super::resolution::SharedNameTable::new(
                                 self.resolution_shared_name_cache().clone(),
                             ),
+                            conn,
                         },
                     )));
                 }
@@ -3053,7 +3277,6 @@ impl AnalyzerStore {
                 conn.retain_before_checkin();
                 Ok(SelectedResolutionMountInventoryOutcome::Ready(Box::new(
                     SelectedResolutionMountInventory {
-                        conn,
                         retained: Some(retained),
                         requested_mounts: RequestedResolutionMountRows::default(),
                         enumerated_mounts: OnceCell::new(),
@@ -3064,7 +3287,6 @@ impl AnalyzerStore {
                         stage_request_used: Cell::new(false),
                         stage_request_identity: next_stage_request_identity(),
                         stage_content_epoch: Cell::new(0),
-                        stage_written_directly: Cell::new(false),
                         stage_direct_write_epoch: Cell::new(0),
                         scope_identity: Cell::new(scope_identity_of(&[])),
                         crate_access: RefCell::default(),
@@ -3073,15 +3295,22 @@ impl AnalyzerStore {
                         site_row_memo: RefCell::default(),
                         path_endpoint_header_memo: RefCell::default(),
                         inventory_revalidation_memo: Cell::new(None),
+                        operation_change_stamp: None,
+                        stage_family_occupancy: RefCell::default(),
                         published_context_tokens: RefCell::default(),
                         derive_helper_decisions: RefCell::default(),
                         stage_read: Cell::new(false),
                         generic_formals_schema_ready: Cell::new(false),
                         generic_formal_defaults_schema_ready: Cell::new(false),
                         reverse_candidate_keys_schema_ready: Cell::new(false),
+                        writer_installed_snapshots: conn
+                            .excludes_store_access()
+                            .then(|| selected_snapshots.clone()),
+                        lent_writer_changed: false,
                         shared_names: super::resolution::SharedNameTable::new(
                             self.resolution_shared_name_cache().clone(),
                         ),
+                        conn,
                     },
                 )))
             }
@@ -4268,6 +4497,333 @@ pub mod tests {
     use super::*;
 
     #[cfg(test)]
+    use brokk_bifrost_test_macros::hardwon;
+
+    // A real published store mount with one catalog-backed qualifier. Key 1
+    // represents the gap-reason suffix retained only in a completion, with no
+    // active resolution_gap_reasons row, as in #6597.
+    #[cfg(test)]
+    pub(crate) fn qualifier_completion_gap_fixture()
+    -> (AnalyzerStore, WorkspaceId, WorkspaceSnapshots) {
+        qualifier_completion_gap_fixture_in(AnalyzerStore::open_ephemeral().unwrap())
+    }
+
+    #[cfg(test)]
+    fn qualifier_completion_gap_fixture_in(
+        store: AnalyzerStore,
+    ) -> (AnalyzerStore, WorkspaceId, WorkspaceSnapshots) {
+        use super::super::resolution::{
+            PreparedResolutionBundle, PreparedResolutionBundleRows, PreparedResolutionRow,
+            PreparedResolutionValue, insert_prepared_bundle_tx,
+        };
+        let generation = store
+            .ensure_language_epoch_value("go", "6597-test")
+            .unwrap();
+        store
+            .ensure_resolution_producer_epoch("go", Language::Go)
+            .unwrap();
+        let oid = Oid::from_str("0000000000000000000000000000000000000001").unwrap();
+        store.register_blobs(&[oid], "go", generation).unwrap();
+        let mut rows = PreparedResolutionBundleRows::default();
+        rows.semantic_catalog.push(PreparedResolutionRow::new(vec![
+            0_i64.into(),
+            [1_u8; 32].into(),
+            PreparedResolutionValue::Null,
+            PreparedResolutionValue::Null,
+            PreparedResolutionValue::Null,
+            PreparedResolutionValue::Null,
+            PreparedResolutionValue::Null,
+        ]));
+        let bundle = PreparedResolutionBundle::new(
+            Language::Go,
+            rows,
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+            Vec::new(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId("a".repeat(64));
+        let writer_workspace = workspace_id.0.clone();
+        store.conn.execute(move |conn| {
+            let tx = conn.transaction().unwrap();
+            let blob_id = tx.query_row("SELECT id FROM blobs WHERE blob_oid=?1 AND lang='go'", [oid.to_string()], |row| row.get::<_, i64>(0)).unwrap();
+            tx.execute("INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,signature_count,signature_metadata_count,supertype_count,child_count,import_statement_count,type_identifier_count,is_complete) VALUES(?1,'go',0,'',0,0,0,0,0,0,0,0,1)", [blob_id]).unwrap();
+            assert!(insert_prepared_bundle_tx(&tx, blob_id, "go", &bundle, &CancellationToken::new()).unwrap());
+            tx.execute("INSERT INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'go',?2,1)", params![writer_workspace, generation.0]).unwrap();
+            tx.execute("INSERT INTO workspace_heads(workspace_id,lang,generation,revision) VALUES(?1,'go',?2,1)", params![writer_workspace, generation.0]).unwrap();
+            tx.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,'go',?2,'fixture.go',?3,?4,1)", params![writer_workspace, generation.0, oid.to_string(), "b".repeat(64)]).unwrap();
+            tx.commit().unwrap();
+        });
+        let snapshots = WorkspaceSnapshots::from_iter([(
+            "go".to_owned(),
+            super::super::WorkspaceSnapshotId {
+                workspace_id: workspace_id.clone(),
+                lang: "go".to_owned(),
+                generation,
+                revision: 1,
+            },
+        )]);
+        (store, workspace_id, snapshots)
+    }
+
+    #[test]
+    fn stage_family_occupancy_tracks_scope_epochs_and_transaction_boundaries() {
+        use super::super::resolution_stage::StageFamily;
+
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let cancellation = CancellationToken::new();
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let SelectedResolutionMountInventoryOutcome::Ready(mut selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &languages,
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("published fixture must open a selected inventory");
+        };
+        selection.begin_operation_reads();
+        let family = StageFamily::TypeFrontiers;
+        assert!(selection.stage_family_is_empty(family).unwrap());
+        assert!(selection.stage_family_is_globally_empty(family).unwrap());
+
+        // Force the SQL path, then prove repeated absence uses its one entry.
+        selection.note_stage_content_commit();
+        assert!(selection.stage_family_is_empty(family).unwrap());
+        assert_eq!(selection.stage_family_occupancy.borrow().families.len(), 1);
+        assert!(selection.stage_family_is_globally_empty(family).unwrap());
+        assert_eq!(selection.stage_family_occupancy.borrow().families.len(), 1);
+
+        let host: u32 = selection
+            .connection()
+            .query_row(
+                "SELECT mount_ordinal FROM temp.selected_resolution_scope_mounts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The write errors after inserting content. Its direct epoch must
+        // invalidate the empty answer despite the failed accounting closure.
+        let failed: Result<()> = selection.with_owned_temp_write(|connection| {
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(?1,zeroblob(32),zeroblob(32))", [host],
+            )?;
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_type_frontiers(host_ordinal,producer_id,sequence,slot_key,role) VALUES(?1,last_insert_rowid(),0,0,0)", [host],
+            )?;
+            Err(StoreError::new("failure after stage content write"))
+        });
+        assert!(failed.is_err());
+        assert!(!selection.stage_family_is_empty(family).unwrap());
+        assert!(!selection.stage_family_is_globally_empty(family).unwrap());
+
+        selection
+            .with_owned_temp_write(|connection| {
+                connection.execute("DELETE FROM temp.selected_resolution_scope_mounts", [])?;
+                Ok(())
+            })
+            .unwrap();
+        selection.note_scope_narrowed(&[[1; 32]]);
+        assert!(selection.stage_family_is_empty(family).unwrap());
+        assert!(!selection.stage_family_is_globally_empty(family).unwrap());
+        selection.reset_scope_mounts().unwrap();
+        assert!(!selection.stage_family_is_empty(family).unwrap());
+
+        // Owned TEMP DDL and transaction boundaries clear the same inventory
+        // as the stamp memo, even when neither staged read epoch moved.
+        let epochs = selection.staged_read_epoch();
+        selection
+            .initialize_owned_temp_schema(
+                selection.connection(),
+                "CREATE TEMP TABLE occupancy_ddl_probe(value)",
+            )
+            .unwrap();
+        assert_eq!(selection.staged_read_epoch(), epochs);
+        assert!(
+            selection
+                .stage_family_occupancy
+                .borrow()
+                .families
+                .is_empty()
+        );
+        assert!(!selection.stage_family_is_empty(family).unwrap());
+        selection.begin_stage_read().unwrap();
+        assert!(
+            selection
+                .stage_family_occupancy
+                .borrow()
+                .families
+                .is_empty()
+        );
+        assert!(!selection.stage_family_is_empty(family).unwrap());
+        selection.pause_stage_read().unwrap();
+        assert!(
+            selection
+                .stage_family_occupancy
+                .borrow()
+                .families
+                .is_empty()
+        );
+        selection.resume_stage_read().unwrap();
+        assert!(!selection.stage_family_is_empty(family).unwrap());
+        selection.end_stage_read().unwrap();
+        assert!(
+            selection
+                .stage_family_occupancy
+                .borrow()
+                .families
+                .is_empty()
+        );
+
+        selection
+            .with_owned_temp_write(|connection| {
+                connection.execute("DELETE FROM temp.selected_resolution_stage_producers", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(selection.stage_family_is_globally_empty(family).unwrap());
+        // Exercise the content epoch independently of the direct epoch.
+        selection.with_owned_temp_transaction(|connection| {
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(?1,zeroblob(32),zeroblob(32))", [host],
+            )?;
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_type_frontiers(host_ordinal,producer_id,sequence,slot_key,role) VALUES(?1,last_insert_rowid(),0,0,0)", [host],
+            )?;
+            Ok(SelectedResolutionTempTransaction::Commit(()))
+        }).unwrap();
+        selection.note_stage_content_commit();
+        assert!(!selection.stage_family_is_empty(family).unwrap());
+    }
+
+    #[test]
+    fn operation_stamp_follows_stage_epochs_and_failed_temp_writes() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let cancellation = CancellationToken::new();
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let SelectedResolutionMountInventoryOutcome::Ready(mut selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &languages,
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("published fixture must open a selected inventory");
+        };
+        assert!(selection.operation_change_stamp.is_none());
+        selection.begin_operation_reads();
+        let initial = selection.operation_workspace_stamp().unwrap();
+        assert_eq!(selection.operation_workspace_stamp().unwrap(), initial);
+        assert!(
+            selection
+                .operation_change_stamp
+                .as_ref()
+                .unwrap()
+                .get()
+                .is_some()
+        );
+
+        // A writer publication becomes visible at the content-commit epoch.
+        store.conn.execute(|conn| {
+            conn.execute_batch("CREATE TABLE selected_stamp_publication_probe(value INTEGER)")
+                .unwrap();
+        });
+        selection.note_stage_content_commit();
+        let published = selection.operation_workspace_stamp().unwrap();
+        assert_ne!(published.main_data_version, initial.main_data_version);
+        assert_eq!(
+            selection
+                .operation_change_stamp
+                .as_ref()
+                .unwrap()
+                .get()
+                .unwrap()
+                .stage,
+            selection.staged_read_epoch()
+        );
+
+        // DDL can succeed before a later statement fails. The direct-write
+        // epoch moves before the closure runs, so its old witness cannot hit.
+        let failed: Result<()> = selection.with_owned_temp_write(|conn| {
+            conn.execute_batch(
+                "CREATE TEMP TABLE stamp_failure_probe(value); SELECT * FROM absent_stamp_table",
+            )?;
+            Ok(())
+        });
+        assert!(failed.is_err());
+        let after_failure = selection.operation_workspace_stamp().unwrap();
+        assert_ne!(
+            after_failure.temp_schema_version,
+            published.temp_schema_version
+        );
+
+        // Private schema initialization uses accounting rather than the
+        // direct-write epoch, but the raw TEMP schema witness must refresh.
+        let stage = selection.staged_read_epoch();
+        selection
+            .initialize_owned_temp_schema(
+                selection.connection(),
+                "CREATE TEMP TABLE stamp_owned_probe(value)",
+            )
+            .unwrap();
+        assert_eq!(selection.staged_read_epoch(), stage);
+        let after_schema = selection.operation_workspace_stamp().unwrap();
+        assert_ne!(
+            after_schema.temp_schema_version,
+            after_failure.temp_schema_version
+        );
+
+        // Rolled-back private writes still count as attempted writes. The
+        // pragma memo must not freeze this independent, in-memory witness.
+        let before_rollback = selection.read_change_stamp().unwrap();
+        selection
+            .with_owned_temp_transaction(|conn| {
+                conn.execute("INSERT INTO stamp_owned_probe VALUES(1)", [])?;
+                Ok(SelectedResolutionTempTransaction::Rollback(()))
+            })
+            .unwrap();
+        assert_eq!(
+            selection.read_change_stamp().unwrap().unowned_changes,
+            before_rollback.unowned_changes + 1
+        );
+
+        // Finishing an operation always checks external commits afresh.
+        store.conn.execute(|conn| {
+            conn.execute("INSERT INTO selected_stamp_publication_probe VALUES(1)", [])
+                .unwrap();
+        });
+        assert!(matches!(
+            selection.revalidate(&cancellation).unwrap(),
+            SelectedResolutionRevalidationOutcome::Current
+        ));
+        assert!(
+            selection
+                .operation_change_stamp
+                .as_ref()
+                .unwrap()
+                .get()
+                .is_none()
+        );
+        assert_ne!(
+            selection
+                .operation_workspace_stamp()
+                .unwrap()
+                .main_data_version,
+            after_schema.main_data_version
+        );
+    }
+
+    #[cfg(test)]
     #[test]
     fn scoped_query_plans_restore_writer_fallback_after_success_and_error() {
         use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
@@ -4309,6 +4865,164 @@ pub mod tests {
                 "a failed read must restore the writer's planner configuration"
             );
         }
+    }
+
+    /// A token that cancels itself as soon as its holder starts to wait for
+    /// the writer, so the wait it observes is the one being tested.
+    #[cfg(test)]
+    fn cancelled_on_writer_wait() -> CancellationToken {
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        token.with_phase_sink(move |phase| {
+            assert_eq!(phase, super::super::writer::WRITER_WAIT_PHASE);
+            canceller.cancel();
+        })
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[hardwon(
+        "#6018: writer-only waits for the selected writer ignored the request's cancellation"
+    )]
+    fn writer_only_waits_for_the_writer_observe_cancellation() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in(
+            AnalyzerStore::open_in_memory_single_connection().unwrap(),
+        );
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let open = |cancellation: &CancellationToken| {
+            store
+                .open_selected_resolution_mount_inventory(
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                    cancellation,
+                )
+                .unwrap()
+        };
+        let SelectedResolutionMountInventoryOutcome::Ready(mut selection) =
+            open(&CancellationToken::new())
+        else {
+            panic!("published fixture must open a selected inventory");
+        };
+        selection.lend_writer().unwrap();
+        std::thread::scope(|scope| {
+            let (held, wait_until_held) = std::sync::mpsc::channel();
+            let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+            let writer = &store.conn;
+            let holder = scope.spawn(move || {
+                let _writer = writer.lock().unwrap();
+                held.send(()).unwrap();
+                wait_for_release.recv().unwrap();
+            });
+            wait_until_held.recv().unwrap();
+            // Only the wait's phase cancels these tokens, so each outcome is
+            // a wait that stopped while the other thread held the writer.
+            let opener = cancelled_on_writer_wait();
+            assert!(matches!(
+                open(&opener),
+                SelectedResolutionMountInventoryOutcome::Cancelled
+            ));
+            assert!(opener.is_cancelled() && opener.phase().is_none());
+            let operation = cancelled_on_writer_wait();
+            assert_eq!(
+                selection.reclaim_writer(&operation).unwrap(),
+                SelectedResolutionRevalidationOutcome::Cancelled
+            );
+            assert!(operation.is_cancelled() && operation.phase().is_none());
+            release.send(()).unwrap();
+            holder.join().unwrap();
+        });
+        // The other thread wrote nothing, so the lent selection is still the
+        // operation's authority.
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            selection.reclaim_writer(&cancellation).unwrap(),
+            SelectedResolutionRevalidationOutcome::Current
+        );
+        assert_eq!(
+            selection.revalidate(&cancellation).unwrap(),
+            SelectedResolutionRevalidationOutcome::Current
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn lent_writer_selection_survives_ordinary_reads_but_not_another_selection() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in(
+            AnalyzerStore::open_in_memory_single_connection().unwrap(),
+        );
+        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
+        let cancellation = CancellationToken::new();
+        let open = || {
+            let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+                .open_selected_resolution_mount_inventory(
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("published fixture must open a selected inventory");
+            };
+            selection
+        };
+        let retained = || store.writer_resolution_selection.lock().unwrap().is_some();
+        let revisions = |selection: &SelectedResolutionMountInventory<'_>| {
+            selection
+                .connection()
+                .prepare("SELECT revision FROM temp.selected_workspace_revisions")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let mut other = snapshots.clone();
+        other.get_mut("go").unwrap().revision += 1;
+
+        // Ordinary reads share the selection's revision rows. A read of its own
+        // snapshots leaves them as they are; a read of other snapshots replaces
+        // them, and the selection restores them when it takes the connection
+        // back.
+        let mut selection = open();
+        selection.lend_writer().unwrap();
+        drop(store.read_conn_for_workspace(&snapshots).unwrap());
+        drop(store.read_conn_for_workspace(&other).unwrap());
+        assert_eq!(
+            selection.reclaim_writer(&cancellation).unwrap(),
+            SelectedResolutionRevalidationOutcome::Current
+        );
+        assert_eq!(revisions(&selection), [1]);
+        assert_eq!(
+            selection.revalidate(&cancellation).unwrap(),
+            SelectedResolutionRevalidationOutcome::Current
+        );
+        drop(selection);
+        assert!(retained(), "a restored selection is retained");
+
+        // Another selection staged over the lent one replaces rows that
+        // ordinary reads never write. The lent operation is stale from then on,
+        // and its connection stays lent so the caller can still read.
+        let mut selection = open();
+        selection.lend_writer().unwrap();
+        drop(open());
+        assert!(retained(), "the other selection retains its own rows");
+        let stale = SelectedResolutionRevalidationOutcome::Stale(
+            SelectedResolutionStale::LentWriterChanged,
+        );
+        assert_eq!(selection.reclaim_writer(&cancellation).unwrap(), stale);
+        drop(store.read_conn_for_workspace(&other).unwrap());
+        assert_eq!(selection.reclaim_writer(&cancellation).unwrap(), stale);
+        selection.end_writer_loan().unwrap();
+        assert_eq!(selection.revalidate(&cancellation).unwrap(), stale);
+        // It clears the connection instead of returning its selection over
+        // the other one.
+        drop(selection);
+        assert!(!retained());
+        assert_eq!(revisions(&open()), [1]);
     }
 
     #[doc(hidden)]

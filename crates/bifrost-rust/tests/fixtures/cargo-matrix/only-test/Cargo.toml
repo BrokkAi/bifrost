@@ -1,0 +1,12 @@
+[package]
+name = "only-test"
+version = "0.1.0"
+edition = "2021"
+autolib = false
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+[[test]]
+name = "custom"
+path = "custom/entry.rs"

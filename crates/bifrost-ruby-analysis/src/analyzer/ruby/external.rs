@@ -165,7 +165,8 @@ impl RubyGemArchivePackProducer {
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
-                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+                extraction: Some(brokk_bifrost_analysis::analyzer::semantic_model::ArtifactExtraction::from_artifact(request.artifact_kind, artifact)),
+schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 pack_id: request.pack_id.clone(),
                 version: request.pack_version.clone(),
                 producer: Producer {

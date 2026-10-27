@@ -808,6 +808,7 @@ impl NfaBuilder<'_> {
         for &old in &fragment.states {
             let new = remap[old];
             let old_state = self.states[old].clone();
+            self.states[new].capture_ends = old_state.capture_ends;
             for target in old_state.epsilon {
                 let Some(mapped) = remap
                     .get(target)
@@ -1236,14 +1237,20 @@ fn parse_inline_flags(
     let mut ascii_mode = None;
     while let Some(character) = chars.get(index).copied() {
         match character {
-            ')' | ':' if saw_flag => {
+            ')' | ':' if saw_flag && (enabled || character == ':') => {
                 if ascii_mode == Some((true, true)) {
                     return None;
                 }
                 return Some((index, flags));
             }
-            '-' if enabled && saw_flag => enabled = false,
+            '-' if enabled => {
+                enabled = false;
+                saw_flag = false;
+            }
             'i' | 'm' | 's' | 'x' | 'a' | 'u' => {
+                if !enabled && matches!(character, 'a' | 'u') {
+                    return None;
+                }
                 saw_flag = true;
                 match character {
                     'i' => flags.ignorecase = enabled,
@@ -1679,7 +1686,6 @@ struct RegexParser<'a> {
     facts: Vec<Fact>,
     frames: Vec<BranchFrame>,
     pending_risks: Vec<(NormalizedKind, usize, usize, usize, String)>,
-    verbose_comments: Vec<(usize, usize)>,
     incomplete: Option<(usize, usize, String)>,
     exceeded: bool,
 }
@@ -1695,7 +1701,6 @@ impl<'a> RegexParser<'a> {
             facts: Vec::new(),
             frames: Vec::new(),
             pending_risks: Vec::new(),
-            verbose_comments: Vec::new(),
             incomplete: None,
             exceeded: false,
         }
@@ -1743,11 +1748,9 @@ impl<'a> RegexParser<'a> {
                     continue;
                 }
                 if self.chars[self.index] == '#' {
-                    let start = self.index;
                     while self.index < length && self.chars[self.index] != '\n' {
                         self.index += 1;
                     }
-                    self.verbose_comments.push((start, self.index));
                     continue;
                 }
             }
@@ -1785,7 +1788,6 @@ impl<'a> RegexParser<'a> {
             return self.budget_result();
         }
         self.compute_minimum_widths();
-        self.classify_verbose_comment_duplicates();
         self.classify_unmatchable_anchors();
         self.classify_hostname();
         self.classify_bad_tag();
@@ -1796,41 +1798,6 @@ impl<'a> RegexParser<'a> {
             return self.budget_result();
         }
         self.facts
-    }
-
-    fn classify_verbose_comment_duplicates(&mut self) {
-        if self.verbose_comments.is_empty()
-            || !self
-                .facts
-                .iter()
-                .any(|fact| fact.kind == NormalizedKind::RegexCharacterClass)
-        {
-            return;
-        }
-        let mut positions = HashMap::<char, Vec<usize>>::new();
-        for &(start, end) in &self.verbose_comments {
-            for (offset, character) in self.chars[start..end].iter().copied().enumerate() {
-                if !character.is_whitespace() {
-                    positions.entry(character).or_default().push(start + offset);
-                }
-            }
-        }
-        let mut duplicates = positions
-            .into_iter()
-            .filter_map(|(character, offsets)| {
-                (offsets.len() > 1).then(|| (character, offsets[0], offsets[1]))
-            })
-            .collect::<Vec<_>>();
-        duplicates.sort_unstable_by_key(|(character, _, _)| *character);
-        if let Some((character, _, _)) = duplicates.first() {
-            self.pending_risks.push((
-                NormalizedKind::RegexRiskDuplicateClassCharacter,
-                0,
-                0,
-                self.chars.len(),
-                format!("duplicate-verbose-comment-character:{character}"),
-            ));
-        }
     }
 
     fn budget_result(&self) -> Vec<Fact> {
@@ -2224,7 +2191,11 @@ impl<'a> RegexParser<'a> {
             self.index += 1;
             return;
         };
-        if self.facts[atom].quantifier.is_some() {
+        if self
+            .facts
+            .iter()
+            .any(|fact| fact.parent == Some(atom) && fact.kind == NormalizedKind::RegexQuantifier)
+        {
             self.mark_incomplete(
                 start,
                 (start + 1).min(self.chars.len()),
@@ -2709,12 +2680,24 @@ impl<'a> RegexParser<'a> {
                     self.facts[id].minimum_width = if self.facts[id]
                         .construct
                         .as_deref()
-                        .is_some_and(|construct| construct.starts_with("look"))
-                    {
+                        .is_some_and(|construct| {
+                            construct.starts_with("look") || construct == "comment"
+                        }) {
                         Some(0)
                     } else {
                         sequence.and_then(|sequence| self.facts[sequence].minimum_width)
                     };
+                    let minimum = self
+                        .facts
+                        .iter()
+                        .find(|fact| {
+                            fact.parent == Some(id) && fact.kind == NormalizedKind::RegexQuantifier
+                        })
+                        .and_then(|fact| fact.quantifier)
+                        .map_or(1, |quantifier| quantifier.minimum);
+                    self.facts[id].minimum_width = self.facts[id]
+                        .minimum_width
+                        .and_then(|width| width.checked_mul(minimum));
                 }
                 _ => {}
             }
@@ -4309,7 +4292,7 @@ re.compile(r"(a+)+aaaaa*a+")
             "{facts:#?}"
         );
         assert!(
-            facts.iter().any(|fact| {
+            !facts.iter().any(|fact| {
                 fact.kind == NormalizedKind::RegexRiskDuplicateClassCharacter
                     && fact.range.start_line == line_with("VERBOSE_REGEX =")
             }),
@@ -4515,5 +4498,834 @@ re.compile(pattern)
                 && fact.range.start_byte == closing_paren
                 && fact.range.end_byte == closing_paren
         }));
+    }
+    #[test]
+    fn qs6_regex_decoder_and_fact_budgets_keep_ranges_and_parent_links() {
+        for (pattern, reason, fact_count) in [
+            (
+                "f'{dynamic}'".to_owned(),
+                "formatted-string-interpolation",
+                1,
+            ),
+            (
+                format!("r'{}'", "a".repeat(8193)),
+                "pattern-character-budget",
+                1,
+            ),
+            (
+                format!("r'{}'", "a|".repeat(2200) + "a"),
+                "regex-fact-budget",
+                3,
+            ),
+        ] {
+            let prefix = "# \u{e9}\nimport re\nre.compile(";
+            let source = format!("{prefix}{pattern})\n");
+            let facts = embedded_for_source(&source);
+            assert_eq!(facts.len(), fact_count, "reason={reason}; facts={facts:?}");
+            let incomplete = facts
+                .iter()
+                .find(|fact| fact.kind == NormalizedKind::RegexIncomplete)
+                .expect("limit explicitly reported");
+            assert_eq!(
+                incomplete.construct.as_deref(),
+                Some(reason),
+                "{incomplete:?}"
+            );
+            let expected = if fact_count == 1 {
+                prefix.len()..prefix.len() + pattern.len()
+            } else {
+                prefix.len() + 2..prefix.len() + pattern.len() - 1
+            };
+            assert_eq!(
+                incomplete.range.start_byte..incomplete.range.end_byte,
+                expected
+            );
+            for (index, fact) in facts.iter().enumerate() {
+                assert!(source.is_char_boundary(fact.range.start_byte));
+                assert!(source.is_char_boundary(fact.range.end_byte));
+                if let Some(parent) = fact.parent {
+                    assert!(parent < index, "{facts:?}");
+                    assert!(
+                        facts[parent].range.start_byte <= fact.range.start_byte
+                            && fact.range.end_byte <= facts[parent].range.end_byte,
+                        "{facts:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            embedded_for_source("import re\nre.compile(r'ab')\n")
+                .iter()
+                .any(|f| f.kind == NormalizedKind::RegexPattern)
+        );
+    }
+
+    #[test]
+    fn qs6_integer_flags_have_radix_independent_semantics() {
+        for (mask, complete) in [
+            (0_u64, true),
+            (2, true),
+            (8, true),
+            (16, true),
+            (256, true),
+            (282, true),
+            (1, false),
+            (64, false),
+        ] {
+            let mut reference = None;
+            for digits in [
+                mask.to_string(),
+                format!("0x{mask:x}"),
+                format!("0o{mask:o}"),
+                format!("0b{mask:b}"),
+            ] {
+                // Python permits separators between digits in every radix.
+                let (prefix, digits) = if digits.starts_with('0') && digits.len() > 1 {
+                    digits.split_at(2)
+                } else {
+                    ("", digits.as_str())
+                };
+                let separated = digits
+                    .chars()
+                    .map(|ch| ch.to_string())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                let source = format!("import re\nre.compile(r'^a.\\w$', {prefix}{separated})\n");
+                let tree = crate::declarations::parse_python_tree(&source).unwrap();
+                let call = tree
+                    .root_node()
+                    .named_child(1)
+                    .unwrap()
+                    .named_child(0)
+                    .unwrap();
+                assert_eq!(call.kind(), "call");
+                let integer = call
+                    .child_by_field_name("arguments")
+                    .unwrap()
+                    .named_child(1)
+                    .unwrap();
+                assert_eq!(integer.kind(), "integer");
+                assert_eq!(node_text(integer, &source), format!("{prefix}{separated}"));
+                let api =
+                    recognized_api(call.child_by_field_name("function").unwrap(), &source).unwrap();
+                let flags = call_flags(call, api, &source);
+                let expected = match mask {
+                    2 => (true, false, false, false),
+                    8 => (false, true, false, false),
+                    16 => (false, false, true, false),
+                    256 => (false, false, false, true),
+                    282 => (true, true, true, true),
+                    _ => (false, false, false, false),
+                };
+                assert_eq!(
+                    (flags.ignorecase, flags.multiline, flags.dotall, flags.ascii),
+                    expected
+                );
+                let facts = embedded_for_source(&source);
+                assert!(
+                    facts
+                        .iter()
+                        .any(|fact| fact.kind == NormalizedKind::RegexPattern)
+                );
+                assert_eq!(
+                    !facts
+                        .iter()
+                        .any(|fact| fact.construct.as_deref() == Some("unsupported-regex-flags")),
+                    complete,
+                    "mask={mask}: {facts:?}"
+                );
+                let semantic = facts
+                    .iter()
+                    .map(|fact| (fact.kind, fact.parent, fact.construct.clone()))
+                    .collect::<Vec<_>>();
+                if let Some(reference) = &reference {
+                    assert_eq!(&semantic, reference);
+                } else {
+                    reference = Some(semantic);
+                }
+            }
+        }
+        for overflow in [
+            "18446744073709551616",
+            "0x1_0000_0000_0000_0000",
+            "0o2_0000_0000_0000_0000_0000_00",
+            "0b1_0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let source = format!("import re\nre.compile('a', {overflow})\n");
+            assert!(
+                embedded_for_source(&source)
+                    .iter()
+                    .any(|fact| fact.construct.as_deref() == Some("unsupported-regex-flags")),
+                "{overflow}"
+            );
+        }
+    }
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: ignored comments produced duplicate-class warnings"
+    )]
+    fn qs6_verbose_comments_are_ignored() {
+        let facts = embedded_for_source("import re\nre.compile('[a] # xx', re.X)\n");
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.kind == NormalizedKind::RegexCharacterClass)
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|f| f.kind == NormalizedKind::RegexRiskDuplicateClassCharacter),
+            "{facts:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: group widths lost quantifiers and comment emptiness"
+    )]
+    fn qs6_group_width_anchor_regression() {
+        for (pattern, risk) in [
+            ("(a)*^", false),
+            ("(a)?^", false),
+            ("(a){0,3}^", false),
+            ("(a)+^", true),
+            ("(?#ignored)a^", true),
+        ] {
+            let facts = embedded_for_source(&format!("import re\nre.compile(r'{pattern}')\n"));
+            assert_eq!(
+                facts
+                    .iter()
+                    .any(|f| f.kind == NormalizedKind::RegexRiskUnmatchableCaret),
+                risk,
+                "{pattern}: {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: multiple repetition operators were accepted"
+    )]
+    fn qs6_multiple_repeat_is_incomplete() {
+        for pattern in ["a**", "a*+*", "(ab){2}{3}"] {
+            let facts = embedded_for_source(&format!("import re\nre.compile(r'{pattern}')\n"));
+            assert!(
+                facts
+                    .iter()
+                    .any(|f| f.construct.as_deref() == Some("nested-quantifier")),
+                "{pattern}: {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: optional clones lost HTML capture evidence"
+    )]
+    fn qs6_optional_captures_retain_bad_tag_evidence() {
+        let facts = embedded_for_source("import re\nre.compile(r'(?:(<!--.*?--)|(<foo))?>')\n");
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.kind == NormalizedKind::RegexRiskBadTag),
+            "{facts:?}"
+        );
+    }
+
+    fn qs6_parse(pattern: &str) -> Vec<Fact> {
+        let decoded = DecodedValue {
+            value: pattern.to_owned(),
+            chars: Vec::new(),
+            source_range: Range {
+                start_byte: 0,
+                end_byte: pattern.len(),
+                start_line: 1,
+                end_line: 1,
+            },
+            is_bytes: false,
+        };
+        RegexParser::new(
+            &decoded,
+            RegexFlags {
+                dotall: false,
+                multiline: false,
+                ignorecase: false,
+                ascii: false,
+                verbose: false,
+                complete: true,
+            },
+            Api {
+                flags_position: 1,
+                scans_from_each_offset: false,
+            },
+        )
+        .parse()
+    }
+
+    // CPython re.match oracle, generated over every word through length three
+    // on {a, b, A, newline}, plus repeat-limit boundary witnesses.
+    #[test]
+    fn qs6_cpython_prefix_language_corpus() {
+        let samples = [
+            "",
+            "a",
+            "b",
+            "A",
+            "\n",
+            "aa",
+            "ab",
+            "aA",
+            "a\n",
+            "ba",
+            "bb",
+            "bA",
+            "b\n",
+            "Aa",
+            "Ab",
+            "AA",
+            "A\n",
+            "\na",
+            "\nb",
+            "\nA",
+            "\n\n",
+            "aaa",
+            "aab",
+            "aaA",
+            "aa\n",
+            "aba",
+            "abb",
+            "abA",
+            "ab\n",
+            "aAa",
+            "aAb",
+            "aAA",
+            "aA\n",
+            "a\na",
+            "a\nb",
+            "a\nA",
+            "a\n\n",
+            "baa",
+            "bab",
+            "baA",
+            "ba\n",
+            "bba",
+            "bbb",
+            "bbA",
+            "bb\n",
+            "bAa",
+            "bAb",
+            "bAA",
+            "bA\n",
+            "b\na",
+            "b\nb",
+            "b\nA",
+            "b\n\n",
+            "Aaa",
+            "Aab",
+            "AaA",
+            "Aa\n",
+            "Aba",
+            "Abb",
+            "AbA",
+            "Ab\n",
+            "AAa",
+            "AAb",
+            "AAA",
+            "AA\n",
+            "A\na",
+            "A\nb",
+            "A\nA",
+            "A\n\n",
+            "\naa",
+            "\nab",
+            "\naA",
+            "\na\n",
+            "\nba",
+            "\nbb",
+            "\nbA",
+            "\nb\n",
+            "\nAa",
+            "\nAb",
+            "\nAA",
+            "\nA\n",
+            "\n\na",
+            "\n\nb",
+            "\n\nA",
+            "\n\n\n",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        for (pattern, expected) in [
+            (
+                "a",
+                "0100011110000000000001111111111111111000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "b",
+                "0010000001111000000000000000000000000111111111111111100000000000000000000000000000000000",
+            ),
+            (
+                "[a]",
+                "0100011110000000000001111111111111111000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "[a-a]",
+                "0100011110000000000001111111111111111000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "[a-b]",
+                "0110011111111000000001111111111111111111111111111111100000000000000000000000000000000111",
+            ),
+            (
+                "[ab]",
+                "0110011111111000000001111111111111111111111111111111100000000000000000000000000000000111",
+            ),
+            (
+                "a?",
+                "1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            (
+                "ab?",
+                "0100011110000000000001111111111111111000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "a{0}",
+                "1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            (
+                "a{1}",
+                "0100011110000000000001111111111111111000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "a{3}",
+                "0000000000000000000001000000000000000000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "a{3,3}",
+                "0000000000000000000001000000000000000000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "a{2,3}",
+                "0000010000000000000001111000000000000000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "a{32}",
+                "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000011",
+            ),
+            (
+                ".",
+                "0111011111111111100001111111111111111111111111111111111111111111111110000000000000000111",
+            ),
+            (
+                "(?s:.)",
+                "0111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            (
+                "(?ai:a)",
+                "0101011110000111100001111111111111111000000000000000011111111111111110000000000000000111",
+            ),
+            (
+                "(?ai:A)",
+                "0101011110000111100001111111111111111000000000000000011111111111111110000000000000000111",
+            ),
+            (
+                "(?ai:[a-z])",
+                "0111011111111111100001111111111111111111111111111111111111111111111110000000000000000111",
+            ),
+            (
+                "(?ai:[A-Z])",
+                "0111011111111111100001111111111111111111111111111111111111111111111110000000000000000111",
+            ),
+            (
+                "(a|aa)",
+                "0100011110000000000001111111111111111000000000000000000000000000000000000000000000000111",
+            ),
+            (
+                "(?:ab|b)*",
+                "1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            (
+                "(?:a|b)+",
+                "0110011111111000000001111111111111111111111111111111100000000000000000000000000000000111",
+            ),
+            (
+                "a{0,2}b",
+                "0010001001111000000000100111100000000111111111111111100000000000000000000000000000000000",
+            ),
+        ] {
+            let facts = qs6_parse(pattern);
+            assert!(
+                !facts
+                    .iter()
+                    .any(|f| f.kind == NormalizedKind::RegexIncomplete),
+                "{pattern}: {facts:?}"
+            );
+            let nfa = RegexNfa::compile(&facts, 0, None).unwrap();
+            for (sample, expected) in samples.iter().zip(expected.bytes()) {
+                assert_eq!(
+                    nfa.match_prefix_capture_groups(sample).0,
+                    expected == b'1',
+                    "{pattern:?} on {sample:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qs6_finite_language_relations() {
+        let patterns = ["a?", "b?", "a", "aa", "aaa", "ab", "ba", "(?:a|aa)"];
+        let nfas = patterns.map(|p| RegexNfa::compile(&qs6_parse(p), 0, None).unwrap());
+        // These finite languages are independently enumerated by CPython fullmatch.
+        let languages: [&[&str]; 8] = [
+            &["", "a"],
+            &["", "b"],
+            &["a"],
+            &["aa"],
+            &["aaa"],
+            &["ab"],
+            &["ba"],
+            &["a", "aa"],
+        ];
+        for (i, left) in nfas.iter().enumerate() {
+            for (j, right) in nfas.iter().enumerate() {
+                let expected = languages[i]
+                    .iter()
+                    .any(|w| !w.is_empty() && languages[j].contains(w));
+                assert_eq!(
+                    left.intersects_on_nonempty_string(right, &mut 65536)
+                        .unwrap(),
+                    expected,
+                    "{i}, {j}"
+                );
+                for (k, pattern) in patterns.iter().enumerate() {
+                    let repeated = RegexNfa::compile(&qs6_parse(pattern), 0, None)
+                        .unwrap()
+                        .positive_closure()
+                        .unwrap();
+                    let expected = languages[j].iter().any(|w| {
+                        (1..w.len()).any(|split| {
+                            if !languages[i].contains(&&w[..split]) {
+                                return false;
+                            }
+                            // Independent word-break oracle for a positive closure.
+                            let suffix = &w[split..];
+                            let mut reachable = vec![false; suffix.len() + 1];
+                            reachable[0] = true;
+                            for offset in 0..suffix.len() {
+                                if reachable[offset] {
+                                    for part in languages[k].iter().filter(|w| !w.is_empty()) {
+                                        if suffix[offset..].starts_with(part) {
+                                            reachable[offset + part.len()] = true;
+                                        }
+                                    }
+                                }
+                            }
+                            reachable[suffix.len()]
+                        })
+                    });
+                    assert_eq!(
+                        left.has_repartitioned_prefix(right, &repeated, &mut 65536)
+                            .unwrap(),
+                        expected,
+                        "{i}, {j}, {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qs6_nfa_fork_and_resource_boundaries() {
+        // Two one-character paths either reconverge on the same letter or
+        // cannot synchronize. Starting at the fork itself also reaches it.
+        for right in ['a', 'b'] {
+            let nfa = RegexNfa {
+                start: 0,
+                end: 2,
+                states: vec![
+                    NfaState {
+                        transitions: vec![(CharacterSet::one('a'), 2)],
+                        ..Default::default()
+                    },
+                    NfaState {
+                        transitions: vec![(CharacterSet::one(right), 2)],
+                        ..Default::default()
+                    },
+                    NfaState::default(),
+                ],
+            };
+            let closures = nfa.epsilon_closures();
+            assert_eq!(
+                nfa.product_reaches_fork((0, 1), 2, &closures, &mut 65536)
+                    .unwrap(),
+                right == 'a'
+            );
+            assert!(
+                nfa.product_reaches_fork((2, 2), 2, &closures, &mut 65536)
+                    .unwrap()
+            );
+        }
+        for count in [31, 32, 33] {
+            let facts = qs6_parse(&format!("a{{{count}}}"));
+            assert_eq!(RegexNfa::compile(&facts, 0, None).is_ok(), count <= 32);
+        }
+        // A linear 256-character language uses exactly the 512-state budget.
+        // Redundant alternation wrappers must not consume its remaining states.
+        for length in [255, 256, 257] {
+            let facts = qs6_parse(&"a".repeat(length));
+            assert_eq!(RegexNfa::compile(&facts, 0, None).is_ok(), length <= 256);
+        }
+        let mut builder = NfaBuilder {
+            facts: &[],
+            children: Vec::new(),
+            selected_branch: None,
+            capture_ids: &[],
+            states: Vec::new(),
+        };
+        for _ in 0..512 {
+            builder.new_state().unwrap();
+        }
+        assert!(matches!(builder.new_state(), Err(NfaError::Budget)));
+        for depth in [126, 127, 128] {
+            let facts = qs6_parse(&format!("{}a{}", "(".repeat(depth), ")".repeat(depth)));
+            assert_eq!(
+                facts
+                    .iter()
+                    .any(|f| f.kind == NormalizedKind::RegexIncomplete),
+                depth >= 128
+            );
+        }
+    }
+
+    #[test]
+    fn qs6_literal_grammar_and_mapping_corpus() {
+        // CPython ast.literal_eval values, preserving each grammar-selected
+        // literal's source mapping rather than searching the source for syntax.
+        for (literal, expected) in [
+            (r"'\u0061'", "a"),
+            (r"'\U00000061'", "a"),
+            (r"b'\x61'", "a"),
+            (r"b'\n'", "\n"),
+            (r"r'\u0061'", r"\u0061"),
+        ] {
+            let tree = crate::declarations::parse_python_tree(literal).unwrap();
+            let node = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            assert_eq!(node.kind(), "string");
+            let decoded = decode_string_literal(node, literal).unwrap();
+            assert_eq!(decoded.value, expected, "{literal}");
+        }
+        for count in [8191, 8192, 8193] {
+            let source = format!("rf'{}{{value}}'", "a".repeat(count));
+            let tree = crate::declarations::parse_python_tree(&source).unwrap();
+            let node = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap();
+            let result = decode_python_fstring_literal_segments(node, &source);
+            if count <= 8192 {
+                assert_eq!(result.unwrap(), ["a".repeat(count), String::new()]);
+            } else {
+                assert_eq!(result, Err("pattern-character-budget"));
+            }
+        }
+        for source in [
+            "import re\nre.compile(r'''a\nb''')\n",
+            "import re\nre.compile('a' '\\n' 'b')\n",
+        ] {
+            let facts = embedded_for_source(source);
+            assert!(facts.iter().any(|f| f.kind == NormalizedKind::RegexLiteral));
+            for fact in facts {
+                let range = fact.range;
+                assert_eq!(
+                    range.start_line,
+                    source[..range.start_byte]
+                        .bytes()
+                        .filter(|b| *b == b'\n')
+                        .count()
+                        + 1
+                );
+                assert_eq!(
+                    range.end_line,
+                    source[..range.end_byte.saturating_sub(1).max(range.start_byte)]
+                        .bytes()
+                        .filter(|b| *b == b'\n')
+                        .count()
+                        + 1
+                );
+            }
+        }
+    }
+    #[test]
+    fn qs6_anchor_and_redos_fact_corpus() {
+        // Safe/unsafe controls follow zero-width assertion semantics and
+        // whether a rejecting suffix forces enumeration of ambiguous partitions.
+        for (pattern, flags, caret, dollar, exponential) in [
+            ("^^a", "0", false, false, false),
+            ("a$$", "0", false, false, false),
+            ("(?=a)^a", "0", false, false, false),
+            ("a^", "0", true, false, false),
+            ("(|a)^", "0", false, false, false),
+            ("(a|)^", "0", false, false, false),
+            ("a$z", "0", false, true, false),
+            (r"a\n^b", "re.M", false, false, false),
+            ("([ab]+)+[a-b]+", "0", false, false, false),
+            ("([a-b]+)+[a-b]+", "0", false, false, false),
+            ("(a|aa)*(?=b)", "0", false, false, true),
+            ("(a|aa)*(?=bb)", "0", false, false, true),
+            ("(a|aa)*", "0", false, false, false),
+        ] {
+            let facts =
+                embedded_for_source(&format!("import re\nre.compile(r'{pattern}', {flags})\n"));
+            let has = |kind| facts.iter().any(|f| f.kind == kind);
+            assert!(has(NormalizedKind::RegexPattern));
+            assert!(
+                !has(NormalizedKind::RegexIncomplete),
+                "{pattern}: {facts:?}"
+            );
+            assert_eq!(
+                (
+                    has(NormalizedKind::RegexRiskUnmatchableCaret),
+                    has(NormalizedKind::RegexRiskUnmatchableDollar),
+                    has(NormalizedKind::RegexRiskExponential)
+                ),
+                (caret, dollar, exponential),
+                "{pattern}: {facts:?}"
+            );
+        }
+        for pattern in ["(ab)", "(^ab)", "(?:ab)"] {
+            let facts = qs6_parse(pattern);
+            let group = facts
+                .iter()
+                .find(|f| f.kind == NormalizedKind::RegexGroup)
+                .unwrap();
+            let first = group.first_set.as_ref().unwrap();
+            assert!(first.contains('a'));
+            assert!(!first.contains('b'), "{pattern}: {facts:?}");
+        }
+        for (pattern, broad) in [
+            ("[:-B]", false),
+            ("[:-C]", true),
+            ("[:-D]", true),
+            ("[A-Z]", false),
+            ("[0-?]", false),
+        ] {
+            let facts = embedded_for_source(&format!("import re\nre.compile(r'{pattern}')\n"));
+            assert_eq!(
+                facts
+                    .iter()
+                    .any(|f| f.kind == NormalizedKind::RegexRiskRange),
+                broad,
+                "{pattern}: {facts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qs6_selected_arguments_and_invalid_token_spans() {
+        let source = "import re\nre.compile(pattern='a')\nre.search(string='subject', pattern='b')\nre.compile(other='unselected')\nre.sub('c', 'replacement', 'subject')\n";
+        let facts = embedded_for_source(source);
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|f| f.kind == NormalizedKind::RegexPattern)
+                .map(|f| f.construct.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        for pattern in ["a|*", "a|+", "a|?", "(?P=name)", "a(?P=name)", "(abc"] {
+            let prefix = "import re\nre.compile(r'";
+            let source = format!("{prefix}{pattern}')\n");
+            let facts = embedded_for_source(&source);
+            let incomplete = facts
+                .iter()
+                .find(|f| f.kind == NormalizedKind::RegexIncomplete)
+                .unwrap();
+            let expected_start = if pattern.starts_with("a|") {
+                2
+            } else if pattern == "a(?P=name)" {
+                1
+            } else {
+                0
+            };
+            let expected_end = if pattern.starts_with("a|") || pattern == "(?P=name)" {
+                3
+            } else if pattern == "a(?P=name)" {
+                4
+            } else {
+                pattern.len()
+            };
+            assert_eq!(
+                incomplete.range.start_byte..incomplete.range.end_byte,
+                prefix.len() + expected_start..prefix.len() + expected_end,
+                "{pattern}: {facts:?}"
+            );
+            // The public fact stream traverses siblings in lexical source order.
+            for parent in 0..facts.len() {
+                let children = facts
+                    .iter()
+                    .filter(|f| f.parent == Some(parent))
+                    .map(|f| f.range.start_byte)
+                    .collect::<Vec<_>>();
+                assert!(
+                    children.windows(2).all(|w| w[0] <= w[1]),
+                    "{pattern}: {facts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qs6_pending_fact_budget_reserves_incomplete_slot() {
+        // Every repeated class member queues a diagnostic. Exercise the point
+        // where parsed facts plus pending diagnostics exhaust the shared cap.
+        for members in [2044, 2045, 2046, 2047, 2048] {
+            let facts = qs6_parse(&format!("[{}]", "a".repeat(members)));
+            assert!(facts.len() <= 4096, "members={members}: {}", facts.len());
+            if members >= 2047 {
+                assert!(
+                    facts
+                        .iter()
+                        .any(|f| f.construct.as_deref() == Some("regex-fact-budget")),
+                    "members={members}: {}",
+                    facts.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: scoped flags could not start by disabling a flag"
+    )]
+    fn qs6_scoped_flags_can_disable_without_enabling() {
+        for pattern in ["(?i:a)(?-i:b)", "(?-i:ab)"] {
+            let facts = qs6_parse(pattern);
+            assert!(
+                !facts
+                    .iter()
+                    .any(|f| f.kind == NormalizedKind::RegexIncomplete),
+                "{facts:?}"
+            );
+            let nfa = RegexNfa::compile(&facts, 0, None).unwrap();
+            assert!(nfa.match_prefix_capture_groups("ab").0);
+            assert!(!nfa.match_prefix_capture_groups("aB").0);
+        }
+        for pattern in ["(?-a:a)", "(?-u:a)", "(?-i)", "(?i-:a)"] {
+            let facts = qs6_parse(pattern);
+            assert!(
+                facts
+                    .iter()
+                    .any(|f| f.construct.as_deref() == Some("invalid-inline-flags")),
+                "{pattern}: {facts:?}"
+            );
+        }
     }
 }

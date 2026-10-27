@@ -378,11 +378,14 @@ fn collect_stdin_writer(
 ) -> Result<(), StdinWriteFailure> {
     let timed_out = !worker_finished_within(&worker, READER_GRACE);
     let cleanup = timed_out.then(|| child.terminate_tree_and_wait());
-    match worker.join() {
-        Ok(Ok(())) if !timed_out => Ok(()),
-        Ok(Ok(())) => Err(StdinWriteFailure::TimedOut {
-            cleanup: cleanup.expect("timeout cleanup must exist"),
-        }),
+    let joined = worker.join();
+    // A writer still blocked at the deadline fails with a broken pipe once
+    // the cleanup kills the reader, so the timeout decides the outcome.
+    if let Some(cleanup) = cleanup {
+        return Err(StdinWriteFailure::TimedOut { cleanup });
+    }
+    match joined {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(StdinWriteFailure::Write(error)),
         Err(_) => Err(StdinWriteFailure::Panicked),
     }
@@ -712,6 +715,332 @@ mod tests {
                 std::fs::write(std::env::var_os(HELPER_MARKER).unwrap(), b"escaped").unwrap();
             }
             _ => {}
+        }
+    }
+
+    // Real-process tests for the Unix process tree. The Windows job-object
+    // paths are not compiled on Unix.
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use brokk_bifrost_test_macros::hardwon;
+        use std::io::BufRead;
+        use std::path::Path;
+        use std::process::Stdio;
+
+        /// A payload far larger than a pipe buffer (64 KiB on Linux), so a
+        /// writer to a child that never reads must block or fail.
+        const LARGE_PAYLOAD: usize = 1 << 20;
+
+        fn shell_request(
+            script: &str,
+            stdin: Option<Vec<u8>>,
+            cwd: &Path,
+        ) -> BoundedProcessRequest {
+            BoundedProcessRequest {
+                program: OsString::from("sh"),
+                args: vec![OsString::from("-c"), OsString::from(script)],
+                env: Vec::new(),
+                clear_env: false,
+                cwd: cwd.to_path_buf(),
+                stdin,
+                timeout: Duration::from_secs(30),
+                stdout_limit: 1 << 20,
+                stderr_limit: 1 << 20,
+                description: "shell test child".to_string(),
+            }
+        }
+
+        fn spawn_shell(script: &str, stdin: Stdio) -> OwnedProcess {
+            OwnedProcess::spawn(
+                Command::new("sh")
+                    .args(["-c", script])
+                    .stdin(stdin)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap()
+        }
+
+        /// Spawn a shell whose background `sleep` is a grandchild, and return
+        /// the shell with the grandchild's pid.
+        fn spawn_with_grandchild() -> (OwnedProcess, libc::pid_t) {
+            let mut process = spawn_shell("sleep 60 & echo $!; wait", Stdio::null());
+            let stdout = process.take_stdout().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .unwrap();
+            let pid: libc::pid_t = line.trim().parse().unwrap();
+            assert!(process_is_alive(pid), "grandchild {pid} must start alive");
+            (process, pid)
+        }
+
+        fn process_is_alive(pid: libc::pid_t) -> bool {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return false;
+            }
+            // A killed orphan stays a zombie until its new parent reaps it,
+            // and a container without a reaper never does. A zombie is dead.
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => !stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+                Err(_) => true,
+            }
+        }
+
+        fn dies_within(pid: libc::pid_t, bound: Duration) -> bool {
+            let started = Instant::now();
+            while process_is_alive(pid) {
+                if started.elapsed() >= bound {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            true
+        }
+
+        /// The environment `env` prints for `clear_env` with one explicit
+        /// variable, one `NAME=value` line per entry.
+        fn printed_environment(clear_env: bool) -> Vec<String> {
+            let temporary = tempfile::tempdir().unwrap();
+            let request = BoundedProcessRequest {
+                program: OsString::from("/usr/bin/env"),
+                args: Vec::new(),
+                env: vec![(
+                    OsString::from("BIFROST_BOUNDED_PROCESS_ENV_PROBE"),
+                    OsString::from("1"),
+                )],
+                clear_env,
+                ..shell_request("", None, temporary.path())
+            };
+            let output = run_bounded_process(&request, || false).unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        #[test]
+        fn clear_env_passes_only_the_explicit_environment() {
+            assert_eq!(
+                printed_environment(true),
+                ["BIFROST_BOUNDED_PROCESS_ENV_PROBE=1"]
+            );
+
+            let inherited = printed_environment(false);
+            assert!(
+                inherited.contains(&"BIFROST_BOUNDED_PROCESS_ENV_PROBE=1".to_string()),
+                "{inherited:?}"
+            );
+            let path = std::env::var("PATH").expect("the test runner has a PATH");
+            assert!(inherited.contains(&format!("PATH={path}")), "{inherited:?}");
+        }
+
+        #[test]
+        fn spawned_child_leads_its_own_session_and_group() {
+            let mut process = spawn_shell("exit 0", Stdio::null());
+            let pid = process.child.id() as libc::pid_t;
+            // The child may already have exited, but it stays unreaped until wait().
+            assert_eq!(unsafe { libc::getsid(pid) }, pid);
+            assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+            assert_ne!(unsafe { libc::getpgid(0) }, pid);
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn terminate_tree_and_wait_kills_the_grandchild() {
+            let (mut process, grandchild) = spawn_with_grandchild();
+            process.terminate_tree_and_wait().unwrap();
+            assert!(
+                dies_within(grandchild, Duration::from_secs(5)),
+                "grandchild {grandchild} survived terminate_tree_and_wait"
+            );
+        }
+
+        #[test]
+        fn terminate_on_an_exited_child_succeeds() {
+            let mut process = spawn_shell("exit 0", Stdio::null());
+            assert!(process.wait().unwrap().success());
+            process.terminate().unwrap();
+            process.terminate().unwrap();
+            process.terminate_tree_and_wait().unwrap();
+        }
+
+        #[test]
+        fn large_stdin_to_a_child_that_exits_unread_is_a_broken_pipe() {
+            let temporary = tempfile::tempdir().unwrap();
+            let mut process = spawn_shell("exit 0", Stdio::piped());
+            let stdin = process.take_stdin().unwrap();
+            let worker = spawn_stdin_writer(stdin, vec![b'x'; LARGE_PAYLOAD]);
+            let failure = collect_stdin_writer(worker, &mut process)
+                .expect_err("an unread large payload must fail");
+            assert!(failure.is_broken_pipe());
+            assert!(matches!(failure, StdinWriteFailure::Write(_)));
+            let message = failure.message(&shell_request("exit 0", None, temporary.path()));
+            assert!(
+                message.contains("failed to write stdin for shell test child"),
+                "{message}"
+            );
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn run_bounded_process_reports_unread_stdin_only_when_the_child_succeeded() {
+            let temporary = tempfile::tempdir().unwrap();
+            let payload = vec![b'x'; LARGE_PAYLOAD];
+
+            let error = run_bounded_process(
+                &shell_request("exit 0", Some(payload.clone()), temporary.path()),
+                || false,
+            )
+            .unwrap_err();
+            assert!(error.contains("failed to write stdin"), "{error}");
+
+            // A child that fails without reading its input is the child's failure, not ours.
+            let output = run_bounded_process(
+                &shell_request("exit 3", Some(payload), temporary.path()),
+                || false,
+            )
+            .unwrap();
+            assert_eq!(output.status.code(), Some(3));
+        }
+
+        /// Block a writer on a child that sleeps without reading, and collect it.
+        /// Returns the failure, the elapsed time and whether the child survived.
+        fn collect_writer_blocked_on_a_sleeping_child() -> (StdinWriteFailure, Duration, bool) {
+            let mut process = spawn_shell("sleep 60", Stdio::piped());
+            let pid = process.child.id() as libc::pid_t;
+            let stdin = process.take_stdin().unwrap();
+            let worker = spawn_stdin_writer(stdin, vec![b'x'; LARGE_PAYLOAD]);
+            let started = Instant::now();
+            let failure = collect_stdin_writer(worker, &mut process)
+                .expect_err("a writer blocked on a sleeping child must fail");
+            (failure, started.elapsed(), process_is_alive(pid))
+        }
+
+        #[test]
+        #[hardwon("7fc8ced1d0e0: a stdin writer that timed out was reported as a broken pipe")]
+        fn stdin_writer_blocked_on_a_stuck_child_fails_after_the_grace_and_kills_it() {
+            let (failure, elapsed, child_alive) = collect_writer_blocked_on_a_sleeping_child();
+            // The cleanup kills the reader, so the blocked write ends with a
+            // broken pipe; the timeout must still be what is reported.
+            assert!(
+                matches!(failure, StdinWriteFailure::TimedOut { cleanup: Ok(()) }),
+                "broken_pipe={}",
+                failure.is_broken_pipe()
+            );
+            assert!(elapsed >= READER_GRACE, "gave up after only {elapsed:?}");
+            assert!(elapsed < READER_GRACE * 5, "took {elapsed:?}");
+            assert!(!child_alive, "timeout must terminate the child");
+        }
+
+        #[test]
+        fn stdin_writer_panic_is_reported_without_a_broken_pipe() {
+            let temporary = tempfile::tempdir().unwrap();
+            let mut process = spawn_shell("exit 0", Stdio::null());
+            // resume_unwind unwinds without running the panic hook, so the test log stays quiet.
+            let worker = thread::spawn(|| -> StdinWriteResult {
+                std::panic::resume_unwind(Box::new("stdin writer test panic"))
+            });
+            let failure = collect_stdin_writer(worker, &mut process)
+                .expect_err("a panicked writer must fail");
+            assert!(!failure.is_broken_pipe());
+            let message = failure.message(&shell_request("exit 0", None, temporary.path()));
+            assert_eq!(message, "shell test child stdin writer panicked");
+            process.wait().unwrap();
+        }
+
+        #[test]
+        fn spawn_failures_name_the_command_and_directory() {
+            let temporary = tempfile::tempdir().unwrap();
+            let mut request = shell_request("exit 0", None, temporary.path());
+            request.program = OsString::from("bifrost-no-such-program-for-process-test");
+            let error = run_bounded_process(&request, || false).unwrap_err();
+            assert!(
+                error.contains("failed to start shell test child"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&temporary.path().display().to_string()),
+                "{error}"
+            );
+            assert!(error.contains("No such file or directory"), "{error}");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_text_file_busy_spawn_is_retried_then_reported() {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let temporary = tempfile::tempdir().unwrap();
+            let script = temporary.path().join("busy.sh");
+            // Linux refuses to exec a file that any process holds open for writing.
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&script)
+                .unwrap();
+            writer.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+
+            let mut request = shell_request("exit 0", None, temporary.path());
+            request.program = script.clone().into_os_string();
+            request.args = Vec::new();
+            let started = Instant::now();
+            let error = run_bounded_process(&request, || false).unwrap_err();
+            assert!(error.contains("Text file busy"), "{error}");
+            assert!(
+                started.elapsed() >= SPAWN_RETRY_DELAY * SPAWN_RETRIES as u32,
+                "ETXTBSY must be retried {SPAWN_RETRIES} times before it is reported: {:?}",
+                started.elapsed()
+            );
+
+            drop(writer);
+            let output = run_bounded_process(&request, || false).unwrap();
+            assert!(output.status.success());
+        }
+    }
+
+    #[cfg(unix)]
+    mod stdin_roundtrip_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(16))]
+
+            /// `cat` is the identity function on bytes, so whatever the
+            /// concurrent stdin writer sends must come back on stdout. Payloads
+            /// straddle the 64 KiB pipe buffer to force writer and readers to overlap.
+            #[test]
+            fn stdin_reaches_the_child_intact(
+                payload in prop_oneof![
+                    prop::collection::vec(any::<u8>(), 0..512),
+                    prop::collection::vec(any::<u8>(), 60_000..200_000),
+                ],
+            ) {
+                let temporary = tempfile::tempdir().unwrap();
+                let request = BoundedProcessRequest {
+                    program: OsString::from("cat"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    clear_env: false,
+                    cwd: temporary.path().to_path_buf(),
+                    stdin: Some(payload.clone()),
+                    timeout: Duration::from_secs(30),
+                    stdout_limit: 1 << 20,
+                    stderr_limit: 1 << 20,
+                    description: "cat round trip".to_string(),
+                };
+                let output = run_bounded_process(&request, || false).unwrap();
+                prop_assert!(output.status.success());
+                prop_assert_eq!(output.stdout, payload);
+            }
         }
     }
 }

@@ -69,7 +69,10 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
         // All paths, source identities and ownership are workspace relative;
         // no file under this synthetic absolute root is opened.
         let root = std::env::temp_dir().join("bifrost-selected-dependency-inputs");
-        let (selected, gaps) = selected_inputs(tx, snapshot, &root, &limits)?;
+        let (selected, gaps) =
+            selected_inputs(tx, snapshot, &root, &limits, std::iter::empty(), |_, _| {
+                unreachable!("disk publication has no overlay inputs")
+            })?;
         let mut evidence = prepare_selected(&snapshot.lang, &root, &selected, &limits);
         evidence.gaps.extend(gaps);
         insert_set(tx, snapshot, &digest, &evidence, &selected)?
@@ -83,11 +86,13 @@ type SelectedInputs = (
     Vec<DependencyEvidenceGap>,
 );
 
-fn selected_inputs(
+fn selected_inputs<'a>(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
     root: &std::path::Path,
     limits: &DependencyFileEvidenceLimits,
+    overlays: impl Iterator<Item = (&'a ProjectFile, &'a [u8; 32])>,
+    mut read_overlay: impl FnMut(&ProjectFile, usize) -> Result<Option<ProjectSourceSnapshot>>,
 ) -> Result<SelectedInputs> {
     let mut selected = Vec::new();
     let mut gaps = Vec::new();
@@ -101,12 +106,61 @@ fn selected_inputs(
         limits.max_file_bytes,
         limits.max_files.saturating_add(1)
     ])?;
-    while let Some(row) = rows.next()? {
-        let path = PathBuf::from(row.get::<_, String>(0)?);
-        let length = row.get::<_, usize>(1)?;
-        let gap = if selected.len() >= limits.max_files {
-            Some("dependency input file cap exceeded")
-        } else if length > limits.max_file_bytes {
+    // Merge the ordered overlay identities into the SQL cursor before applying
+    // limits. Replaced disk bytes must neither exhaust the budget nor prevent
+    // later inputs from being considered. Only capped sources survive this call.
+    let mut overlays = overlays.peekable();
+    let mut disk = rows.next()?;
+    while disk.is_some() || overlays.peek().is_some() {
+        let disk_path = disk.map(|row| row.get::<_, String>(0)).transpose()?;
+        let overlay_path = overlays
+            .peek()
+            .map(|(file, _)| brokk_bifrost_core::path_utils::rel_path_string(file));
+        let take_overlay = overlay_path
+            .as_ref()
+            .is_some_and(|path| disk_path.as_ref().is_none_or(|disk| path <= disk));
+        let advance_disk = !take_overlay || disk_path == overlay_path;
+        let path = PathBuf::from(if take_overlay {
+            overlay_path.unwrap()
+        } else {
+            disk_path.unwrap()
+        });
+        if selected.len() >= limits.max_files {
+            gaps.push(DependencyEvidenceGap {
+                kind: DependencyEvidenceGapKind::Limit,
+                build_file: path,
+                byte_range: 0..0,
+                message: "dependency input file cap exceeded".into(),
+            });
+            break;
+        }
+        let mut overlay_source = None;
+        let mut overlay_digest = None;
+        let length = if take_overlay {
+            let (file, digest) = overlays.next().expect("selected overlay input");
+            overlay_digest = Some(digest);
+            let Some(source) = read_overlay(
+                file,
+                limits
+                    .max_file_bytes
+                    .min(limits.max_total_bytes.saturating_sub(bytes)),
+            )?
+            else {
+                gaps.push(DependencyEvidenceGap {
+                    kind: DependencyEvidenceGapKind::Limit,
+                    build_file: path,
+                    byte_range: 0..0,
+                    message: "dependency overlay byte cap exceeded".into(),
+                });
+                break;
+            };
+            let length = source.source().len();
+            overlay_source = Some(source);
+            length
+        } else {
+            disk.expect("selected disk input").get::<_, usize>(1)?
+        };
+        let gap = if length > limits.max_file_bytes {
             Some("dependency input file byte cap exceeded")
         } else if bytes.saturating_add(length) > limits.max_total_bytes {
             Some("dependency input total byte cap exceeded")
@@ -123,8 +177,27 @@ fn selected_inputs(
             break;
         }
         bytes += length;
-        let source = row.get::<_, Vec<u8>>(2)?;
-        match ProjectSourceSnapshot::disk_bytes(source) {
+        let source = if let Some(source) = overlay_source {
+            Ok(source)
+        } else {
+            ProjectSourceSnapshot::disk_bytes(
+                disk.expect("selected disk input").get::<_, Vec<u8>>(2)?,
+            )
+        };
+        match source {
+            Ok(source)
+                if overlay_digest.is_some_and(|digest| {
+                    &crate::analyzer::canonical_hash::sha256_bytes(source.source().as_bytes())
+                        != digest
+                }) =>
+            {
+                gaps.push(DependencyEvidenceGap {
+                    kind: DependencyEvidenceGapKind::Conflict,
+                    build_file: path,
+                    byte_range: 0..0,
+                    message: "dependency overlay changed during admission".into(),
+                })
+            }
             Ok(source) => selected.push((ProjectFile::new(root, path), source)),
             Err(error) => gaps.push(DependencyEvidenceGap {
                 kind: DependencyEvidenceGapKind::Malformed,
@@ -132,6 +205,9 @@ fn selected_inputs(
                 byte_range: 0..0,
                 message: format!("dependency input decoding failed: {error}"),
             }),
+        }
+        if advance_disk {
+            disk = rows.next()?;
         }
     }
     Ok((selected, gaps))
@@ -343,63 +419,30 @@ pub fn publish_overlay(
         super::StoreError::new("dependency overlay has no selected input revision")
     })?;
     let limits = DependencyFileEvidenceLimits::default();
-    let (mut selected, mut gaps) = {
+    let (selected, gaps) = {
         let conn = store.read_conn_for_workspace(snapshots)?;
-        selected_inputs(&conn, snapshot, project.root(), &limits)?
+        selected_inputs(
+            &conn,
+            snapshot,
+            project.root(),
+            &limits,
+            entries
+                .iter()
+                .filter(|(file, _)| {
+                    super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
+                })
+                .map(|(file, digest)| (file, digest)),
+            |file, limit| {
+                project
+                    .read_source_snapshot_limited(file, limit)
+                    .map_err(|error| {
+                        super::StoreError::new(format!(
+                            "reading selected dependency overlay {file}: {error}"
+                        ))
+                    })
+            },
+        )?
     };
-    let mut bytes = selected
-        .iter()
-        .map(|(_, source)| source.source().len())
-        .sum::<usize>();
-    for (file, digest) in entries.iter().filter(|(file, _)| {
-        super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
-    }) {
-        if let Some(index) = selected.iter().position(|(input, _)| input == file) {
-            bytes = bytes.saturating_sub(selected.swap_remove(index).1.source().len());
-        }
-        if selected.len() >= limits.max_files {
-            gaps.push(DependencyEvidenceGap {
-                kind: DependencyEvidenceGapKind::Limit,
-                build_file: file.rel_path().into(),
-                byte_range: 0..0,
-                message: "dependency overlay file cap exceeded".into(),
-            });
-            break;
-        }
-        let source = project
-            .read_source_snapshot_limited(
-                file,
-                limits
-                    .max_file_bytes
-                    .min(limits.max_total_bytes.saturating_sub(bytes)),
-            )
-            .map_err(|error| {
-                super::StoreError::new(format!(
-                    "reading selected dependency overlay {file}: {error}"
-                ))
-            })?;
-        match source {
-            Some(source)
-                if &crate::analyzer::canonical_hash::sha256_bytes(source.source().as_bytes())
-                    == digest =>
-            {
-                bytes += source.source().len();
-                selected.push((file.clone(), source));
-            }
-            Some(_) => gaps.push(DependencyEvidenceGap {
-                kind: DependencyEvidenceGapKind::Conflict,
-                build_file: file.rel_path().into(),
-                byte_range: 0..0,
-                message: "dependency overlay changed during admission".into(),
-            }),
-            None => gaps.push(DependencyEvidenceGap {
-                kind: DependencyEvidenceGapKind::Limit,
-                build_file: file.rel_path().into(),
-                byte_range: 0..0,
-                message: "dependency overlay byte cap exceeded".into(),
-            }),
-        }
-    }
     let mut evidence = prepare_selected(&snapshot.lang, project.root(), &selected, &limits);
     evidence.gaps.extend(gaps);
     // A private set has one Arc lease. UUID ownership prevents a drop from
@@ -536,4 +579,122 @@ fn gap_kind(label: &str) -> rusqlite::Result<DependencyEvidenceGapKind> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::analyzer::store::{StoreLanguageSupport, WorkspaceConfigurationInput, WorkspaceId};
+    use crate::analyzer::{FilesystemProject, Language, OverlayProject};
+    use brokk_bifrost_test_macros::hardwon;
+
+    const OVERLAY: &str = "[package]\nname='demo'\nversion='0.1.0'\n";
+
+    struct OverlayEvidenceSupport(std::sync::atomic::AtomicUsize);
+    impl StoreLanguageSupport for OverlayEvidenceSupport {
+        fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+            path == std::path::Path::new("Cargo.toml")
+        }
+
+        fn selected_dependency_file_evidence(
+            &self,
+            _root: &std::path::Path,
+            selected: &[(ProjectFile, ProjectSourceSnapshot)],
+            _limits: &DependencyFileEvidenceLimits,
+        ) -> DependencyFileEvidence {
+            // This test concerns store acquisition, not language parsing. Prove
+            // that the real publisher admitted the replacement buffer.
+            if let Some((file, source)) = selected.first() {
+                assert!(selected.len() <= 2);
+                assert_eq!(file.rel_path(), std::path::Path::new("Cargo.toml"));
+                assert_eq!(source.source(), OVERLAY);
+                assert!(matches!(
+                    source.origin(),
+                    crate::analyzer::ProjectSourceOrigin::Overlay(_)
+                ));
+                if let Some((file, source)) = selected.get(1) {
+                    assert_eq!(file.rel_path(), std::path::Path::new("member/Cargo.toml"));
+                    assert_eq!(source.source(), OVERLAY);
+                    assert_eq!(source.origin(), crate::analyzer::ProjectSourceOrigin::Disk);
+                }
+                self.0
+                    .fetch_add(selected.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            DependencyFileEvidence::default()
+        }
+    }
+
+    #[test]
+    #[hardwon("4fe7c7de1924: a small overlay retains the replaced disk file's byte-cap gap")]
+    fn small_overlay_clears_replaced_disk_acquisition_limit_gap() {
+        static SUPPORT: OverlayEvidenceSupport =
+            OverlayEvidenceSupport(std::sync::atomic::AtomicUsize::new(0));
+        let _support =
+            super::super::language_support::neutral_fixture::dependency_overlay_fixture(&SUPPORT);
+        let mut admitted = 0;
+        // The second case pins the suffix the old disk acquisition abandoned:
+        // a replacement must reconsider that retained source, not just its gap.
+        for paths in [vec!["Cargo.toml"], vec!["Cargo.toml", "member/Cargo.toml"]] {
+            let root = tempfile::tempdir().unwrap();
+            let disk = vec![b' '; DependencyFileEvidenceLimits::default().max_file_bytes + 1];
+            std::fs::write(root.path().join("Cargo.toml"), &disk).unwrap();
+            let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
+            let generation = store
+                .ensure_language_epoch_value("rust", "overlay-acquisition-gap-test")
+                .unwrap();
+            let snapshot = store
+                .sync_workspace_inputs_for_workspace(
+                    &WorkspaceId("a".repeat(64)),
+                    "rust",
+                    generation,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &paths
+                        .iter()
+                        .map(|path| {
+                            WorkspaceConfigurationInput::new(
+                                (*path).into(),
+                                if *path == "Cargo.toml" {
+                                    disk.clone().into_boxed_slice()
+                                } else {
+                                    OVERLAY.as_bytes().into()
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            let snapshots = WorkspaceSnapshots::from_iter([("rust".into(), snapshot)]);
+            let before = store.dependency_file_evidence(&snapshots).unwrap();
+            assert_eq!(before.gaps.len(), 1);
+            assert_eq!(before.gaps[0].kind, DependencyEvidenceGapKind::Limit);
+            assert_eq!(
+                before.gaps[0].message,
+                "dependency input file byte cap exceeded"
+            );
+            let project =
+                OverlayProject::new(Arc::new(FilesystemProject::new(root.path()).unwrap()));
+            // Key the overlay by the project's canonical root, as an editor
+            // resolving through the project would. The raw temp path can be a
+            // Windows 8.3 short name that never prefixes the canonical root.
+            assert!(project.set(project.root().join("Cargo.toml"), OVERLAY.into()));
+            let publication = publish_overlay(&store, &snapshots, &project, Language::Rust)
+                .unwrap()
+                .expect("configuration overlay must publish evidence");
+            let after = publication.read().unwrap();
+            admitted += paths.len();
+            assert_eq!(
+                SUPPORT.0.load(std::sync::atomic::Ordering::Relaxed),
+                admitted
+            );
+            assert_eq!(
+                after.gaps,
+                Vec::new(),
+                "replacement overlay must clear the disk acquisition gap"
+            );
+        }
+    }
+}

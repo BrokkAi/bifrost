@@ -2496,12 +2496,14 @@ pub fn merge_unit_rows(
     let mut budgeted_work: Option<CodeQueryBudgetedWork> = None;
     let mut diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut truncated = false;
-    let union = PlanPartitioning::classify(&query.plan).is_seed_union();
-    let fair_share_divisor = if union {
-        PlanPartitioning::classify_union(&query.plan)
-            .expect("seed-union merge requires an eligible union plan")
-    } else {
-        1
+    let partitioning = PlanPartitioning::classify(&query.plan);
+    let union = partitioning.is_seed_union();
+    let fair_share_divisor = match partitioning {
+        PlanPartitioning::BySeedUnion | PlanPartitioning::BySeedExcept => {
+            PlanPartitioning::fair_share_divisor(&query.plan)
+                .expect("a seed-partitioned set has a checked fair-share divisor")
+        }
+        PlanPartitioning::BySeed | PlanPartitioning::Whole => 1,
     };
     let mut raw_rows = Vec::new();
 
@@ -2646,50 +2648,66 @@ pub fn structural_seed_file_order(left: &ProjectFile, right: &ProjectFile) -> st
 /// still records the reads that prove it yields none.
 ///
 /// An eligible union enumerates the union of its leaf language filters and
-/// uses their common comparator. Other `Set` sources are [`Whole`] by
+/// uses their common comparator. An eligible except enumerates the union of
+/// every branch's language filters, because the whole execution evaluates
+/// each subtrahend over its own files and a unit must account for that work
+/// and its diagnostics, and orders them by its innermost minuend's
+/// comparator, which is the order its rows merge in. Other `Set` sources are [`Whole`] by
 /// classification and never reach this function.
 ///
 /// [`Whole`]: crate::query::PlanPartitioning::Whole
 pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<ProjectFile> {
-    if PlanPartitioning::classify(plan).is_seed_union() {
-        let leaves = PlanPartitioning::union_leaf_plans(plan)
-            .expect("seed-union enumeration requires an eligible union plan");
-        let mut languages = Vec::new();
-        let mut accepts_all_languages = false;
-        let mut structural = None;
-        for (leaf, _, _) in leaves {
-            let (leaf_languages, leaf_structural) = seed_languages(&leaf);
-            structural.get_or_insert(leaf_structural);
-            if leaf_languages.is_empty() {
-                accepts_all_languages = true;
-            } else {
-                for language in leaf_languages {
-                    if !languages.contains(language) {
-                        languages.push(*language);
-                    }
+    let (leaves, structural) = match PlanPartitioning::classify(plan) {
+        PlanPartitioning::BySeedUnion => {
+            let leaves = PlanPartitioning::union_leaf_plans(plan)
+                .expect("seed-union enumeration requires an eligible union plan")
+                .into_iter()
+                .map(|(leaf, _, _)| leaf)
+                .collect::<Vec<_>>();
+            let structural = seed_languages(
+                leaves
+                    .first()
+                    .expect("an eligible union has at least one leaf"),
+            )
+            .1;
+            (leaves, structural)
+        }
+        PlanPartitioning::BySeedExcept => {
+            let minuend = PlanPartitioning::except_minuend_leaf(plan)
+                .expect("an eligible except has a minuend");
+            let structural = seed_languages(minuend).1;
+            let mut leaves = Vec::new();
+            let mut pending = vec![plan];
+            while let Some(current) = pending.pop() {
+                match &current.source {
+                    CodeQueryPlanSource::Set { branches, .. } => pending.extend(branches),
+                    _ => leaves.push(current.clone()),
                 }
             }
+            (leaves, structural)
         }
-        let mut selected = files
-            .iter()
-            .filter(|file| {
-                accepts_all_languages
-                    || languages.contains(&crate::analyzer::common::language_for_file(file))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if structural.expect("an eligible union has at least one leaf") {
-            selected.sort_by(structural_seed_file_order);
-        } else {
-            selected.sort_by(seed_file_order);
+        PlanPartitioning::BySeed | PlanPartitioning::Whole => {
+            let structural = seed_languages(plan).1;
+            (vec![plan.clone()], structural)
         }
-        return selected;
+    };
+    let mut languages = Vec::new();
+    let mut accepts_all_languages = false;
+    for leaf in &leaves {
+        let leaf_languages = seed_languages(leaf).0;
+        if leaf_languages.is_empty() {
+            accepts_all_languages = true;
+        }
+        for language in leaf_languages {
+            if !languages.contains(language) {
+                languages.push(*language);
+            }
+        }
     }
-    let (languages, structural) = seed_languages(plan);
     let mut selected = files
         .iter()
         .filter(|file| {
-            languages.is_empty()
+            accepts_all_languages
                 || languages.contains(&crate::analyzer::common::language_for_file(file))
         })
         .cloned()
@@ -2716,7 +2734,7 @@ fn seed_languages(plan: &CodeQueryPlan) -> (&[Language], bool) {
             (&[], false)
         }
         CodeQueryPlanSource::Set { .. } => {
-            unreachable!("a union leaf has no set source")
+            unreachable!("a seed enumeration leaf has no set source")
         }
         CodeQueryPlanSource::Correlate(_) | CodeQueryPlanSource::RequireBoth(_) => {
             unreachable!("cross-domain plans are whole and never union leaves")

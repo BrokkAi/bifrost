@@ -136,11 +136,11 @@ impl RetainedPythonEnvironment {
     ///
     /// The lookup is by declaration identity rather than by name, so it cannot
     /// be satisfied by a same-named symbol from another module.
-    fn published_declaration<'a>(
+    fn published_declaration(
         &self,
-        overlay: &'a SemanticModelOverlay,
+        overlay: &SemanticModelOverlay,
         path: &str,
-    ) -> Result<&'a SemanticModelSymbol, PythonEnvironmentBoundary> {
+    ) -> Result<Arc<SemanticModelSymbol>, PythonEnvironmentBoundary> {
         let matched = overlay.symbols_with_id(&python_declaration_id(path));
         match matched.disposition {
             SemanticModelOverlayDisposition::Empty => Err(self.missing_evidence(path)),
@@ -156,16 +156,17 @@ impl RetainedPythonEnvironment {
             SemanticModelOverlayDisposition::Unique => Ok(matched
                 .records
                 .first()
-                .expect("a unique overlay match has one record")),
+                .expect("a unique overlay match has one record")
+                .clone()),
         }
     }
 
     /// The module surface an active pack publishes for `module_path`.
-    fn module_surface<'a>(
+    fn module_surface(
         &self,
-        overlay: &'a SemanticModelOverlay,
+        overlay: &SemanticModelOverlay,
         module_path: &str,
-    ) -> Result<&'a SemanticModelSymbol, PythonEnvironmentBoundary> {
+    ) -> Result<Arc<SemanticModelSymbol>, PythonEnvironmentBoundary> {
         let symbol = self.published_declaration(overlay, module_path)?;
         if symbol.kind != SemanticModelSymbolKind::Module {
             return Err(PythonEnvironmentBoundary::Incomplete(
@@ -256,7 +257,7 @@ impl RetainedPythonEnvironment {
     fn type_member(
         &self,
         overlay: &SemanticModelOverlay,
-        owner: &SemanticModelSymbol,
+        owner: &Arc<SemanticModelSymbol>,
         owner_path: &str,
         member: &str,
     ) -> PythonEnvironmentBoundary {
@@ -349,9 +350,9 @@ impl PythonEnvironmentSurface for RetainedPythonEnvironment {
             Err(boundary) => return boundary,
         };
         if owner.kind == SemanticModelSymbolKind::Module {
-            self.module_member(overlay, owner, owner_path, member)
+            self.module_member(overlay, &owner, owner_path, member)
         } else {
-            self.type_member(overlay, owner, owner_path, member)
+            self.type_member(overlay, &owner, owner_path, member)
         }
     }
 }
@@ -417,6 +418,95 @@ mod tests {
             _temp: temp,
             analyzer,
             root,
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "6b123df7cc68: quicksilver round 6 on brokk-bifrost-python: with context expression was suppressed as an alias binder"
+    )]
+    fn qs6_python_lexical_diagnostic_corpus() {
+        // A single lexical corpus, with deliberately absent reads as controls.
+        // Expected rows are the CPython lexical-scope oracle, in byte order.
+        let source = "def run(self):\n def helper():\n  return self\n helper()\n return missing\nidentity = lambda value: value\nwith manager() as alias:\n print(alias)\nraise AssertionError('failure')\nAssertionError_\n";
+        let fixture = fixture(&[("app.py", source)]);
+        let report = fixture.report_for("app.py");
+        let actual = report
+            .diagnostics()
+            .iter()
+            .map(|d| {
+                (
+                    &source[d.range.start_byte..d.range.end_byte],
+                    d.range.start_line,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [("missing", 5), ("manager", 7), ("AssertionError_", 10)],
+            "{report:#?}"
+        );
+        // Declaration and with-alias nodes are binders, not read candidates.
+        use brokk_bifrost_core::analyzer::model::SemanticDiagnosticOutcome;
+        let lambda_reads = report.outcomes().iter().filter(|outcome| matches!(outcome, SemanticDiagnosticOutcome::Resolved { range, .. } if range.start_line == 6)).count();
+        assert_eq!(
+            lambda_reads, 1,
+            "only the lambda body is a read: {report:?}"
+        );
+        for outcome in report.outcomes() {
+            let range = match outcome {
+                SemanticDiagnosticOutcome::Resolved { range, .. }
+                | SemanticDiagnosticOutcome::Ambiguous { range, .. }
+                | SemanticDiagnosticOutcome::Absent(
+                    brokk_bifrost_core::analyzer::model::SemanticAbsenceProof { range, .. },
+                ) => range,
+                SemanticDiagnosticOutcome::Incomplete { .. } => continue,
+            };
+            assert_ne!(
+                range.start_line, 1,
+                "parameter declaration was judged: {outcome:?}"
+            );
+            assert!(
+                range.start_line != 7 || &source[range.start_byte..range.end_byte] == "manager",
+                "with alias was judged: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qs6_python_diagnostic_limits() {
+        use brokk_bifrost_core::analyzer::model::{
+            SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
+        };
+        let truncated = |report: &SemanticDiagnosticReport| {
+            report.outcomes().iter().any(|outcome| matches!(outcome, SemanticDiagnosticOutcome::Incomplete { reasons, .. } if reasons.contains(&SemanticDiagnosticIncompleteReason::Truncated)))
+        };
+        for bytes in [524287, 524288, 524289] {
+            let mut source = "missing\n#".to_owned();
+            source.extend(std::iter::repeat_n(' ', bytes - source.len()));
+            let fixture = fixture(&[("app.py", &source)]);
+            let report = fixture.report_for("app.py");
+            assert_eq!(
+                report.diagnostics().len(),
+                usize::from(bytes <= 524288),
+                "{bytes}: {report:?}"
+            );
+            assert_eq!(truncated(&report), bytes > 524288, "{bytes}: {report:?}");
+        }
+        for count in [199, 200, 201] {
+            let source = (0..count)
+                .map(|i| format!("missing_{i}\n"))
+                .collect::<String>();
+            let fixture = fixture(&[("app.py", &source)]);
+            let report = fixture.report_for("app.py");
+            assert_eq!(report.diagnostics().len(), count.min(200), "{report:?}");
+            assert_eq!(truncated(&report), count > 200, "{report:?}");
+            for (i, diagnostic) in report.diagnostics().iter().enumerate() {
+                assert_eq!(
+                    &source[diagnostic.range.start_byte..diagnostic.range.end_byte],
+                    format!("missing_{i}")
+                );
+            }
         }
     }
 

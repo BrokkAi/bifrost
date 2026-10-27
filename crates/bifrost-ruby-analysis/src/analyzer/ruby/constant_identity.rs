@@ -14,6 +14,7 @@
 //! a gem archive, walks a gem directory, or starts dependency discovery.
 
 use brokk_bifrost_core::analyzer::model::SemanticDiagnosticDomain;
+use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelArgumentBinding;
 
@@ -66,10 +67,10 @@ pub struct RubyOverlayConstants<'a> {
 }
 
 /// The published surface a constant lookup under one gem owner may search.
-pub(crate) struct RubyConstantSurface<'a> {
+pub(crate) struct RubyConstantSurface {
     /// The owner and every ancestor the walk could reach. Best effort: a name
     /// published anywhere in it suppresses a diagnostic even when `open` is set.
-    pub(crate) searched: Vec<&'a SemanticModelSymbol>,
+    pub(crate) searched: Vec<Arc<SemanticModelSymbol>>,
     /// Why a name missing from `searched` is still not proven absent, if it is
     /// not. `None` means every hop on Ruby's constant lookup path is published,
     /// unambiguous, and described completely.
@@ -113,7 +114,7 @@ impl<'a> RubyOverlayConstants<'a> {
     /// overlay marks it `Conflict` and this returns `None`, so neither
     /// navigation nor a diagnostic picks an arbitrary winner.
     #[doc(hidden)]
-    pub fn unique_type(&self, constant_path: &str) -> Option<&'a SemanticModelSymbol> {
+    pub fn unique_type(&self, constant_path: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?
             .symbols_with_id(&Self::declaration_id(constant_path))
             .unique()
@@ -127,7 +128,7 @@ impl<'a> RubyOverlayConstants<'a> {
         owner: &SemanticModelSymbol,
         name: &str,
         argument_count: usize,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let matched = self.overlay?.member_target_on_owner(&owner.id, name);
         if matched.disposition != SemanticModelMemberTargetDisposition::Unique {
             return None;
@@ -155,13 +156,16 @@ impl<'a> RubyOverlayConstants<'a> {
         {
             return None;
         }
-        Some(*member)
+        Some(member.clone())
     }
 
     /// An applicable callable produces its declared result type. Neither
     /// constructors nor separately named factories imply their result owner.
     #[doc(hidden)]
-    pub fn declared_result(&self, member: &SemanticModelSymbol) -> Option<&'a SemanticModelSymbol> {
+    pub fn declared_result(
+        &self,
+        member: &SemanticModelSymbol,
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let result = match member.structured_signature()?.returns.as_ref()? {
             TypeRef::Declared {
                 id,
@@ -172,7 +176,7 @@ impl<'a> RubyOverlayConstants<'a> {
                 if matched.disposition != SemanticModelOverlayDisposition::Unique {
                     return None;
                 }
-                *matched.records.first()?
+                matched.records.first()?.clone()
             }
             TypeRef::Named {
                 name,
@@ -226,19 +230,16 @@ impl<'a> RubyOverlayConstants<'a> {
     /// published type. An edge whose target no pack publishes is the #1789 case:
     /// the surface is not complete, whatever the pack's own manifest says,
     /// because the members it inherits were never described.
-    pub(crate) fn constant_surface(
-        &self,
-        owner: &'a SemanticModelSymbol,
-    ) -> RubyConstantSurface<'a> {
+    pub(crate) fn constant_surface(&self, owner: &Arc<SemanticModelSymbol>) -> RubyConstantSurface {
         let Some(overlay) = self.overlay else {
             return RubyConstantSurface {
                 searched: Vec::new(),
                 open: Some("no activated gem pack is published".to_string()),
             };
         };
-        let mut searched: Vec<&'a SemanticModelSymbol> = Vec::new();
+        let mut searched: Vec<Arc<SemanticModelSymbol>> = Vec::new();
         let mut open = None;
-        let mut queue = vec![owner];
+        let mut queue = vec![Arc::clone(owner)];
         // The walk keeps going after it records a reason: what it still finds
         // can suppress a diagnostic even once absence is off the table.
         while let Some(symbol) = queue.pop() {
@@ -270,7 +271,7 @@ impl<'a> RubyOverlayConstants<'a> {
                     )
                 });
             }
-            searched.push(symbol);
+            searched.push(Arc::clone(&symbol));
             for relation in overlay.relations_from(&symbol.id).records {
                 if !CONSTANT_LOOKUP_EDGES.contains(&relation.kind.as_str()) {
                     continue;
@@ -279,7 +280,7 @@ impl<'a> RubyOverlayConstants<'a> {
                 if matched.records.is_empty() {
                     matched = overlay.symbols_named(&relation.to);
                 }
-                match matched.records.first().copied() {
+                match matched.records.first().cloned() {
                     Some(ancestor) => queue.push(ancestor),
                     // #1789: an unresolvable ancestor means the surface is not
                     // complete whatever the pack manifest claims, because the

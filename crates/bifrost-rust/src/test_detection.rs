@@ -35,7 +35,7 @@ pub fn rust_source_contains_tests(root: Node<'_>, source: &str) -> bool {
 ///    custom `#[my::test]`), which subsumes the historical literal allowlist;
 ///  - `#[rstest]`, whose spelling has no `test` segment but is a well-known
 ///    test-case attribute;
-///  - `#[cfg(...)]` whose predicate carries a positive `test` token
+///  - `#[cfg(...)]` whose predicate carries a positive `test` atom
 ///    (`cfg(test)`, `cfg(all(test, feature = "x"))`), while `cfg(not(test))`
 ///    is not evidence.
 ///
@@ -52,8 +52,10 @@ pub fn rust_attribute_is_test_evidence(attribute_item: Node<'_>, source: &str) -
     if last_segment == Some("cfg") {
         return attribute
             .child_by_field_name("arguments")
-            .and_then(|arguments| rust_token_tree_interior_text(arguments, source))
-            .is_some_and(cfg_body_has_positive_test_token);
+            .and_then(|arguments| {
+                crate::lexical_scope::rust_cfg_argument_condition(arguments, source)
+            })
+            .is_some_and(|condition| cfg_has_positive_test_atom(&condition));
     }
     matches!(last_segment, Some("test") | Some("rstest"))
 }
@@ -81,42 +83,37 @@ fn rust_attribute_path_last_segment<'a>(path: Node<'_>, source: &'a str) -> Opti
     }
 }
 
-/// Interior text of a delimited `token_tree` (`( ... )`), excluding the
-/// outermost delimiters, so `#[cfg(all(test))]`'s arguments yield `all(test)`.
-fn rust_token_tree_interior_text<'a>(token_tree: Node<'_>, source: &'a str) -> Option<&'a str> {
-    if token_tree.kind() != "token_tree" {
-        return None;
+/// Track test occurrences in both polarities through the structured postfix
+/// predicate. Negation swaps polarity; all/any retain their children's evidence.
+fn cfg_has_positive_test_atom(
+    condition: &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition,
+) -> bool {
+    use brokk_bifrost_core::analyzer::rust_facts::RustCfgInstruction;
+    let mut stack: Vec<(bool, bool)> = Vec::new();
+    for instruction in condition.instructions() {
+        match instruction {
+            RustCfgInstruction::Atom(name) => stack.push((name == "test", false)),
+            RustCfgInstruction::KeyValue { .. } | RustCfgInstruction::Unknown => {
+                stack.push((false, false))
+            }
+            RustCfgInstruction::Not => {
+                let (positive, negative) = stack.pop().expect("cfg negation operand");
+                stack.push((negative, positive));
+            }
+            RustCfgInstruction::All(count) | RustCfgInstruction::Any(count) => {
+                assert!(stack.len() >= count, "cfg predicate operands");
+                let start = stack.len() - count;
+                let evidence = stack
+                    .drain(start..)
+                    .fold((false, false), |(positive, negative), child| {
+                        (positive || child.0, negative || child.1)
+                    });
+                stack.push(evidence);
+            }
+        }
     }
-    let interior = crate::declarations::rust_macro_token_tree_interior(token_tree)?;
-    source.get(interior.start_byte..interior.end_byte)
-}
-
-fn cfg_body_has_positive_test_token(body: &str) -> bool {
-    if body.contains("not(test)") {
-        return false;
-    }
-
-    let mut token = String::new();
-    let mut in_string = false;
-    for ch in body.chars() {
-        if ch == '"' {
-            in_string = !in_string;
-            token.clear();
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            token.push(ch);
-            continue;
-        }
-        if token == "test" {
-            return true;
-        }
-        token.clear();
-    }
-    token == "test"
+    assert_eq!(stack.len(), 1, "cfg predicate result");
+    stack[0].0
 }
 
 static RUST_TEST_FN_RE: LazyLock<Regex> = LazyLock::new(|| {

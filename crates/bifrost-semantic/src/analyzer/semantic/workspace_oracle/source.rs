@@ -43,7 +43,11 @@ use crate::analyzer::semantic::OracleCandidate;
 
 use crate::analyzer::semantic::PointsToResult;
 
+use crate::analyzer::semantic::ProcedureHandle;
+
 use crate::analyzer::semantic::SemanticArtifact;
+
+use crate::analyzer::semantic::SemanticCallSite;
 
 use crate::analyzer::semantic::SemanticBudgetExceeded;
 
@@ -126,6 +130,8 @@ pub fn dispatch_question(
 /// revision and measures the call range from the owning procedure's start.
 /// That is the exact scope a procedure summary needs: another declaration in
 /// the same file may move both absolute ranges without changing this call.
+/// Calls that share the range are told apart by their position among the
+/// procedure's call rows at it, which replay counts the same way.
 #[doc(hidden)]
 pub fn procedure_dispatch_question(
     call: &CallSiteHandle,
@@ -135,6 +141,15 @@ pub fn procedure_dispatch_question(
     let procedure_start = procedure.semantics().locator().anchor().span().start_byte() as usize;
     let start_byte = range.start_byte.checked_sub(procedure_start)?;
     let end_byte = range.end_byte.checked_sub(procedure_start)?;
+    let ordinal = procedure
+        .semantics()
+        .call_sites()
+        .iter()
+        .take_while(|candidate| candidate.id != call.id())
+        .filter(|candidate| {
+            call_row_has_exact_bytes(procedure, candidate, range.start_byte, range.end_byte)
+        })
+        .count();
     Some(
         crate::analyzer::semantic::read_ledger::LookupQuestion::procedure_call_site(
             procedure.artifact().key().path().as_str(),
@@ -145,9 +160,29 @@ pub fn procedure_dispatch_question(
             crate::analyzer::semantic::read_ledger::ProcedureCallSiteLocator {
                 start_byte,
                 end_byte,
+                ordinal,
             },
         ),
     )
+}
+
+/// Whether one of `procedure`'s call rows maps exactly onto these absolute
+/// bytes: the test that both a recorded procedure-dispatch question and its
+/// replay count call ordinals by.
+#[doc(hidden)]
+pub fn call_row_has_exact_bytes(
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+    start_byte: usize,
+    end_byte: usize,
+) -> bool {
+    procedure
+        .semantics()
+        .source_mapping(call.source)
+        .is_some_and(|mapping| {
+            let span = mapping.locator.anchor().span();
+            span.start_byte() as usize == start_byte && span.end_byte() as usize == end_byte
+        })
 }
 
 #[doc(hidden)]

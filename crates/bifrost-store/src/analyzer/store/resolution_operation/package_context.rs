@@ -1,5 +1,5 @@
 //! Demand-local package metadata hydration. Language readers own membership.
-use super::super::resolution_stage::codec;
+use super::super::resolution_stage::{StageFamily, codec};
 use super::*;
 use crate::analyzer::resolution::{
     LoweredPackageMember, LoweredPackageReference, SharedNameId, SharedNameInterner,
@@ -385,21 +385,27 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let names = self.ready.shared_names();
         let mut result = BTreeMap::new();
-        let mut statement = connection.prepare_cached(STAGED_PACKAGE_REFERENCES)?;
-        let mut rows = statement.query([mount.get()])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedPackageRows::Cancelled);
-            }
-            let fact = PackageCoordinates::staged(row)?.reference();
-            let key = (fact.reference, fact.namespace);
-            if result
-                .insert(key, fact)
-                .is_some_and(|previous| previous != fact)
-            {
-                return Err(StoreError::corrupt(
-                    "contradictory staged package references",
-                ));
+        if !self
+            .ready
+            .inventory
+            .stage_family_is_empty(StageFamily::PackageReferences)?
+        {
+            let mut statement = connection.prepare_cached(STAGED_PACKAGE_REFERENCES)?;
+            let mut rows = statement.query([mount.get()])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(SelectedPackageRows::Cancelled);
+                }
+                let fact = PackageCoordinates::staged(row)?.reference();
+                let key = (fact.reference, fact.namespace);
+                if result
+                    .insert(key, fact)
+                    .is_some_and(|previous| previous != fact)
+                {
+                    return Err(StoreError::corrupt(
+                        "contradictory staged package references",
+                    ));
+                }
             }
         }
         let mut statement = connection.prepare_cached(ORDINARY_REFERENCES)?;
@@ -473,6 +479,10 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let names = self.ready.shared_names();
         let mut result = BTreeMap::new();
+        if !self
+            .ready
+            .inventory
+            .stage_family_is_empty(StageFamily::PackageReferences)?
         {
             let mut statement = connection.prepare_cached(staged_sql)?;
             let mut rows = statement.query(rusqlite::params![mount.get(), staged_key])?;
@@ -521,19 +531,25 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let names = self.ready.shared_names();
         let mut result = BTreeMap::new();
-        let mut statement = connection.prepare_cached(STAGED_MEMBERS)?;
-        let mut rows = statement.query(rusqlite::params![mount.get(), shared.get()])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedPackageRows::Cancelled);
-            }
-            let fact = PackageMemberCoordinates::staged(row)?.member();
-            let key = (fact.definition, fact.namespace);
-            if result
-                .insert(key, fact)
-                .is_some_and(|previous| previous != fact)
-            {
-                return Err(StoreError::corrupt("contradictory staged package members"));
+        if !self
+            .ready
+            .inventory
+            .stage_family_is_empty(StageFamily::PackageMembers)?
+        {
+            let mut statement = connection.prepare_cached(STAGED_MEMBERS)?;
+            let mut rows = statement.query(rusqlite::params![mount.get(), shared.get()])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(SelectedPackageRows::Cancelled);
+                }
+                let fact = PackageMemberCoordinates::staged(row)?.member();
+                let key = (fact.definition, fact.namespace);
+                if result
+                    .insert(key, fact)
+                    .is_some_and(|previous| previous != fact)
+                {
+                    return Err(StoreError::corrupt("contradictory staged package members"));
+                }
             }
         }
         if let Some(stored) = names.to_persisted(shared) {
@@ -546,26 +562,34 @@ impl SelectedResolutionOperation<'_, '_> {
                 let fact = PackageMemberCoordinates::ordinary(row, mount.get(), &names)?.member();
                 // A staged row for this identity wins even when it changed the
                 // lookup name and therefore was absent from the lookup query.
-                let mut stage = connection.prepare_cached(
+                let mut authority = None;
+                if !self
+                    .ready
+                    .inventory
+                    .stage_family_is_globally_empty(StageFamily::PackageMembers)?
+                {
+                    let mut stage = connection.prepare_cached(
                     "SELECT token_key,domain_shared,definition_key,source_site,root_scope_key,namespace,lookup_shared
                      FROM temp.selected_resolution_stage_package_members
                      WHERE host_ordinal=?1 AND definition_key=?2 AND namespace=?3",
                 )?;
-                let mut staged = stage.query(rusqlite::params![
-                    mount.get(),
-                    codec::encode_semantic(fact.definition),
-                    fact.namespace.label()
-                ])?;
-                let mut authority = None;
-                while let Some(row) = staged.next()? {
-                    if cancellation.is_cancelled() {
-                        return Ok(SelectedPackageRows::Cancelled);
+                    let mut staged = stage.query(rusqlite::params![
+                        mount.get(),
+                        codec::encode_semantic(fact.definition),
+                        fact.namespace.label()
+                    ])?;
+                    while let Some(row) = staged.next()? {
+                        if cancellation.is_cancelled() {
+                            return Ok(SelectedPackageRows::Cancelled);
+                        }
+                        let staged_fact = PackageMemberCoordinates::staged(row)?.member();
+                        if authority.is_some_and(|prior| prior != staged_fact) {
+                            return Err(StoreError::corrupt(
+                                "contradictory staged package members",
+                            ));
+                        }
+                        authority = Some(staged_fact);
                     }
-                    let staged_fact = PackageMemberCoordinates::staged(row)?.member();
-                    if authority.is_some_and(|prior| prior != staged_fact) {
-                        return Err(StoreError::corrupt("contradictory staged package members"));
-                    }
-                    authority = Some(staged_fact);
                 }
                 if let Some(staged_fact) = authority {
                     if staged_fact.lookup == lookup {
@@ -595,19 +619,25 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let names = self.ready.shared_names();
         let mut by_identity = BTreeMap::new();
-        let mut statement = connection.prepare_cached(STAGED_MEMBERS_BY_MOUNT)?;
-        let mut rows = statement.query([mount.get()])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedPackageRows::Cancelled);
-            }
-            let member = PackageMemberCoordinates::staged(row)?.member();
-            let key = (member.definition, member.namespace);
-            if by_identity
-                .insert(key, member)
-                .is_some_and(|previous| previous != member)
-            {
-                return Err(StoreError::corrupt("contradictory staged package members"));
+        if !self
+            .ready
+            .inventory
+            .stage_family_is_empty(StageFamily::PackageMembers)?
+        {
+            let mut statement = connection.prepare_cached(STAGED_MEMBERS_BY_MOUNT)?;
+            let mut rows = statement.query([mount.get()])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(SelectedPackageRows::Cancelled);
+                }
+                let member = PackageMemberCoordinates::staged(row)?.member();
+                let key = (member.definition, member.namespace);
+                if by_identity
+                    .insert(key, member)
+                    .is_some_and(|previous| previous != member)
+                {
+                    return Err(StoreError::corrupt("contradictory staged package members"));
+                }
             }
         }
         let mut statement = connection.prepare_cached(ORDINARY_MEMBERS_BY_MOUNT)?;

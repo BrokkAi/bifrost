@@ -243,6 +243,28 @@ pub mod native_resolution_test_support {
         )
     }
 
+    /// Run the native route probe with the caller's metered session.
+    pub fn python_native_route_probe_in_session(
+        publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
+        project: &dyn crate::analyzer::Project,
+        revision: i64,
+        session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+    ) -> crate::analyzer::store::Result<String> {
+        with_python_native_operation(
+            publication,
+            project,
+            revision,
+            |operation, summary, cancellation| {
+                operation.python_native_route_probe_in_session(
+                    summary,
+                    publication.profile.python_version,
+                    session,
+                    cancellation,
+                )
+            },
+        )
+    }
+
     /// Selected implicit-root and intrinsic inventory integration golden.
     pub fn python_native_builtin_hierarchy_probe(
         publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
@@ -263,19 +285,26 @@ pub mod native_resolution_test_support {
         )
     }
 
-    /// Nomination receipts only: forward confirmation and members remain open.
-    pub fn python_native_reverse_nomination_probe(
+    /// Dormant native confirmation through the shared reverse pipeline.
+    pub fn python_native_reverse_confirmation(
         publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
         project: &dyn crate::analyzer::Project,
         revision: i64,
         targets: &[crate::CodeUnit],
-    ) -> crate::analyzer::store::Result<String> {
+    ) -> crate::analyzer::store::Result<
+        crate::analyzer::store::resolution_operation::python_reverse::PythonNativeReverseResult,
+    > {
         with_python_native_operation(
             publication,
             project,
             revision,
             |operation, summary, cancellation| {
-                operation.python_native_reverse_nomination_probe(summary, targets, cancellation)
+                operation.python_native_reverse_confirmation(
+                    summary,
+                    targets,
+                    publication.profile.python_version,
+                    cancellation,
+                )
             },
         )
     }
@@ -309,9 +338,9 @@ pub mod native_resolution_test_support {
         snapshots.insert("python".into(), snapshot.clone());
         let languages = [SelectedResolutionLanguage::new("python", Language::Python)];
         let cancellation = crate::CancellationToken::default();
-        // Native publication intentionally does not populate production file
-        // versions. Select the exact admitted source content behind this
-        // environment rather than opening an empty workspace projection.
+        // Select the exact admitted members behind this summary. The explicit
+        // mounts preserve the probes' counterfactual source witnesses even when
+        // ordinary workspace membership selects the same source content.
         let members = {
             let connection = publication.store.read_conn()?;
             let mut statement = connection.prepare(

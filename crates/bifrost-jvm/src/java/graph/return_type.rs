@@ -3,7 +3,7 @@ use crate::java::graph_support::{
     JavaSource, UniqueClassInFile, resolve_java_usage_type_components_in,
 };
 use crate::java::source_facts::JavaFileSourceFacts;
-use crate::java::source_types::java_has_anonymous_class_body;
+use crate::java::source_types::{is_java_nested_return_scope, java_has_anonymous_class_body};
 use brokk_bifrost_core::analyzer::RelationalDefinitionFrontier;
 use brokk_bifrost_core::analyzer::java_facts::{JavaSourceTypeId, JavaTypeSyntaxShape};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
@@ -908,7 +908,7 @@ fn method_declaration_covering<'tree>(root: Node<'tree>, range: &Range) -> Optio
     let mut result = None;
     visit_covering_method_declarations(root, range, |method| {
         result = Some(method);
-        false
+        true
     });
     result
 }
@@ -977,10 +977,7 @@ fn method_declaration_anonymous_return_type(
             return_types.push(fqn);
             continue;
         }
-        if matches!(
-            node.kind(),
-            "class_declaration" | "interface_declaration" | "lambda_expression"
-        ) {
+        if is_java_nested_return_scope(node) {
             continue;
         }
         for index in (0..node.named_child_count()).rev() {

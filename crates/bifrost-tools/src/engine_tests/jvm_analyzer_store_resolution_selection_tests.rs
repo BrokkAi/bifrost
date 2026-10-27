@@ -877,78 +877,6 @@ mod jvm_extraction_tests {
         assert!(error.to_string().contains("overlapping file versions"));
     }
     #[test]
-    fn read_change_stamp_excludes_only_committed_private_request_rows() {
-        let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        let ready = fixture.open_ready(&[]);
-        let mount = ready.mounts().unwrap()[0].ordinal();
-        let cancellation = CancellationToken::default();
-        let original = ready.read_change_stamp().unwrap();
-        for key in [0, 1, 2] {
-            assert!(
-                ready
-                    .replace_resolution_requests_1([(mount, key)], &cancellation)
-                    .unwrap()
-            );
-            assert!(
-                ready
-                    .replace_resolution_requests_2([(mount, key, key)], &cancellation)
-                    .unwrap()
-            );
-            assert_eq!(ready.read_change_stamp().unwrap(), original);
-        }
-
-        // An unrelated write before a successful carrier replacement must not
-        // be swallowed by accounting for that replacement.
-        ready
-            .connection()
-            .execute_batch("CREATE TEMP TABLE accounting_scratch(value INTEGER)")
-            .unwrap();
-        ready
-            .connection()
-            .execute("INSERT INTO temp.accounting_scratch VALUES(1)", [])
-            .unwrap();
-        assert!(
-            ready
-                .replace_resolution_requests_1([(mount, 3)], &cancellation)
-                .unwrap()
-        );
-        assert!(
-            ready
-                .replace_resolution_requests_2([(mount, 3, 3)], &cancellation)
-                .unwrap()
-        );
-        let changed = ready.read_change_stamp().unwrap();
-        assert_eq!(changed.unowned_changes, original.unowned_changes + 1);
-
-        // Duplicate rows roll back the DELETE and successful first INSERT.
-        // SQLite still counts their work; neither helper may neutralize it.
-        assert!(
-            ready
-                .replace_resolution_requests_1([(mount, 4), (mount, 4)], &cancellation)
-                .is_err()
-        );
-        let failed_one = ready.read_change_stamp().unwrap();
-        assert_eq!(failed_one.unowned_changes, changed.unowned_changes + 2);
-        assert!(
-            ready
-                .replace_resolution_requests_2([(mount, 4, 4), (mount, 4, 4)], &cancellation)
-                .is_err()
-        );
-        let failed_two = ready.read_change_stamp().unwrap();
-        assert_eq!(failed_two.unowned_changes, failed_one.unowned_changes + 2);
-        assert!(
-            ready
-                .replace_resolution_requests_1([], &cancellation)
-                .unwrap()
-        );
-        assert!(
-            ready
-                .replace_resolution_requests_2([], &cancellation)
-                .unwrap()
-        );
-        assert_eq!(ready.read_change_stamp().unwrap(), failed_two);
-    }
-    #[test]
     fn read_change_stamp_observes_schema_external_and_same_connection_changes() {
         // The single-connection store retains the writable fallback; pooled
         // readers permit TEMP writes but intentionally reject main writes.
@@ -1004,13 +932,6 @@ mod jvm_extraction_tests {
             same_connection.unowned_changes,
             main_schema.unowned_changes + 1
         );
-        let mount = ready.mounts().unwrap()[0].ordinal();
-        assert!(
-            ready
-                .replace_resolution_requests_1([(mount, 0)], &CancellationToken::default())
-                .unwrap()
-        );
-        assert_eq!(ready.read_change_stamp().unwrap(), same_connection);
         conn.execute_batch("VACUUM").unwrap();
         let vacuumed = ready.read_change_stamp().unwrap();
         assert_eq!(vacuumed.unowned_changes, same_connection.unowned_changes);
@@ -1215,6 +1136,14 @@ mod jvm_extraction_tests {
                 },
             )
             .unwrap();
+        let scope_before: i64 = ready
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM temp.selected_resolution_scope_mounts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let committed_before = ready.retained().committed_request_changes.get();
         let cancelled = ready.with_owned_temp_transaction(|connection| {
             ready.ensure_generic_formals_schema(connection)?;
@@ -1227,7 +1156,7 @@ mod jvm_extraction_tests {
                     Ok(())
                 })?;
                 connection.execute(
-                    "WITH RECURSIVE generated(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM generated WHERE n<100000) INSERT INTO temp.selected_resolution_typed_requests_1(mount_ordinal,key0) SELECT 0,cancel_stage_dml(n) FROM generated",
+                    "WITH RECURSIVE generated(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM generated WHERE n<100000) INSERT INTO temp.selected_resolution_scope_mounts(mount_ordinal) SELECT cancel_stage_dml(n) FROM generated",
                     [],
                 )?;
                 Ok(())
@@ -1259,12 +1188,12 @@ mod jvm_extraction_tests {
         let count: i64 = ready
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM temp.selected_resolution_typed_requests_1",
+                "SELECT COUNT(*) FROM temp.selected_resolution_scope_mounts",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, scope_before);
         // This exceeds the progress quantum while the original token remains
         // cancelled; a leaked handler would interrupt it.
         let sum: i64 = ready.connection().query_row(
@@ -1288,16 +1217,7 @@ mod jvm_extraction_tests {
         ready
             .connection()
             .execute(
-                "INSERT INTO temp.selected_resolution_typed_requests_1(mount_ordinal, key0)
-                 VALUES(0, 7)",
-                [],
-            )
-            .unwrap();
-        ready
-            .connection()
-            .execute(
-                "INSERT INTO temp.selected_resolution_typed_requests_2(mount_ordinal, key0, key1)
-                 VALUES(0, 7, 42)",
+                "INSERT INTO temp.selected_resolution_scope_mounts(mount_ordinal) VALUES(7)",
                 [],
             )
             .unwrap();
@@ -1311,8 +1231,7 @@ mod jvm_extraction_tests {
             "selected_resolution_mounts",
             "selected_rust_transient_placement_attributes",
             "selected_resolution_transient_placements",
-            "selected_resolution_typed_requests_1",
-            "selected_resolution_typed_requests_2",
+            "selected_resolution_scope_mounts",
             "selected_workspace_revisions",
         ] {
             let count: i64 = conn
@@ -1505,8 +1424,7 @@ mod jvm_extraction_tests {
                 ("selected_resolution_overlay_masks", 0),
                 ("selected_resolution_content_mounts", 0),
                 ("selected_resolution_mounts", 1),
-                ("selected_resolution_typed_requests_1", 0),
-                ("selected_resolution_typed_requests_2", 0),
+                ("selected_resolution_scope_mounts", 1),
                 ("selected_workspace_revisions", 1),
             ] {
                 assert_eq!(

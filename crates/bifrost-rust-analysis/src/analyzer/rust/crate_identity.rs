@@ -43,6 +43,7 @@
 //! discovery, runs `cargo` or `rustdoc`, or reads `target/doc`.
 
 use crate::analyzer::semantic_model::SemanticModelCompleteness;
+use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
 
@@ -81,15 +82,15 @@ impl<'a> RustOverlayCrates<'a> {
     /// the overlay marks it `Conflict` and this returns `None`, so neither the
     /// trace nor a diagnostic picks an arbitrary winner between, say, two
     /// versions of the same crate.
-    pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
+    pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?.symbols_named(qualified_name).unique()
     }
 
     /// The unique symbol a Rust reference may resolve to: one visible, public
     /// Rust declaration.
-    fn visible_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
+    fn visible_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         let symbol = self.unique_symbol(qualified_name)?;
-        SemanticModelOverlay::symbol_is_visible_public(symbol, "rust").then_some(symbol)
+        SemanticModelOverlay::symbol_is_visible_public(&symbol, "rust").then_some(symbol)
     }
 
     /// Whether `symbol` is a crate root that `spelling` names.
@@ -136,7 +137,7 @@ impl<'a> RustOverlayCrates<'a> {
     /// join's inverse; it happens here once, for every consumer, rather than
     /// in each of them.
     #[doc(hidden)]
-    pub fn referenceable_symbol(&self, qualified_name: &str) -> Option<&'a SemanticModelSymbol> {
+    pub fn referenceable_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         let root = qualified_name.split('.').next()?;
         self.publishes_crate_root(root)
             .then(|| self.visible_symbol(qualified_name))

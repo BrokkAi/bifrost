@@ -8,13 +8,13 @@ impl SemanticModelOverlay {
     /// selected artifact context. This does not prove lambda execution or
     /// expression compatibility. Unsupported substitution/override cases stay
     /// unknown. Every traversal and pair comparison spends the caller's work.
-    pub fn java_functional_method<'a>(
-        &'a self,
-        owner: &'a SemanticModelSymbol,
+    pub fn java_functional_method(
+        &self,
+        owner: &Arc<SemanticModelSymbol>,
         object: &SemanticModelSymbol,
         remaining_work: &mut usize,
         cancellation: &crate::CancellationToken,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         if owner.language != "java"
             || owner.kind != SemanticModelSymbolKind::Interface
             || owner.declaration_is_sealed
@@ -53,7 +53,7 @@ impl SemanticModelOverlay {
         }
         let mut methods = Vec::new();
         for (id, interface) in interfaces {
-            for index in self.symbols_by_owner.get(id).into_iter().flatten() {
+            for index in self.symbols_by_owner.get(&id).into_iter().flatten() {
                 spend(remaining_work, cancellation, 1)?;
                 let member = &self.symbols[*index];
                 if member.kind != SemanticModelSymbolKind::Method
@@ -96,7 +96,7 @@ impl SemanticModelOverlay {
                         return None;
                     }
                 } else {
-                    methods.push((id, member));
+                    methods.push((id.clone(), member));
                 }
             }
         }
@@ -126,7 +126,7 @@ impl SemanticModelOverlay {
                 effective.push(*member);
             }
         }
-        let mut contract: Option<&SemanticModelSymbol> = None;
+        let mut contract: Option<Arc<SemanticModelSymbol>> = None;
         for (index, member) in effective.iter().enumerate() {
             for other in &effective[index + 1..] {
                 spend(remaining_work, cancellation, 1)?;
@@ -139,7 +139,7 @@ impl SemanticModelOverlay {
             if !member.declaration_is_abstract {
                 continue;
             }
-            if let Some(prior) = contract {
+            if let Some(prior) = &contract {
                 if !same_signature(prior, member)
                     || prior.structured_signature.as_ref()?.returns
                         != member.structured_signature.as_ref()?.returns
@@ -147,25 +147,25 @@ impl SemanticModelOverlay {
                     return None;
                 }
             } else {
-                contract = Some(member);
+                contract = Some(Arc::clone(member));
             }
         }
         contract
     }
     // Retained source inventories prove declaration families independently of
     // global pack completeness. This is not executable dispatch/effect proof.
-    fn java_callable_inventory<'a>(
-        &'a self,
-        owner: &'a SemanticModelSymbol,
+    fn java_callable_inventory(
+        &self,
+        owner: &Arc<SemanticModelSymbol>,
         remaining_work: &mut usize,
         cancellation: &crate::CancellationToken,
-    ) -> Option<JavaCallableInventory<'a>> {
-        let mut pending = vec![owner];
+    ) -> Option<JavaCallableInventory> {
+        let mut pending = vec![Arc::clone(owner)];
         let mut types = HashMap::default();
         let mut parents = HashMap::default();
         while let Some(current) = pending.pop() {
             spend(remaining_work, cancellation, 1)?;
-            if types.contains_key(current.id.as_str()) {
+            if types.contains_key(&current.id) {
                 continue;
             }
             if !matches!(
@@ -182,7 +182,7 @@ impl SemanticModelOverlay {
                 cancellation,
                 self.relations_from.get(&current.id).map_or(0, Vec::len),
             )?;
-            let direct = self.direct_ancestors_of(current);
+            let direct = self.direct_ancestors_of(&current);
             if !direct.defects.is_empty()
                 || direct.disposition == SemanticModelOverlayDisposition::Conflict
             {
@@ -190,27 +190,27 @@ impl SemanticModelOverlay {
             }
             spend(remaining_work, cancellation, direct.records.len())?;
             parents.insert(
-                current.id.as_str(),
+                current.id.clone(),
                 direct
                     .records
                     .iter()
-                    .map(|record| record.id.as_str())
+                    .map(|record| record.id.clone())
                     .collect::<Vec<_>>(),
             );
             pending.extend(direct.records);
-            types.insert(current.id.as_str(), current);
+            types.insert(current.id.clone(), current);
         }
         let mut ancestry = HashMap::default();
-        for id in types.keys().copied() {
+        for id in types.keys().cloned() {
             let mut seen = HashSet::default();
-            let mut pending = parents[id].clone();
+            let mut pending = parents[&id].clone();
             while let Some(parent) = pending.pop() {
                 spend(remaining_work, cancellation, 1)?;
                 if parent == id {
                     return None;
                 }
-                if seen.insert(parent) {
-                    pending.extend(parents[parent].iter().copied());
+                if seen.insert(parent.clone()) {
+                    pending.extend(parents[&parent].iter().cloned());
                 }
             }
             ancestry.insert(id, seen);
@@ -222,18 +222,18 @@ impl SemanticModelOverlay {
     /// Return an unambiguous public instance declaration only when its entire
     /// inherited name family has one member. Overloaded and overridden families
     /// require applicability/override proof and stay unknown at this boundary.
-    pub fn java_single_instance_method<'a>(
-        &'a self,
-        owner: &'a SemanticModelSymbol,
+    pub fn java_single_instance_method(
+        &self,
+        owner: &Arc<SemanticModelSymbol>,
         name: &str,
         remaining_work: &mut usize,
         cancellation: &crate::CancellationToken,
-    ) -> Option<&'a SemanticModelSymbol> {
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let JavaCallableInventory { types, .. } =
             self.java_callable_inventory(owner, remaining_work, cancellation)?;
         let mut selected = None;
         for id in types.keys() {
-            for index in self.symbols_by_owner.get(*id).into_iter().flatten() {
+            for index in self.symbols_by_owner.get(id).into_iter().flatten() {
                 spend(remaining_work, cancellation, 1)?;
                 let member = &self.symbols[*index];
                 if member.kind != SemanticModelSymbolKind::Method || member.name != name {
@@ -247,7 +247,7 @@ impl SemanticModelOverlay {
                     return None;
                 }
                 member.structured_signature.as_ref()?;
-                selected = Some(member);
+                selected = Some(Arc::clone(member));
             }
         }
         selected

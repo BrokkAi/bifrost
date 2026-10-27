@@ -368,7 +368,7 @@ pub fn go_modeled_result_binding_type_identity_is_exact(
         file,
         source,
         binding,
-        result_type,
+        &result_type,
     )
 }
 
@@ -588,7 +588,7 @@ fn modeled_result_matches_target(
                 };
                 if target_name.is_absolute()
                     || !target_name.lexical_scope().is_empty()
-                    || !context.declared_name_matches(target_name.path(), qualified_name)
+                    || !context.declared_name_matches(target_name.path(), &qualified_name)
                 {
                     return false;
                 }

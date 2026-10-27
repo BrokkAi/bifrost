@@ -161,7 +161,9 @@ pub fn rust_prelude_trait_module(name: &str) -> Option<&'static str> {
     match name {
         "Clone" => Some("clone"),
         "Copy" | "Send" | "Sized" | "Sync" | "Unpin" => Some("marker"),
-        "Drop" => Some("ops"),
+        "Drop" | "Fn" | "FnMut" | "FnOnce" | "AsyncFn" | "AsyncFnMut" | "AsyncFnOnce" => {
+            Some("ops")
+        }
         "Eq" | "Ord" | "PartialEq" | "PartialOrd" => Some("cmp"),
         "AsMut" | "AsRef" | "From" | "Into" | "TryFrom" | "TryInto" => Some("convert"),
         "Default" => Some("default"),
@@ -533,7 +535,13 @@ mod tests {
     fn itemless_standard_marker_traits_are_distinct_from_clone() {
         let mut entries = RUST_MARKER_TRAITS_WITHOUT_ASSOCIATED_ITEMS
             .iter()
-            .map(|entry| (entry.name, entry.module, entry.in_prelude))
+            .map(|entry| {
+                // Registry entries must round-trip through the lookup API,
+                // including explicit panic routes outside the prelude.
+                let selected = rust_marker_trait_without_associated_items(entry.name)
+                    .expect("registered standard marker is selectable");
+                (selected.name, selected.module, selected.in_prelude)
+            })
             .collect::<Vec<_>>();
         entries.sort_unstable();
         assert_eq!(

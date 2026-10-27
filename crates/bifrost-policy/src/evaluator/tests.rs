@@ -928,6 +928,45 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#6638: repeated per-site diagnostics filled the retention cap and hid later distinct causes"
+)]
+fn retained_query_diagnostics_are_a_function_of_the_set_raised() {
+    let diagnostic = |message: &str| CodeQueryDiagnostic {
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: "python",
+        message: message.to_string(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    };
+    let repeated = diagnostic("dispatch outcome=unknown");
+    let later = diagnostic("dispatch outcome=unproven");
+    // One producer raises one diagnostic per call site, so a run raises the
+    // same message many times before a different one.
+    let mut raised = vec![repeated.clone(); 3];
+    raised.push(later.clone());
+    let adapted = adapt_query_diagnostics(&raised, 2, 64);
+    assert!(!adapted.truncated, "two distinct causes fit two slots");
+    assert_eq!(
+        adapted
+            .diagnostics
+            .iter()
+            .map(PolicyDiagnostic::message)
+            .collect::<Vec<_>>(),
+        ["dispatch outcome=unknown", "dispatch outcome=unproven"]
+    );
+    // The same set raised in another order and multiplicity is the same
+    // retained list.
+    let reordered = adapt_query_diagnostics(&[later, repeated.clone(), repeated], 2, 64);
+    assert_eq!(reordered.diagnostics, adapted.diagnostics);
+    assert_eq!(reordered.truncated, adapted.truncated);
+}
+
+#[test]
 fn rejected_detailed_row_does_not_hide_later_positive_candidates() {
     let source = r#"export function run() {
     alpha();

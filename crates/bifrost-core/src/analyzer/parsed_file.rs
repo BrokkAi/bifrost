@@ -908,9 +908,10 @@ impl ParsedFile {
         }
         self.ranges.insert(code_unit.clone(), vec![range]);
         if let Some(parent) = parent {
-            // The old physical edge is deliberately still present, so this
-            // must append the replacement occurrence even when it is equal.
-            self.link_child(parent, code_unit.clone(), false);
+            // The old occurrence may still sit in this list, but preparation
+            // removed every inverse edge of this unit, so the replacement
+            // occurrence is appended after it.
+            self.link_child(parent, code_unit.clone(), true);
         }
         if let Some(top_level) = top_level {
             self.children.entry(top_level).or_default();
@@ -1232,16 +1233,31 @@ impl ParsedFile {
     /// parent, while `add_child` appends unconditionally. The inverse edge is
     /// always deduplicated -- it answers "which lists name this unit?", and one
     /// answer per owner is enough to unlink every copy.
+    ///
+    /// A child counts as already listed only when the list holds it and its
+    /// inverse edge names the parent. A list can still hold the old occurrence
+    /// of a pending deferred replacement, whose inverse edge preparation
+    /// removed, and that occurrence must not stop the unit from joining the
+    /// list again. Requiring both also keeps a list correct when a language
+    /// edits the public `children` map directly (Scala's usage-graph filter
+    /// retains children without touching the inverse edges): the check errs
+    /// toward appending, which finalization compacts, never toward dropping.
     fn link_child(&mut self, parent: CodeUnit, child: CodeUnit, deduplicate: bool) {
-        let children = self.children.entry(parent.clone()).or_default();
-        if deduplicate && children.contains(&child) {
+        let owners = self.child_owners.entry(child.clone()).or_default();
+        let owned = owners.contains(&parent);
+        if deduplicate
+            && owned
+            && self
+                .children
+                .get(&parent)
+                .is_some_and(|listed| listed.contains(&child))
+        {
             return;
         }
-        children.push(child.clone());
-        let owners = self.child_owners.entry(child).or_default();
-        if !owners.contains(&parent) {
-            owners.push(parent);
+        if !owned {
+            owners.push(parent.clone());
         }
+        self.children.entry(parent).or_default().push(child);
     }
 
     pub fn mark_type_alias(&mut self, code_unit: CodeUnit) {
@@ -1278,9 +1294,7 @@ impl ParsedFile {
             if !removed.insert(unit.clone()) {
                 continue;
             }
-            if let Some(children) = self.children.remove(&unit) {
-                pending.extend(children);
-            }
+            pending.extend(self.take_owned_children(&unit));
 
             // Only the owners that actually name this unit are touched. The
             // alternative -- scanning every child list in the file -- is what
@@ -1315,6 +1329,23 @@ impl ParsedFile {
         removed
     }
 
+    /// Removes `owner`'s child list and returns the children it still owns.
+    ///
+    /// A pending deferred replacement leaves its unit's old occurrence in the
+    /// list it moved away from until finalize compacts that list. The inverse
+    /// edge no longer names `owner`, so that occurrence is skipped here:
+    /// removing `owner` must not remove a unit that eager replacement had
+    /// already moved elsewhere.
+    fn take_owned_children(&mut self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        let mut children = self.children.remove(owner).unwrap_or_default();
+        children.retain(|child| {
+            self.child_owners
+                .get(child)
+                .is_some_and(|owners| owners.contains(owner))
+        });
+        children
+    }
+
     /// Clears replaceable facts while leaving incoming ordering entries until
     /// the batch finalizer can compact their vectors once.
     fn prepare_deferred_replacement(&mut self, code_unit: &CodeUnit) -> bool {
@@ -1330,7 +1361,7 @@ impl ParsedFile {
             .extend(affected_owners.drain(..));
         self.top_level_units.remove(code_unit);
 
-        let children = self.children.remove(code_unit).unwrap_or_default();
+        let children = self.take_owned_children(code_unit);
         let mut removed = self.remove_code_units(children);
         removed.insert(code_unit.clone());
         self.source_declaration_metadata
@@ -1760,5 +1791,330 @@ mod tests {
                 .signature_metadata_signature_ordinals
                 .contains_key(&deferred)
         );
+    }
+}
+
+/// Deferred replacement must leave the state that eager replacement leaves.
+/// The eager path, remove-and-reappend, is the reference: the oracle runs the
+/// same operation sequence through `replace_code_unit_with_range` on one copy
+/// and through the deferred calls plus one finalize on the other.
+#[cfg(test)]
+mod deferred_replacement_properties {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use brokk_bifrost_test_macros::hardwon;
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::analyzer::common::test_range;
+    use crate::analyzer::model::CodeUnitType;
+
+    const UNITS: usize = 5;
+
+    fn units() -> Vec<CodeUnit> {
+        let file = ProjectFile::new(std::env::temp_dir(), "deferred-properties.cpp");
+        (0..UNITS)
+            .map(|index| {
+                CodeUnit::new(
+                    file.clone(),
+                    CodeUnitType::Class,
+                    "pkg",
+                    format!("U{index}"),
+                )
+            })
+            .collect()
+    }
+
+    /// Parents always have a lower index than the unit they own, so the
+    /// generated ownership graph has no cycles.
+    #[derive(Debug, Clone)]
+    enum Op {
+        Add {
+            unit: usize,
+            start: usize,
+            parent: Option<usize>,
+        },
+        AddChild {
+            parent: usize,
+            child: usize,
+        },
+        AddSignature {
+            unit: usize,
+            signature: u8,
+        },
+        AddLookup {
+            unit: usize,
+            start: usize,
+        },
+        Replace {
+            unit: usize,
+            start: usize,
+            parent: Option<usize>,
+        },
+    }
+
+    impl Op {
+        fn named_units(&self) -> Vec<usize> {
+            match *self {
+                Op::Add { unit, parent, .. } | Op::Replace { unit, parent, .. } => {
+                    std::iter::once(unit).chain(parent).collect()
+                }
+                Op::AddChild { parent, child } => vec![parent, child],
+                Op::AddSignature { unit, .. } | Op::AddLookup { unit, .. } => vec![unit],
+            }
+        }
+    }
+
+    fn unit_and_parent() -> impl Strategy<Value = (usize, Option<usize>)> {
+        (1..UNITS).prop_flat_map(|unit| (Just(unit), proptest::option::of(0..unit)))
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (unit_and_parent(), 0usize..4)
+                .prop_map(|((unit, parent), start)| Op::Add { unit, start, parent }),
+            1 => (0..UNITS, 0usize..4).prop_map(|(unit, start)| Op::Add {
+                unit,
+                start,
+                parent: None
+            }),
+            1 => (1..UNITS)
+                .prop_flat_map(|child| (0..child, Just(child)))
+                .prop_map(|(parent, child)| Op::AddChild { parent, child }),
+            1 => (0..UNITS, 0u8..2).prop_map(|(unit, signature)| Op::AddSignature {
+                unit,
+                signature
+            }),
+            1 => (0..UNITS, 0usize..4).prop_map(|(unit, start)| Op::AddLookup { unit, start }),
+            3 => (unit_and_parent(), 4usize..8)
+                .prop_map(|((unit, parent), start)| Op::Replace { unit, start, parent }),
+        ]
+    }
+
+    fn apply(parsed: &mut ParsedFile, units: &[CodeUnit], op: &Op, deferred: bool) {
+        match *op {
+            Op::Add {
+                unit,
+                start,
+                parent,
+            } => parsed.add_code_unit_with_range(
+                units[unit].clone(),
+                test_range(start),
+                parent.map(|parent| units[parent].clone()),
+                None,
+            ),
+            Op::AddChild { parent, child } => {
+                parsed.add_child(units[parent].clone(), units[child].clone())
+            }
+            Op::AddSignature { unit, signature } => {
+                parsed.add_signature(units[unit].clone(), format!("sig{signature}"));
+            }
+            Op::AddLookup { unit, start } => {
+                parsed.add_definition_lookup_unit_with_range(units[unit].clone(), test_range(start))
+            }
+            Op::Replace {
+                unit,
+                start,
+                parent,
+            } => {
+                let unit = units[unit].clone();
+                let parent = parent.map(|parent| units[parent].clone());
+                if deferred {
+                    parsed.replace_code_unit_with_range_deferred(
+                        unit,
+                        test_range(start),
+                        parent,
+                        None,
+                    );
+                } else {
+                    parsed.replace_code_unit_with_range(unit, test_range(start), parent, None);
+                }
+            }
+        }
+    }
+
+    fn sorted<V: Clone>(map: &HashMap<CodeUnit, V>) -> BTreeMap<CodeUnit, V> {
+        map.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Every collection the generated operations can reach, in a form that
+    /// compares independently of hash iteration order. Vector order is kept:
+    /// it is the declaration order that consumers observe.
+    fn observable(parsed: &ParsedFile) -> String {
+        let identities: BTreeMap<CodeUnit, usize> = parsed
+            .declaration_identities
+            .iter()
+            .map(|(identity, count)| (identity.0.clone(), *count))
+            .collect();
+        format!(
+            "top_level={:?}\ntop_level_units={:?}\ndeclarations={:?}\nidentities={:?}\n\
+             lookup={:?}\nranges={:?}\nnavigation={:?}\nsignatures={:?}\nchildren={:?}\n\
+             child_owners={:?}",
+            parsed.top_level_declarations,
+            parsed.top_level_units.iter().collect::<BTreeSet<_>>(),
+            parsed.declarations.iter().collect::<BTreeSet<_>>(),
+            identities,
+            parsed
+                .definition_lookup_units
+                .iter()
+                .collect::<BTreeSet<_>>(),
+            sorted(&parsed.ranges),
+            sorted(&parsed.navigation_ranges),
+            sorted(&parsed.signatures),
+            sorted(&parsed.children),
+            sorted(&parsed.child_owners),
+        )
+    }
+
+    /// The eager and the deferred outcome of one batch, rendered by
+    /// [`observable`].
+    fn outcomes(ops: &[Op]) -> (String, String) {
+        let units = units();
+        let mut eager = ParsedFile::new(String::new());
+        let mut deferred = ParsedFile::new(String::new());
+        for op in ops {
+            apply(&mut eager, &units, op, false);
+            apply(&mut deferred, &units, op, true);
+        }
+        deferred.finalize_deferred_replacements();
+        (observable(&eager), observable(&deferred))
+    }
+
+    /// Drops the operations that fall outside the deferred contract, judged
+    /// on the eager state reached so far.
+    fn in_contract(ops: Vec<Op>) -> Vec<Op> {
+        let units = units();
+        let mut eager = ParsedFile::new(String::new());
+        let mut replaced = HashSet::default();
+        let mut named = HashSet::default();
+        let mut kept = Vec::new();
+        for op in ops {
+            match op {
+                // C++, the only deferred caller, replaces a declared unit or
+                // one the batch has not named yet. An undeclared unit that
+                // already holds facts diverges; the ignored test below pins
+                // that case.
+                Op::Replace { unit, .. }
+                    if named.contains(&unit) && !eager.contains_declaration(&units[unit]) =>
+                {
+                    continue;
+                }
+                // Finalize keeps one occurrence of each replaced unit per
+                // vector, so a batch must not name a replaced child twice
+                // under one owner. Duplicate edges of other units stay in.
+                Op::AddChild { parent, child }
+                    if replaced.contains(&child)
+                        && eager
+                            .children
+                            .get(&units[parent])
+                            .is_some_and(|children| children.contains(&units[child])) =>
+                {
+                    continue;
+                }
+                Op::Replace { unit, .. } => {
+                    replaced.insert(unit);
+                }
+                _ => {}
+            }
+            named.extend(op.named_units());
+            apply(&mut eager, &units, &op, false);
+            kept.push(op);
+        }
+        kept
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn deferred_replacement_then_finalize_equals_eager_replacement(
+            ops in proptest::collection::vec(op(), 0..14)
+        ) {
+            let (eager, deferred) = outcomes(&in_contract(ops));
+            prop_assert_eq!(eager, deferred);
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "0b69363c87d2: an old occurrence left by a pending deferred replacement acted as a live child edge"
+    )]
+    fn stale_occurrence_of_a_deferred_replacement_is_not_a_child_edge() {
+        // Replacing the old owner removed the moved unit with it.
+        let removed_with_old_owner = [
+            Op::Add {
+                unit: 1,
+                start: 0,
+                parent: None,
+            },
+            Op::Add {
+                unit: 3,
+                start: 0,
+                parent: Some(1),
+            },
+            Op::Replace {
+                unit: 3,
+                start: 4,
+                parent: None,
+            },
+            Op::Replace {
+                unit: 1,
+                start: 4,
+                parent: None,
+            },
+        ];
+        // Adding the unit back under its old owner was deduplicated against
+        // the old occurrence, so finalize dropped the unit from that owner.
+        let readded_under_old_owner = [
+            Op::Add {
+                unit: 4,
+                start: 0,
+                parent: Some(2),
+            },
+            Op::Replace {
+                unit: 4,
+                start: 5,
+                parent: None,
+            },
+            Op::Add {
+                unit: 4,
+                start: 1,
+                parent: Some(2),
+            },
+        ];
+        for ops in [&removed_with_old_owner[..], &readded_under_old_owner[..]] {
+            let (eager, deferred) = outcomes(ops);
+            assert_eq!(eager, deferred, "{ops:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "finds real bug: deferred replacement of an undeclared unit keeps the lookup facts and child edges that eager replacement clears"]
+    fn deferred_replacement_of_an_undeclared_unit_that_holds_facts_equals_eager() {
+        let lookup_only = [
+            Op::AddLookup { unit: 4, start: 0 },
+            Op::Replace {
+                unit: 4,
+                start: 4,
+                parent: None,
+            },
+        ];
+        let child_edge_only = [
+            Op::AddChild {
+                parent: 0,
+                child: 3,
+            },
+            Op::Replace {
+                unit: 3,
+                start: 4,
+                parent: None,
+            },
+        ];
+        for ops in [&lookup_only[..], &child_edge_only[..]] {
+            let (eager, deferred) = outcomes(ops);
+            assert_eq!(eager, deferred, "{ops:?}");
+        }
     }
 }
